@@ -7,36 +7,41 @@ $global:ConnMode = "Wi-Fi"
 $global:PcIp = "192.168.137.1"
 $global:MacIp = "192.168.137.58"
 
+# Check if any Apple USB-C NCM device (VID 05AC, PID 1902) is connected and started
+$appleConnected = $false
+foreach ($k in (Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Enum\USB\VID_05AC&PID_1902" -ErrorAction SilentlyContinue)) {
+    if ([CfgMgr]::IsDeviceStarted("USB\VID_05AC&PID_1902\" + $k.PSChildName)) {
+        $appleConnected = $true
+        break
+    }
+}
+
 $usbcAlive = $false
-if ([CfgMgr]::IsDeviceStarted("USB\VID_05AC&PID_1902\FVFDX9HXQ05D")) {
+if ($appleConnected) {
     $ping = New-Object System.Net.NetworkInformation.Ping
-    # 1. Probe direct link-local 10.99.99.2 (60ms timeout)
     try {
+        # 1. Probe direct link-local 10.99.99.2 (60ms timeout)
         $reply = $ping.Send("10.99.99.2", 60)
         if ($reply.Status -eq "Success") {
             $usbcAlive = $true
             $global:ConnMode = "USB-C"
             $global:PcIp = "10.99.99.1"
             $global:MacIp = "10.99.99.2"
-        }
-    } catch {}
-
-    # 2. Probe macOS Internet Sharing link 192.168.2.1 (60ms timeout)
-    if (-not $usbcAlive) {
-        try {
+        } else {
+            # 2. Probe macOS Internet Sharing link 192.168.2.1 (60ms timeout)
             $reply2 = $ping.Send("192.168.2.1", 60)
             if ($reply2.Status -eq "Success") {
                 $usbcAlive = $true
                 $global:ConnMode = "USB-C"
-                $myIp = (Get-NetIPAddress -InterfaceAlias 'Apple USB-C NCM' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like "192.168.2.*" } | Select-Object -First 1).IPAddress
-                if (-not $myIp) { $myIp = "192.168.2.2" }
-                $global:PcIp = $myIp
+                $global:PcIp = "192.168.2.2"
                 $global:MacIp = "192.168.2.1"
             }
-        } catch {}
-    }
+        }
+    } catch {}
+    $ping.Dispose()
 }
 
+# 3. Fall back to Wi-Fi if USB-C is not alive
 if (-not $usbcAlive) {
     $arpOut = & arp.exe -a
     foreach ($line in $arpOut) {
@@ -58,7 +63,7 @@ if (Test-Path $regHost2) {
     Set-ItemProperty -Path $regHost2 -Name "manualaddress" -Value $global:MacIp -ErrorAction SilentlyContinue
 }
 
-$iniPath = "C:\Users\Manveer Singh\Moonlight\Moonlight Game Streaming Project\Moonlight.ini"
+$iniPath = "$env:USERPROFILE\Moonlight\Moonlight Game Streaming Project\Moonlight.ini"
 if (Test-Path $iniPath) {
     $iniContent = [System.IO.File]::ReadAllText($iniPath)
     $iniContent = [regex]::Replace($iniContent, '(?m)^1\\localaddress=.*$', "1\localaddress=$($global:PcIp)")

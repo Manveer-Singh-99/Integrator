@@ -91,7 +91,7 @@ This automatically:
 ```bash
 sudo bash ./macos/install-macos.sh
 ```
-This configures your Mac's `AppleUSBDeviceNCM` interface (`en3` / `en5`) at **`10.99.99.2/24`** via a one-shot boot `LaunchDaemon` (`KeepAlive = false`, so zero background processes run on macOS).
+This configures your Mac's `AppleUSBDeviceNCM` interface (`en3` / `en5`) at **`10.99.99.2/24`** and installs an event-driven LaunchDaemon watchdog (`apple-usb-ncm-watchdog.sh`) via `scutil` dynamic store notifications (`0.0%` CPU, zero polling). It automatically adapts to macOS Internet Sharing (`bridge100`), port changes (`en3`/`en5`), and cable reconnections.
 
 ### 4. Test the Link
 From your Mac:
