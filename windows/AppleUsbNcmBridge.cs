@@ -442,9 +442,9 @@ namespace AppleUsbNcmBridge {
             string a = "\"" + AdapterName + "\"";
             // Static IPs only, no gateway: 10.99.99.1 (direct link) + 192.168.2.2 (macOS Internet Sharing subnet)
             Netsh("interface ip set address name=" + a + " static 10.99.99.1 255.255.255.0 none");
-            Thread.Sleep(100);
+            Thread.Sleep(500);
             Netsh("interface ip add address name=" + a + " 192.168.2.2 255.255.255.0");
-            Thread.Sleep(50);
+            Thread.Sleep(100);
             Netsh("interface ipv4 set interface interface=" + a + " metric=10");
 
             // Gateway + DNS are only installed while macOS Internet Sharing is detected (see GatewayApplyLoop)
