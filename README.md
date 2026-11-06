@@ -106,9 +106,19 @@ You can now use `10.99.99.1` (Windows) and `10.99.99.2` (Mac) for **Moonlight/Su
 
 ---
 
+## macOS Internet Sharing Support (`192.168.2.x`)
+
+The bridge supports dual-homed operation with both **direct link-local (`10.99.99.x`)** and **macOS GUI Internet Sharing (`192.168.2.x`)** running simultaneously on the same physical USB-C cable:
+
+* **Share Mac's Internet to Windows:** In macOS **System Settings > General > Sharing > Internet Sharing**, choose *Share your connection from: Wi-Fi* to *computers using: Ethernet Adapter (en3)* (or `en5`).
+* **Zero Configuration on Windows:** `AppleUsbNcmBridge` responds to ARP requests for both `10.99.99.1` and `192.168.2.2`, assigns default gateway `192.168.2.1` and DNS `192.168.2.1` / `1.1.1.1`.
+* **Zero Disruption:** Moonlight, SSH, and SMB continue working seamlessly across either subnet.
+
+---
+
 ## Optional Extras: Moonlight + Sunshine Second-Screen Auto-Switcher
 
-In [`extras/moonlight-second-screen/`](extras/moonlight-second-screen/), you'll find fast, zero-CIM mutual detection scripts (`detect_connection.ps1`, `toggle.ps1`, `detect-pc-link.sh`, and `set_sunshine_display.swift`) that automatically detect whether your USB-C cable (`10.99.99.x`) is plugged in or if you're on Wi-Fi (`192.168.137.x`), syncing Moonlight and Sunshine across both systems in `<80 ms`.
+In [`extras/moonlight-second-screen/`](extras/moonlight-second-screen/), you'll find fast, zero-CIM mutual detection scripts (`detect_connection.ps1`, `toggle.ps1`, `detect-pc-link.sh`, and `set_sunshine_display.swift`) that automatically detect whether your USB-C cable (`10.99.99.x` or `192.168.2.x`) is active or if you're on Wi-Fi (`192.168.137.x`), syncing Moonlight and Sunshine across both systems in `<80 ms`.
 
 ---
 

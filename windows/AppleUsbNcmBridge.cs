@@ -200,20 +200,29 @@ namespace AppleUsbNcmBridge {
         static void HandleArpRequest(IntPtr hIntf1, byte[] rxBuf, int offset, int len) {
             if (len < 42) return;
             ushort oper = (ushort)((rxBuf[offset + 20] << 8) | rxBuf[offset + 21]);
-            if (oper != 1) return;
+            if (oper != 1) return; // ARP Request
 
-            if (rxBuf[offset + 38] == 10 && rxBuf[offset + 39] == 99 && rxBuf[offset + 40] == 99 && rxBuf[offset + 41] == 1) {
+            byte t0 = rxBuf[offset + 38];
+            byte t1 = rxBuf[offset + 39];
+            byte t2 = rxBuf[offset + 40];
+            byte t3 = rxBuf[offset + 41];
+
+            // Respond to ARP for 10.99.99.1 (Direct Link) or 192.168.2.2 (macOS Internet Sharing)
+            bool match1099 = (t0 == 10 && t1 == 99 && t2 == 99 && t3 == 1);
+            bool match1922 = (t0 == 192 && t1 == 168 && t2 == 2 && t3 == 2);
+
+            if (match1099 || match1922) {
                 byte[] reply = new byte[42];
-                Buffer.BlockCopy(rxBuf, offset + 6, reply, 0, 6);
-                Buffer.BlockCopy(winVirtualMac, 0, reply, 6, 6);
-                reply[12] = 0x08; reply[13] = 0x06;
-                reply[14] = 0x00; reply[15] = 0x01;
-                reply[16] = 0x08; reply[17] = 0x00;
-                reply[18] = 6;    reply[19] = 4;
-                reply[20] = 0x00; reply[21] = 0x02;
-                Buffer.BlockCopy(winVirtualMac, 0, reply, 22, 6);
-                reply[28] = 10; reply[29] = 99; reply[30] = 99; reply[31] = 1;
-                Buffer.BlockCopy(rxBuf, offset + 22, reply, 32, 10);
+                Buffer.BlockCopy(rxBuf, offset + 6, reply, 0, 6); // Destination MAC (requester)
+                Buffer.BlockCopy(winVirtualMac, 0, reply, 6, 6);   // Source MAC (Windows virtual MAC)
+                reply[12] = 0x08; reply[13] = 0x06;               // EtherType ARP
+                reply[14] = 0x00; reply[15] = 0x01;               // Hardware type: Ethernet (1)
+                reply[16] = 0x08; reply[17] = 0x00;               // Protocol type: IPv4 (0x0800)
+                reply[18] = 6;    reply[19] = 4;                  // HW size 6, Proto size 4
+                reply[20] = 0x00; reply[21] = 0x02;               // Opcode: ARP Reply (2)
+                Buffer.BlockCopy(winVirtualMac, 0, reply, 22, 6);  // Sender MAC
+                reply[28] = t0; reply[29] = t1; reply[30] = t2; reply[31] = t3; // Sender IP (requested target)
+                Buffer.BlockCopy(rxBuf, offset + 22, reply, 32, 10); // Target MAC + Target IP (from request)
 
                 SendSingleEthernetFrame(hIntf1, reply, 42);
             }
@@ -356,17 +365,47 @@ namespace AppleUsbNcmBridge {
         }
 
         static void ConfigureAdapterIp() {
-            ProcessStartInfo psi = new ProcessStartInfo("netsh.exe", "interface ip set address name=\"Apple USB-C NCM\" static 10.99.99.1 255.255.255.0 none");
-            psi.CreateNoWindow = true;
-            psi.UseShellExecute = false;
-            Process p = Process.Start(psi);
-            p.WaitForExit(5000);
+            // Primary static IP: 10.99.99.1/24 (Direct link-local without gateway)
+            try {
+                ProcessStartInfo psi = new ProcessStartInfo("netsh.exe", "interface ip set address name=\"Apple USB-C NCM\" static 10.99.99.1 255.255.255.0 none");
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                Process p = Process.Start(psi);
+                if (p != null) p.WaitForExit(5000);
+            } catch {}
 
-            ProcessStartInfo psi2 = new ProcessStartInfo("netsh.exe", "advfirewall firewall add rule name=\"Apple USB-C NCM Allow All\" dir=in action=allow remoteip=10.99.99.0/24");
-            psi2.CreateNoWindow = true;
-            psi2.UseShellExecute = false;
-            Process p2 = Process.Start(psi2);
-            p2.WaitForExit(5000);
+            // Secondary static IP: 192.168.2.2/24 with gateway 192.168.2.1 metric 25 (macOS Internet Sharing)
+            try {
+                ProcessStartInfo psi2 = new ProcessStartInfo("netsh.exe", "interface ip add address name=\"Apple USB-C NCM\" 192.168.2.2 255.255.255.0 192.168.2.1 25");
+                psi2.CreateNoWindow = true;
+                psi2.UseShellExecute = false;
+                Process p2 = Process.Start(psi2);
+                if (p2 != null) p2.WaitForExit(5000);
+            } catch {}
+
+            // DNS servers on Apple USB-C NCM (Mac gateway 192.168.2.1, Cloudflare 1.1.1.1 fallback)
+            try {
+                ProcessStartInfo psiDns1 = new ProcessStartInfo("netsh.exe", "interface ip set dns name=\"Apple USB-C NCM\" static 192.168.2.1");
+                psiDns1.CreateNoWindow = true;
+                psiDns1.UseShellExecute = false;
+                Process pDns1 = Process.Start(psiDns1);
+                if (pDns1 != null) pDns1.WaitForExit(3000);
+
+                ProcessStartInfo psiDns2 = new ProcessStartInfo("netsh.exe", "interface ip add dns name=\"Apple USB-C NCM\" 1.1.1.1 index=2");
+                psiDns2.CreateNoWindow = true;
+                psiDns2.UseShellExecute = false;
+                Process pDns2 = Process.Start(psiDns2);
+                if (pDns2 != null) pDns2.WaitForExit(3000);
+            } catch {}
+
+            // Firewall rule allowing all traffic from both subnets
+            try {
+                ProcessStartInfo psiFw = new ProcessStartInfo("netsh.exe", "advfirewall firewall add rule name=\"Apple USB-C NCM Allow All\" dir=in action=allow remoteip=10.99.99.0/24,192.168.2.0/24");
+                psiFw.CreateNoWindow = true;
+                psiFw.UseShellExecute = false;
+                Process pFw = Process.Start(psiFw);
+                if (pFw != null) pFw.WaitForExit(5000);
+            } catch {}
         }
 
         static void Main(string[] args) {
@@ -390,7 +429,7 @@ namespace AppleUsbNcmBridge {
                 return;
             }
             ConfigureAdapterIp();
-            Log("WinTun adapter 'Apple USB-C NCM' configured at 10.99.99.1/24");
+            Log("WinTun adapter 'Apple USB-C NCM' configured at 10.99.99.1/24 + 192.168.2.2/24");
 
             IntPtr hPlugEvent = CreateEvent(IntPtr.Zero, false, false, null);
             CM_NOTIFY_FILTER filter = new CM_NOTIFY_FILTER();

@@ -12,8 +12,13 @@ mkdir -p /usr/local/bin
 
 cat << 'EOF' > /usr/local/bin/apple-usb-ncm-watchdog.sh
 #!/bin/bash
-# Assigns 10.99.99.2/24 at boot to AppleUSBDeviceNCM interface; macOS retains this IP across cable hotplugs
-ifconfig en3 inet 10.99.99.2 netmask 255.255.255.0 up 2>/dev/null || true
+# One-shot setup at boot: configure both en3 and en5 physical USB-C ports with 10.99.99.2 and alias 192.168.2.1
+for iface in en3 en5; do
+    if ifconfig "$iface" >/dev/null 2>&1; then
+        ifconfig "$iface" inet 10.99.99.2 netmask 255.255.255.0 up 2>/dev/null || true
+        ifconfig "$iface" alias 192.168.2.1 netmask 255.255.255.0 2>/dev/null || true
+    fi
+done
 EOF
 chmod +x /usr/local/bin/apple-usb-ncm-watchdog.sh
 

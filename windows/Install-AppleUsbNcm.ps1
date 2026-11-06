@@ -262,9 +262,9 @@ Register-ScheduledTask -TaskName "AppleUsbNcmBridge" -Action $action -Trigger @(
 Start-ScheduledTask -TaskName "AppleUsbNcmBridge"
 
 if (-not (Get-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -Direction Inbound -Action Allow -RemoteAddress 10.99.99.0/24 -Profile Any | Out-Null
+    New-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -Direction Inbound -Action Allow -RemoteAddress 10.99.99.0/24,192.168.2.0/24 -Profile Any | Out-Null
 }
 
 Start-Sleep -Seconds 3
 Get-Content (Join-Path $dir "bridge.log") -ErrorAction SilentlyContinue
-Write-Host "`nInstallation complete! Windows USB-C IP is 10.99.99.1/24." -ForegroundColor Green
+Write-Host "`nInstallation complete! Windows USB-C IP is 10.99.99.1/24 (Direct Link) and 192.168.2.2/24 (macOS Internet Sharing)." -ForegroundColor Green
