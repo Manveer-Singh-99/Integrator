@@ -461,10 +461,13 @@ public class CfgMgr
     [DllImport("user32.dll")]
     public static extern int SetDisplayConfig(uint numPathArrayElements, IntPtr pathArray, uint numModeInfoArrayElements, IntPtr modeInfoArray, uint flags);
 
-    private static void GetVirtualDisplayInfo(out List<DISPLAY_DEVICEW> vdds, out int primaryWidth)
+    private static void GetVirtualDisplayInfo(out List<DISPLAY_DEVICEW> vdds, out int primaryX, out int primaryY, out int primaryWidth, out int primaryHeight)
     {
         vdds = new List<DISPLAY_DEVICEW>();
+        primaryX = 0;
+        primaryY = 0;
         primaryWidth = 1920;
+        primaryHeight = 1200;
         uint idx = 0;
         while (true)
         {
@@ -477,7 +480,12 @@ public class CfgMgr
                 DEVMODEW pdm = new DEVMODEW();
                 pdm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
                 if (EnumDisplaySettingsExW(dd.DeviceName, -1, ref pdm, 0) && pdm.dmPelsWidth > 0)
+                {
+                    primaryX = pdm.dmPositionX;
+                    primaryY = pdm.dmPositionY;
                     primaryWidth = pdm.dmPelsWidth;
+                    primaryHeight = (pdm.dmPelsHeight > 0) ? pdm.dmPelsHeight : 1200;
+                }
             }
             if (dd.DeviceString != null && dd.DeviceString.IndexOf("Virtual Display Driver", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -491,6 +499,170 @@ public class CfgMgr
             int.TryParse(b.DeviceName.Replace(@"\\.\DISPLAY", ""), out nb);
             return na.CompareTo(nb);
         });
+    }
+
+    private const string PositionsFilePath = @"C:\VirtualDisplayDriver\positions.txt";
+
+    private static bool RectsOverlap(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2)
+    {
+        return (x1 < x2 + w2) && (x1 + w1 > x2) && (y1 < y2 + h2) && (y1 + h1 > y2);
+    }
+
+    private static bool RectsNear(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2)
+    {
+        return RectsOverlap(x1 - 32, y1 - 32, w1 + 64, h1 + 64, x2, y2, w2, h2);
+    }
+
+    private static bool IsValidSoloPos(int x, int y, int w, int h, int px, int py, int pw, int ph)
+    {
+        if (x < -12000 || x > 12000 || y < -12000 || y > 12000) return false;
+        if (RectsOverlap(x, y, w, h, px, py, pw, ph)) return false;
+        return RectsNear(x, y, w, h, px, py, pw, ph);
+    }
+
+    private static bool IsValidDualPos(int x0, int y0, int w0, int h0, int x1, int y1, int w1, int h1, int px, int py, int pw, int ph)
+    {
+        if (x0 < -12000 || x0 > 12000 || y0 < -12000 || y0 > 12000) return false;
+        if (x1 < -12000 || x1 > 12000 || y1 < -12000 || y1 > 12000) return false;
+        if (RectsOverlap(x0, y0, w0, h0, px, py, pw, ph)) return false;
+        if (RectsOverlap(x1, y1, w1, h1, px, py, pw, ph)) return false;
+        if (RectsOverlap(x0, y0, w0, h0, x1, y1, w1, h1)) return false;
+        bool t0p = RectsNear(x0, y0, w0, h0, px, py, pw, ph);
+        bool t1p = RectsNear(x1, y1, w1, h1, px, py, pw, ph);
+        bool t01 = RectsNear(x0, y0, w0, h0, x1, y1, w1, h1);
+        return (t0p && (t1p || t01)) || (t1p && (t0p || t01));
+    }
+
+    private static void LoadSavedPositions(
+        out bool hasSolo0, out int s0x, out int s0y,
+        out bool hasSolo1, out int s1x, out int s1y,
+        out bool hasDual, out int d0x, out int d0y, out int d1x, out int d1y)
+    {
+        hasSolo0 = false; s0x = 0; s0y = 0;
+        hasSolo1 = false; s1x = 0; s1y = 0;
+        hasDual = false; d0x = 0; d0y = 0; d1x = 0; d1y = 0;
+        try
+        {
+            if (!File.Exists(PositionsFilePath)) return;
+            string[] lines = File.ReadAllLines(PositionsFilePath);
+            foreach (string raw in lines)
+            {
+                string line = raw.Trim();
+                if (line.StartsWith("solo0=", StringComparison.Ordinal))
+                {
+                    string[] p = line.Substring(6).Split(',');
+                    if (p.Length == 2 && int.TryParse(p[0], out s0x) && int.TryParse(p[1], out s0y))
+                        hasSolo0 = true;
+                }
+                else if (line.StartsWith("solo1=", StringComparison.Ordinal))
+                {
+                    string[] p = line.Substring(6).Split(',');
+                    if (p.Length == 2 && int.TryParse(p[0], out s1x) && int.TryParse(p[1], out s1y))
+                        hasSolo1 = true;
+                }
+                else if (line.StartsWith("dual=", StringComparison.Ordinal))
+                {
+                    string[] p = line.Substring(5).Split(',');
+                    if (p.Length == 4 &&
+                        int.TryParse(p[0], out d0x) && int.TryParse(p[1], out d0y) &&
+                        int.TryParse(p[2], out d1x) && int.TryParse(p[3], out d1y))
+                        hasDual = true;
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static void SaveSavedPositions(
+        bool hasSolo0, int s0x, int s0y,
+        bool hasSolo1, int s1x, int s1y,
+        bool hasDual, int d0x, int d0y, int d1x, int d1y)
+    {
+        try
+        {
+            StringBuilder sb = new StringBuilder();
+            if (hasSolo0) sb.AppendFormat("solo0={0},{1}\r\n", s0x, s0y);
+            if (hasSolo1) sb.AppendFormat("solo1={0},{1}\r\n", s1x, s1y);
+            if (hasDual) sb.AppendFormat("dual={0},{1},{2},{3}\r\n", d0x, d0y, d1x, d1y);
+            string newTxt = sb.ToString();
+            string oldTxt = File.Exists(PositionsFilePath) ? File.ReadAllText(PositionsFilePath) : "";
+            if (!string.Equals(newTxt, oldTxt, StringComparison.Ordinal))
+            {
+                File.WriteAllText(PositionsFilePath, newTxt, Encoding.ASCII);
+            }
+        }
+        catch { }
+    }
+
+    private static void CaptureCurrentLayoutPositions(
+        bool okCur0, DEVMODEW dm0, bool okCur1, DEVMODEW dm1,
+        int px, int py, int pw, int ph)
+    {
+        bool hasSolo0, hasSolo1, hasDual;
+        int s0x, s0y, s1x, s1y, d0x, d0y, d1x, d1y;
+        LoadSavedPositions(out hasSolo0, out s0x, out s0y, out hasSolo1, out s1x, out s1y, out hasDual, out d0x, out d0y, out d1x, out d1y);
+
+        bool valid0 = okCur0 && dm0.dmPelsWidth == 2360 && dm0.dmPelsHeight == 1640;
+        bool valid1 = okCur1 && dm1.dmPelsWidth == 2560 && dm1.dmPelsHeight == 1600;
+
+        if (valid0 && !okCur1)
+        {
+            if (IsValidSoloPos(dm0.dmPositionX, dm0.dmPositionY, 2360, 1640, px, py, pw, ph))
+            {
+                hasSolo0 = true;
+                s0x = dm0.dmPositionX;
+                s0y = dm0.dmPositionY;
+                SaveSavedPositions(hasSolo0, s0x, s0y, hasSolo1, s1x, s1y, hasDual, d0x, d0y, d1x, d1y);
+            }
+        }
+        else if (valid1 && !okCur0)
+        {
+            if (IsValidSoloPos(dm1.dmPositionX, dm1.dmPositionY, 2560, 1600, px, py, pw, ph))
+            {
+                hasSolo1 = true;
+                s1x = dm1.dmPositionX;
+                s1y = dm1.dmPositionY;
+                SaveSavedPositions(hasSolo0, s0x, s0y, hasSolo1, s1x, s1y, hasDual, d0x, d0y, d1x, d1y);
+            }
+        }
+        else if (valid0 && valid1)
+        {
+            if (IsValidDualPos(dm0.dmPositionX, dm0.dmPositionY, 2360, 1640, dm1.dmPositionX, dm1.dmPositionY, 2560, 1600, px, py, pw, ph))
+            {
+                hasDual = true;
+                d0x = dm0.dmPositionX;
+                d0y = dm0.dmPositionY;
+                d1x = dm1.dmPositionX;
+                d1y = dm1.dmPositionY;
+                SaveSavedPositions(hasSolo0, s0x, s0y, hasSolo1, s1x, s1y, hasDual, d0x, d0y, d1x, d1y);
+            }
+        }
+    }
+
+    public static void SnapshotActivePositions()
+    {
+        try
+        {
+            List<DISPLAY_DEVICEW> vdds;
+            int px, py, pw, ph;
+            GetVirtualDisplayInfo(out vdds, out px, out py, out pw, out ph);
+            if (vdds.Count < 2) return;
+
+            bool att0 = (vdds[0].StateFlags & 1) != 0;
+            bool att1 = (vdds[1].StateFlags & 1) != 0;
+            if (!att0 && !att1) return;
+
+            DEVMODEW dm0 = new DEVMODEW();
+            dm0.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+            bool okCur0 = att0 && EnumDisplaySettingsExW(vdds[0].DeviceName, -1, ref dm0, 0);
+
+            DEVMODEW dm1 = new DEVMODEW();
+            dm1.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+            bool okCur1 = att1 && EnumDisplaySettingsExW(vdds[1].DeviceName, -1, ref dm1, 0);
+
+            CaptureCurrentLayoutPositions(okCur0, dm0, okCur1, dm1, px, py, pw, ph);
+        }
+        catch { }
     }
 
     private static void StageDetachDisplay(string devName)
@@ -531,15 +703,15 @@ public class CfgMgr
             try { locked = mtx.WaitOne(3000); } catch (AbandonedMutexException) { locked = true; }
 
             List<DISPLAY_DEVICEW> vdds;
-            int primaryW;
-            GetVirtualDisplayInfo(out vdds, out primaryW);
+            int primaryX, primaryY, primaryW, primaryH;
+            GetVirtualDisplayInfo(out vdds, out primaryX, out primaryY, out primaryW, out primaryH);
 
             if ((slot0Active || slot1Active) && vdds.Count < 2 && IsDeviceStarted(@"ROOT\DISPLAY\0001"))
             {
                 for (int attempt = 0; attempt < 25; attempt++)
                 {
                     Thread.Sleep(80);
-                    GetVirtualDisplayInfo(out vdds, out primaryW);
+                    GetVirtualDisplayInfo(out vdds, out primaryX, out primaryY, out primaryW, out primaryH);
                     if (vdds.Count >= 2) break;
                 }
             }
@@ -557,9 +729,9 @@ public class CfgMgr
                 c0.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
                 bool ok0 = att && EnumDisplaySettingsExW(vdds[0].DeviceName, -1, ref c0, 0);
                 if (!want && !att) return "noop";
-                if (want && ok0 && c0.dmPelsWidth == tw && c0.dmPelsHeight == th && c0.dmPositionX == primaryW && c0.dmPositionY == 0)
+                if (want && ok0 && c0.dmPelsWidth == tw && c0.dmPelsHeight == th && IsValidSoloPos(c0.dmPositionX, c0.dmPositionY, tw, th, primaryX, primaryY, primaryW, primaryH))
                     return "noop";
-                if (want) StageAttachDisplay(vdds[0].DeviceName, primaryW, 0, tw, th, 60);
+                if (want) StageAttachDisplay(vdds[0].DeviceName, primaryX + primaryW, primaryY, tw, th, 60);
                 else StageDetachDisplay(vdds[0].DeviceName);
                 ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
                 return vdds[0].DeviceName;
@@ -576,25 +748,116 @@ public class CfgMgr
             dm1.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
             bool okCur1 = att1 && EnumDisplaySettingsExW(vdds[1].DeviceName, -1, ref dm1, 0);
 
-            int targetX0 = primaryW;
-            int targetX1 = primaryW;
+            // Persist any custom display arrangement the user made before changing topology
+            CaptureCurrentLayoutPositions(okCur0, dm0, okCur1, dm1, primaryX, primaryY, primaryW, primaryH);
 
-            if (slot0Active && slot1Active)
+            bool hasSolo0, hasSolo1, hasDual;
+            int s0x, s0y, s1x, s1y, d0x, d0y, d1x, d1y;
+            LoadSavedPositions(out hasSolo0, out s0x, out s0y, out hasSolo1, out s1x, out s1y, out hasDual, out d0x, out d0y, out d1x, out d1y);
+
+            int targetX0 = primaryX + primaryW;
+            int targetY0 = primaryY;
+            int targetX1 = primaryX + primaryW;
+            int targetY1 = primaryY;
+
+            if (slot0Active && !slot1Active)
             {
-                if (okCur1 && dm1.dmPositionX == primaryW && (!okCur0 || dm0.dmPositionX != primaryW))
+                if (okCur0 && !okCur1 && dm0.dmPelsWidth == 2360 && dm0.dmPelsHeight == 1640 &&
+                    IsValidSoloPos(dm0.dmPositionX, dm0.dmPositionY, 2360, 1640, primaryX, primaryY, primaryW, primaryH))
                 {
-                    targetX1 = primaryW;
-                    targetX0 = primaryW + 2560;
+                    targetX0 = dm0.dmPositionX;
+                    targetY0 = dm0.dmPositionY;
+                }
+                else if (hasSolo0 && IsValidSoloPos(s0x, s0y, 2360, 1640, primaryX, primaryY, primaryW, primaryH))
+                {
+                    targetX0 = s0x;
+                    targetY0 = s0y;
+                }
+            }
+            else if (!slot0Active && slot1Active)
+            {
+                if (okCur1 && !okCur0 && dm1.dmPelsWidth == 2560 && dm1.dmPelsHeight == 1600 &&
+                    IsValidSoloPos(dm1.dmPositionX, dm1.dmPositionY, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                {
+                    targetX1 = dm1.dmPositionX;
+                    targetY1 = dm1.dmPositionY;
+                }
+                else if (hasSolo1 && IsValidSoloPos(s1x, s1y, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                {
+                    targetX1 = s1x;
+                    targetY1 = s1y;
+                }
+            }
+            else if (slot0Active && slot1Active)
+            {
+                if (okCur0 && okCur1 &&
+                    dm0.dmPelsWidth == 2360 && dm0.dmPelsHeight == 1640 &&
+                    dm1.dmPelsWidth == 2560 && dm1.dmPelsHeight == 1600 &&
+                    IsValidDualPos(dm0.dmPositionX, dm0.dmPositionY, 2360, 1640, dm1.dmPositionX, dm1.dmPositionY, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                {
+                    targetX0 = dm0.dmPositionX;
+                    targetY0 = dm0.dmPositionY;
+                    targetX1 = dm1.dmPositionX;
+                    targetY1 = dm1.dmPositionY;
+                }
+                else if (hasDual && IsValidDualPos(d0x, d0y, 2360, 1640, d1x, d1y, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                {
+                    targetX0 = d0x;
+                    targetY0 = d0y;
+                    targetX1 = d1x;
+                    targetY1 = d1y;
                 }
                 else
                 {
-                    targetX0 = primaryW;
-                    targetX1 = primaryW + 2360;
+                    int cand0X = hasSolo0 ? s0x : (primaryX + primaryW);
+                    int cand0Y = hasSolo0 ? s0y : primaryY;
+                    int cand1X = hasSolo1 ? s1x : (primaryX + primaryW);
+                    int cand1Y = hasSolo1 ? s1y : primaryY;
+
+                    if (okCur0 && IsValidSoloPos(dm0.dmPositionX, dm0.dmPositionY, 2360, 1640, primaryX, primaryY, primaryW, primaryH))
+                    {
+                        cand0X = dm0.dmPositionX;
+                        cand0Y = dm0.dmPositionY;
+                    }
+                    if (okCur1 && IsValidSoloPos(dm1.dmPositionX, dm1.dmPositionY, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                    {
+                        cand1X = dm1.dmPositionX;
+                        cand1Y = dm1.dmPositionY;
+                    }
+
+                    if (IsValidDualPos(cand0X, cand0Y, 2360, 1640, cand1X, cand1Y, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                    {
+                        targetX0 = cand0X;
+                        targetY0 = cand0Y;
+                        targetX1 = cand1X;
+                        targetY1 = cand1Y;
+                    }
+                    else if (okCur1 && IsValidSoloPos(cand1X, cand1Y, 2560, 1600, primaryX, primaryY, primaryW, primaryH))
+                    {
+                        targetX1 = cand1X;
+                        targetY1 = cand1Y;
+                        targetX0 = Math.Max(primaryX + primaryW, targetX1 + 2560);
+                        targetY0 = primaryY;
+                    }
+                    else if (okCur0 && IsValidSoloPos(cand0X, cand0Y, 2360, 1640, primaryX, primaryY, primaryW, primaryH))
+                    {
+                        targetX0 = cand0X;
+                        targetY0 = cand0Y;
+                        targetX1 = Math.Max(primaryX + primaryW, targetX0 + 2360);
+                        targetY1 = primaryY;
+                    }
+                    else
+                    {
+                        targetX0 = primaryX + primaryW;
+                        targetY0 = primaryY;
+                        targetX1 = primaryX + primaryW + 2360;
+                        targetY1 = primaryY;
+                    }
                 }
             }
 
-            bool need0 = (slot0Active != att0) || (slot0Active && (!okCur0 || dm0.dmPelsWidth != 2360 || dm0.dmPelsHeight != 1640 || dm0.dmPositionX != targetX0 || dm0.dmPositionY != 0));
-            bool need1 = (slot1Active != att1) || (slot1Active && (!okCur1 || dm1.dmPelsWidth != 2560 || dm1.dmPelsHeight != 1600 || dm1.dmPositionX != targetX1 || dm1.dmPositionY != 0));
+            bool need0 = (slot0Active != att0) || (slot0Active && (!okCur0 || dm0.dmPelsWidth != 2360 || dm0.dmPelsHeight != 1640 || dm0.dmPositionX != targetX0 || dm0.dmPositionY != targetY0));
+            bool need1 = (slot1Active != att1) || (slot1Active && (!okCur1 || dm1.dmPelsWidth != 2560 || dm1.dmPelsHeight != 1600 || dm1.dmPositionX != targetX1 || dm1.dmPositionY != targetY1));
 
             if (!need0 && !need1)
                 return "noop";
@@ -605,13 +868,13 @@ public class CfgMgr
                 StageDetachDisplay(vdds[1].DeviceName);
 
             if (slot0Active)
-                StageAttachDisplay(vdds[0].DeviceName, targetX0, 0, 2360, 1640, 60);
+                StageAttachDisplay(vdds[0].DeviceName, targetX0, targetY0, 2360, 1640, 60);
             if (slot1Active)
-                StageAttachDisplay(vdds[1].DeviceName, targetX1, 0, 2560, 1600, 60);
+                StageAttachDisplay(vdds[1].DeviceName, targetX1, targetY1, 2560, 1600, 60);
 
             ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
 
-            GetVirtualDisplayInfo(out vdds, out primaryW);
+            GetVirtualDisplayInfo(out vdds, out primaryX, out primaryY, out primaryW, out primaryH);
             if (vdds.Count >= 2)
             {
                 bool nowAtt0 = (vdds[0].StateFlags & 1) != 0;
@@ -621,14 +884,14 @@ public class CfgMgr
                     SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, 0x00000004 | 0x00000080);
                     Thread.Sleep(200);
                     if (!slot0Active) StageDetachDisplay(vdds[0].DeviceName);
-                    else StageAttachDisplay(vdds[0].DeviceName, targetX0, 0, 2360, 1640, 60);
+                    else StageAttachDisplay(vdds[0].DeviceName, targetX0, targetY0, 2360, 1640, 60);
                     if (!slot1Active) StageDetachDisplay(vdds[1].DeviceName);
-                    else StageAttachDisplay(vdds[1].DeviceName, targetX1, 0, 2560, 1600, 60);
+                    else StageAttachDisplay(vdds[1].DeviceName, targetX1, targetY1, 2560, 1600, 60);
                     ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
                 }
             }
 
-            return string.Format("slot0={0}@{1},slot1={2}@{3}", slot0Active, targetX0, slot1Active, targetX1);
+            return string.Format("slot0={0}@{1},{2};slot1={3}@{4},{5}", slot0Active, targetX0, targetY0, slot1Active, targetX1, targetY1);
         }
         finally
         {
@@ -825,11 +1088,20 @@ public class CfgMgr
 
             try
             {
+                SnapshotActivePositions();
+                int snapTick = 0;
                 while (IsDeviceStarted(@"ROOT\DISPLAY\0001"))
                 {
                     wakeEvent.WaitOne(2000);
                     if (!IsDeviceStarted(@"ROOT\DISPLAY\0001"))
                         break;
+
+                    snapTick++;
+                    if (snapTick >= 3)
+                    {
+                        snapTick = 0;
+                        SnapshotActivePositions();
+                    }
 
                     int ev0 = ReadNewSessionEvent(log0, ref pos0);
                     if (ev0 == 1)
