@@ -14,15 +14,14 @@ if ([System.IO.File]::Exists($vddXmlPath)) {
         $activeCount = [int]$matches[1]
     }
 }
-$desiredCount = if ($global:MacPresent -and $global:IpadPresent) { 2 } else { 1 }
-$upgradeToDual = ($isRunning -and $activeCount -eq 1 -and $desiredCount -eq 2)
+$upgradeToDual = ($isRunning -and $activeCount -lt 2)
 
-function Set-VddMonitorCount([int]$count) {
+function Ensure-DualVddConfig {
     $desiredXml = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <IddSampleDriverConfig>
   <monitors>
-    <count>$count</count>
+    <count>2</count>
     <monitor>
       <friendlyname>Intel(R) Arc(TM) 140T GPU (16GB)</friendlyname>
       <modes>
@@ -42,14 +41,20 @@ function Set-VddMonitorCount([int]$count) {
 </IddSampleDriverConfig>
 "@
     $currentXml = if ([System.IO.File]::Exists($vddXmlPath)) { [System.IO.File]::ReadAllText($vddXmlPath) } else { "" }
-    if ($currentXml -notmatch "<count>$count</count>") {
+    if ($currentXml -notmatch "<count>2</count>") {
         [System.IO.File]::WriteAllText($vddXmlPath, $desiredXml)
     }
 }
 
+function Stop-DynamicWatcher {
+    & schtasks.exe /End /TN "VddDynamicWatcher" 2>$null | Out-Null
+    Get-Process -Name "VddCtl" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-SecondarySunshine {
     if ([CfgMgr]::IsLocalPortListening(48989) -or [CfgMgr]::IsLocalPortListening(48990)) {
-        & curl.exe -k -s --max-time 1 -u "admin:alpine" -X POST "https://localhost:48990/api/apps/close" -H "Content-Type: application/json" | Out-Null
+        [CfgMgr]::ResetSunshinePersistence(48990)
+        [CfgMgr]::CloseSunshineApp(48990)
     }
     & schtasks.exe /End /TN "SunshineSecondary" 2>$null | Out-Null
     [CfgMgr]::StopProcessOnPort(48989)
@@ -57,14 +62,23 @@ function Stop-SecondarySunshine {
 }
 
 if ($isRunning -and -not $upgradeToDual) {
-    # 1. Terminate active stream on Primary Sunshine (47990) & Secondary Sunshine (48990)
-    & curl.exe -k -s --max-time 1 -u "admin:alpine" -X POST "https://localhost:47990/api/apps/close" -H "Content-Type: application/json" | Out-Null
+    # 1. Stop dynamic display watcher first so it doesn't fight shutdown
+    Stop-DynamicWatcher
+
+    # 2. Close active streams & clear persistence on Primary (:47990) and Secondary (:48990)
+    [CfgMgr]::DeleteJoinStamp(0)
+    [CfgMgr]::DeleteJoinStamp(1)
+    if ([CfgMgr]::IsLocalPortListening(47990)) {
+        [CfgMgr]::ResetSunshinePersistence(47990)
+        [CfgMgr]::CloseSunshineApp(47990)
+    }
     Stop-SecondarySunshine
 
-    # 2. Disable Virtual Display via pnputil (~80ms, eliminates hidden desktop & stops GPU duplication)
+    # 3. Detach both virtual connectors cleanly in registry, then disable ROOT\DISPLAY\0001
+    [CfgMgr]::SyncVirtualDisplays($false, $false) | Out-Null
     & pnputil.exe /disable-device $deviceId | Out-Null
 
-    # 3. Close Moonlight (and any pending stream-pc-screen wait loop) on Mac if reachable (non-blocking)
+    # 4. Close Moonlight on Mac if reachable (non-blocking)
     if ($global:MacPresent -or $global:MacIp) {
         Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"pkill -f stream-pc-screen 2>/dev/null; killall Moonlight 2>/dev/null || true`"" -WindowStyle Hidden
     }
@@ -72,73 +86,62 @@ if ($isRunning -and -not $upgradeToDual) {
     [System.Windows.Forms.MessageBox]::Show("All virtual extended displays DISABLED.", "Second Screen", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 } else {
     if ($upgradeToDual) {
-        # Upgrading live from 1 virtual display -> 2 independent extended displays
-        & curl.exe -k -s --max-time 1 -u "admin:alpine" -X POST "https://localhost:47990/api/apps/close" -H "Content-Type: application/json" | Out-Null
+        Stop-DynamicWatcher
+        if ([CfgMgr]::IsLocalPortListening(47990)) {
+            [CfgMgr]::ResetSunshinePersistence(47990)
+            [CfgMgr]::CloseSunshineApp(47990)
+        }
         & pnputil.exe /disable-device $deviceId | Out-Null
         Start-Sleep -Milliseconds 350
     }
-    # Ensure Primary SunshineService is running (sc.exe start is a 2ms no-op if already running)
+
+    # 1. Always prepare 2 independent virtual slots (both detached until actively streaming):
+    #    - Slot 0 ({5eb52002-...}): iPad 2360x1640 @ 60Hz on Primary Sunshine (:47989, HP-Omen)
+    #    - Slot 1 ({456a3c17-...}): Mac  2560x1600 @ 60Hz on Secondary Sunshine (:48989, HP-Omen-Mac2)
+    Ensure-DualVddConfig
+    & pnputil.exe /enable-device $deviceId | Out-Null
+
+    # 2. Ensure both Sunshine instances are running
     & sc.exe start SunshineService 2>$null | Out-Null
+    [CfgMgr]::EnsureSecondarySunshineReady()
 
-    if ($global:MacPresent -and $global:IpadPresent) {
-        # =========================================================================
-        # CASE 1: BOTH MAC + IPAD CONNECTED (Triple Display: PC + iPad + Mac)
-        #   - Virtual Monitor 1 ({5eb52002-...}): 2360x1640 @ 60Hz -> Primary Sunshine (:47989) for iPad
-        #   - Virtual Monitor 2 ({456a3c17-...}): 2560x1600 @ 60Hz -> Secondary Sunshine (:48989) for Mac
-        # =========================================================================
-        Set-VddMonitorCount 2
-        & pnputil.exe /enable-device $deviceId | Out-Null
+    $s0 = [CfgMgr]::IsSlotStreaming(0)
 
-        if (-not [CfgMgr]::IsLocalPortListening(48989)) {
-            & schtasks.exe /Run /TN "SunshineSecondary" 2>$null | Out-Null
-        }
-
-        [CfgMgr]::ConfigureVirtualDisplays(2, 2360, 1640, 2560, 1600) | Out-Null
+    if ($global:MacPresent) {
+        # Attach Mac display immediately & launch Moonlight on Mac; iPad slot stays detached unless/until iPad streams
+        [CfgMgr]::WriteJoinStamp(1)
+        [CfgMgr]::SyncVirtualDisplays($s0, $true) | Out-Null
 
         Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"/usr/local/bin/stream-pc-screen.sh $($global:PcIp) 48989`"" -WindowStyle Hidden
 
+        & schtasks.exe /Run /TN "VddDynamicWatcher" 2>$null | Out-Null
+
+        $ipadNote = if ($s0) {
+            "iPad (2360x1640 @ 60Hz): Active"
+        } else {
+            "iPad (2360x1640 @ 60Hz): Ready — auto-attaches when you tap Desktop in Moonlight on iPad, and auto-detaches on exit"
+        }
+
         [System.Windows.Forms.MessageBox]::Show(
-            "Dual Extended Displays ENABLED:`n`n" +
-            "1. iPad (2360x1640 @ 60Hz) via $($global:IpadMode) [Primary Sunshine :47989]`n" +
-            "2. Mac (2560x1600 @ 60Hz) via $($global:MacMode) ($($global:PcIp):48989)",
-            "Second Screen (Mac + iPad)",
+            "Dynamic Extended Display ENABLED:`n`n" +
+            "- Mac (2560x1600 @ 60Hz): Connecting via $($global:MacMode) ($($global:PcIp):48989)`n" +
+            "- $ipadNote",
+            "Second Screen (Dynamic)",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null
-
-    } elseif ($global:MacPresent) {
-        # =========================================================================
-        # CASE 2: MAC ONLY CONNECTED (Dual Display: PC + Mac 2560x1600 @ 60Hz)
-        # =========================================================================
-        Stop-SecondarySunshine
-        Set-VddMonitorCount 1
-        & pnputil.exe /enable-device $deviceId | Out-Null
-
-        [CfgMgr]::ConfigureVirtualDisplays(1, 2560, 1600, 0, 0) | Out-Null
-
-        Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"/usr/local/bin/stream-pc-screen.sh $($global:PcIp) 47989`"" -WindowStyle Hidden
-
-        [System.Windows.Forms.MessageBox]::Show(
-            "Mac Extended Display ENABLED (2560x1600 @ 60Hz) via $($global:MacMode) ($($global:PcIp)).",
-            "Second Screen (Mac)",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-
     } else {
-        # =========================================================================
-        # CASE 3: IPAD ONLY CONNECTED (Dual Display: PC + iPad 2360x1640 @ 60Hz)
-        # =========================================================================
-        Stop-SecondarySunshine
-        Set-VddMonitorCount 1
-        & pnputil.exe /enable-device $deviceId | Out-Null
+        # Keep unstreamed slots detached until a client connects so there is never a phantom display
+        [CfgMgr]::SyncVirtualDisplays($s0, $false) | Out-Null
+        & schtasks.exe /Run /TN "VddDynamicWatcher" 2>$null | Out-Null
 
-        [CfgMgr]::ConfigureVirtualDisplays(1, 2360, 1640, 0, 0) | Out-Null
-
-        $ipadTransport = if ($global:IpadMode) { $global:IpadMode } else { "Wi-Fi / USB-C" }
+        $ipadTransport = if ($global:IpadMode) { " via $($global:IpadMode)" } else { "" }
         [System.Windows.Forms.MessageBox]::Show(
-            "iPad Extended Display ENABLED (2360x1640 @ 60Hz) via $ipadTransport.`nOpen Moonlight on iPad and tap Desktop.",
-            "Second Screen (iPad)",
+            "Dynamic Extended Display READY$ipadTransport.`n`n" +
+            "- Tap Desktop on iPad Moonlight (HP-Omen) -> 2360x1640 display auto-attaches`n" +
+            "- Plug in or connect Mac (HP-Omen-Mac2) -> 2560x1600 display auto-attaches`n" +
+            "- Exiting any stream automatically detaches that display.",
+            "Second Screen (Dynamic)",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -249,6 +251,29 @@ public class CfgMgr
         return "";
     }
 
+    public static bool HasActiveNonUsbStream(int basePort)
+    {
+        try
+        {
+            int httpsPort = basePort - 5;
+            int rtspPort = basePort + 21;
+            IPGlobalProperties props = IPGlobalProperties.GetIPGlobalProperties();
+            TcpConnectionInformation[] conns = props.GetActiveTcpConnections();
+            foreach (TcpConnectionInformation c in conns)
+            {
+                int lp = c.LocalEndPoint.Port;
+                if (lp == basePort || lp == httpsPort || lp == rtspPort)
+                {
+                    string lip = c.LocalEndPoint.Address.ToString();
+                    if (!lip.StartsWith("10.99.99.") && !lip.StartsWith("192.168.2.") && !lip.StartsWith("127."))
+                        return true;
+                }
+            }
+        }
+        catch { }
+        return false;
+    }
+
     public static string QueryMdnsHosts(string[] hostnames, int timeoutMs)
     {
         try
@@ -463,70 +488,712 @@ public class CfgMgr
     [DllImport("user32.dll")]
     public static extern int SetDisplayConfig(uint numPathArrayElements, IntPtr pathArray, uint numModeInfoArrayElements, IntPtr modeInfoArray, uint flags);
 
-    public static string ConfigureVirtualDisplays(int expectedCount, int w1, int h1, int w2, int h2)
+    public static int GetAttachedVirtualDisplayCount()
     {
-        List<string> vdds = new List<string>();
-        bool needExtend = false;
-
-        for (int attempt = 0; attempt < 25; attempt++)
+        int count = 0;
+        uint idx = 0;
+        while (true)
         {
-            vdds.Clear();
-            needExtend = false;
-            uint idx = 0;
-            while (true)
+            DISPLAY_DEVICEW dd = new DISPLAY_DEVICEW();
+            dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICEW));
+            if (!EnumDisplayDevicesW(null, idx, ref dd, 0)) break;
+            idx++;
+            if (dd.DeviceString != null && dd.DeviceString.IndexOf("Virtual Display Driver", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                DISPLAY_DEVICEW dd = new DISPLAY_DEVICEW();
-                dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICEW));
-                if (!EnumDisplayDevicesW(null, idx, ref dd, 0)) break;
-                idx++;
-                if (dd.DeviceString != null && dd.DeviceString.IndexOf("Virtual Display Driver", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    if ((dd.StateFlags & 1) == 0)
-                        needExtend = true;
-                    vdds.Add(dd.DeviceName);
-                }
+                if ((dd.StateFlags & 1) != 0)
+                    count++;
             }
-            if (vdds.Count >= expectedCount)
-                break;
-            Thread.Sleep(80);
         }
+        return count;
+    }
 
-        if (needExtend)
+    private static void GetVirtualDisplayInfo(out List<DISPLAY_DEVICEW> vdds, out int primaryWidth)
+    {
+        vdds = new List<DISPLAY_DEVICEW>();
+        primaryWidth = 1920;
+        uint idx = 0;
+        while (true)
         {
-            SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, 0x00000004 | 0x00000080); // SDC_TOPOLOGY_EXTEND | SDC_APPLY
-            Thread.Sleep(250);
+            DISPLAY_DEVICEW dd = new DISPLAY_DEVICEW();
+            dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICEW));
+            if (!EnumDisplayDevicesW(null, idx, ref dd, 0)) break;
+            idx++;
+            if ((dd.StateFlags & 4) != 0) // DISPLAY_DEVICE_PRIMARY_DEVICE
+            {
+                DEVMODEW pdm = new DEVMODEW();
+                pdm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+                if (EnumDisplaySettingsExW(dd.DeviceName, -1, ref pdm, 0) && pdm.dmPelsWidth > 0)
+                    primaryWidth = pdm.dmPelsWidth;
+            }
+            if (dd.DeviceString != null && dd.DeviceString.IndexOf("Virtual Display Driver", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                vdds.Add(dd);
+            }
         }
-
         vdds.Sort((a, b) =>
         {
             int na = 0, nb = 0;
-            int.TryParse(a.Replace(@"\\.\DISPLAY", ""), out na);
-            int.TryParse(b.Replace(@"\\.\DISPLAY", ""), out nb);
+            int.TryParse(a.DeviceName.Replace(@"\\.\DISPLAY", ""), out na);
+            int.TryParse(b.DeviceName.Replace(@"\\.\DISPLAY", ""), out nb);
             return na.CompareTo(nb);
         });
+    }
 
-        int curX = 1920;
-        for (int i = 0; i < vdds.Count && i < expectedCount; i++)
+    private static void StageDetachDisplay(string devName)
+    {
+        DEVMODEW dm = new DEVMODEW();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+        dm.dmPelsWidth = 0;
+        dm.dmPelsHeight = 0;
+        dm.dmFields = 0x00000020 | 0x00080000 | 0x00100000; // DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT
+        ChangeDisplaySettingsExW(devName, ref dm, IntPtr.Zero, 0x00000001 | 0x10000000, IntPtr.Zero);
+    }
+
+    private static void StageAttachDisplay(string devName, int posX, int posY, int width, int height, int hz)
+    {
+        DEVMODEW dm = new DEVMODEW();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+        if (!EnumDisplaySettingsExW(devName, -1, ref dm, 0))
         {
-            int targetW = (i == 0) ? w1 : w2;
-            int targetH = (i == 0) ? h1 : h2;
-            if (targetW <= 0 || targetH <= 0) break;
+            EnumDisplaySettingsExW(devName, 0, ref dm, 0);
+        }
+        dm.dmPositionX = posX;
+        dm.dmPositionY = posY;
+        dm.dmPelsWidth = width;
+        dm.dmPelsHeight = height;
+        dm.dmBitsPerPel = 32;
+        dm.dmDisplayFrequency = hz;
+        dm.dmFields = 0x00000020 | 0x00040000 | 0x00080000 | 0x00100000 | 0x00400000;
+        ChangeDisplaySettingsExW(devName, ref dm, IntPtr.Zero, 0x00000001 | 0x10000000, IntPtr.Zero);
+    }
 
-            DEVMODEW dm = new DEVMODEW();
-            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
-            if (EnumDisplaySettingsExW(vdds[i], -1, ref dm, 0))
+    // Dynamic per-slot display allocator:
+    //   - Slot 0 (vdds[0], {5eb52002-...}): iPad 2360x1640 @ 60Hz (Primary Sunshine :47989)
+    //   - Slot 1 (vdds[1], {456a3c17-...}): Mac  2560x1600 @ 60Hz (Secondary Sunshine :48989)
+    public static string SyncVirtualDisplays(bool slot0Active, bool slot1Active)
+    {
+        bool locked = false;
+        Mutex mtx = null;
+        try
+        {
+            mtx = new Mutex(false, @"Local\VddSyncDisplayMutex");
+            try { locked = mtx.WaitOne(3000); } catch (AbandonedMutexException) { locked = true; }
+
+            List<DISPLAY_DEVICEW> vdds;
+            int primaryW;
+            GetVirtualDisplayInfo(out vdds, out primaryW);
+
+            if ((slot0Active || slot1Active) && vdds.Count < 2 && IsDeviceStarted(@"ROOT\DISPLAY\0001"))
             {
-                dm.dmPelsWidth = targetW;
-                dm.dmPelsHeight = targetH;
-                dm.dmDisplayFrequency = 60;
-                dm.dmPositionX = curX;
-                dm.dmPositionY = 0;
-                dm.dmFields = 0x00000020 | 0x00080000 | 0x00100000 | 0x00400000;
-                ChangeDisplaySettingsExW(vdds[i], ref dm, IntPtr.Zero, 0x00000001 | 0x10000000, IntPtr.Zero);
-                curX += targetW;
+                for (int attempt = 0; attempt < 25; attempt++)
+                {
+                    Thread.Sleep(80);
+                    GetVirtualDisplayInfo(out vdds, out primaryW);
+                    if (vdds.Count >= 2) break;
+                }
+            }
+
+            if (vdds.Count == 0)
+                return "none";
+
+            if (vdds.Count == 1)
+            {
+                bool want = slot0Active || slot1Active;
+                int tw = slot1Active ? 2560 : 2360;
+                int th = slot1Active ? 1600 : 1640;
+                bool att = (vdds[0].StateFlags & 1) != 0;
+                DEVMODEW c0 = new DEVMODEW();
+                c0.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+                bool ok0 = att && EnumDisplaySettingsExW(vdds[0].DeviceName, -1, ref c0, 0);
+                if (!want && !att) return "noop";
+                if (want && ok0 && c0.dmPelsWidth == tw && c0.dmPelsHeight == th && c0.dmPositionX == primaryW && c0.dmPositionY == 0)
+                    return "noop";
+                if (want) StageAttachDisplay(vdds[0].DeviceName, primaryW, 0, tw, th, 60);
+                else StageDetachDisplay(vdds[0].DeviceName);
+                ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+                return vdds[0].DeviceName;
+            }
+
+            bool att0 = (vdds[0].StateFlags & 1) != 0;
+            bool att1 = (vdds[1].StateFlags & 1) != 0;
+
+            DEVMODEW dm0 = new DEVMODEW();
+            dm0.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+            bool okCur0 = att0 && EnumDisplaySettingsExW(vdds[0].DeviceName, -1, ref dm0, 0);
+
+            DEVMODEW dm1 = new DEVMODEW();
+            dm1.dmSize = (short)Marshal.SizeOf(typeof(DEVMODEW));
+            bool okCur1 = att1 && EnumDisplaySettingsExW(vdds[1].DeviceName, -1, ref dm1, 0);
+
+            int targetX0 = primaryW;
+            int targetX1 = primaryW;
+
+            if (slot0Active && slot1Active)
+            {
+                // Preserve (primaryW, 0) for whichever display is already positioned at primaryW so active windows never jump
+                if (okCur1 && dm1.dmPositionX == primaryW && (!okCur0 || dm0.dmPositionX != primaryW))
+                {
+                    targetX1 = primaryW;
+                    targetX0 = primaryW + 2560;
+                }
+                else
+                {
+                    targetX0 = primaryW;
+                    targetX1 = primaryW + 2360;
+                }
+            }
+
+            bool need0 = (slot0Active != att0) || (slot0Active && (!okCur0 || dm0.dmPelsWidth != 2360 || dm0.dmPelsHeight != 1640 || dm0.dmPositionX != targetX0 || dm0.dmPositionY != 0));
+            bool need1 = (slot1Active != att1) || (slot1Active && (!okCur1 || dm1.dmPelsWidth != 2560 || dm1.dmPelsHeight != 1600 || dm1.dmPositionX != targetX1 || dm1.dmPositionY != 0));
+
+            if (!need0 && !need1)
+                return "noop";
+
+            if (!slot0Active && att0)
+                StageDetachDisplay(vdds[0].DeviceName);
+            if (!slot1Active && att1)
+                StageDetachDisplay(vdds[1].DeviceName);
+
+            if (slot0Active)
+                StageAttachDisplay(vdds[0].DeviceName, targetX0, 0, 2360, 1640, 60);
+            if (slot1Active)
+                StageAttachDisplay(vdds[1].DeviceName, targetX1, 0, 2560, 1600, 60);
+
+            ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+
+            // Verify attachment; if a brand-new virtual connector has never been in CCD topology, extend once and re-stage
+            GetVirtualDisplayInfo(out vdds, out primaryW);
+            if (vdds.Count >= 2)
+            {
+                bool nowAtt0 = (vdds[0].StateFlags & 1) != 0;
+                bool nowAtt1 = (vdds[1].StateFlags & 1) != 0;
+                if ((slot0Active && !nowAtt0) || (slot1Active && !nowAtt1))
+                {
+                    SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, 0x00000004 | 0x00000080); // SDC_TOPOLOGY_EXTEND | SDC_APPLY
+                    Thread.Sleep(200);
+                    if (!slot0Active) StageDetachDisplay(vdds[0].DeviceName);
+                    else StageAttachDisplay(vdds[0].DeviceName, targetX0, 0, 2360, 1640, 60);
+                    if (!slot1Active) StageDetachDisplay(vdds[1].DeviceName);
+                    else StageAttachDisplay(vdds[1].DeviceName, targetX1, 0, 2560, 1600, 60);
+                    ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+                }
+            }
+
+            return string.Format("slot0={0}@{1},slot1={2}@{3}", slot0Active, targetX0, slot1Active, targetX1);
+        }
+        finally
+        {
+            if (locked && mtx != null)
+            {
+                try { mtx.ReleaseMutex(); } catch { }
+            }
+            if (mtx != null)
+            {
+                try { mtx.Dispose(); } catch { }
             }
         }
-        ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-        return string.Join(",", vdds.ToArray());
+    }
+
+    public static string ConfigureVirtualDisplays(int expectedCount, int w1, int h1, int w2, int h2)
+    {
+        if (expectedCount >= 2 && w1 > 0 && w2 > 0)
+            return SyncVirtualDisplays(true, true);
+        if (expectedCount == 1 && w1 == 2560)
+            return SyncVirtualDisplays(false, true);
+        if (expectedCount == 1 && w1 == 2360)
+            return SyncVirtualDisplays(true, false);
+        return SyncVirtualDisplays(false, false);
+    }
+
+    private static DateTime ParseSunshineLogTimestamp(string line)
+    {
+        // Format: [2026-11-08 03:30:19.535]: ...
+        if (line != null && line.Length >= 25 && line[0] == '[' && line[24] == ']')
+        {
+            DateTime dt;
+            if (DateTime.TryParseExact(line.Substring(1, 23), "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out dt))
+                return dt;
+        }
+        return DateTime.MinValue;
+    }
+
+    private static long[] _lastLogLen = new long[] { -1, -1 };
+    private static DateTime[] _lastLogWriteUtc = new DateTime[] { DateTime.MinValue, DateTime.MinValue };
+    private static bool[] _lastSlotResult = new bool[] { false, false };
+
+    public static bool IsSlotStreaming(int slot)
+    {
+        int idx = (slot == 0) ? 0 : 1;
+        int port = (idx == 0) ? 47989 : 48989;
+        string logPath = (idx == 0)
+            ? @"C:\Program Files\Sunshine\config\sunshine.log"
+            : @"C:\Program Files\Sunshine\config\sunshine_mac2.log";
+        string stampFile = (idx == 0)
+            ? @"C:\VirtualDisplayDriver\slot0_join.stamp"
+            : @"C:\VirtualDisplayDriver\slot1_join.stamp";
+
+        if (!IsLocalPortListening(port))
+        {
+            _lastLogLen[idx] = -1;
+            _lastSlotResult[idx] = false;
+            return false;
+        }
+
+        DateTime stampLocalTime = DateTime.MinValue;
+        bool hasFreshStamp = false;
+        try
+        {
+            if (File.Exists(stampFile))
+            {
+                stampLocalTime = File.GetLastWriteTime(stampFile);
+                double ageSec = (DateTime.Now - stampLocalTime).TotalSeconds;
+                if (ageSec >= 0 && ageSec < 18.0)
+                    hasFreshStamp = true;
+                else
+                    File.Delete(stampFile);
+            }
+        }
+        catch { }
+
+        try
+        {
+            FileInfo fi = new FileInfo(logPath);
+            if (!fi.Exists)
+                return hasFreshStamp;
+
+            if (!hasFreshStamp && _lastLogLen[idx] == fi.Length && _lastLogWriteUtc[idx] == fi.LastWriteTimeUtc)
+                return _lastSlotResult[idx];
+
+            string content = "";
+            using (FileStream fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                content = sr.ReadToEnd();
+            }
+
+            int startIdx = content.LastIndexOf("Info: Sunshine version:", StringComparison.Ordinal);
+            if (startIdx > 0)
+            {
+                int lineStart = content.LastIndexOf('\n', startIdx);
+                startIdx = (lineStart >= 0) ? lineStart + 1 : 0;
+                content = content.Substring(startIdx);
+            }
+
+            int state = 0; // 0 = disconnected, 1 = launching, 2 = connected
+            DateTime lastLaunchTime = DateTime.MinValue;
+            DateTime lastDisconnectTime = DateTime.MinValue;
+
+            string[] lines = content.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string line in lines)
+            {
+                if (line.IndexOf("Scheduling display device configuration:", StringComparison.Ordinal) >= 0 ||
+                    line.IndexOf("Display device configuration applied successfully.", StringComparison.Ordinal) >= 0 ||
+                    line.IndexOf("Executing [Desktop]", StringComparison.Ordinal) >= 0 ||
+                    line.IndexOf("Executing Do Cmd:", StringComparison.Ordinal) >= 0)
+                {
+                    if (state != 2)
+                        state = 1;
+                    DateTime ts = ParseSunshineLogTimestamp(line);
+                    if (ts != DateTime.MinValue)
+                        lastLaunchTime = ts;
+                }
+                else if (line.IndexOf("Info: CLIENT CONNECTED", StringComparison.Ordinal) >= 0)
+                {
+                    state = 2;
+                }
+                else if (line.IndexOf("Info: CLIENT DISCONNECTED", StringComparison.Ordinal) >= 0 ||
+                         line.IndexOf("Info: Process terminated", StringComparison.Ordinal) >= 0 ||
+                         line.IndexOf("Failed to initialize video capture", StringComparison.Ordinal) >= 0 ||
+                         line.IndexOf("Failed to start the specified application", StringComparison.Ordinal) >= 0)
+                {
+                    state = 0;
+                    DateTime ts = ParseSunshineLogTimestamp(line);
+                    if (ts != DateTime.MinValue)
+                        lastDisconnectTime = ts;
+                }
+            }
+
+            bool res = false;
+            if (state == 2)
+            {
+                res = true;
+            }
+            else if (state == 1)
+            {
+                if (lastLaunchTime != DateTime.MinValue && Math.Abs((DateTime.Now - lastLaunchTime).TotalSeconds) < 20.0)
+                    res = true;
+                else if (hasFreshStamp)
+                    res = true;
+            }
+            else if (state == 0 && hasFreshStamp)
+            {
+                if (lastDisconnectTime != DateTime.MinValue && lastDisconnectTime >= stampLocalTime.AddMilliseconds(-200))
+                {
+                    try { File.Delete(stampFile); } catch { }
+                    res = false;
+                }
+                else
+                {
+                    res = true;
+                }
+            }
+
+            if (state != 1 && !hasFreshStamp)
+            {
+                _lastLogLen[idx] = fi.Length;
+                _lastLogWriteUtc[idx] = fi.LastWriteTimeUtc;
+                _lastSlotResult[idx] = res;
+            }
+            return res;
+        }
+        catch { }
+
+        return false;
+    }
+
+    public static void PostSunshineApi(int webPort, string path)
+    {
+        try
+        {
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(string.Format("https://localhost:{0}{1}", webPort, path));
+            req.Method = "POST";
+            req.ContentType = "application/json";
+            req.Timeout = 1200;
+            req.ReadWriteTimeout = 1200;
+            string auth = Convert.ToBase64String(Encoding.ASCII.GetBytes("admin:alpine"));
+            req.Headers["Authorization"] = "Basic " + auth;
+            using (Stream s = req.GetRequestStream())
+            {
+                byte[] body = Encoding.UTF8.GetBytes("{}");
+                s.Write(body, 0, body.Length);
+            }
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse()) { }
+        }
+        catch { }
+    }
+
+    public static void ResetSunshinePersistence(int webPort)
+    {
+        PostSunshineApi(webPort, "/api/reset-display-device-persistence");
+    }
+
+    public static void CloseSunshineApp(int webPort)
+    {
+        PostSunshineApi(webPort, "/api/apps/close");
+    }
+
+    public static void WriteJoinStamp(int slot)
+    {
+        string stampFile = (slot == 0)
+            ? @"C:\VirtualDisplayDriver\slot0_join.stamp"
+            : @"C:\VirtualDisplayDriver\slot1_join.stamp";
+        try
+        {
+            File.WriteAllText(stampFile, DateTime.UtcNow.Ticks.ToString());
+        }
+        catch { }
+    }
+
+    public static void DeleteJoinStamp(int slot)
+    {
+        string stampFile = (slot == 0)
+            ? @"C:\VirtualDisplayDriver\slot0_join.stamp"
+            : @"C:\VirtualDisplayDriver\slot1_join.stamp";
+        try
+        {
+            if (File.Exists(stampFile))
+                File.Delete(stampFile);
+        }
+        catch { }
+    }
+
+    public static void RunSchtasks(string args)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", args);
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            using (Process p = Process.Start(psi))
+            {
+                if (p != null) p.WaitForExit(3000);
+            }
+        }
+        catch { }
+    }
+
+    public static void EnsureSecondarySunshineReady()
+    {
+        try
+        {
+            string logPath = @"C:\Program Files\Sunshine\config\sunshine_mac2.log";
+            bool listening = IsLocalPortListening(48989);
+            bool hasEnsureActive = false;
+            if (listening && File.Exists(logPath))
+            {
+                using (FileStream fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                {
+                    string txt = sr.ReadToEnd();
+                    int idx = txt.LastIndexOf("Info: Sunshine version:", StringComparison.Ordinal);
+                    if (idx >= 0) txt = txt.Substring(idx);
+                    if (txt.IndexOf("'dd_configuration_option' = ensure_active", StringComparison.Ordinal) >= 0)
+                        hasEnsureActive = true;
+                }
+            }
+
+            if (!listening || !hasEnsureActive)
+            {
+                if (listening)
+                {
+                    RunSchtasks("/End /TN \"SunshineSecondary\"");
+                    StopProcessOnPort(48989);
+                    StopProcessOnPort(48990);
+                    Thread.Sleep(300);
+                }
+                RunSchtasks("/Run /TN \"SunshineSecondary\"");
+            }
+        }
+        catch { }
+    }
+
+    private static void LaunchMacStreamOverSsh(string pcIp, string macIp)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = @"C:\Windows\System32\OpenSSH\ssh.exe";
+            psi.Arguments = string.Format("-i \"C:\\Users\\Manveer Singh\\.ssh\\id_ed25519\" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@{0} \"/usr/local/bin/stream-pc-screen.sh {1} 48989\"", macIp, pcIp);
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process.Start(psi);
+        }
+        catch { }
+    }
+
+    public static void RunDaemon()
+    {
+        bool createdNew = false;
+        using (Mutex daemonMtx = new Mutex(true, @"Local\VddDynamicWatcherMutex", out createdNew))
+        {
+            if (!createdNew)
+                return;
+
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+
+            AutoResetEvent wakeEvent = new AutoResetEvent(false);
+            FileSystemWatcher fsw = null;
+            FileSystemWatcher fswStamp = null;
+            try
+            {
+                string cfgDir = @"C:\Program Files\Sunshine\config";
+                if (Directory.Exists(cfgDir))
+                {
+                    fsw = new FileSystemWatcher(cfgDir, "sunshine*.log");
+                    fsw.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+                    FileSystemEventHandler onFs = delegate { try { wakeEvent.Set(); } catch { } };
+                    fsw.Changed += onFs;
+                    fsw.Created += onFs;
+                    fsw.EnableRaisingEvents = true;
+                }
+                string vddDir = @"C:\VirtualDisplayDriver";
+                if (Directory.Exists(vddDir))
+                {
+                    fswStamp = new FileSystemWatcher(vddDir, "*.stamp");
+                    fswStamp.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+                    FileSystemEventHandler onSt = delegate { try { wakeEvent.Set(); } catch { } };
+                    fswStamp.Changed += onSt;
+                    fswStamp.Created += onSt;
+                    fswStamp.Deleted += onSt;
+                    fswStamp.EnableRaisingEvents = true;
+                }
+            }
+            catch { }
+
+            NetworkAddressChangedEventHandler onNet = delegate { try { wakeEvent.Set(); } catch { } };
+            NetworkChange.NetworkAddressChanged += onNet;
+
+            try
+            {
+                bool prevS0 = IsSlotStreaming(0);
+                bool prevS1 = IsSlotStreaming(1);
+                bool prevUsbNcm = IsAppleUsbNcmStarted();
+
+                SyncVirtualDisplays(prevS0, prevS1);
+
+                while (IsDeviceStarted(@"ROOT\DISPLAY\0001"))
+                {
+                    bool signaled = wakeEvent.WaitOne(2500);
+                    if (!IsDeviceStarted(@"ROOT\DISPLAY\0001"))
+                        break;
+
+                    bool curUsbNcm = IsAppleUsbNcmStarted();
+                    if (prevUsbNcm && !curUsbNcm)
+                    {
+                        // Physical USB-C cable unplugged from Mac
+                        prevUsbNcm = false;
+                        if (prevS1 && !HasActiveNonUsbStream(48989))
+                        {
+                            DeleteJoinStamp(1);
+                            ResetSunshinePersistence(48990);
+                            CloseSunshineApp(48990);
+                            prevS1 = false;
+                            SyncVirtualDisplays(IsSlotStreaming(0), false);
+                            EnsureSecondarySunshineReady();
+                        }
+                    }
+                    else if (!prevUsbNcm && curUsbNcm)
+                    {
+                        // Physical USB-C cable plugged into Mac -> dynamically allocate Mac display & launch Moonlight
+                        prevUsbNcm = true;
+                        string pcUsbIp = "";
+                        string macUsbIp = "";
+                        for (int retry = 0; retry < 16; retry++)
+                        {
+                            if (!IsAppleUsbNcmStarted()) break;
+                            if (ProbeHostAlive("10.99.99.2", 22, 120))
+                            {
+                                pcUsbIp = "10.99.99.1";
+                                macUsbIp = "10.99.99.2";
+                                break;
+                            }
+                            if (ProbeHostAlive("192.168.2.1", 22, 120))
+                            {
+                                pcUsbIp = "192.168.2.2";
+                                macUsbIp = "192.168.2.1";
+                                break;
+                            }
+                            Thread.Sleep(250);
+                        }
+                        if (!string.IsNullOrEmpty(macUsbIp))
+                        {
+                            EnsureSecondarySunshineReady();
+                            WriteJoinStamp(1);
+                            prevS1 = true;
+                            SyncVirtualDisplays(IsSlotStreaming(0), true);
+                            LaunchMacStreamOverSsh(pcUsbIp, macUsbIp);
+                        }
+                    }
+
+                    bool curS0 = IsSlotStreaming(0);
+                    if (!prevS0 && curS0)
+                    {
+                        prevS0 = true;
+                        ResetSunshinePersistence(47990);
+                        SyncVirtualDisplays(true, IsSlotStreaming(1));
+                    }
+                    else if (prevS0 && !curS0)
+                    {
+                        Thread.Sleep(400);
+                        curS0 = IsSlotStreaming(0);
+                        if (!curS0)
+                        {
+                            prevS0 = false;
+                            DeleteJoinStamp(0);
+                            ResetSunshinePersistence(47990);
+                            CloseSunshineApp(47990);
+                            SyncVirtualDisplays(false, IsSlotStreaming(1));
+                        }
+                    }
+
+                    bool curS1 = IsSlotStreaming(1);
+                    if (!prevS1 && curS1)
+                    {
+                        prevS1 = true;
+                        ResetSunshinePersistence(48990);
+                        SyncVirtualDisplays(IsSlotStreaming(0), true);
+                    }
+                    else if (prevS1 && !curS1)
+                    {
+                        Thread.Sleep(400);
+                        curS1 = IsSlotStreaming(1);
+                        if (!curS1)
+                        {
+                            prevS1 = false;
+                            DeleteJoinStamp(1);
+                            ResetSunshinePersistence(48990);
+                            CloseSunshineApp(48990);
+                            SyncVirtualDisplays(IsSlotStreaming(0), false);
+                            EnsureSecondarySunshineReady();
+                        }
+                    }
+
+                    if (!prevS1 && !IsLocalPortListening(48989))
+                    {
+                        EnsureSecondarySunshineReady();
+                    }
+
+                    if (signaled)
+                    {
+                        SyncVirtualDisplays(prevS0, prevS1);
+                    }
+                }
+            }
+            finally
+            {
+                NetworkChange.NetworkAddressChanged -= onNet;
+                if (fsw != null)
+                {
+                    try { fsw.Dispose(); } catch { }
+                }
+                if (fswStamp != null)
+                {
+                    try { fswStamp.Dispose(); } catch { }
+                }
+            }
+        }
+    }
+
+    public static void Main(string[] args)
+    {
+        if (args == null || args.Length == 0)
+            return;
+
+        string cmd = args[0].ToLowerInvariant();
+        if (cmd == "join" && args.Length >= 2)
+        {
+            int slot = (args[1] == "1") ? 1 : 0;
+            WriteJoinStamp(slot);
+            if (slot == 0)
+            {
+                SyncVirtualDisplays(true, IsSlotStreaming(1));
+            }
+            else
+            {
+                SyncVirtualDisplays(IsSlotStreaming(0), true);
+            }
+        }
+        else if (cmd == "leave" && args.Length >= 2)
+        {
+            int slot = (args[1] == "1") ? 1 : 0;
+            DeleteJoinStamp(slot);
+            if (slot == 0)
+            {
+                ResetSunshinePersistence(47990);
+                SyncVirtualDisplays(false, IsSlotStreaming(1));
+            }
+            else
+            {
+                ResetSunshinePersistence(48990);
+                SyncVirtualDisplays(IsSlotStreaming(0), false);
+            }
+        }
+        else if (cmd == "sync")
+        {
+            SyncVirtualDisplays(IsSlotStreaming(0), IsSlotStreaming(1));
+        }
+        else if (cmd == "detach-all")
+        {
+            DeleteJoinStamp(0);
+            DeleteJoinStamp(1);
+            SyncVirtualDisplays(false, false);
+        }
+        else if (cmd == "daemon")
+        {
+            RunDaemon();
+        }
     }
 }

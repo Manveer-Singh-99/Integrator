@@ -1,5 +1,5 @@
 # Zero-CIM, Zero-Module Precompiled Multi-Device Detection (Mac + iPad across USB-C, Hotspot, & Wi-Fi)
-if (-not ("CfgMgr" -as [type]) -or -not ([CfgMgr].GetMethod("ConfigureVirtualDisplays"))) {
+if (-not ("CfgMgr" -as [type]) -or -not ([CfgMgr].GetMethod("SyncVirtualDisplays"))) {
     Add-Type -Path "C:\VirtualDisplayDriver\CfgMgr.dll"
 }
 
