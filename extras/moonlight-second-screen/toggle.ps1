@@ -7,6 +7,16 @@ $deviceId = "ROOT\DISPLAY\0001"
 $vddXmlPath = "C:\VirtualDisplayDriver\vdd_settings.xml"
 $isRunning = [CfgMgr]::IsDeviceStarted($deviceId)
 
+$activeCount = 1
+if ([System.IO.File]::Exists($vddXmlPath)) {
+    $xmlTxt = [System.IO.File]::ReadAllText($vddXmlPath)
+    if ($xmlTxt -match "<count>(\d+)</count>") {
+        $activeCount = [int]$matches[1]
+    }
+}
+$desiredCount = if ($global:MacPresent -and $global:IpadPresent) { 2 } else { 1 }
+$upgradeToDual = ($isRunning -and $activeCount -eq 1 -and $desiredCount -eq 2)
+
 function Set-VddMonitorCount([int]$count) {
     $desiredXml = @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -46,7 +56,7 @@ function Stop-SecondarySunshine {
     [CfgMgr]::StopProcessOnPort(48990)
 }
 
-if ($isRunning) {
+if ($isRunning -and -not $upgradeToDual) {
     # 1. Terminate active stream on Primary Sunshine (47990) & Secondary Sunshine (48990)
     & curl.exe -k -s --max-time 1 -u "admin:alpine" -X POST "https://localhost:47990/api/apps/close" -H "Content-Type: application/json" | Out-Null
     Stop-SecondarySunshine
@@ -61,6 +71,12 @@ if ($isRunning) {
 
     [System.Windows.Forms.MessageBox]::Show("All virtual extended displays DISABLED.", "Second Screen", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 } else {
+    if ($upgradeToDual) {
+        # Upgrading live from 1 virtual display -> 2 independent extended displays
+        & curl.exe -k -s --max-time 1 -u "admin:alpine" -X POST "https://localhost:47990/api/apps/close" -H "Content-Type: application/json" | Out-Null
+        & pnputil.exe /disable-device $deviceId | Out-Null
+        Start-Sleep -Milliseconds 350
+    }
     # Ensure Primary SunshineService is running (sc.exe start is a 2ms no-op if already running)
     & sc.exe start SunshineService 2>$null | Out-Null
 

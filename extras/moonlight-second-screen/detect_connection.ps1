@@ -41,9 +41,10 @@ $arpMacWifiIp = ""
 
 $arpOut = & arp.exe -a
 foreach ($line in $arpOut) {
-    if ($line -match "^\s*(192\.168\.137\.(?!1\b|255\b)\d+)\s+([0-9a-f]{2}-){5}[0-9a-f]{2}\s+dynamic") {
+    # Note: Windows 11 Mobile Hotspot (icssvc) registers connected DHCP clients as 'static' in arp -a
+    if ($line -match "^\s*(192\.168\.137\.(?!1\b|255\b)\d+)\s+(?!ff-ff-ff-ff-ff-ff)([0-9a-f]{2}-){5}[0-9a-f]{2}\s+(?:dynamic|static)") {
         $hotspotNeighbors.Add($matches[1])
-    } elseif ($line -match "^\s*(192\.168\.2\.(?!1\b|2\b|255\b)\d+)\s+([0-9a-f]{2}-){5}[0-9a-f]{2}\s+dynamic") {
+    } elseif ($line -match "^\s*(192\.168\.2\.(?!1\b|2\b|255\b)\d+)\s+(?!ff-ff-ff-ff-ff-ff)([0-9a-f]{2}-){5}[0-9a-f]{2}\s+(?:dynamic|static)") {
         $bridgeNeighbors.Add($matches[1])
     }
     if ($line -match "^\s*(\d+\.\d+\.\d+\.\d+)\s+a0-78-17-5c-6b-93\s+") {
@@ -132,7 +133,7 @@ if (-not $global:IpadPresent) {
 # 4d. Windows Mobile Hotspot (192.168.137.x neighbor that is alive and is NOT the Mac)
 if (-not $global:IpadPresent) {
     foreach ($hip in $hotspotNeighbors) {
-        if ($hip -ne $global:MacIp -and [CfgMgr]::ProbeHostAlive($hip, 62078, 80)) {
+        if ($hip -ne $global:MacIp -and [CfgMgr]::ProbeHostAlive($hip, 62078, 120)) {
             $global:IpadPresent = $true
             $global:IpadMode = "Wi-Fi (Hotspot)"
             $global:IpadIp = $hip
