@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mutual detection of USB-C (10.99.99.x or 192.168.2.x) vs Wi-Fi on Mac
+# Mutual detection of USB-C (10.99.99.x or 192.168.2.x), Hotspot (192.168.137.1), or Wi-Fi LAN on Mac
 
 USBC_ACTIVE=0
 for iface in bridge100 en3 en5; do
@@ -36,21 +36,33 @@ elif [ "$USBC_ACTIVE" -eq 1 ]; then
     done
 fi
 
-# 4. Fall back to Wi-Fi
+# 4. Fall back to Wi-Fi (Windows Mobile Hotspot 192.168.137.1 or Shared Router LAN via mDNS)
 if [ -z "$PC_IP" ]; then
     CONN_MODE="Wi-Fi"
-    PC_IP="192.168.137.1"
     MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "192.168.137.58")
+    if ping -c 1 -W 150 192.168.137.1 >/dev/null 2>&1; then
+        PC_IP="192.168.137.1"
+    else
+        for cand in $(dscacheutil -q host -a name HP-Omen.local 2>/dev/null | awk '/^ip_address:/ {print $2}' | grep -vE '^(10\.99\.99\.|192\.168\.2\.)'); do
+            if ping -c 1 -W 150 "$cand" >/dev/null 2>&1 || nc -z -G 1 "$cand" 47989 >/dev/null 2>&1; then
+                PC_IP="$cand"
+                break
+            fi
+        done
+        [ -z "$PC_IP" ] && PC_IP="192.168.137.1"
+    fi
 fi
 
-# Update Moonlight settings if user or root
+# Update Moonlight host addresses (for both Primary HP-Omen and Secondary HP-Omen-Mac2)
 CURRENT_USER=$(stat -f "%Su" /dev/console 2>/dev/null || echo "$USER")
-if [ "$(id -u)" -eq 0 ] && [ -n "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
-    sudo -u "$CURRENT_USER" defaults write com.moonlight-stream.Moonlight "hosts.1.localaddress" -string "$PC_IP"
-    sudo -u "$CURRENT_USER" defaults write com.moonlight-stream.Moonlight "hosts.1.manualaddress" -string "192.168.137.1"
-else
-    defaults write com.moonlight-stream.Moonlight "hosts.1.localaddress" -string "$PC_IP"
-    defaults write com.moonlight-stream.Moonlight "hosts.1.manualaddress" -string "192.168.137.1"
-fi
+for idx in 1 2; do
+    if [ "$(id -u)" -eq 0 ] && [ -n "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
+        sudo -u "$CURRENT_USER" defaults write com.moonlight-stream.Moonlight "hosts.${idx}.localaddress" -string "$PC_IP"
+        sudo -u "$CURRENT_USER" defaults write com.moonlight-stream.Moonlight "hosts.${idx}.manualaddress" -string "$PC_IP"
+    else
+        defaults write com.moonlight-stream.Moonlight "hosts.${idx}.localaddress" -string "$PC_IP"
+        defaults write com.moonlight-stream.Moonlight "hosts.${idx}.manualaddress" -string "$PC_IP"
+    fi
+done
 
 echo "${CONN_MODE}|${PC_IP}|${MAC_IP}"
