@@ -83,7 +83,9 @@ if ($isRunning -and -not $upgradeToDual) {
         Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"pkill -f stream-pc-screen 2>/dev/null; killall Moonlight 2>/dev/null || true`"" -WindowStyle Hidden
     }
 
-    [System.Windows.Forms.MessageBox]::Show("All virtual extended displays DISABLED.", "Second Screen", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    if ([Environment]::UserInteractive) {
+        [System.Windows.Forms.MessageBox]::Show("All virtual extended displays DISABLED.", "Second Screen", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    }
 } else {
     if ($upgradeToDual) {
         Stop-DynamicWatcher
@@ -116,30 +118,34 @@ if ($isRunning -and -not $upgradeToDual) {
         $ipadNote = if ($s0) {
             "iPad (2360x1640 @ 60Hz): Active"
         } else {
-            "iPad (2360x1640 @ 60Hz): Ready — auto-attaches when you tap Desktop in Moonlight on iPad, and auto-detaches on exit"
+            "iPad (2360x1640 @ 60Hz): Ready - auto-attaches when you tap Desktop in Moonlight on iPad, and auto-detaches on exit"
         }
 
-        [System.Windows.Forms.MessageBox]::Show(
-            "Dynamic Extended Display ENABLED:`n`n" +
-            "- Mac (2560x1600 @ 60Hz): Connecting via $($global:MacMode) ($($global:PcIp):48989)`n" +
-            "- $ipadNote",
-            "Second Screen (Dynamic)",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
+        if ([Environment]::UserInteractive) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Dynamic Extended Display ENABLED:`n`n" +
+                "- Mac (2560x1600 @ 60Hz): Connecting via $($global:MacMode) ($($global:PcIp):48989)`n" +
+                "- $ipadNote",
+                "Second Screen (Dynamic)",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
     } else {
         [CfgMgr]::SyncVirtualDisplays($s0, $false) | Out-Null
         & schtasks.exe /Run /TN "VddDynamicWatcher" 2>$null | Out-Null
 
         $ipadTransport = if ($global:IpadMode) { " via $($global:IpadMode)" } else { "" }
-        [System.Windows.Forms.MessageBox]::Show(
-            "Dynamic Extended Display READY$ipadTransport.`n`n" +
-            "- Tap Desktop on iPad Moonlight (HP-Omen) -> 2360x1640 display auto-attaches`n" +
-            "- Connect Mac (HP-Omen-Mac2) -> 2560x1600 display auto-attaches`n" +
-            "- Exiting any stream automatically detaches that display.",
-            "Second Screen (Dynamic)",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
+        if ([Environment]::UserInteractive) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Dynamic Extended Display READY$ipadTransport.`n`n" +
+                "- Tap Desktop on iPad Moonlight (HP-Omen) -> 2360x1640 display auto-attaches`n" +
+                "- Connect Mac (HP-Omen-Mac2) -> 2560x1600 display auto-attaches`n" +
+                "- Exiting any stream automatically detaches that display.",
+                "Second Screen (Dynamic)",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
     }
 }
