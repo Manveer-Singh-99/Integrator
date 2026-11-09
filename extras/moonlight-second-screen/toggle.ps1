@@ -16,6 +16,15 @@ if ([System.IO.File]::Exists($vddXmlPath)) {
 }
 $upgradeToDual = ($isRunning -and $activeCount -lt 2)
 
+function Show-Notification([string]$text, [string]$title) {
+    if ([Environment]::UserInteractive) {
+        try {
+            $ws = New-Object -ComObject WScript.Shell
+            $ws.Popup($text, 2, $title, 64) | Out-Null
+        } catch { }
+    }
+}
+
 function Ensure-DualVddConfig {
     $desiredXml = @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,15 +61,9 @@ function Stop-DynamicWatcher {
 }
 
 function Stop-SecondarySunshine {
-    # 1. Close active stream & reset persistence via Sunshine API (with 1s timeout)
+    # 1. Close active stream & reset persistence via Sunshine API (instant disconnect & releases GPU encoder)
     & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:48990/api/reset-display-device-persistence" -H "Content-Type: application/json" 2>$null | Out-Null
     & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:48990/api/apps/close" -H "Content-Type: application/json" 2>$null | Out-Null
-
-    # 2. End scheduled task and stop the secondary sunshine process (running sunshine_mac2.conf)
-    & schtasks.exe /End /TN "SunshineSecondary" 2>$null | Out-Null
-    Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*sunshine_mac2.conf*" } | ForEach-Object {
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    }
 }
 
 if ($isRunning -and -not $upgradeToDual) {
@@ -83,9 +86,7 @@ if ($isRunning -and -not $upgradeToDual) {
         Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"pkill -f stream-pc-screen 2>/dev/null; killall Moonlight 2>/dev/null || true`"" -WindowStyle Hidden
     }
 
-    if ([Environment]::UserInteractive) {
-        [System.Windows.Forms.MessageBox]::Show("All virtual extended displays DISABLED.", "Second Screen", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-    }
+    Show-Notification "All virtual extended displays DISABLED." "Second Screen"
 } else {
     if ($upgradeToDual) {
         Stop-DynamicWatcher
@@ -103,7 +104,9 @@ if ($isRunning -and -not $upgradeToDual) {
 
     # 2. Ensure Primary SunshineService and hidden Secondary Sunshine (via VddCtl.exe launch-secondary) are running
     & sc.exe start SunshineService 2>$null | Out-Null
-    & schtasks.exe /Run /TN "SunshineSecondary" 2>$null | Out-Null
+    if (-not [CfgMgr]::IsLocalPortListening(48989)) {
+        & schtasks.exe /Run /TN "SunshineSecondary" 2>$null | Out-Null
+    }
 
     $s0 = [CfgMgr]::IsSlotMarkedActive(0)
 
@@ -121,31 +124,19 @@ if ($isRunning -and -not $upgradeToDual) {
             "iPad (2360x1640 @ 60Hz): Ready - auto-attaches when you tap Desktop in Moonlight on iPad, and auto-detaches on exit"
         }
 
-        if ([Environment]::UserInteractive) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Dynamic Extended Display ENABLED:`n`n" +
-                "- Mac (2560x1600 @ 60Hz): Connecting via $($global:MacMode) ($($global:PcIp):48989)`n" +
-                "- $ipadNote",
-                "Second Screen (Dynamic)",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information
-            ) | Out-Null
-        }
+        $msg = "Dynamic Extended Display ENABLED:`n`n" +
+               "- Mac (2560x1600 @ 60Hz): Connecting via $($global:MacMode) ($($global:PcIp):48989)`n" +
+               "- $ipadNote"
+        Show-Notification $msg "Second Screen (Dynamic)"
     } else {
         [CfgMgr]::SyncVirtualDisplays($s0, $false) | Out-Null
         & schtasks.exe /Run /TN "VddDynamicWatcher" 2>$null | Out-Null
 
         $ipadTransport = if ($global:IpadMode) { " via $($global:IpadMode)" } else { "" }
-        if ([Environment]::UserInteractive) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Dynamic Extended Display READY$ipadTransport.`n`n" +
-                "- Tap Desktop on iPad Moonlight (HP-Omen) -> 2360x1640 display auto-attaches`n" +
-                "- Connect Mac (HP-Omen-Mac2) -> 2560x1600 display auto-attaches`n" +
-                "- Exiting any stream automatically detaches that display.",
-                "Second Screen (Dynamic)",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information
-            ) | Out-Null
-        }
+        $msg = "Dynamic Extended Display READY$ipadTransport.`n`n" +
+               "- Tap Desktop on iPad Moonlight (HP-Omen) -> 2360x1640 display auto-attaches`n" +
+               "- Connect Mac (HP-Omen-Mac2) -> 2560x1600 display auto-attaches`n" +
+               "- Exiting any stream automatically detaches that display."
+        Show-Notification $msg "Second Screen (Dynamic)"
     }
 }

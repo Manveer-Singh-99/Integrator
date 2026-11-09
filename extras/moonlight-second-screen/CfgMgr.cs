@@ -1159,10 +1159,10 @@ public class CfgMgr
         }
     }
 
-    public static void Main(string[] args)
+    public static int Main(string[] args)
     {
         if (args == null || args.Length == 0)
-            return;
+            return 0;
 
         string cmd = args[0].ToLowerInvariant();
         if (cmd == "join" && args.Length >= 2)
@@ -1197,5 +1197,58 @@ public class CfgMgr
         {
             RunDaemon();
         }
+        else if (cmd == "toggle")
+        {
+            return RunToggleShortcut();
+        }
+        else if (cmd == "run-toggle-direct")
+        {
+            return RunToggleScriptDirect();
+        }
+        return 0;
+    }
+
+    public static int RunToggleShortcut()
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = @"C:\Windows\System32\schtasks.exe";
+            psi.Arguments = "/Run /TN \"ToggleSecondScreen\"";
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process p = Process.Start(psi);
+            if (p != null)
+            {
+                p.WaitForExit(3000);
+                if (p.ExitCode == 0) return 0;
+            }
+        }
+        catch { }
+
+        return RunToggleScriptDirect();
+    }
+
+    public static int RunToggleScriptDirect()
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+            psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:\\VirtualDisplayDriver\\toggle.ps1\"";
+            psi.WorkingDirectory = @"C:\VirtualDisplayDriver";
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process p = Process.Start(psi);
+            if (p != null)
+            {
+                p.WaitForExit();
+                return p.ExitCode;
+            }
+        }
+        catch { }
+        return 0;
     }
 }
