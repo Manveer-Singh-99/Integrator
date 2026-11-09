@@ -52,26 +52,26 @@ function Stop-DynamicWatcher {
 }
 
 function Stop-SecondarySunshine {
-    if ([CfgMgr]::IsLocalPortListening(48989) -or [CfgMgr]::IsLocalPortListening(48990)) {
-        [CfgMgr]::ResetSunshinePersistence(48990)
-        [CfgMgr]::CloseSunshineApp(48990)
-    }
+    # 1. Close active stream & reset persistence via Sunshine API (with 1s timeout)
+    & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:48990/api/reset-display-device-persistence" -H "Content-Type: application/json" 2>$null | Out-Null
+    & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:48990/api/apps/close" -H "Content-Type: application/json" 2>$null | Out-Null
+
+    # 2. End scheduled task and stop the secondary sunshine process (running sunshine_mac2.conf)
     & schtasks.exe /End /TN "SunshineSecondary" 2>$null | Out-Null
-    [CfgMgr]::StopProcessOnPort(48989)
-    [CfgMgr]::StopProcessOnPort(48990)
+    Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*sunshine_mac2.conf*" } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($isRunning -and -not $upgradeToDual) {
     # 1. Stop dynamic display watcher first
     Stop-DynamicWatcher
 
-    # 2. Close active streams & clear persistence on Primary (:47990) and Secondary (:48990)
+    # 2. Close active streams & clear persistence unconditionally on both Primary (:47990) and Secondary (:48990)
     [CfgMgr]::SetSlotMarkedActive(0, $false)
     [CfgMgr]::SetSlotMarkedActive(1, $false)
-    if ([CfgMgr]::IsLocalPortListening(47990)) {
-        [CfgMgr]::ResetSunshinePersistence(47990)
-        [CfgMgr]::CloseSunshineApp(47990)
-    }
+    & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:47990/api/reset-display-device-persistence" -H "Content-Type: application/json" 2>$null | Out-Null
+    & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:47990/api/apps/close" -H "Content-Type: application/json" 2>$null | Out-Null
     Stop-SecondarySunshine
 
     # 3. Detach both virtual connectors cleanly in registry, then disable ROOT\DISPLAY\0001
@@ -87,10 +87,8 @@ if ($isRunning -and -not $upgradeToDual) {
 } else {
     if ($upgradeToDual) {
         Stop-DynamicWatcher
-        if ([CfgMgr]::IsLocalPortListening(47990)) {
-            [CfgMgr]::ResetSunshinePersistence(47990)
-            [CfgMgr]::CloseSunshineApp(47990)
-        }
+        & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:47990/api/reset-display-device-persistence" -H "Content-Type: application/json" 2>$null | Out-Null
+        & curl.exe -k -s -m 1 -u "admin:alpine" -X POST "https://127.0.0.1:47990/api/apps/close" -H "Content-Type: application/json" 2>$null | Out-Null
         & pnputil.exe /disable-device $deviceId | Out-Null
         Start-Sleep -Milliseconds 350
     }

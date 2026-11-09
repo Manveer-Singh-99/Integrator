@@ -354,10 +354,14 @@ public class CfgMgr
     {
         try
         {
-            IPGlobalProperties props = IPGlobalProperties.GetIPGlobalProperties();
-            foreach (IPEndPoint ep in props.GetActiveTcpListeners())
+            using (TcpClient tcp = new TcpClient())
             {
-                if (ep.Port == port) return true;
+                IAsyncResult ar = tcp.BeginConnect(IPAddress.Loopback, port, null, null);
+                if (ar.AsyncWaitHandle.WaitOne(150))
+                {
+                    tcp.EndConnect(ar);
+                    return true;
+                }
             }
         }
         catch { }
@@ -954,7 +958,8 @@ public class CfgMgr
         try
         {
             ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
-            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(string.Format("https://localhost:{0}{1}", webPort, path));
+            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | (SecurityProtocolType)12288;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(string.Format("https://127.0.0.1:{0}{1}", webPort, path));
             req.Method = "POST";
             req.ContentType = "application/json";
             req.Timeout = 1200;
