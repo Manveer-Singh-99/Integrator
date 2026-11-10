@@ -17,12 +17,15 @@ if ([System.IO.File]::Exists($vddXmlPath)) {
 $upgradeToDual = ($isRunning -and $activeCount -lt 2)
 
 function Show-Notification([string]$text, [string]$title) {
-    if ([Environment]::UserInteractive) {
-        try {
-            $ws = New-Object -ComObject WScript.Shell
-            $ws.Popup($text, 2, $title, 64) | Out-Null
-        } catch { }
-    }
+    try {
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+        $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+        $textNodes = $template.GetElementsByTagName("text")
+        $textNodes.Item(0).AppendChild($template.CreateTextNode($title)) | Out-Null
+        $textNodes.Item(1).AppendChild($template.CreateTextNode($text)) | Out-Null
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Second Screen").Show($toast)
+    } catch { }
 }
 
 function Ensure-DualVddConfig {
@@ -82,8 +85,12 @@ if ($isRunning -and -not $upgradeToDual) {
     & pnputil.exe /disable-device $deviceId | Out-Null
 
     # 4. Close Moonlight on Mac if reachable (non-blocking)
-    if ($global:MacPresent -or $global:MacIp) {
-        Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"pkill -f stream-pc-screen 2>/dev/null; killall Moonlight 2>/dev/null || true`"" -WindowStyle Hidden
+    $candidateIps = @("10.99.99.2", "192.168.2.1")
+    if ($global:MacIp -and $candidateIps -notcontains $global:MacIp) {
+        $candidateIps += $global:MacIp
+    }
+    foreach ($mip in $candidateIps) {
+        [CfgMgr]::RunHidden("C:\Windows\System32\OpenSSH\ssh.exe", "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=1 -o StrictHostKeyChecking=no manveersingh@$mip `"pkill -f stream-pc-screen 2>/dev/null; killall Moonlight 2>/dev/null || true`"")
     }
 
     Show-Notification "All virtual extended displays DISABLED." "Second Screen"
@@ -114,7 +121,7 @@ if ($isRunning -and -not $upgradeToDual) {
         [CfgMgr]::SetSlotMarkedActive(1, $true)
         [CfgMgr]::SyncVirtualDisplays($s0, $true) | Out-Null
 
-        Start-Process -FilePath "C:\Windows\System32\OpenSSH\ssh.exe" -ArgumentList "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"/usr/local/bin/stream-pc-screen.sh $($global:PcIp) 48989`"" -WindowStyle Hidden
+        [CfgMgr]::RunHidden("C:\Windows\System32\OpenSSH\ssh.exe", "-i `"C:\Users\Manveer Singh\.ssh\id_ed25519`" -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no manveersingh@$($global:MacIp) `"/usr/local/bin/stream-pc-screen.sh $($global:PcIp) 48989`"")
 
         & schtasks.exe /Run /TN "VddDynamicWatcher" 2>$null | Out-Null
 

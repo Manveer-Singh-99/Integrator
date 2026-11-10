@@ -1208,6 +1208,25 @@ public class CfgMgr
         return 0;
     }
 
+    public static void RunHidden(string fileName, string args, bool wait = false, int timeoutMs = 5000)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = fileName;
+            psi.Arguments = args;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process p = Process.Start(psi);
+            if (p != null && wait)
+            {
+                p.WaitForExit(timeoutMs);
+            }
+        }
+        catch { }
+    }
+
     public static int RunToggleShortcut()
     {
         try
@@ -1221,13 +1240,13 @@ public class CfgMgr
             Process p = Process.Start(psi);
             if (p != null)
             {
-                p.WaitForExit(3000);
+                p.WaitForExit(2000);
                 if (p.ExitCode == 0) return 0;
             }
         }
         catch { }
 
-        return RunToggleScriptDirect();
+        return 0;
     }
 
     public static int RunToggleScriptDirect()

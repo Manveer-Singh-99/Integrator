@@ -10,6 +10,16 @@ for iface in bridge100 en3 en5; do
     fi
 done
 
+# Auto-heal direct link static IP on active NCM adapter if Internet Sharing (bridge100) is OFF
+if ! ifconfig bridge100 >/dev/null 2>&1; then
+    for iface in en3 en5; do
+        if ifconfig "$iface" 2>/dev/null | grep -q "status: active" && ! ifconfig "$iface" 2>/dev/null | grep -q "inet 10.99.99.2"; then
+            networksetup -setmanual "Ethernet Adapter ($iface)" 10.99.99.2 255.255.255.0 2>/dev/null || true
+            sleep 0.1
+        fi
+    done
+fi
+
 CONN_MODE=""
 PC_IP=""
 MAC_IP=""
