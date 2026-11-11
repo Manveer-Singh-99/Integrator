@@ -37,5 +37,6 @@ MacBook Pro acts as the primary workstation; your Windows laptop / PC (e.g. HP O
   - Updates Moonlight host registry entry (`HKCU:\Software\Moonlight Game Streaming Project\Moonlight\hosts\2`).
   - Probes Mac port `47989` to verify Sunshine readiness before launching.
   - Launches Moonlight in full-screen mode at native resolution (`1920x1200 @ 165Hz`, 100 Mbps bitrate, host audio).
-- **`Stream-Mac-Second-Screen.bat`**: Wrapper for Task Scheduler.
-- **Windows Task Scheduler (`LaunchMoonlightWin`)**: Configured with `DisallowStartIfOnBatteries = false` and `MultipleInstancesPolicy = StopExisting` so it triggers instantly on battery or AC power.
+- **`launch_silent.vbs`**: Completely silent VBS wrapper executed via GUI subsystem (`wscript.exe`) so zero `cmd.exe` or PowerShell console windows ever flash on Windows before Moonlight starts.
+- **`Stream-Mac-Second-Screen.bat`**: Shortcut launcher for manual execution.
+- **Windows Task Scheduler (`LaunchMoonlightWin`)**: Runs `wscript.exe "C:\VirtualDisplayDriver\launch_silent.vbs"` with `DisallowStartIfOnBatteries = false` and `MultipleInstancesPolicy = StopExisting`.
