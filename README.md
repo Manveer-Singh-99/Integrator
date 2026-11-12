@@ -156,7 +156,9 @@ In [`extras/moonlight-second-screen/`](extras/moonlight-second-screen/), you'll 
 > 
 > The next major evolution (`v1.0.0`) is envisioned as a **single, unified desktop companion app** for macOS and Windows (with Linux planned later), written in lightweight, memory-safe **Rust (Tauri 2.0)** with an idle footprint of ~30 MB RAM.
 > 
-> **No Deadlines Disclaimer:** This roadmap represents the project's long-term aspirational direction, not a commercial commitment. Features will be implemented progressively in spare time whenever life and work allow. Pull requests and community contributions are always welcome.
+> **Revitalizing RAM-Limited Macs into "Super-Netbooks":** Offloading heavy compilation, 3D rendering, and high-FPS gaming to a powerful Windows host (e.g. 32GB RAM + dedicated RTX GPU) breathes new life into older or memory-constrained (8GB) MacBooks. The Mac acts as an ultra-efficient, cool-running terminal with pristine hardware (Retina display, trackpad, keyboard, long battery life) while tapping into desktop-grade compute over a $5 cable.
+> 
+> **⚠️ No Deadlines & Feasibility Disclaimer:** This roadmap represents long-term experimental research directions, not a commercial guarantee. Features will be explored progressively in spare time whenever life allows. **Some proposed features (such as Touch Bar takeovers, virtual camera extensions, or low-level input hooks) are heavily dependent on private API restrictions, platform sandboxes, and OS security barriers; any feature may be altered, postponed, or abandoned entirely if deemed technically infeasible or impractical to maintain.** Pull requests and community contributions are always welcome.
 
 ### The Two Core Operating States
 
@@ -193,6 +195,10 @@ The unified app is designed around **two primary, mutually exclusive operating s
   * **Automatic Modifier Translation:** Keystrokes originating on the Slave are dynamically remapped to match the Master's native OS conventions:
     * *When Mac is Master and Windows is Slave:* Pressing `Ctrl + C` or `Ctrl + V` on the Windows laptop keyboard maps to `Command ⌘ + C` / `Command ⌘ + V` on the Mac host.
     * *When Windows is Master and Mac is Slave:* Pressing `Command ⌘` on the Mac keyboard maps to `Ctrl` (or `Windows Key`) on the Windows host.
+* **Touch Bar Integration (Windows Telemetry & Control Strip):**
+  * When Windows is the Master and an OLED Touch Bar-equipped Mac acts as the extended display/terminal, the frontmost Mac client app captures the Touch Bar via `NSTouchBar`.
+  * **Off-Screen NVIDIA Performance HUD**: Direct queries to NVIDIA Management Library (`nvml.dll` on Windows) stream GPU temperatures, power draw (Watts), GPU utilization, and clock speeds onto the 2170&times;60 OLED strip. This gives gamers a real-time hardware HUD without cluttering the primary gaming monitor with intrusive on-screen overlays (like GeForce `Alt+R`).
+  * **Strict Scope Isolation**: Windows **only** gains control of the Touch Bar while in this specific mode. When Mac is the Master, or when running in Input Sharing mode, macOS retains 100% native control over its Touch Bar.
 
 #### 🖱️ State 2: Universal Input Sharing Mode (Dual-OS KVM Workspace)
 *In this mode, **both operating systems** run independently and visibly side-by-side. You use a single keyboard and mouse seamlessly across both machines via clean-room edge-hopping.*
