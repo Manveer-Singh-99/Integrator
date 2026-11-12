@@ -148,5 +148,93 @@ In [`extras/moonlight-second-screen/`](extras/moonlight-second-screen/), you'll 
 
 ---
 
+## 🚀 Proposed for the Future (With No Deadlines)
+
+> [!NOTE]
+> **Project Evolution: `v0.x` (Prototype) &rarr; `v1.0.0` (Unified App)**  
+> The current codebase (`v0.x.x`) is an open, working Proof-of-Concept built from a collection of shell scripts, PowerShell automation, driver bridges, and scheduled tasks. 
+> 
+> The next major evolution (`v1.0.0`) is envisioned as a **single, unified desktop companion app** for macOS and Windows (with Linux planned later), written in lightweight, memory-safe **Rust (Tauri 2.0)** with an idle footprint of ~30 MB RAM.
+> 
+> **No Deadlines Disclaimer:** This roadmap represents the project's long-term aspirational direction, not a commercial commitment. Features will be implemented progressively in spare time whenever life and work allow. Pull requests and community contributions are always welcome.
+
+### The Two Core Operating States
+
+The unified app is designed around **two primary, mutually exclusive operating states** that govern how the two computers interact:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        PRIMARY OPERATING STATES                        │
+│                                                                        │
+│   ┌─────────────────────────────────┐ ┌────────────────────────────┐   │
+│   │   STATE 1: EXTENDED DESKTOP     │ │ STATE 2: INPUT SHARING     │   │
+│   │   • Single OS across displays   │ │ • Dual OS running together │   │
+│   │   • Master & Slave hierarchy    │ │ • Dynamic Temporary Master │   │
+│   │   • Slave inputs map to Master  │ │ • Active OS dictates keys  │   │
+│   └─────────────────────────────────┘ └────────────────────────────┘   │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+               ┌────────────────────┴───────────────────┐
+               ▼                                        ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                     INDEPENDENT MODULAR TOGGLES                        │
+│  [✓] Universal Clipboard   [✓] Shared Folders   [✓] Camera & Mic       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 🖥️ State 1: Extended Desktop Mode (Single-OS Workspace)
+*In this mode, only **one operating system** is in control of the entire physical workspace, using the other machine's screen as a high-refresh external monitor.*
+
+* **Role Definitions:**
+  * **Master (Host):** The primary computer running the operating system and transmitting the low-latency display feed (e.g., your MacBook running macOS).
+  * **Slave (Client):** The secondary computer whose physical screen acts as the extended display (e.g., your Windows laptop running the client display).
+* **Unified Input & Smart Modifier Mapping:**
+  * All input devices connected to the **Slave** (its built-in keyboard, trackpad, mouse, touchscreen) are forwarded across the USB-C link to control the **Master**.
+  * **Automatic Modifier Translation:** Keystrokes originating on the Slave are dynamically remapped to match the Master's native OS conventions:
+    * *When Mac is Master and Windows is Slave:* Pressing `Ctrl + C` or `Ctrl + V` on the Windows laptop keyboard maps to `Command ⌘ + C` / `Command ⌘ + V` on the Mac host.
+    * *When Windows is Master and Mac is Slave:* Pressing `Command ⌘` on the Mac keyboard maps to `Ctrl` (or `Windows Key`) on the Windows host.
+
+#### 🖱️ State 2: Universal Input Sharing Mode (Dual-OS KVM Workspace)
+*In this mode, **both operating systems** run independently and visibly side-by-side. You use a single keyboard and mouse seamlessly across both machines via clean-room edge-hopping.*
+
+* **Role Definitions (Dynamic Handover):**
+  * **Temporary Master:** Whichever computer currently holds the active cursor on its screen.
+  * **Temporary Slave:** The computer whose screen is currently idle without the cursor.
+* **Dynamic Keyboard & Modifier Governance:**
+  * The **Temporary Master** dictates the active keyboard mapping rules.
+  * Whichever physical keyboard you type on, the inputs strictly adapt to the operating system where the cursor currently resides:
+    * When your cursor crosses the border onto the **Mac**, the active modifier context switches to macOS (`Command ⌘` shortcuts, Mac-specific accents).
+    * When your cursor crosses back onto **Windows**, the active modifier context immediately switches to native Windows (`Ctrl` / `Alt` / `Win` shortcuts).
+* **Edge Detection & Guard Logic:**
+  * **Dead Corners:** User-configurable edge margins to prevent accidental switching when clicking the Apple menu, taskbars, or window close buttons (`X`).
+  * **Switch Delay & Double-Tap:** Optional threshold buffers (e.g., 50–100ms) requiring an intentional push against the border to initiate the hop.
+
+---
+
+### Independent Modular Features (Toggleable On / Off)
+
+Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mode, all other features operate as independent modular background services that can be enabled or disabled individually:
+
+* **📋 Universal Clipboard:**
+  * Bidirectional clipboard synchronization for plain text, rich text (HTML/RTF), and image bitmaps (PNG/JPEG).
+  * Hash-based deduplication (SHA-256) to prevent infinite ping-pong echo loops between devices.
+* **📁 Auto-Mounted Shared Folders:**
+  * Designated user folders automatically mount into `/Volumes/PC` on macOS and a mapped drive (e.g., `M:`) on Windows upon link connection.
+  * Clean, automated unmounting when the USB-C cable is unplugged—zero hanging Finder or Explorer windows.
+* **🎥 Universal Camera & Virtual Microphone:**
+  * Stream the MacBook’s FaceTime HD camera and studio mic into Windows as a native DirectShow / Media Foundation webcam.
+  * Stream Windows camera or studio audio hardware into macOS via modern `CMIOExtension` virtual camera plugins.
+  * Hardware-accelerated low latency (Apple VideoToolbox & NVIDIA NVENC).
+* **📡 Zero-Config Pairing & Automatic Handover:**
+  * Instant mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi.
+  * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
+  * End-to-end encrypted control channel (TLS 1.3 / Noise Protocol) with a one-time 6-digit PIN pairing handshake.
+
+---
+
+*The ultimate goal: two computers, one workspace.*
+
+---
+
 ## License
 MIT License
