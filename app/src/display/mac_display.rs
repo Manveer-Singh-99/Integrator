@@ -135,6 +135,19 @@ impl MacDisplayManager {
         false
     }
 
+    /// Waits until remote port on peer IP is reachable.
+    pub async fn wait_for_port(ip: &str, port: u16, timeout: Duration) -> bool {
+        let addr = format!("{}:{}", ip, port);
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        false
+    }
+
     /// Launches Moonlight on macOS connected to remote PC.
     pub fn start_moonlight_client(pc_ip: &str, port: u16, host_name: &str) -> Result<()> {
         // 1. Kill any existing instance
@@ -148,14 +161,31 @@ impl MacDisplayManager {
         let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "enableVsync", "-bool", "false"]).status();
         let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "framePacing", "-bool", "false"]).status();
 
-        for idx in 1..=2 {
-            let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", &format!("hosts.{}.localaddress", idx), "-string", pc_ip]).status();
-            let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", &format!("hosts.{}.manualaddress", idx), "-string", pc_ip]).status();
-            let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", &format!("hosts.{}.localport", idx), "-int", &port.to_string()]).status();
-            let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", &format!("hosts.{}.manualport", idx), "-int", &port.to_string()]).status();
+        // Host 1: HP-Omen (port 47989)
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.1.localaddress", "-string", pc_ip]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.1.manualaddress", "-string", pc_ip]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.1.localport", "-int", "47989"]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.1.manualport", "-int", "47989"]).status();
+
+        // Host 2: HP-Omen-Mac2 (port 48989)
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.2.localaddress", "-string", pc_ip]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.2.manualaddress", "-string", pc_ip]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.2.localport", "-int", "48989"]).status();
+        let _ = Command::new("defaults").args(["write", "com.moonlight-stream.Moonlight", "hosts.2.manualport", "-int", "48989"]).status();
+
+        // 3. Wait up to 5 seconds for remote Sunshine port to respond
+        let addr = format!("{}:{}", pc_ip, port);
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Ok(target_addr) = addr.parse() {
+                if std::net::TcpStream::connect_timeout(&target_addr, Duration::from_millis(250)).is_ok() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
 
-        // 3. Launch Moonlight executable directly in background
+        // 4. Launch Moonlight executable directly in background
         let moonlight_bin = "/Applications/Moonlight.app/Contents/MacOS/Moonlight";
         let mut cmd = Command::new(moonlight_bin);
         cmd.args(["stream", host_name, "Desktop", "--no-vsync", "--no-frame-pacing", "--quit-after"]);

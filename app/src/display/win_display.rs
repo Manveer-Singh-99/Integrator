@@ -120,20 +120,52 @@ impl WinDisplayManager {
         Ok(())
     }
 
-    /// Enables the Virtual Display Driver (ROOT\DISPLAY\0001).
+    /// Enables the Virtual Display Driver (ROOT\DISPLAY\0001) and attaches Slot 1 for Mac.
     pub fn enable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            let status = Command::new("pnputil.exe")
-                .args(["/enable-device", r"ROOT\DISPLAY\0001"])
-                .creation_flags(0x08000000)
-                .status()?;
-            if !status.success() {
-                warn!("pnputil /enable-device returned non-zero status");
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+            // 1. Enable ROOT\DISPLAY\0001 via PowerShell Enable-PnpDevice
+            let _ = Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Enable-PnpDevice -InstanceId 'ROOT\\DISPLAY\\0001' -Confirm:$false"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+
+            // 2. Ensure Primary SunshineService is running
+            let _ = Command::new("sc.exe")
+                .args(["start", "SunshineService"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+
+            // 3. Ensure Secondary Sunshine (listening on port 48989 for Mac 2560x1600) is running
+            let _ = Command::new("schtasks.exe")
+                .args(["/Run", "/TN", "SunshineSecondary"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+
+            // 4. Attach virtual display slot 1 for Mac via VddCtl.exe join 1
+            let vdd_ctl = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\VddCtl.exe");
+            if vdd_ctl.exists() {
+                let _ = Command::new(vdd_ctl)
+                    .args(["join", "1"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            } else {
+                let _ = Command::new("schtasks.exe")
+                    .args(["/Run", "/TN", "ToggleSecondScreen"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
             }
+
+            // 5. Ensure dynamic watcher is running
+            let _ = Command::new("schtasks.exe")
+                .args(["/Run", "/TN", "VddDynamicWatcher"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
         }
-        info!("Enabled Virtual Display Driver device (ROOT\\DISPLAY\\0001)");
+        info!("Enabled Virtual Display Driver device and Slot 1 for Mac on Windows");
         Ok(())
     }
 
@@ -142,30 +174,32 @@ impl WinDisplayManager {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            let status = Command::new("pnputil.exe")
-                .args(["/disable-device", r"ROOT\DISPLAY\0001"])
-                .creation_flags(0x08000000)
-                .status()?;
-            if !status.success() {
-                warn!("pnputil /disable-device returned non-zero status");
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+            // 1. Leave slot 1 via VddCtl.exe leave 1
+            let vdd_ctl = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\VddCtl.exe");
+            if vdd_ctl.exists() {
+                let _ = Command::new(vdd_ctl)
+                    .args(["leave", "1"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
             }
+
+            // Remove marker directly if still present
+            let marker = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\slot1.active");
+            let _ = std::fs::remove_file(marker);
         }
-        info!("Disabled Virtual Display Driver device (ROOT\\DISPLAY\\0001)");
+        info!("Disabled Virtual Display Driver slot 1 on Windows");
         Ok(())
     }
 
-    /// Checks if ROOT\DISPLAY\0001 is active.
+    /// Checks if Slot 1 (Mac extended display) is active on Windows.
     pub fn is_vdd_active() -> bool {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            if let Ok(output) = Command::new("pnputil.exe")
-                .args(["/enum-devices", "/instanceid", r"ROOT\DISPLAY\0001"])
-                .creation_flags(0x08000000)
-                .output()
-            {
-                let text = String::from_utf8_lossy(&output.stdout);
-                return text.contains("Started") || text.contains("OK");
+            let marker = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\slot1.active");
+            if marker.exists() {
+                return true;
             }
         }
         false

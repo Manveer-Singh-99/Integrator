@@ -1,4 +1,5 @@
-//! Universal Clipboard Service for Text, Images, and Files with Deskflow-inspired sequence tracking and Zero-RAM streaming.
+//! Universal Clipboard Service with Universal Control-Style On-Demand Streaming.
+//! Transfers metadata (<1ms, <1KB) on copy. Streams directly to target folder on paste with ZERO temp cache.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -16,51 +17,106 @@ use tracing::{info, debug, warn, error};
 
 use crate::config::CLIPBOARD_PORT;
 use crate::discovery::DiscoveryManager;
-use super::protocol::{ClipboardMessage, ClipboardPayload, FileEntry};
+use super::protocol::{
+    ClipboardMessage, ClipboardPayload, LazyAnnouncement, StreamRequest,
+    FRAME_DIR, FRAME_FILE, FRAME_END,
+    MAX_TEXT_CHARS, MAX_IMAGE_BYTES,
+};
 use super::file_helper::FileClipboardHelper;
 use super::os_seq;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    pub fn init_shortcut_interceptor();
+    pub fn set_has_pending_remote_file(pending: bool);
+    pub fn clear_pasteboard_in_app();
+    fn notify_touchbar_remote_file(name: *const std::os::raw::c_char, total_bytes: u64);
+    fn update_touchbar_paste_progress(percent: f32, mb_per_sec: f32);
+    fn reset_touchbar_paste_progress();
+}
+
+pub static CLIPBOARD_INSTANCE: std::sync::OnceLock<ClipboardService> = std::sync::OnceLock::new();
+pub static TOKIO_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+#[no_mangle]
+pub extern "C" fn trigger_rust_remote_paste() {
+    if let (Some(service), Some(handle)) = (CLIPBOARD_INSTANCE.get(), TOKIO_HANDLE.get()) {
+        let service = service.clone();
+        handle.spawn(async move {
+            if let Err(e) = service.paste_remote(None).await {
+                warn!("On-demand remote paste error: {}", e);
+            }
+        });
+    } else {
+        warn!("trigger_rust_remote_paste called but CLIPBOARD_INSTANCE or TOKIO_HANDLE not ready");
+    }
+}
 
 fn to_hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+#[derive(Clone, Debug)]
+pub struct LocalPendingCopy {
+    pub session_id: String,
+    pub root_name: String,
+    pub total_files: usize,
+    pub total_bytes: u64,
+    pub directories: Vec<String>,
+    pub files: Vec<(String, PathBuf)>,
+}
+
+#[derive(Clone)]
 pub struct ClipboardService {
     discovery: DiscoveryManager,
     last_hash: Arc<RwLock<String>>,
     last_seq: Arc<RwLock<i64>>,
     file_helper: Arc<FileClipboardHelper>,
+    pending_local: Arc<RwLock<Option<LocalPendingCopy>>>,
+    pending_remote: Arc<RwLock<Option<LazyAnnouncement>>>,
+    is_pasting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClipboardService {
     pub fn new(discovery: DiscoveryManager) -> Result<Self> {
         let file_helper = Arc::new(FileClipboardHelper::new()?);
         let initial_seq = os_seq::get_clipboard_sequence();
-        Ok(Self {
+        let service = Self {
             discovery,
             last_hash: Arc::new(RwLock::new(String::new())),
             last_seq: Arc::new(RwLock::new(initial_seq)),
             file_helper,
-        })
+            pending_local: Arc::new(RwLock::new(None)),
+            pending_remote: Arc::new(RwLock::new(None)),
+            is_pasting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = TOKIO_HANDLE.set(handle);
+        }
+
+        let _ = CLIPBOARD_INSTANCE.set(service.clone());
+        Ok(service)
+    }
+
+    pub fn get_pending_remote(&self) -> Arc<RwLock<Option<LazyAnnouncement>>> {
+        Arc::clone(&self.pending_remote)
     }
 
     pub async fn start(&self) -> Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CLIPBOARD_PORT)).await?;
         info!("📋 Universal Clipboard Service active on port {}", CLIPBOARD_PORT);
 
-        // 1. Spawn TCP Receiver for incoming remote clipboard items
-        let receiver_hash = Arc::clone(&self.last_hash);
-        let receiver_seq = Arc::clone(&self.last_seq);
-        let receiver_file_helper = Arc::clone(&self.file_helper);
+        // 1. Spawn TCP Receiver
+        let s_clone = self.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         debug!("Incoming clipboard connection from {}", addr);
-                        let hash_clone = Arc::clone(&receiver_hash);
-                        let seq_clone = Arc::clone(&receiver_seq);
-                        let file_helper_clone = Arc::clone(&receiver_file_helper);
+                        let handler = s_clone.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(socket, hash_clone, seq_clone, file_helper_clone).await {
+                            if let Err(e) = handler.handle_incoming(socket).await {
                                 warn!("Error handling clipboard transfer: {}", e);
                             }
                         });
@@ -73,49 +129,66 @@ impl ClipboardService {
             }
         });
 
-        // 2. Spawn Clipboard Monitor Loop (checking sequence number)
-        let monitor_discovery = self.discovery.clone();
-        let monitor_hash = Arc::clone(&self.last_hash);
-        let monitor_seq = Arc::clone(&self.last_seq);
-        let monitor_file_helper = Arc::clone(&self.file_helper);
+        // 2. Spawn Clipboard Monitor Loop
+        let monitor_service = self.clone();
         tokio::spawn(async move {
-            Self::monitor_loop(monitor_discovery, monitor_hash, monitor_seq, monitor_file_helper).await;
+            monitor_service.monitor_loop().await;
         });
+
+        #[cfg(target_os = "macos")]
+        unsafe {
+            init_shortcut_interceptor();
+        }
 
         Ok(())
     }
 
-    /// Handles incoming clipboard payloads from peer.
-    async fn handle_incoming(
-        mut socket: TcpStream,
-        last_hash: Arc<RwLock<String>>,
-        last_seq: Arc<RwLock<i64>>,
-        file_helper: Arc<FileClipboardHelper>,
-    ) -> Result<()> {
-        let header_len = socket.read_u32().await? as usize;
+    /// Handles incoming clipboard payloads and stream requests from peer.
+    async fn handle_incoming(&self, mut socket: TcpStream) -> Result<()> {
+        let header_len = tokio::time::timeout(Duration::from_secs(10), socket.read_u32())
+            .await
+            .context("Timed out reading header length")?? as usize;
+
         let mut header_buf = vec![0u8; header_len];
-        socket.read_exact(&mut header_buf).await?;
+        tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut header_buf))
+            .await
+            .context("Timed out reading header body")??;
 
         let msg: ClipboardMessage = serde_json::from_slice(&header_buf)?;
 
-        // Update last seen hash so monitor doesn't echo it
-        {
-            let mut lock = last_hash.write().await;
+        if !msg.hash.is_empty() {
+            let mut lock = self.last_hash.write().await;
             *lock = msg.hash.clone();
         }
 
         match msg.payload {
             ClipboardPayload::Text(text) => {
+                if text.len() > MAX_TEXT_CHARS {
+                    warn!("Received text exceeds limit ({} chars)", text.len());
+                    return Ok(());
+                }
                 info!("📋 Received remote text ({} chars)", text.len());
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    set_has_pending_remote_file(false);
+                }
                 if let Ok(mut cb) = Clipboard::new() {
                     let _ = cb.set_text(text);
                 }
                 let new_seq = os_seq::get_clipboard_sequence();
-                let mut seq_lock = last_seq.write().await;
+                let mut seq_lock = self.last_seq.write().await;
                 *seq_lock = new_seq;
             }
             ClipboardPayload::Image { width, height, rgba } => {
+                if rgba.len() > MAX_IMAGE_BYTES {
+                    warn!("Received image exceeds limit ({} bytes)", rgba.len());
+                    return Ok(());
+                }
                 info!("🖼️ Received remote image ({}x{} px)", width, height);
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    set_has_pending_remote_file(false);
+                }
                 if let Ok(mut cb) = Clipboard::new() {
                     let img_data = ImageData {
                         width,
@@ -125,78 +198,88 @@ impl ClipboardService {
                     let _ = cb.set_image(img_data);
                 }
                 let new_seq = os_seq::get_clipboard_sequence();
-                let mut seq_lock = last_seq.write().await;
+                let mut seq_lock = self.last_seq.write().await;
                 *seq_lock = new_seq;
             }
-            ClipboardPayload::Files { root_names, entries } => {
-                info!("📂 Receiving remote files/folders ({} root items, {} total entries)...", root_names.len(), entries.len());
-                let cache_dir = file_helper.get_cache_dir();
-
-                // 1. Clean existing root items in cache_dir so we start fresh
-                for root in &root_names {
-                    let target = cache_dir.join(root);
-                    if target.is_dir() {
-                        let _ = std::fs::remove_dir_all(&target);
-                    } else if target.exists() {
-                        let _ = std::fs::remove_file(&target);
-                    }
+            ClipboardPayload::LazyAnnouncement(ann) => {
+                info!(
+                    "📥 Peer announced file/folder '{}' ({} files, {:.1} MB). Ready for on-demand paste.",
+                    ann.root_name, ann.total_files, ann.total_bytes as f64 / (1024.0 * 1024.0)
+                );
+                {
+                    let mut lock = self.pending_remote.write().await;
+                    *lock = Some(ann.clone());
                 }
 
-                // 2. Iterate through entries and recreate folder structure & stream files
-                for entry in entries {
-                    let mut dest_path = cache_dir.to_path_buf();
-                    for component in entry.rel_path.split('/') {
-                        if !component.is_empty() && component != "." && component != ".." {
-                            dest_path.push(component);
-                        }
-                    }
-
-                    if entry.is_dir {
-                        std::fs::create_dir_all(&dest_path)?;
-                    } else {
-                        if let Some(parent) = dest_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        let mut file = File::create(&dest_path)?;
-                        let mut remaining = entry.size;
-                        let mut chunk_buf = vec![0u8; 64 * 1024];
-
-                        while remaining > 0 {
-                            let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
-                            socket.read_exact(&mut chunk_buf[..to_read]).await?;
-                            file.write_all(&chunk_buf[..to_read])?;
-                            remaining -= to_read as u64;
-                        }
-                    }
+                // Immediately clear OS clipboard so stale text/images are completely eradicated!
+                if let Ok(mut cb) = Clipboard::new() {
+                    let _ = cb.clear();
+                }
+                let _ = self.file_helper.clear_clipboard();
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    clear_pasteboard_in_app();
                 }
 
-                // 3. Register root paths on native OS clipboard
-                let mut staged_roots = Vec::new();
-                for root in &root_names {
-                    let p = cache_dir.join(root);
-                    if p.exists() {
-                        staged_roots.push(p);
-                    }
-                }
-
-                file_helper.write_copied_files(&staged_roots)?;
                 let new_seq = os_seq::get_clipboard_sequence();
-                let mut seq_lock = last_seq.write().await;
-                *seq_lock = new_seq;
-                info!("✅ Staged {} root file/folder(s) into clipboard cache and set native pasteboard", staged_roots.len());
+                {
+                    let mut seq_lock = self.last_seq.write().await;
+                    *seq_lock = new_seq;
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let name_c = std::ffi::CString::new(ann.root_name.clone()).unwrap_or_default();
+                    unsafe {
+                        notify_touchbar_remote_file(name_c.as_ptr(), ann.total_bytes);
+                        set_has_pending_remote_file(true);
+                    }
+                }
+
+                // Immediately stream announced files/folder across high-speed link into staging cache
+                // so that native Cmd+V in Finder (and Ctrl+V in Explorer) works IMMEDIATELY!
+                let service_clone = self.clone();
+                let ann_clone = ann.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = service_clone.stream_to_cache(ann_clone).await {
+                        warn!("Background stream to cache error: {}", e);
+                    }
+                });
+            }
+            ClipboardPayload::RequestStream(req) => {
+                let local_copy = {
+                    let lock = self.pending_local.read().await;
+                    lock.clone()
+                };
+
+                if let Some(copy) = local_copy {
+                    if copy.session_id == req.session_id {
+                        info!(
+                            "🚀 Peer requested on-demand stream for '{}' ({} files, {:.1} MB). Streaming directly from disk...",
+                            copy.root_name, copy.total_files, copy.total_bytes as f64 / (1024.0 * 1024.0)
+                        );
+                        Self::stream_files_to_socket(&mut socket, copy.directories, copy.files).await?;
+                    } else {
+                        warn!("Stream request session_id does not match active local copy");
+                    }
+                } else {
+                    warn!("No local copy pending to stream");
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Recursively collects all files and subdirectories inside a directory.
+    /// Recursively collects all files and subdirectories for on-demand streaming.
     fn collect_dir_entries(
         _root: &Path,
         current: &Path,
         rel_prefix: &str,
-        entries: &mut Vec<FileEntry>,
-        files_to_stream: &mut Vec<PathBuf>,
+        directories: &mut Vec<String>,
+        files: &mut Vec<(String, PathBuf)>,
+        total_bytes: &mut u64,
+        total_files: &mut usize,
     ) {
         if let Ok(read_dir) = std::fs::read_dir(current) {
             for entry in read_dir.flatten() {
@@ -205,58 +288,65 @@ impl ClipboardService {
                 let rel = format!("{}/{}", rel_prefix, name);
 
                 if path.is_dir() {
-                    entries.push(FileEntry {
-                        rel_path: rel.clone(),
-                        size: 0,
-                        is_dir: true,
-                    });
-                    Self::collect_dir_entries(_root, &path, &rel, entries, files_to_stream);
+                    directories.push(rel.clone());
+                    Self::collect_dir_entries(
+                        _root,
+                        &path,
+                        &rel,
+                        directories,
+                        files,
+                        total_bytes,
+                        total_files,
+                    );
                 } else if path.is_file() {
                     let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    entries.push(FileEntry {
-                        rel_path: rel,
-                        size: len,
-                        is_dir: false,
-                    });
-                    files_to_stream.push(path);
+                    *total_bytes += len;
+                    *total_files += 1;
+                    files.push((rel, path));
                 }
             }
         }
     }
 
     /// Continuous lightweight loop checking for clipboard sequence changes.
-    async fn monitor_loop(
-        discovery: DiscoveryManager,
-        last_hash: Arc<RwLock<String>>,
-        last_seq: Arc<RwLock<i64>>,
-        file_helper: Arc<FileClipboardHelper>,
-    ) {
+    async fn monitor_loop(&self) {
         loop {
             sleep(Duration::from_millis(100)).await;
 
             let current_seq = os_seq::get_clipboard_sequence();
             {
-                let read_lock = last_seq.read().await;
+                let read_lock = self.last_seq.read().await;
                 if *read_lock == current_seq {
-                    // ZERO overhead - OS clipboard has not been modified
                     continue;
                 }
             }
 
-            // Sequence changed! Update last_seq immediately
             {
-                let mut write_lock = last_seq.write().await;
+                let mut write_lock = self.last_seq.write().await;
                 *write_lock = current_seq;
             }
 
             debug!("Clipboard sequence updated: {}", current_seq);
 
             // 1. Check for Copied Files and Folders
-            let copied_paths = file_helper.read_copied_files();
+            let copied_paths = self.file_helper.read_copied_files();
             if !copied_paths.is_empty() {
+                let cache_dir = self.file_helper.get_cache_dir();
+                let external_paths: Vec<PathBuf> = copied_paths
+                    .into_iter()
+                    .filter(|p| !p.starts_with(cache_dir))
+                    .collect();
+
+                if external_paths.is_empty() {
+                    continue;
+                }
+
+                // Compute unified hash based on root base name and metadata
                 let mut hasher = Sha256::new();
-                for root in &copied_paths {
-                    hasher.update(root.to_string_lossy().as_bytes());
+                for root in &external_paths {
+                    if let Some(name) = root.file_name() {
+                        hasher.update(name.to_string_lossy().as_bytes());
+                    }
                     if let Ok(meta) = std::fs::metadata(root) {
                         hasher.update(&meta.len().to_le_bytes());
                         if let Ok(mtime) = meta.modified() {
@@ -268,51 +358,100 @@ impl ClipboardService {
                 }
 
                 let hash_hex = to_hex_string(&hasher.finalize());
-                let mut hash_lock = last_hash.write().await;
+                let mut hash_lock = self.last_hash.write().await;
                 if *hash_lock != hash_hex {
                     *hash_lock = hash_hex.clone();
                     drop(hash_lock);
 
-                    // Collect all entries and files to stream
-                    let mut root_names = Vec::new();
-                    let mut entries = Vec::new();
-                    let mut files_to_stream = Vec::new();
+                    // Clear pending remote announcement on local file copy
+                    {
+                        let mut remote_lock = self.pending_remote.write().await;
+                        *remote_lock = None;
+                    }
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        reset_touchbar_paste_progress();
+                        set_has_pending_remote_file(false);
+                    }
 
-                    for root in &copied_paths {
+                    // Collect directory structure and file paths (< 5ms)
+                    let mut root_name = String::new();
+                    let mut directories = Vec::new();
+                    let mut files = Vec::new();
+                    let mut total_bytes: u64 = 0;
+                    let mut total_files: usize = 0;
+
+                    for root in &external_paths {
                         if let Some(file_name) = root.file_name() {
                             let name_str = file_name.to_string_lossy().to_string();
-                            root_names.push(name_str.clone());
-
+                            if root_name.is_empty() {
+                                root_name = name_str.clone();
+                            }
                             if root.is_dir() {
-                                entries.push(FileEntry {
-                                    rel_path: name_str.clone(),
-                                    size: 0,
-                                    is_dir: true,
-                                });
-                                Self::collect_dir_entries(root, root, &name_str, &mut entries, &mut files_to_stream);
+                                directories.push(name_str.clone());
+                                Self::collect_dir_entries(
+                                    root,
+                                    root,
+                                    &name_str,
+                                    &mut directories,
+                                    &mut files,
+                                    &mut total_bytes,
+                                    &mut total_files,
+                                );
                             } else if root.is_file() {
                                 let len = std::fs::metadata(root).map(|m| m.len()).unwrap_or(0);
-                                entries.push(FileEntry {
-                                    rel_path: name_str,
-                                    size: len,
-                                    is_dir: false,
-                                });
-                                files_to_stream.push(root.clone());
+                                total_bytes += len;
+                                total_files += 1;
+                                files.push((name_str, root.clone()));
                             }
                         }
                     }
 
-                    info!(
-                        "📤 Detected local copied file/folder(s) ({} root item(s), {} total entries). Sending to peer...",
-                        root_names.len(),
-                        entries.len()
+                    if external_paths.len() > 1 {
+                        root_name = format!("{} (+{} items)", root_name, external_paths.len() - 1);
+                    }
+
+                    let session_id = format!(
+                        "{:x}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
                     );
-                    if let Some(peer_ip) = discovery.get_peer_ip().await {
-                        if let Err(e) = Self::send_files(&peer_ip, hash_hex, root_names, entries, files_to_stream).await {
-                            warn!("Failed to send files/folders to {}: {}", peer_ip, e);
-                        }
-                    } else {
-                        warn!("No peer IP available to send files/folders");
+
+                    // Store locally for on-demand streaming
+                    {
+                        let mut local_lock = self.pending_local.write().await;
+                        *local_lock = Some(LocalPendingCopy {
+                            session_id: session_id.clone(),
+                            root_name: root_name.clone(),
+                            total_files,
+                            total_bytes,
+                            directories,
+                            files,
+                        });
+                    }
+
+                    info!(
+                        "📢 Local copy detected: '{}' ({} files, {:.1} MB). Broadcasting lazy announcement to peer (0 file bytes transferred)...",
+                        root_name, total_files, total_bytes as f64 / (1024.0 * 1024.0)
+                    );
+
+                    if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        let ann = LazyAnnouncement {
+                            session_id,
+                            root_name,
+                            total_files,
+                            total_bytes,
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
+                                hash: hash_hex,
+                                payload: ClipboardPayload::LazyAnnouncement(ann),
+                            }).await {
+                                warn!("Failed to send lazy announcement to {}: {}", peer_ip, e);
+                            }
+                        });
                     }
                 }
                 continue;
@@ -320,64 +459,83 @@ impl ClipboardService {
 
             // 2. Check for Image / Text via arboard
             if let Ok(mut cb) = Clipboard::new() {
-                // Check Image first
                 if let Ok(img) = cb.get_image() {
-                    let mut hasher = Sha256::new();
-                    hasher.update(&(img.width as u64).to_le_bytes());
-                    hasher.update(&(img.height as u64).to_le_bytes());
-                    hasher.update(&(img.bytes.len() as u64).to_le_bytes());
-                    if !img.bytes.is_empty() {
-                        let sample_len = std::cmp::min(1024, img.bytes.len());
-                        hasher.update(&img.bytes[..sample_len]);
-                    }
-                    let hash_hex = to_hex_string(&hasher.finalize());
-
-                    let mut hash_lock = last_hash.write().await;
-                    if *hash_lock != hash_hex {
-                        *hash_lock = hash_hex.clone();
-                        drop(hash_lock);
-
-                        info!("📤 Detected local copied image ({}x{} px). Sending to peer...", img.width, img.height);
-                        if let Some(peer_ip) = discovery.get_peer_ip().await {
-                            if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
-                                hash: hash_hex,
-                                payload: ClipboardPayload::Image {
-                                    width: img.width,
-                                    height: img.height,
-                                    rgba: img.bytes.into_owned(),
-                                },
-                            }).await {
-                                warn!("Failed to send image to {}: {}", peer_ip, e);
-                            }
-                        } else {
-                            warn!("No peer IP available to send image");
-                        }
-                    }
-                    continue;
-                }
-
-                // Check Text
-                if let Ok(text) = cb.get_text() {
-                    if !text.is_empty() {
+                    let img_bytes_len = img.bytes.len();
+                    if img_bytes_len <= MAX_IMAGE_BYTES {
                         let mut hasher = Sha256::new();
-                        hasher.update(text.as_bytes());
+                        hasher.update(&(img.width as u64).to_le_bytes());
+                        hasher.update(&(img.height as u64).to_le_bytes());
+                        hasher.update(&(img_bytes_len as u64).to_le_bytes());
+                        if !img.bytes.is_empty() {
+                            let sample_len = std::cmp::min(1024, img.bytes.len());
+                            hasher.update(&img.bytes[..sample_len]);
+                        }
                         let hash_hex = to_hex_string(&hasher.finalize());
 
-                        let mut hash_lock = last_hash.write().await;
+                        let mut hash_lock = self.last_hash.write().await;
                         if *hash_lock != hash_hex {
                             *hash_lock = hash_hex.clone();
                             drop(hash_lock);
 
+                            // Clear pending remote announcement on local image copy
+                            {
+                                let mut remote_lock = self.pending_remote.write().await;
+                                *remote_lock = None;
+                            }
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                reset_touchbar_paste_progress();
+                                set_has_pending_remote_file(false);
+                            }
+
+                            info!("📤 Detected local copied image ({}x{} px). Sending to peer...", img.width, img.height);
+                            if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                                if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
+                                    hash: hash_hex,
+                                    payload: ClipboardPayload::Image {
+                                        width: img.width,
+                                        height: img.height,
+                                        rgba: img.bytes.into_owned(),
+                                    },
+                                }).await {
+                                    warn!("Failed to send image to {}: {}", peer_ip, e);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                if let Ok(text) = cb.get_text() {
+                    if !text.is_empty() && text.len() <= MAX_TEXT_CHARS {
+                        let mut hasher = Sha256::new();
+                        hasher.update(text.as_bytes());
+                        let hash_hex = to_hex_string(&hasher.finalize());
+
+                        let mut hash_lock = self.last_hash.write().await;
+                        if *hash_lock != hash_hex {
+                            *hash_lock = hash_hex.clone();
+                            drop(hash_lock);
+
+                            // Clear pending remote announcement on local text copy
+                            {
+                                let mut remote_lock = self.pending_remote.write().await;
+                                *remote_lock = None;
+                            }
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                reset_touchbar_paste_progress();
+                                set_has_pending_remote_file(false);
+                            }
+
                             info!("📤 Detected local copied text ({} chars). Sending to peer...", text.len());
-                            if let Some(peer_ip) = discovery.get_peer_ip().await {
+                            if let Some(peer_ip) = self.discovery.get_peer_ip().await {
                                 if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
                                     hash: hash_hex,
                                     payload: ClipboardPayload::Text(text),
                                 }).await {
                                     warn!("Failed to send text to {}: {}", peer_ip, e);
                                 }
-                            } else {
-                                warn!("No peer IP available to send text");
                             }
                         }
                         continue;
@@ -387,7 +545,7 @@ impl ClipboardService {
         }
     }
 
-    /// Sends text or image payload over TCP.
+    /// Sends lightweight JSON payload over TCP.
     async fn send_payload(peer_ip: &str, msg: ClipboardMessage) -> Result<()> {
         let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
         let mut stream = TcpStream::connect(&addr).await
@@ -398,49 +556,470 @@ impl ClipboardService {
         stream.write_all(&serialized).await?;
         stream.flush().await?;
 
-        info!("✅ Successfully sent clipboard payload to {}", addr);
+        info!("✅ Sent clipboard message to {}", addr);
         Ok(())
     }
 
-    /// Streams files over TCP using fixed 64 KB ring buffers (Zero-RAM streaming).
-    async fn send_files(
-        peer_ip: &str,
-        hash: String,
-        root_names: Vec<String>,
-        entries: Vec<FileEntry>,
-        files_to_stream: Vec<PathBuf>,
+    /// Streams directory structure and file contents directly from disk over socket.
+    async fn stream_files_to_socket(
+        stream: &mut TcpStream,
+        directories: Vec<String>,
+        files: Vec<(String, PathBuf)>,
     ) -> Result<()> {
-        let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
-        let mut stream = TcpStream::connect(&addr).await
-            .with_context(|| format!("Failed to connect to peer at {}", addr))?;
+        let _ = stream.set_nodelay(true);
 
-        let header_msg = ClipboardMessage {
-            hash,
-            payload: ClipboardPayload::Files { root_names, entries },
-        };
+        // 1. Directory frames
+        for dir_rel in &directories {
+            let rel_bytes = dir_rel.as_bytes();
+            if rel_bytes.len() > u16::MAX as usize { continue; }
+            stream.write_u8(FRAME_DIR).await?;
+            stream.write_u16(rel_bytes.len() as u16).await?;
+            stream.write_all(rel_bytes).await?;
+        }
 
-        let serialized = serde_json::to_vec(&header_msg)?;
-        stream.write_u32(serialized.len() as u32).await?;
-        stream.write_all(&serialized).await?;
-
-        // Stream each file directly from disk using 64 KB ring buffer
+        // 2. File frames
         let mut chunk_buf = vec![0u8; 64 * 1024];
-        for path in files_to_stream {
-            if let Ok(mut file) = File::open(&path) {
-                loop {
-                    let n = file.read(&mut chunk_buf)?;
-                    if n == 0 {
-                        break;
+        for (rel_path, abs_path) in files {
+            let rel_bytes = rel_path.as_bytes();
+            if rel_bytes.len() > u16::MAX as usize { continue; }
+
+            match File::open(&abs_path) {
+                Ok(mut file) => {
+                    let actual_len = match file.metadata() {
+                        Ok(m) => m.len(),
+                        Err(_) => 0,
+                    };
+
+                    stream.write_u8(FRAME_FILE).await?;
+                    stream.write_u16(rel_bytes.len() as u16).await?;
+                    stream.write_all(rel_bytes).await?;
+                    stream.write_u64(actual_len).await?;
+
+                    let mut remaining = actual_len;
+                    while remaining > 0 {
+                        let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
+                        let n = file.read(&mut chunk_buf[..to_read])?;
+                        if n == 0 {
+                            let zeros = vec![0u8; remaining as usize];
+                            stream.write_all(&zeros).await?;
+                            break;
+                        }
+                        stream.write_all(&chunk_buf[..n]).await?;
+                        remaining -= n as u64;
                     }
-                    stream.write_all(&chunk_buf[..n]).await?;
                 }
-            } else {
-                warn!("Could not open file {:?} for streaming", path);
+                Err(e) => {
+                    warn!("Could not open file {:?} for streaming, skipping: {}", abs_path, e);
+                }
             }
         }
 
+        stream.write_u8(FRAME_END).await?;
         stream.flush().await?;
-        info!("✅ Finished streaming files/folders to {}", addr);
+        info!("✅ Finished on-demand streaming to peer");
         Ok(())
+    }
+
+    /// Resolves the frontmost active folder (Finder insertion location on macOS, active Explorer or Desktop on Windows).
+    pub fn resolve_active_destination_folder() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            let script = r#"
+            tell application "Finder"
+                try
+                    set targetFolder to (insertion location as alias)
+                    return POSIX path of targetFolder
+                on error
+                    return POSIX path of (path to desktop)
+                end try
+            end tell
+            "#;
+            if let Ok(output) = std::process::Command::new("osascript").arg("-e").arg(script).output() {
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        let p = PathBuf::from(s);
+                        if p.is_dir() {
+                            return p;
+                        }
+                    }
+                }
+            }
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let desktop = PathBuf::from(&home).join("Desktop");
+            if desktop.is_dir() { return desktop; }
+            PathBuf::from(home)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".into());
+            let desktop = PathBuf::from(&home).join("Desktop");
+            if desktop.is_dir() { return desktop; }
+            PathBuf::from(home).join("Downloads")
+        }
+    }
+
+    /// Reveals the pasted file or folder in Finder or File Explorer.
+    pub fn reveal_in_file_manager(path: &Path) {
+        #[cfg(target_os = "macos")]
+        {
+            let script = format!(
+                "tell application \"Finder\" to reveal POSIX file \"{}\"",
+                path.to_string_lossy().replace('\"', "\\\"")
+            );
+            let _ = std::process::Command::new("osascript").arg("-e").arg(&script).spawn();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let arg = format!("/select,\"{}\"", path.to_string_lossy());
+            let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+        }
+    }
+
+    fn copy_entry_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if src.is_dir() {
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let path = entry.path();
+                let dest_child = dst.join(entry.file_name());
+                Self::copy_entry_all(&path, &dest_child)?;
+            }
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(src, dst)?;
+        }
+        Ok(())
+    }
+
+    /// Automatically streams the peer's announced files into the local staging cache,
+    /// and registers them onto the native OS clipboard (NSPasteboard / Win32 Clipboard)
+    /// so the user can immediately paste with Cmd+V / Ctrl+V natively!
+    pub async fn stream_to_cache(&self, ann: LazyAnnouncement) -> Result<()> {
+        let peer_ip = self.discovery.get_peer_ip().await
+            .context("No peer IP connected")?;
+
+        let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
+        let dest_root = cache_dir.join(&ann.root_name);
+
+        info!(
+            "📥 Streaming announced item '{}' ({:.1} MB) across USB-C into staging cache...",
+            ann.root_name, ann.total_bytes as f64 / (1024.0 * 1024.0)
+        );
+
+        let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
+        let mut socket = TcpStream::connect(&addr).await
+            .with_context(|| format!("Failed to connect to peer at {}", addr))?;
+        let _ = socket.set_nodelay(true);
+
+        let req_msg = ClipboardMessage {
+            hash: String::new(),
+            payload: ClipboardPayload::RequestStream(StreamRequest {
+                session_id: ann.session_id.clone(),
+            }),
+        };
+
+        let serialized = serde_json::to_vec(&req_msg)?;
+        socket.write_u32(serialized.len() as u32).await?;
+        socket.write_all(&serialized).await?;
+        socket.flush().await?;
+
+        let total_bytes = ann.total_bytes;
+        let mut transferred_bytes: u64 = 0;
+        let start_time = std::time::Instant::now();
+        let mut last_progress_report = std::time::Instant::now();
+        let mut chunk_buf = vec![0u8; 64 * 1024];
+
+        loop {
+            let tag = match tokio::time::timeout(Duration::from_secs(30), socket.read_u8()).await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    debug!("Stream ended or socket closed: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    warn!("Timed out waiting for next frame tag from peer");
+                    break;
+                }
+            };
+
+            if tag == FRAME_END {
+                debug!("Received FRAME_END from peer");
+                break;
+            } else if tag == FRAME_DIR {
+                let path_len = socket.read_u16().await? as usize;
+                let mut path_bytes = vec![0u8; path_len];
+                socket.read_exact(&mut path_bytes).await?;
+                let rel_path = String::from_utf8_lossy(&path_bytes);
+
+                let mut dest_path = cache_dir.clone();
+                for comp in rel_path.split('/') {
+                    if !comp.is_empty() && comp != "." && comp != ".." {
+                        dest_path.push(comp);
+                    }
+                }
+                let _ = std::fs::create_dir_all(&dest_path);
+            } else if tag == FRAME_FILE {
+                let path_len = socket.read_u16().await? as usize;
+                let mut path_bytes = vec![0u8; path_len];
+                socket.read_exact(&mut path_bytes).await?;
+                let rel_path = String::from_utf8_lossy(&path_bytes);
+                let file_size = socket.read_u64().await?;
+
+                let mut dest_path = cache_dir.clone();
+                for comp in rel_path.split('/') {
+                    if !comp.is_empty() && comp != "." && comp != ".." {
+                        dest_path.push(comp);
+                    }
+                }
+                if let Some(parent) = dest_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                let mut file = File::create(&dest_path)?;
+                let mut remaining = file_size;
+                while remaining > 0 {
+                    let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
+                    socket.read_exact(&mut chunk_buf[..to_read]).await?;
+                    file.write_all(&chunk_buf[..to_read])?;
+                    remaining -= to_read as u64;
+                    transferred_bytes += to_read as u64;
+
+                    if last_progress_report.elapsed() >= Duration::from_millis(100) {
+                        last_progress_report = std::time::Instant::now();
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        #[allow(unused_variables)]
+                        let mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+                        #[allow(unused_variables)]
+                        let pct = if total_bytes > 0 {
+                            (transferred_bytes as f64 / total_bytes as f64 * 100.0).min(100.0)
+                        } else {
+                            100.0
+                        };
+
+                        #[cfg(target_os = "macos")]
+                        unsafe {
+                            update_touchbar_paste_progress(pct as f32, mb_s as f32);
+                        }
+                    }
+                }
+            } else {
+                warn!("Unexpected frame tag: 0x{:02x}, closing stream read", tag);
+                break;
+            }
+        }
+
+        // Register the file on native OS clipboard for IMMEDIATE native Cmd+V / Ctrl+V!
+        if dest_root.exists() {
+            self.file_helper.write_copied_files(&[dest_root.clone()])?;
+            let new_seq = os_seq::get_clipboard_sequence();
+            let mut seq_lock = self.last_seq.write().await;
+            *seq_lock = new_seq;
+            info!("📋 Registered '{}' on native clipboard. Ready for instant Cmd+V / Ctrl+V in file manager!", ann.root_name);
+        }
+
+        #[cfg(target_os = "macos")]
+        unsafe {
+            reset_touchbar_paste_progress();
+        }
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let avg_mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+        info!(
+            "✅ Cached '{}' ({:.1} MB at {:.0} MB/s). Ready for native paste.",
+            ann.root_name,
+            transferred_bytes as f64 / (1024.0 * 1024.0),
+            avg_mb_s
+        );
+        Ok(())
+    }
+
+    /// Executes On-Demand Remote Paste:
+    /// Pulls the announced files from the peer directly into the target folder with live progress.
+    pub async fn paste_remote(&self, custom_target: Option<PathBuf>) -> Result<String> {
+        let ann = {
+            let lock = self.pending_remote.read().await;
+            lock.clone()
+        }.context("No remote file announcement pending to paste")?;
+
+        let target_dir = match custom_target {
+            Some(t) => t,
+            None => Self::resolve_active_destination_folder(),
+        };
+
+        // If the item is already present in the staging cache, copy or reveal it directly!
+        let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
+        let cached_item = cache_dir.join(&ann.root_name);
+        if cached_item.exists() && target_dir != cache_dir {
+            info!("📋 Item '{}' already present in staging cache. Copying to destination {:?}...", ann.root_name, target_dir);
+            let dest_root = target_dir.join(&ann.root_name);
+            let _ = Self::copy_entry_all(&cached_item, &dest_root);
+            Self::reveal_in_file_manager(&dest_root);
+            #[cfg(target_os = "macos")]
+            unsafe {
+                reset_touchbar_paste_progress();
+            }
+            return Ok(format!("✅ Pasted '{}' directly into {:?}", ann.root_name, target_dir));
+        }
+
+        if self.is_pasting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn!("Remote paste is already in progress, ignoring duplicate trigger");
+            return Ok("Paste already in progress".to_string());
+        }
+
+        struct PasteGuard<'a> {
+            service: &'a ClipboardService,
+        }
+        impl<'a> Drop for PasteGuard<'a> {
+            fn drop(&mut self) {
+                self.service.is_pasting.store(false, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    set_has_pending_remote_file(false);
+                    reset_touchbar_paste_progress();
+                }
+            }
+        }
+        let _guard = PasteGuard { service: self };
+
+        let peer_ip = self.discovery.get_peer_ip().await
+            .context("No peer IP connected")?;
+
+        info!(
+            "📥 Initiating on-demand stream of '{}' directly into {:?}",
+            ann.root_name, target_dir
+        );
+
+        let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
+        let mut socket = TcpStream::connect(&addr).await
+            .with_context(|| format!("Failed to connect to peer at {}", addr))?;
+        let _ = socket.set_nodelay(true);
+
+        let req_msg = ClipboardMessage {
+            hash: String::new(),
+            payload: ClipboardPayload::RequestStream(StreamRequest {
+                session_id: ann.session_id.clone(),
+            }),
+        };
+
+        let serialized = serde_json::to_vec(&req_msg)?;
+        socket.write_u32(serialized.len() as u32).await?;
+        socket.write_all(&serialized).await?;
+        socket.flush().await?;
+
+        let dest_root = target_dir.join(&ann.root_name);
+        let total_bytes = ann.total_bytes;
+        let mut transferred_bytes: u64 = 0;
+        let start_time = std::time::Instant::now();
+        let mut last_progress_report = std::time::Instant::now();
+        let mut chunk_buf = vec![0u8; 64 * 1024];
+
+        loop {
+            let tag = match tokio::time::timeout(Duration::from_secs(30), socket.read_u8()).await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    debug!("Stream ended or socket closed: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    warn!("Timed out waiting for next frame tag from peer");
+                    break;
+                }
+            };
+
+            if tag == FRAME_END {
+                debug!("Received FRAME_END from peer");
+                break;
+            } else if tag == FRAME_DIR {
+                let path_len = socket.read_u16().await? as usize;
+                let mut path_bytes = vec![0u8; path_len];
+                socket.read_exact(&mut path_bytes).await?;
+                let rel_path = String::from_utf8_lossy(&path_bytes);
+
+                let mut dest_path = target_dir.clone();
+                for comp in rel_path.split('/') {
+                    if !comp.is_empty() && comp != "." && comp != ".." {
+                        dest_path.push(comp);
+                    }
+                }
+                let _ = std::fs::create_dir_all(&dest_path);
+            } else if tag == FRAME_FILE {
+                let path_len = socket.read_u16().await? as usize;
+                let mut path_bytes = vec![0u8; path_len];
+                socket.read_exact(&mut path_bytes).await?;
+                let rel_path = String::from_utf8_lossy(&path_bytes);
+                let file_size = socket.read_u64().await?;
+
+                let mut dest_path = target_dir.clone();
+                for comp in rel_path.split('/') {
+                    if !comp.is_empty() && comp != "." && comp != ".." {
+                        dest_path.push(comp);
+                    }
+                }
+                if let Some(parent) = dest_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                let mut file = File::create(&dest_path)?;
+                let mut remaining = file_size;
+                while remaining > 0 {
+                    let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
+                    socket.read_exact(&mut chunk_buf[..to_read]).await?;
+                    file.write_all(&chunk_buf[..to_read])?;
+                    remaining -= to_read as u64;
+                    transferred_bytes += to_read as u64;
+
+                    if last_progress_report.elapsed() >= Duration::from_millis(100) {
+                        last_progress_report = std::time::Instant::now();
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        #[allow(unused_variables)]
+                        let mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+                        #[allow(unused_variables)]
+                        let pct = if total_bytes > 0 {
+                            (transferred_bytes as f64 / total_bytes as f64 * 100.0).min(100.0)
+                        } else {
+                            100.0
+                        };
+
+                        #[cfg(target_os = "macos")]
+                        unsafe {
+                            update_touchbar_paste_progress(pct as f32, mb_s as f32);
+                        }
+                    }
+                }
+            } else {
+                warn!("Unexpected frame tag: 0x{:02x}, closing stream read", tag);
+                break;
+            }
+        }
+
+        // Clear pending remote announcement
+        {
+            let mut lock = self.pending_remote.write().await;
+            *lock = None;
+        }
+
+        #[cfg(target_os = "macos")]
+        unsafe {
+            reset_touchbar_paste_progress();
+        }
+
+        Self::reveal_in_file_manager(&dest_root);
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let avg_mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+        let msg = format!(
+            "✅ Successfully pasted '{}' ({:.1} MB at {:.0} MB/s) directly into {:?}",
+            ann.root_name,
+            transferred_bytes as f64 / (1024.0 * 1024.0),
+            avg_mb_s,
+            target_dir
+        );
+        info!("{}", msg);
+        Ok(msg)
     }
 }

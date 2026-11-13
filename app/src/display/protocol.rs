@@ -27,6 +27,10 @@ pub enum DisplayRpcRequest {
     GetStatus,
     /// Query live GPU telemetry (temps, watts, clocks, utilization)
     GetGpuTelemetry,
+    /// On-demand paste remote announced files directly into active folder
+    PasteRemote,
+    /// Show and focus main application window (Single-Instance IPC)
+    ShowWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

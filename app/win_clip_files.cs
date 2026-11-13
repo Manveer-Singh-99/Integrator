@@ -14,6 +14,7 @@ class Program {
                 }
             }
             if (sc.Count > 0) {
+                Clipboard.Clear();
                 Clipboard.SetFileDropList(sc);
             }
         } else if (args.Length > 0 && args[0] == "read") {
@@ -22,6 +23,8 @@ class Program {
                     Console.WriteLine(f);
                 }
             }
+        } else if (args.Length > 0 && args[0] == "clear") {
+            Clipboard.Clear();
         }
     }
 }

@@ -22,6 +22,25 @@ use discovery::DiscoveryManager;
 use clipboard::ClipboardService;
 use display::{DisplayController, DisplayServer, DisplayRpcRequest};
 
+pub static GLOBAL_APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn init_touchbar_in_app(peer_ip: *const std::os::raw::c_char);
+    fn dismiss_touchbar_in_app();
+    fn is_touchbar_active_in_app() -> bool;
+    fn run_touchbar_cli_loop(peer_ip: *const std::os::raw::c_char);
+    #[allow(dead_code)]
+    fn update_touchbar_telemetry_in_app(
+        temp: u32,
+        power: f32,
+        clock: u32,
+        vram_used: u64,
+        vram_total: u64,
+        util: u32,
+    );
+}
+
 pub struct AppState {
     pub discovery: DiscoveryManager,
     pub display_ctrl: DisplayController,
@@ -76,11 +95,7 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
     let (encode_gpu, decode_gpu) = crate::display::WinDisplayManager::get_gpu_preferences();
 
     #[cfg(target_os = "macos")]
-    let touchbar_active = std::process::Command::new("pgrep")
-        .arg("touchbar_hud")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let touchbar_active = unsafe { is_touchbar_active_in_app() };
 
     #[cfg(not(target_os = "macos"))]
     let touchbar_active = false;
@@ -138,15 +153,10 @@ async fn get_gpu_telemetry(state: State<'_, AppState>) -> Result<crate::telemetr
 async fn toggle_touchbar_hud(state: State<'_, AppState>, force: Option<bool>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        // Check if touchbar_hud process is running
-        let is_running = std::process::Command::new("pgrep")
-            .arg("touchbar_hud")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let is_running = unsafe { is_touchbar_active_in_app() };
 
         if is_running {
-            let _ = std::process::Command::new("pkill").arg("touchbar_hud").spawn();
+            unsafe { dismiss_touchbar_in_app() };
             return Ok("Touch Bar NVIDIA HUD disabled".to_string());
         }
 
@@ -159,21 +169,12 @@ async fn toggle_touchbar_hud(state: State<'_, AppState>, force: Option<bool>) ->
             return Err("Touch Bar NVIDIA HUD requires Windows Master mode (when Windows PC extends desktop to this MacBook Pro). Start 'Extend to MacBook Pro' first or use test override.".into());
         }
 
-        let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
-        let bin_path = if helper_path.exists() {
-            helper_path
-        } else {
-            std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
-        };
-
-        if !bin_path.exists() {
-            return Err("touchbar_hud helper binary not found. Please compile it first.".into());
-        }
-
         let peer_ip = state.discovery.get_peer_ip().await.unwrap_or_else(|| "10.99.99.1".to_string());
-        let _ = std::process::Command::new(bin_path).arg(peer_ip).spawn()
-            .map_err(|e| format!("Failed to spawn touchbar_hud: {}", e))?;
-        Ok("Touch Bar NVIDIA Performance HUD enabled (Liquid Glass)".to_string())
+        let c_ip = std::ffi::CString::new(peer_ip).map_err(|e| e.to_string())?;
+        unsafe {
+            init_touchbar_in_app(c_ip.as_ptr());
+        }
+        Ok("Touch Bar NVIDIA Performance HUD enabled (Goopy Liquid Glass)".to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -213,6 +214,11 @@ async fn open_cache_folder() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn paste_remote(state: State<'_, AppState>) -> Result<String, String> {
+    state.clipboard.paste_remote(None).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn hide_window(app_handle: AppHandle) -> Result<(), String> {
     if let Some(win) = app_handle.get_webview_window("main") {
         let _ = win.hide();
@@ -224,6 +230,26 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // 1. Check for CLI Subcommands (e.g. `mac_windows_bridge display toggle`, `mac_windows_bridge benchmark`)
+    if args.len() > 1 && (args[1] == "paste-remote" || args[1] == "--paste-remote") {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async {
+            println!("📥 Requesting on-demand remote paste from daemon...");
+            match DisplayController::send_remote_rpc("127.0.0.1", &DisplayRpcRequest::PasteRemote).await {
+                Ok(resp) => {
+                    println!("{}", resp.message);
+                    if !resp.success {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to bridge daemon: {}. Is mac_windows_bridge running?", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     if args.len() > 1 && args[1] == "benchmark" {
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(async {
@@ -278,15 +304,12 @@ fn main() -> Result<()> {
     if args.len() > 1 && args[1] == "touchbar" {
         #[cfg(target_os = "macos")]
         {
-            let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
-            let bin_path = if helper_path.exists() {
-                helper_path
-            } else {
-                std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
-            };
-            println!("Launching Touch Bar HUD ({:?})...", bin_path);
-            let mut child = std::process::Command::new(bin_path).spawn()?;
-            let _ = child.wait();
+            let peer_ip = if args.len() > 2 { &args[2] } else { "10.99.99.1" };
+            let c_ip = std::ffi::CString::new(peer_ip)?;
+            println!("Initializing in-app Goopy Liquid Glass Touch Bar HUD for peer {}...", peer_ip);
+            unsafe {
+                run_touchbar_cli_loop(c_ip.as_ptr());
+            }
             return Ok(());
         }
         #[cfg(not(target_os = "macos"))]
@@ -327,7 +350,46 @@ fn main() -> Result<()> {
         });
     }
 
-    // 2. Initialize Logging for Daemon
+    // 2. Single Instance Check: if already running, focus existing window and exit!
+    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], crate::config::CONTROL_PORT)),
+        std::time::Duration::from_millis(150),
+    ) {
+        let req = DisplayRpcRequest::ShowWindow;
+        if let Ok(bytes) = serde_json::to_vec(&req) {
+            use std::io::Write;
+            let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
+            let _ = stream.write_all(&bytes);
+            let _ = stream.flush();
+        }
+        println!("Existing MacWindowsBridge instance is already running. Brought window to front.");
+        return Ok(());
+    }
+
+    // 3. Purge legacy autostart persistence so the app never relaunches against user's will
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let plist_path = std::path::PathBuf::from(home).join("Library/LaunchAgents/com.manveersingh.macwindowsbridge.plist");
+            if plist_path.exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", plist_path.to_str().unwrap_or_default()])
+                    .status();
+                let _ = std::fs::remove_file(&plist_path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("schtasks.exe")
+            .args(["/delete", "/tn", "MacWindowsBridge", "/f"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status();
+    }
+
+    // 4. Initialize Logging for Daemon
     let home = if cfg!(target_os = "windows") {
         std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into())
     } else {
@@ -373,6 +435,8 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    let _ = clipboard::TOKIO_HANDLE.set(rt.handle().clone());
+
     let (discovery, display_ctrl, clipboard) = rt.block_on(async {
         // Multi-Subnet Discovery
         let discovery = DiscoveryManager::new(device_name);
@@ -416,11 +480,20 @@ fn main() -> Result<()> {
             set_gpu_preferences,
             run_speed_test,
             get_gpu_telemetry,
-            toggle_touchbar_hud
+            toggle_touchbar_hud,
+            paste_remote
         ])
         .setup(move |app| {
+            GLOBAL_APP_HANDLE.set(app.handle().clone()).ok();
+
+            #[cfg(target_os = "macos")]
+            unsafe {
+                clipboard::service::init_shortcut_interceptor();
+            }
+
             // Setup Tray Menu
             let show_i = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
+            let paste_i = MenuItem::with_id(app, "paste_remote", "📥 Paste Remote Item into Active Folder", true, None::<&str>)?;
             let toggle_label = if cfg!(target_os = "windows") {
                 "Extend to MacBook Pro (VideoToolbox 60Hz)"
             } else {
@@ -430,7 +503,7 @@ fn main() -> Result<()> {
             let cache_i = MenuItem::with_id(app, "open_cache", "Open Clipboard Cache", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Bridge", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show_i, &toggle_i, &cache_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&show_i, &paste_i, &toggle_i, &cache_i, &quit_i])?;
 
             if let Some(icon) = app.default_window_icon() {
                 let _tray = TrayIconBuilder::new()
@@ -444,6 +517,15 @@ fn main() -> Result<()> {
                                     let _ = win.show();
                                     let _ = win.set_focus();
                                 }
+                            }
+                            "paste_remote" => {
+                                let state = app.state::<AppState>();
+                                let cb = state.clipboard.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if let Err(e) = cb.paste_remote(None).await {
+                                        tracing::warn!("Remote paste error: {}", e);
+                                    }
+                                });
                             }
                             "toggle_display" => {
                                 let state = app.state::<AppState>();
@@ -470,7 +552,7 @@ fn main() -> Result<()> {
                                 let _ = std::process::Command::new("explorer").arg(&cache_dir).spawn();
                             }
                             "quit" => {
-                                app.exit(0);
+                                std::process::exit(0);
                             }
                             _ => {}
                         }
@@ -514,8 +596,23 @@ fn main() -> Result<()> {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            match event {
+                tauri::RunEvent::Reopen { .. } => {
+                    if let Some(win) = app_handle.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.unminimize();
+                        let _ = win.set_focus();
+                    }
+                }
+                tauri::RunEvent::ExitRequested { .. } => {
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        });
 
     Ok(())
 }

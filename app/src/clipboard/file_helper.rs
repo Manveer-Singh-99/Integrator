@@ -131,6 +131,7 @@ impl FileClipboardHelper {
     }
 
     /// Sets the OS clipboard so that the user can immediately paste the file(s) into Finder or Explorer.
+    #[allow(dead_code)]
     pub fn write_copied_files(&self, files: &[PathBuf]) -> Result<()> {
         if files.is_empty() {
             return Ok(());
@@ -172,6 +173,31 @@ impl FileClipboardHelper {
         }
 
         info!("Registered {} file(s) onto native OS clipboard for pasting", files.len());
+        Ok(())
+    }
+
+    /// Clears the native OS clipboard so stale text/files are removed immediately.
+    #[allow(dead_code)]
+    pub fn clear_clipboard(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(helper) = Self::find_helper("macos_clip_files") {
+                let _ = Command::new(helper).arg("clear").status();
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+            if let Some(helper) = Self::find_helper("win_clip_files.exe") {
+                let mut cmd = Command::new(helper);
+                cmd.arg("clear").creation_flags(CREATE_NO_WINDOW);
+                let _ = cmd.status();
+            }
+        }
+
         Ok(())
     }
 }

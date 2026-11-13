@@ -128,7 +128,7 @@ impl DisplayController {
 
     /// Toggles PC-as-Host extended desktop to Mac.
     pub async fn toggle_pc_to_mac(&self) -> Result<String> {
-        let is_running = WinDisplayManager::is_vdd_active();
+        let is_running = *self.is_active.read().await || WinDisplayManager::is_vdd_active();
         if is_running {
             self.stop_pc_to_mac().await?;
             Ok("Stopped PC-to-Mac second screen display".into())
@@ -153,9 +153,23 @@ impl DisplayController {
 
         info!("Starting PC-to-Mac second screen (Host: {}, Client: {})", my_ip, peer_ip);
 
-        // 1. Enable VDD device on Windows
+        // 1. Enable VDD device and Slot 1 for Mac on Windows
         WinDisplayManager::enable_vdd_device()?;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Wait up to 4 seconds for Sunshine port 48989 (or 47989) on Windows
+        let mut ready = false;
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect("127.0.0.1:48989").await.is_ok()
+                || tokio::net::TcpStream::connect("127.0.0.1:47989").await.is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !ready {
+            warn!("Sunshine secondary port 48989 not yet responding; proceeding with RPC anyway");
+        }
 
         // 2. Send RPC to Mac to launch Moonlight client
         let rpc = DisplayRpcRequest::StartMoonlight {
@@ -207,13 +221,19 @@ impl DisplayController {
                 info!("Handling StartMoonlight RPC from host {}", host_ip);
                 if cfg!(target_os = "windows") {
                     match WinDisplayManager::start_moonlight_client(&host_ip, width, height, fps, bitrate_kbps, audio_on_host) {
-                        Ok(_) => DisplayRpcResponse {
-                            success: true,
-                            message: format!("Started Moonlight client on Windows for host {}", host_ip),
-                            is_active: true,
-                            active_mode: Some("Client".into()),
-                            gpu_telemetry: None,
-                        },
+                        Ok(_) => {
+                            let mut active = self.is_active.write().await;
+                            *active = true;
+                            let mut mode = self.active_mode.write().await;
+                            *mode = Some("Client".into());
+                            DisplayRpcResponse {
+                                success: true,
+                                message: format!("Started Moonlight client on Windows for host {}", host_ip),
+                                is_active: true,
+                                active_mode: Some("Client".into()),
+                                gpu_telemetry: None,
+                            }
+                        }
                         Err(e) => DisplayRpcResponse {
                             success: false,
                             message: format!("Failed to start Moonlight on Windows: {}", e),
@@ -223,14 +243,28 @@ impl DisplayController {
                         },
                     }
                 } else {
-                    match MacDisplayManager::start_moonlight_client(&host_ip, 48989, "HP-Omen-Mac2") {
-                        Ok(_) => DisplayRpcResponse {
-                            success: true,
-                            message: format!("Started Moonlight client on Mac for host {}", host_ip),
-                            is_active: true,
-                            active_mode: Some("Client".into()),
-                            gpu_telemetry: None,
-                        },
+                    let port = if MacDisplayManager::wait_for_port(&host_ip, 48989, Duration::from_secs(5)).await {
+                        48989
+                    } else if MacDisplayManager::wait_for_port(&host_ip, 47989, Duration::from_secs(2)).await {
+                        47989
+                    } else {
+                        48989
+                    };
+                    let host_name = if port == 48989 { "HP-Omen-Mac2" } else { "HP-Omen" };
+                    match MacDisplayManager::start_moonlight_client(&host_ip, port, host_name) {
+                        Ok(_) => {
+                            let mut active = self.is_active.write().await;
+                            *active = true;
+                            let mut mode = self.active_mode.write().await;
+                            *mode = Some("Client".into());
+                            DisplayRpcResponse {
+                                success: true,
+                                message: format!("Started Moonlight client on Mac for host {} on port {}", host_ip, port),
+                                is_active: true,
+                                active_mode: Some("Client".into()),
+                                gpu_telemetry: None,
+                            }
+                        }
                         Err(e) => DisplayRpcResponse {
                             success: false,
                             message: format!("Failed to start Moonlight on Mac: {}", e),
@@ -248,6 +282,10 @@ impl DisplayController {
                 } else {
                     let _ = MacDisplayManager::stop_moonlight_client();
                 }
+                let mut active = self.is_active.write().await;
+                *active = false;
+                let mut mode = self.active_mode.write().await;
+                *mode = None;
                 DisplayRpcResponse {
                     success: true,
                     message: "Stopped Moonlight client".into(),
@@ -324,6 +362,51 @@ impl DisplayController {
                     is_active: *self.is_active.read().await,
                     active_mode: self.active_mode.read().await.clone(),
                     gpu_telemetry: telemetry,
+                }
+            }
+            DisplayRpcRequest::PasteRemote => {
+                if let Some(service) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+                    match service.paste_remote(None).await {
+                        Ok(msg) => DisplayRpcResponse {
+                            success: true,
+                            message: msg,
+                            is_active: *self.is_active.read().await,
+                            active_mode: self.active_mode.read().await.clone(),
+                            gpu_telemetry: None,
+                        },
+                        Err(e) => DisplayRpcResponse {
+                            success: false,
+                            message: format!("Failed to paste remote item: {}", e),
+                            is_active: *self.is_active.read().await,
+                            active_mode: self.active_mode.read().await.clone(),
+                            gpu_telemetry: None,
+                        },
+                    }
+                } else {
+                    DisplayRpcResponse {
+                        success: false,
+                        message: "Clipboard service not initialized".to_string(),
+                        is_active: false,
+                        active_mode: None,
+                        gpu_telemetry: None,
+                    }
+                }
+            }
+            DisplayRpcRequest::ShowWindow => {
+                if let Some(app) = crate::GLOBAL_APP_HANDLE.get() {
+                    use tauri::Manager;
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.unminimize();
+                        let _ = win.set_focus();
+                    }
+                }
+                DisplayRpcResponse {
+                    success: true,
+                    message: "Window focused".into(),
+                    is_active: *self.is_active.read().await,
+                    active_mode: self.active_mode.read().await.clone(),
+                    gpu_telemetry: None,
                 }
             }
         }
