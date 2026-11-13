@@ -41,6 +41,8 @@ pub struct BridgeStatus {
     pub link_type: String,
     pub encode_gpu: String,
     pub decode_gpu: String,
+    pub touchbar_active: bool,
+    pub is_windows_master: bool,
 }
 
 fn detect_link_info(peer_ip: Option<&str>) -> (String, String) {
@@ -73,6 +75,18 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
 
     let (encode_gpu, decode_gpu) = crate::display::WinDisplayManager::get_gpu_preferences();
 
+    #[cfg(target_os = "macos")]
+    let touchbar_active = std::process::Command::new("pgrep")
+        .arg("touchbar_hud")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    #[cfg(not(target_os = "macos"))]
+    let touchbar_active = false;
+
+    let is_windows_master = display_active && active_mode.as_deref() == Some("Client");
+
     Ok(BridgeStatus {
         peer_connected,
         peer_ip: peer_ip.unwrap_or_else(|| "Searching...".to_string()),
@@ -84,6 +98,8 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
         link_type,
         encode_gpu,
         decode_gpu,
+        touchbar_active,
+        is_windows_master,
     })
 }
 
@@ -119,7 +135,7 @@ async fn get_gpu_telemetry(state: State<'_, AppState>) -> Result<crate::telemetr
 }
 
 #[tauri::command]
-async fn toggle_touchbar_hud() -> Result<String, String> {
+async fn toggle_touchbar_hud(state: State<'_, AppState>, force: Option<bool>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         // Check if touchbar_hud process is running
@@ -131,27 +147,39 @@ async fn toggle_touchbar_hud() -> Result<String, String> {
 
         if is_running {
             let _ = std::process::Command::new("pkill").arg("touchbar_hud").spawn();
-            Ok("Touch Bar NVIDIA HUD dismissed".to_string())
-        } else {
-            let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
-            let bin_path = if helper_path.exists() {
-                helper_path
-            } else {
-                std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
-            };
-
-            if !bin_path.exists() {
-                return Err("touchbar_hud helper binary not found. Please compile it first.".into());
-            }
-
-            let _ = std::process::Command::new(bin_path).spawn()
-                .map_err(|e| format!("Failed to spawn touchbar_hud: {}", e))?;
-            Ok("Touch Bar NVIDIA Performance HUD active on physical OLED strip".to_string())
+            return Ok("Touch Bar NVIDIA HUD disabled".to_string());
         }
+
+        let is_display_active = state.display_ctrl.is_active().await;
+        let active_mode = state.display_ctrl.get_active_mode().await;
+        let is_windows_master = is_display_active && active_mode.as_deref() == Some("Client");
+
+        let allow_run = is_windows_master || force.unwrap_or(false);
+        if !allow_run {
+            return Err("Touch Bar NVIDIA HUD requires Windows Master mode (when Windows PC extends desktop to this MacBook Pro). Start 'Extend to MacBook Pro' first or use test override.".into());
+        }
+
+        let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
+        let bin_path = if helper_path.exists() {
+            helper_path
+        } else {
+            std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
+        };
+
+        if !bin_path.exists() {
+            return Err("touchbar_hud helper binary not found. Please compile it first.".into());
+        }
+
+        let peer_ip = state.discovery.get_peer_ip().await.unwrap_or_else(|| "10.99.99.1".to_string());
+        let _ = std::process::Command::new(bin_path).arg(peer_ip).spawn()
+            .map_err(|e| format!("Failed to spawn touchbar_hud: {}", e))?;
+        Ok("Touch Bar NVIDIA Performance HUD enabled (Liquid Glass)".to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = state;
+        let _ = force;
         Err("Touch Bar is only available on macOS hardware with a physical Touch Bar".to_string())
     }
 }

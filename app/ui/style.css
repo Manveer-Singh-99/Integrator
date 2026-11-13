@@ -1149,6 +1149,14 @@ body {
 .touchbar-pill.oled-clock { color: #60a5fa; border-color: rgba(59, 130, 246, 0.3); }
 .touchbar-pill.oled-vram { color: #93c5fd; border-color: rgba(147, 197, 253, 0.3); }
 .touchbar-pill.oled-fps { color: #c084fc; border-color: rgba(168, 85, 247, 0.3); font-weight: 700; }
+.touchbar-pill.oled-control-strip {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  color: #9ca3af;
+  font-size: 9px;
+  font-weight: 500;
+  margin-left: auto;
+}
 
 /* Feature 11: Multi-WAN Visualizer */
 .multiwan-visual-box {

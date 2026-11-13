@@ -514,34 +514,34 @@
               <p class="card-desc">Off-screen GPU hardware telemetry on MacBook 2170×60 OLED strip</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <span id="touchbar-state-badge" class="pill pill-idle">Windows Master Inactive</span>
         </div>
 
         <!-- Mini OLED Touch Bar Visualizer -->
         <div class="touchbar-strip-visual">
-          <div class="touchbar-pill oled-logo" id="tb-vis-logo">🎮 RTX 5070</div>
           <div class="touchbar-pill oled-temp" id="tb-vis-temp">🌡️ 44°C</div>
           <div class="touchbar-pill oled-power" id="tb-vis-power">⚡ 17.4W</div>
           <div class="touchbar-pill oled-clock" id="tb-vis-clock">🚀 0 MHz</div>
           <div class="touchbar-pill oled-vram" id="tb-vis-vram">💾 0 / 8.1 GB</div>
           <div class="touchbar-pill oled-fps" id="tb-vis-fps">📊 0% GPU</div>
+          <div class="touchbar-pill oled-control-strip">Native macOS Strip ➔</div>
         </div>
 
         <div class="checkbox-group">
           <label class="checkbox-label">
             <input type="checkbox" checked id="chk-touchbar-scope">
-            <span>Strict Scope Isolation (Windows only captures Touch Bar when acting as Master)</span>
+            <span>Strict Scope Isolation (Only active when Windows is Master extending to macOS Slave)</span>
           </label>
           <label class="checkbox-label">
-            <input type="checkbox" checked id="chk-nvml-polling">
-            <span>Zero-Overhead NVML Polling (Streams temps and watts without on-screen overlays)</span>
+            <input type="checkbox" checked id="chk-touchbar-liquid-glass">
+            <span>Liquid Glass Styling (Translucent blurred frosted effect with glowing borders)</span>
           </label>
         </div>
 
         <div class="card-actions">
           <button class="btn btn-primary" id="btn-toggle-touchbar">
             <span class="btn-icon">📊</span>
-            <span id="btn-touchbar-label">Bring NVIDIA Overlay to MacBook Touch Bar</span>
+            <span id="btn-touchbar-label">Enable Touch Bar NVIDIA HUD</span>
           </button>
         </div>
       </section>

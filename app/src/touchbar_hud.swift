@@ -21,19 +21,83 @@ struct DisplayRpcResponseData: Codable {
     let gpu_telemetry: GpuTelemetryData?
 }
 
+/// Custom Liquid Glass Pill View for Touch Bar
+class LiquidGlassPillView: NSView {
+    let visualEffectView = NSVisualEffectView()
+    let label = NSTextField(labelWithString: "")
+    var accentColor: NSColor = .systemGreen {
+        didSet { updateGlow() }
+    }
+
+    init(text: String, accent: NSColor, width: CGFloat = 85) {
+        self.accentColor = accent
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
+        setup(text: text)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    func setup(text: String) {
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.masksToBounds = true
+
+        // 1. Frosted Glass Blur Effect
+        visualEffectView.frame = bounds
+        visualEffectView.autoresizingMask = [.width, .height]
+        visualEffectView.material = .hudWindow
+        visualEffectView.blendingMode = .withinWindow
+        visualEffectView.state = .active
+        visualEffectView.wantsLayer = true
+        visualEffectView.layer?.cornerRadius = 9
+        visualEffectView.layer?.masksToBounds = true
+        addSubview(visualEffectView)
+
+        // 2. Liquid Glass Border & Specular Edge Highlight
+        visualEffectView.layer?.borderWidth = 0.8
+        visualEffectView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.22).cgColor
+        visualEffectView.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.45).cgColor
+
+        // 3. Monospace High-Legibility Typography
+        label.frame = bounds
+        label.autoresizingMask = [.width, .height]
+        label.alignment = .center
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .white
+        label.stringValue = text
+        addSubview(label)
+
+        updateGlow()
+    }
+
+    func setText(_ newText: String) {
+        label.stringValue = newText
+    }
+
+    func setAccent(_ color: NSColor) {
+        self.accentColor = color
+    }
+
+    func updateGlow() {
+        visualEffectView.layer?.borderColor = accentColor.withAlphaComponent(0.4).cgColor
+        visualEffectView.layer?.backgroundColor = accentColor.withAlphaComponent(0.14).cgColor
+    }
+}
+
 class TouchBarHudController: NSObject, NSTouchBarDelegate {
     var touchBar: NSTouchBar?
     var peerIp: String = "10.99.99.1"
     var pollTimer: Timer?
     var isRunning: Bool = true
     
-    // Touch Bar UI Item References
-    var btnGpu: NSButton?
-    var btnTemp: NSButton?
-    var btnPower: NSButton?
-    var btnClock: NSButton?
-    var btnVram: NSButton?
-    var btnUtil: NSButton?
+    // Liquid Glass Item Views
+    var viewTemp: LiquidGlassPillView?
+    var viewPower: LiquidGlassPillView?
+    var viewClock: LiquidGlassPillView?
+    var viewVram: LiquidGlassPillView?
+    var viewUtil: LiquidGlassPillView?
     
     init(peerIp: String = "10.99.99.1") {
         self.peerIp = peerIp
@@ -48,26 +112,28 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
     func setupTouchBar() {
         let tb = NSTouchBar()
         tb.delegate = self
+        
+        // Exclusively render the 5 performance metric pills
+        // (RTX 5070 title and Close button removed as requested)
         tb.defaultItemIdentifiers = [
-            NSTouchBarItem.Identifier("gpu"),
             NSTouchBarItem.Identifier("temp"),
             NSTouchBarItem.Identifier("power"),
             NSTouchBarItem.Identifier("clock"),
             NSTouchBarItem.Identifier("vram"),
-            NSTouchBarItem.Identifier("util"),
-            NSTouchBarItem.Identifier("close")
+            NSTouchBarItem.Identifier("util")
         ]
         self.touchBar = tb
         
-        // Present as System-Modal Touch Bar across all spaces
+        // Present with placement: 0 (NSTouchBarPlacementDefault)
+        // This keeps the native macOS Control Strip on the right completely intact!
         let sel = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
         if NSTouchBar.responds(to: sel) {
             typealias PresentFunc = @convention(c) (AnyClass, Selector, AnyObject, Int64, AnyObject?) -> Void
             let method = class_getClassMethod(NSTouchBar.self, sel)!
             let imp = method_getImplementation(method)
             let fn = unsafeBitCast(imp, to: PresentFunc.self)
-            fn(NSTouchBar.self, sel, tb, 1, nil)
-            print("🚀 NVIDIA Performance HUD presented on physical OLED Touch Bar!")
+            fn(NSTouchBar.self, sel, tb, 0, nil) // placement 0 preserves macOS Control Strip
+            print("🚀 NVIDIA Liquid Glass Performance HUD presented (Native macOS Control Strip Preserved)")
         } else {
             let sel2 = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
             typealias PresentFunc2 = @convention(c) (AnyClass, Selector, AnyObject, AnyObject?) -> Void
@@ -75,47 +141,33 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
             let imp2 = method_getImplementation(method2)
             let fn2 = unsafeBitCast(imp2, to: PresentFunc2.self)
             fn2(NSTouchBar.self, sel2, tb, nil)
-            print("🚀 NVIDIA Performance HUD presented on physical Touch Bar via fallback!")
+            print("🚀 NVIDIA Liquid Glass Performance HUD presented via fallback")
         }
     }
     
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         let item = NSCustomTouchBarItem(identifier: identifier)
         switch identifier.rawValue {
-        case "gpu":
-            let btn = NSButton(title: "🎮 RTX 5070", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.46, green: 0.73, blue: 0.0, alpha: 1.0) // NVIDIA Green
-            self.btnGpu = btn
-            item.view = btn
         case "temp":
-            let btn = NSButton(title: "🌡️ --°C", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.2, green: 0.6, blue: 0.3, alpha: 1.0)
-            self.btnTemp = btn
-            item.view = btn
+            let v = LiquidGlassPillView(text: "🌡️ --°C", accent: NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0), width: 82)
+            self.viewTemp = v
+            item.view = v
         case "power":
-            let btn = NSButton(title: "⚡ -- W", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.85, green: 0.65, blue: 0.1, alpha: 1.0)
-            self.btnPower = btn
-            item.view = btn
+            let v = LiquidGlassPillView(text: "⚡ --W", accent: NSColor(red: 0.95, green: 0.65, blue: 0.1, alpha: 1.0), width: 80)
+            self.viewPower = v
+            item.view = v
         case "clock":
-            let btn = NSButton(title: "🚀 -- MHz", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.2, green: 0.6, blue: 0.85, alpha: 1.0)
-            self.btnClock = btn
-            item.view = btn
+            let v = LiquidGlassPillView(text: "🚀 -- MHz", accent: NSColor(red: 0.05, green: 0.7, blue: 0.85, alpha: 1.0), width: 92)
+            self.viewClock = v
+            item.view = v
         case "vram":
-            let btn = NSButton(title: "💾 -- / 8 GB", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.3, green: 0.4, blue: 0.9, alpha: 1.0)
-            self.btnVram = btn
-            item.view = btn
+            let v = LiquidGlassPillView(text: "💾 -- / 8.1 GB", accent: NSColor(red: 0.25, green: 0.5, blue: 0.95, alpha: 1.0), width: 105)
+            self.viewVram = v
+            item.view = v
         case "util":
-            let btn = NSButton(title: "📊 --%", target: nil, action: nil)
-            btn.bezelColor = NSColor(red: 0.65, green: 0.3, blue: 0.85, alpha: 1.0)
-            self.btnUtil = btn
-            item.view = btn
-        case "close":
-            let btn = NSButton(title: "✕", target: self, action: #selector(closeTouchBar))
-            btn.bezelColor = NSColor(red: 0.7, green: 0.2, blue: 0.2, alpha: 1.0)
-            item.view = btn
+            let v = LiquidGlassPillView(text: "📊 --% GPU", accent: NSColor(red: 0.65, green: 0.35, blue: 0.95, alpha: 1.0), width: 85)
+            self.viewUtil = v
+            item.view = v
         default:
             return nil
         }
@@ -123,10 +175,7 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
     }
     
     func startPolling() {
-        // Initial fetch
         queryTelemetry()
-        
-        // Repeating timer every 1.0 second
         self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.queryTelemetry()
         }
@@ -136,7 +185,6 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self, self.isRunning else { return }
             
-            // Query telemetry via socket to 10.99.99.1:58281
             let host = self.peerIp
             let port: UInt16 = 58281
             
@@ -164,17 +212,14 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
                 return
             }
             
-            // Request payload: "\"GetGpuTelemetry\""
             let reqJson = "\"GetGpuTelemetry\"".data(using: .utf8)!
             var lenBigEndian = UInt32(reqJson.count).bigEndian
             
-            // Send length prefix (4 bytes) + JSON
             send(clientSocket, &lenBigEndian, 4, 0)
             reqJson.withUnsafeBytes { rawPtr in
                 _ = send(clientSocket, rawPtr.baseAddress, reqJson.count, 0)
             }
             
-            // Read response length prefix (4 bytes)
             var respLenBigEndian: UInt32 = 0
             let rcvLen = recv(clientSocket, &respLenBigEndian, 4, 0)
             guard rcvLen == 4 else {
@@ -188,7 +233,6 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
                 return
             }
             
-            // Read response buffer
             var respData = Data(count: respLen)
             var totalRead = 0
             while totalRead < respLen {
@@ -204,7 +248,6 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
             
             guard totalRead == respLen else { return }
             
-            // Decode JSON
             if let decoded = try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData),
                let t = decoded.gpu_telemetry {
                 DispatchQueue.main.async { [weak self] in
@@ -215,42 +258,42 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
     }
     
     func updateUi(with t: GpuTelemetryData) {
-        // Temperature badge
-        if let btn = self.btnTemp {
-            btn.title = "🌡️ \(t.temperature_c)°C"
+        // 1. Temperature with Dynamic Thermal Color
+        if let v = self.viewTemp {
+            v.setText("🌡️ \(t.temperature_c)°C")
             if t.temperature_c < 55 {
-                btn.bezelColor = NSColor(red: 0.1, green: 0.7, blue: 0.3, alpha: 1.0)
+                v.setAccent(NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0)) // Emerald Green
             } else if t.temperature_c < 75 {
-                btn.bezelColor = NSColor(red: 0.9, green: 0.5, blue: 0.1, alpha: 1.0)
+                v.setAccent(NSColor(red: 0.95, green: 0.55, blue: 0.1, alpha: 1.0)) // Amber Gold
             } else {
-                btn.bezelColor = NSColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 1.0)
+                v.setAccent(NSColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1.0)) // Ruby Red
             }
         }
         
-        // Power badge
-        if let btn = self.btnPower {
-            btn.title = String(format: "⚡ %.1fW", t.power_usage_watts)
+        // 2. Power Draw
+        if let v = self.viewPower {
+            v.setText(String(format: "⚡ %.1fW", t.power_usage_watts))
         }
         
-        // Core Clock
-        if let btn = self.btnClock {
-            btn.title = "🚀 \(t.core_clock_mhz) MHz"
+        // 3. Core Clock
+        if let v = self.viewClock {
+            v.setText("🚀 \(t.core_clock_mhz) MHz")
         }
         
-        // VRAM
-        if let btn = self.btnVram {
+        // 4. VRAM Usage
+        if let v = self.viewVram {
             let usedGb = Float(t.memory_used_mb) / 1024.0
             let totalGb = Float(t.memory_total_mb) / 1024.0
-            btn.title = String(format: "💾 %.1f/%.1f GB", usedGb, totalGb)
+            v.setText(String(format: "💾 %.1f/%.1f GB", usedGb, totalGb))
         }
         
-        // Utilization
-        if let btn = self.btnUtil {
-            btn.title = "📊 \(t.gpu_utilization_percent)%"
+        // 5. Utilization
+        if let v = self.viewUtil {
+            v.setText("📊 \(t.gpu_utilization_percent)% GPU")
         }
     }
     
-    @objc func closeTouchBar() {
+    func dismiss() {
         self.isRunning = false
         self.pollTimer?.invalidate()
         if let tb = self.touchBar {
@@ -263,7 +306,7 @@ class TouchBarHudController: NSObject, NSTouchBarDelegate {
                 fn(NSTouchBar.self, sel, tb)
             }
         }
-        print("Touch Bar HUD dismissed cleanly.")
+        print("Touch Bar HUD dismissed.")
         exit(0)
     }
 }
@@ -274,12 +317,7 @@ let app = NSApplication.shared
 let controller = TouchBarHudController(peerIp: peerIp)
 controller.start()
 
-// Register signal handlers for clean exit
-signal(SIGINT) { _ in
-    controller.closeTouchBar()
-}
-signal(SIGTERM) { _ in
-    controller.closeTouchBar()
-}
+signal(SIGINT) { _ in controller.dismiss() }
+signal(SIGTERM) { _ in controller.dismiss() }
 
 app.run()

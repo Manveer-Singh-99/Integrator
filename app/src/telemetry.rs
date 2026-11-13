@@ -30,17 +30,20 @@ impl Default for GpuTelemetry {
     }
 }
 
-/// Queries live NVIDIA GPU telemetry via nvidia-smi.
+/// Queries live NVIDIA GPU telemetry via nvidia-smi with zero console window creation.
 pub fn query_gpu_telemetry() -> Option<GpuTelemetry> {
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("nvidia-smi")
-            .args(&[
-                "--query-gpu=name,temperature.gpu,power.draw,clocks.current.graphics,memory.used,memory.total,utilization.gpu",
-                "--format=csv,noheader,nounits"
-            ])
-            .output()
-            .ok()?;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let mut cmd = std::process::Command::new("nvidia-smi");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.args(&[
+            "--query-gpu=name,temperature.gpu,power.draw,clocks.current.graphics,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits"
+        ]);
+        let output = cmd.output().ok()?;
 
         if !output.status.success() {
             return None;

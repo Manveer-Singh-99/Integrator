@@ -135,6 +135,31 @@ async function updateStatus() {
       }
       if (streamArrow) streamArrow.style.opacity = '0.4';
     }
+
+    // 3. Touch Bar HUD State & Scope Tracking
+    const tbStateBadge = document.getElementById('touchbar-state-badge');
+    const btnTb = document.getElementById('btn-toggle-touchbar');
+    const btnTbLabel = document.getElementById('btn-touchbar-label');
+
+    if (tbStateBadge && btnTb && btnTbLabel) {
+      if (status.touchbar_active) {
+        tbStateBadge.className = 'pill pill-active';
+        tbStateBadge.innerText = 'Liquid Glass Active';
+        btnTb.className = 'btn btn-primary btn-active-stop';
+        btnTbLabel.innerText = 'Disable Touch Bar NVIDIA HUD';
+      } else {
+        btnTb.className = 'btn btn-primary';
+        if (status.is_windows_master) {
+          tbStateBadge.className = 'pill pill-active';
+          tbStateBadge.innerText = 'Windows Master Active';
+          btnTbLabel.innerText = 'Enable Touch Bar NVIDIA HUD';
+        } else {
+          tbStateBadge.className = 'pill pill-idle';
+          tbStateBadge.innerText = 'Windows Master Inactive';
+          btnTbLabel.innerText = 'Enable Touch Bar NVIDIA HUD (Windows Master Only)';
+        }
+      }
+    }
   } catch (e) {
     // ignore polling error
   }
@@ -399,20 +424,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // Touch Bar HUD Toggle
   const btnToggleTouchbar = document.getElementById('btn-toggle-touchbar');
   const btnTouchbarLabel = document.getElementById('btn-touchbar-label');
+  const chkTouchbarScope = document.getElementById('chk-touchbar-scope');
 
   if (btnToggleTouchbar) {
     btnToggleTouchbar.addEventListener('click', async () => {
       try {
-        appendLog('📊 Toggling Touch Bar NVIDIA Performance HUD on physical OLED strip...', 'info');
-        const res = await invokeCmd('toggle_touchbar_hud');
+        const strictScope = chkTouchbarScope ? chkTouchbarScope.checked : true;
+        appendLog('📊 Toggling Touch Bar NVIDIA Performance HUD (Liquid Glass)...', 'info');
+        btnToggleTouchbar.disabled = true;
+
+        const res = await invokeCmd('toggle_touchbar_hud', { force: !strictScope });
         appendLog(`🚀 ${res}`, 'success');
-        if (btnTouchbarLabel) {
-          btnTouchbarLabel.innerText = res.includes('active')
-            ? 'Dismiss Touch Bar NVIDIA Overlay'
-            : 'Bring NVIDIA Overlay to MacBook Touch Bar';
-        }
+        await updateStatus();
       } catch (err) {
-        appendLog(`❌ Touch Bar error: ${err}`, 'error');
+        appendLog(`❌ Touch Bar requirement error: ${err}`, 'warn');
+      } finally {
+        btnToggleTouchbar.disabled = false;
       }
     });
   }
