@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use anyhow::{Result, Context};
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct WinDisplayManager;
 
@@ -32,7 +32,8 @@ impl WinDisplayManager {
     }
 
     /// Updates Moonlight host registry entry (host 2) with the active Mac IP.
-    pub fn update_moonlight_host_registry(_mac_ip: &str) -> Result<()> {
+    #[allow(unused_variables)]
+    pub fn update_moonlight_host_registry(mac_ip: &str) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
