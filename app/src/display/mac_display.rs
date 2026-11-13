@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use anyhow::{Result, Context};
-use tracing::{info, warn, error};
+use tracing::info;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -50,7 +50,7 @@ impl MacDisplayManager {
         let home = std::env::var("HOME").context("HOME not set")?;
         let conf_path = PathBuf::from(home).join(".config/sunshine/sunshine.conf");
 
-        let mut content = fs::read_to_string(&conf_path).unwrap_or_default();
+        let content = fs::read_to_string(&conf_path).unwrap_or_default();
         let target_line = format!("output_name = {}", display_id);
 
         let mut replaced = false;

@@ -5,7 +5,9 @@
 pub const DISCOVERY_PORT: u16 = 58280;
 pub const CONTROL_PORT: u16 = 58281;
 pub const CLIPBOARD_PORT: u16 = 58283;
+#[allow(dead_code)]
 pub const AUDIO_PORT: u16 = 58284;
+#[allow(dead_code)]
 pub const TELEMETRY_PORT: u16 = 58285;
 
 /// Known candidate IP endpoints for peer connection attempts.

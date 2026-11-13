@@ -7,11 +7,13 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+#[allow(dead_code)]
 pub struct LinkMonitor {
     peer_addr: SocketAddr,
     check_interval: Duration,
 }
 
+#[allow(dead_code)]
 impl LinkMonitor {
     pub fn new(peer_ip: &str, port: u16) -> Result<Self> {
         let addr_str = format!("{}:{}", peer_ip, port);

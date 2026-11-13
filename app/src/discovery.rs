@@ -24,6 +24,7 @@ pub struct DiscoveryBeacon {
 pub struct PeerCandidate {
     pub addr: SocketAddr,
     pub last_seen: Instant,
+    #[allow(dead_code)]
     pub device_name: String,
 }
 

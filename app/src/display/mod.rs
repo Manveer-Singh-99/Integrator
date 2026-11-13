@@ -6,4 +6,4 @@ pub mod server;
 
 pub use controller::DisplayController;
 pub use server::DisplayServer;
-pub use protocol::{DisplayRpcRequest, DisplayRpcResponse};
+pub use protocol::DisplayRpcRequest;

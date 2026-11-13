@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use anyhow::{Result, Context};
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 
 pub struct FileClipboardHelper {
     cache_dir: PathBuf,

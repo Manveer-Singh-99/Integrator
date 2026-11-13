@@ -1,6 +1,5 @@
 //! TCP server for display control RPC requests.
 
-use std::sync::Arc;
 use std::time::Duration;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +9,7 @@ use tracing::{info, debug, warn, error};
 
 use crate::config::CONTROL_PORT;
 use super::controller::DisplayController;
-use super::protocol::{DisplayRpcRequest, DisplayRpcResponse};
+use super::protocol::DisplayRpcRequest;
 
 pub struct DisplayServer {
     controller: DisplayController,

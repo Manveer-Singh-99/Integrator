@@ -6,7 +6,7 @@ use anyhow::{Result, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 use crate::config::CONTROL_PORT;
 use crate::discovery::DiscoveryManager;
@@ -303,6 +303,15 @@ impl DisplayController {
                     active_mode: mode,
                 }
             }
+        }
+    }
+
+    /// Returns whether display streaming is currently active.
+    pub async fn is_active(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            MacDisplayManager::is_virtual_display_active()
+        } else {
+            *self.is_active.read().await
         }
     }
 

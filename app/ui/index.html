@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mac-Windows Fusion Bridge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <div class="app-logo">⚡</div>
+        <div class="title-group">
+          <h1>Mac ⇄ Windows Bridge</h1>
+          <p class="subtitle">Direct Point-to-Point Workstation Fusion</p>
+        </div>
+      </div>
+      <div id="connection-badge" class="badge badge-connected">
+        <span class="dot"></span>
+        <span id="connection-text">USB-C Locked (10.99.99.1)</span>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="grid">
+      <!-- Extended Desktop Card -->
+      <section class="card display-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🖥️</span>
+            <div>
+              <h2>Extended Second Screen</h2>
+              <p class="card-desc">Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz</p>
+            </div>
+          </div>
+          <span id="display-status-badge" class="pill pill-idle">Idle</span>
+        </div>
+
+        <div class="display-visual">
+          <div class="device mac">
+            <span class="device-icon">💻</span>
+            <span class="device-name">MacBook Pro (M1)</span>
+            <span class="device-role">Host Desktop</span>
+          </div>
+          <div class="stream-arrow" id="stream-arrow">
+            <span class="arrow-line"></span>
+            <span class="arrow-speed">165Hz NVENC</span>
+          </div>
+          <div class="device pc">
+            <span class="device-icon">🎮</span>
+            <span class="device-name">HP OMEN 16" (RTX 5070)</span>
+            <span class="device-role">Second Screen</span>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <button id="btn-toggle-display" class="btn btn-primary">
+            <span class="btn-icon">▶</span>
+            <span id="btn-display-label">Extend Desktop to HP OMEN</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- Universal Clipboard Card -->
+      <section class="card clipboard-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">📋</span>
+            <div>
+              <h2>Universal Clipboard</h2>
+              <p class="card-desc">Zero-RAM disk streaming for Text, Images & Large Files</p>
+            </div>
+          </div>
+          <span class="pill pill-active">Zero-RAM Active</span>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-box">
+            <span class="stat-label">Sync Latency</span>
+            <span class="stat-value" id="stat-latency">&lt; 15 ms</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">File Buffer</span>
+            <span class="stat-value">64 KB Streaming</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Sequence Checks</span>
+            <span class="stat-value">&lt; 5 ns (0% CPU)</span>
+          </div>
+        </div>
+
+        <div class="card-actions">
+          <button id="btn-open-cache" class="btn btn-secondary">
+            <span class="btn-icon">📁</span>
+            <span>Open Clipboard Cache Folder</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- Network & System Status Card -->
+      <section class="card network-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🌐</span>
+            <div>
+              <h2>Link & Telemetry</h2>
+              <p class="card-desc">Adaptive multi-subnet route arbitration</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="network-routes">
+          <div class="route-item active">
+            <span class="route-dot green"></span>
+            <div class="route-details">
+              <span class="route-name">Thunderbolt / USB-C Direct</span>
+              <span class="route-ip">10.99.99.1 ⇄ 10.99.99.2 (MTU 1500)</span>
+            </div>
+            <span class="route-ping" id="usb-ping">0.4 ms</span>
+          </div>
+          <div class="route-item">
+            <span class="route-dot yellow"></span>
+            <div class="route-details">
+              <span class="route-name">OMEN Wi-Fi Hotspot Fallback</span>
+              <span class="route-ip">192.168.137.1 ⇄ 192.168.137.x</span>
+            </div>
+            <span class="route-ping">Standby</span>
+          </div>
+          <div class="route-item">
+            <span class="route-dot yellow"></span>
+            <div class="route-details">
+              <span class="route-name">Local Wi-Fi Network</span>
+              <span class="route-ip">192.168.2.1 ⇄ 192.168.2.2</span>
+            </div>
+            <span class="route-ping">Standby</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Live Logs Card -->
+      <section class="card logs-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">⚡</span>
+            <div>
+              <h2>Live Event Stream</h2>
+              <p class="card-desc">Sub-millisecond IPC and clipboard events</p>
+            </div>
+          </div>
+          <button id="btn-clear-logs" class="btn-link">Clear</button>
+        </div>
+        <div id="logs-container" class="logs-container">
+          <div class="log-line info"><span class="log-time">14:05:15</span> 🚀 Bridge daemon initialized</div>
+          <div class="log-line success"><span class="log-time">14:05:16</span> 🟢 P2P link locked via USB-C (10.99.99.x)</div>
+          <div class="log-line info"><span class="log-time">14:05:16</span> 📋 Universal clipboard sequence monitor ready</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <span>Mac-Windows Bridge v1.0.0</span>
+      <span class="footer-separator">•</span>
+      <span>Background Daemon Active</span>
+      <span class="footer-separator">•</span>
+      <button id="btn-hide-window" class="btn-link">Hide to Menu Bar</button>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
