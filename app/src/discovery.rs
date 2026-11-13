@@ -21,72 +21,88 @@ pub struct DiscoveryBeacon {
 }
 
 #[derive(Debug, Clone)]
-pub struct PeerState {
+pub struct PeerCandidate {
     pub addr: SocketAddr,
-    pub rtt_ms: f32,
     pub last_seen: Instant,
     pub device_name: String,
 }
 
 #[derive(Clone)]
 pub struct DiscoveryManager {
-    pub active_peer: Arc<RwLock<Option<PeerState>>>,
-    pub my_device_name: String,
+    candidates: Arc<RwLock<Vec<PeerCandidate>>>,
+    active_peer_ip: Arc<RwLock<Option<String>>>,
+    my_device_name: String,
 }
 
 impl DiscoveryManager {
     pub fn new(my_device_name: &str) -> Self {
         Self {
-            active_peer: Arc::new(RwLock::new(None)),
+            candidates: Arc::new(RwLock::new(Vec::new())),
+            active_peer_ip: Arc::new(RwLock::new(None)),
             my_device_name: my_device_name.to_string(),
         }
     }
 
+    /// Returns the best currently active peer IP.
+    /// Priority: 10.99.99.x (USB-C 0.7ms) > 192.168.2.x (Mac Sharing) > 192.168.137.x (Hotspot) > Other Wi-Fi.
     pub async fn get_peer_ip(&self) -> Option<String> {
-        self.active_peer.read().await.as_ref().map(|p| p.addr.ip().to_string())
+        self.active_peer_ip.read().await.clone()
     }
 
-    /// Spawns the discovery engine: both broadcaster and listener.
     pub async fn start(&self) -> Result<()> {
         let socket = UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT)).await?;
         socket.set_broadcast(true)?;
         let socket = Arc::new(socket);
 
         let listener_socket = Arc::clone(&socket);
-        let active_peer = Arc::clone(&self.active_peer);
+        let candidates = Arc::clone(&self.candidates);
+        let active_peer_ip = Arc::clone(&self.active_peer_ip);
         let my_name = self.my_device_name.clone();
 
-        // Background Listener
+        // 1. Background Listener
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             loop {
                 if let Ok((len, src_addr)) = listener_socket.recv_from(&mut buf).await {
                     if let Ok(beacon) = serde_json::from_slice::<DiscoveryBeacon>(&buf[..len]) {
-                        // Ignore our own beacons
                         if beacon.sender_name == my_name {
                             continue;
                         }
 
                         let now = Instant::now();
-                        let mut peer_lock = active_peer.write().await;
-                        let is_new = peer_lock.is_none() || peer_lock.as_ref().map(|p| p.addr != src_addr).unwrap_or(false);
+                        let mut cand_lock = candidates.write().await;
+                        
+                        // Update or add candidate
+                        if let Some(existing) = cand_lock.iter_mut().find(|c| c.addr.ip() == src_addr.ip()) {
+                            existing.last_seen = now;
+                        } else {
+                            cand_lock.push(PeerCandidate {
+                                addr: src_addr,
+                                last_seen: now,
+                                device_name: beacon.sender_name.clone(),
+                            });
+                        }
 
-                        *peer_lock = Some(PeerState {
-                            addr: src_addr,
-                            rtt_ms: 0.8, // updated via TCP ping
-                            last_seen: now,
-                            device_name: beacon.sender_name.clone(),
-                        });
+                        // Remove stale candidates (>6 seconds old)
+                        cand_lock.retain(|c| now.duration_since(c.last_seen).as_secs() < 6);
 
-                        if is_new {
-                            info!("🟢 Connected to peer [{}] at {} (Discovered via UDP)", beacon.sender_name, src_addr);
+                        // Select best link based on hardware hierarchy
+                        let best_ip = Self::select_best_ip(&cand_lock);
+                        let mut active_lock = active_peer_ip.write().await;
+                        if *active_lock != best_ip {
+                            if let Some(ref new_ip) = best_ip {
+                                info!("🟢 Link locked to peer [{}] at {} via optimal route", beacon.sender_name, new_ip);
+                            } else {
+                                info!("🔴 Peer connection lost across all routes");
+                            }
+                            *active_lock = best_ip;
                         }
                     }
                 }
             }
         });
 
-        // Background Broadcaster
+        // 2. Background Broadcaster
         let broadcaster_socket = Arc::clone(&socket);
         let my_name_broadcast = self.my_device_name.clone();
 
@@ -101,7 +117,6 @@ impl DiscoveryManager {
 
             let payload = serde_json::to_vec(&beacon).unwrap_or_default();
 
-            // Broadcast endpoints across all candidate networks
             let broadcast_addrs = [
                 format!("255.255.255.255:{}", DISCOVERY_PORT),
                 format!("10.99.99.255:{}", DISCOVERY_PORT),
@@ -110,22 +125,47 @@ impl DiscoveryManager {
             ];
 
             loop {
-                // Send broadcast to all subnets
                 for addr in &broadcast_addrs {
                     let _ = broadcaster_socket.send_to(&payload, addr).await;
                 }
-
-                // Also unicast directly to known candidate IPs in case broadcast is filtered
                 for ip in CANDIDATE_PEER_IPS {
                     let unicast_addr = format!("{}:{}", ip, DISCOVERY_PORT);
                     let _ = broadcaster_socket.send_to(&payload, &unicast_addr).await;
                 }
-
-                debug!("Sent multi-subnet discovery beacons");
+                debug!("Broadcasted discovery beacons");
                 sleep(Duration::from_millis(1500)).await;
             }
         });
 
         Ok(())
+    }
+
+    /// Selects the best active IP address based on priority:
+    /// 1. 10.99.99.x (USB-C cable: <0.7ms latency)
+    /// 2. 192.168.2.x (USB-C Mac Internet Sharing: <0.8ms)
+    /// 3. 192.168.137.x (Windows Wi-Fi Hotspot: ~3-5ms)
+    /// 4. Any other candidate
+    fn select_best_ip(candidates: &[PeerCandidate]) -> Option<String> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Tier 1: USB-C 10.99.99.x
+        if let Some(c) = candidates.iter().find(|c| c.addr.ip().to_string().starts_with("10.99.99.")) {
+            return Some(c.addr.ip().to_string());
+        }
+
+        // Tier 2: Mac Sharing 192.168.2.x
+        if let Some(c) = candidates.iter().find(|c| c.addr.ip().to_string().starts_with("192.168.2.")) {
+            return Some(c.addr.ip().to_string());
+        }
+
+        // Tier 3: Hotspot 192.168.137.x
+        if let Some(c) = candidates.iter().find(|c| c.addr.ip().to_string().starts_with("192.168.137.")) {
+            return Some(c.addr.ip().to_string());
+        }
+
+        // Tier 4: Fallback to first available
+        candidates.first().map(|c| c.addr.ip().to_string())
     }
 }

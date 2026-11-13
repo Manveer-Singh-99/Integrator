@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use anyhow::{Result, Context};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 pub struct FileClipboardHelper {
     cache_dir: PathBuf,
@@ -29,57 +29,79 @@ impl FileClipboardHelper {
         &self.cache_dir
     }
 
+    fn find_helper(name: &str) -> Option<PathBuf> {
+        let candidates = [
+            PathBuf::from(name),
+            PathBuf::from(format!("app/{}", name)),
+            if cfg!(target_os = "windows") {
+                PathBuf::from(r"C:\Users\Manveer Singh\mac-windows-usbc-bridge\app").join(name)
+            } else {
+                PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app").join(name)
+            },
+        ];
+        for c in &candidates {
+            if c.exists() {
+                return Some(c.clone());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let c1 = parent.join(name);
+                if c1.exists() { return Some(c1); }
+                let c2 = parent.join("../../").join(name);
+                if c2.exists() { return Some(c2); }
+                let c3 = parent.join("../../app").join(name);
+                if c3.exists() { return Some(c3); }
+            }
+        }
+        None
+    }
+
     /// Reads currently copied file paths from the OS clipboard.
     pub fn read_copied_files(&self) -> Vec<PathBuf> {
         let mut results = Vec::new();
 
         #[cfg(target_os = "macos")]
         {
-            let helper_path = Path::new("macos_clip_files");
-            let helper = if helper_path.exists() {
-                helper_path.to_path_buf()
-            } else {
-                Path::new("app/macos_clip_files").to_path_buf()
-            };
-
-            if let Ok(output) = Command::new(helper).arg("read").output() {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            let p = PathBuf::from(trimmed);
-                            if p.exists() {
-                                results.push(p);
+            if let Some(helper) = Self::find_helper("macos_clip_files") {
+                if let Ok(output) = Command::new(helper).arg("read").output() {
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        for line in text.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let p = PathBuf::from(trimmed);
+                                if p.exists() {
+                                    results.push(p);
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                debug!("macos_clip_files helper binary not found");
             }
         }
 
         #[cfg(target_os = "windows")]
         {
-            let helper_path = Path::new("win_clip_files.exe");
-            let helper = if helper_path.exists() {
-                helper_path.to_path_buf()
-            } else {
-                Path::new("app/win_clip_files.exe").to_path_buf()
-            };
-
-            if let Ok(output) = Command::new(helper).arg("read").output() {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            let p = PathBuf::from(trimmed);
-                            if p.exists() {
-                                results.push(p);
+            if let Some(helper) = Self::find_helper("win_clip_files.exe") {
+                if let Ok(output) = Command::new(helper).arg("read").output() {
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        for line in text.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let p = PathBuf::from(trimmed);
+                                if p.exists() {
+                                    results.push(p);
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                debug!("win_clip_files.exe helper binary not found");
             }
         }
 
@@ -94,12 +116,8 @@ impl FileClipboardHelper {
 
         #[cfg(target_os = "macos")]
         {
-            let helper_path = Path::new("macos_clip_files");
-            let helper = if helper_path.exists() {
-                helper_path.to_path_buf()
-            } else {
-                Path::new("app/macos_clip_files").to_path_buf()
-            };
+            let helper = Self::find_helper("macos_clip_files")
+                .context("macos_clip_files helper not found")?;
 
             let mut cmd = Command::new(helper);
             cmd.arg("write");
@@ -114,12 +132,8 @@ impl FileClipboardHelper {
 
         #[cfg(target_os = "windows")]
         {
-            let helper_path = Path::new("win_clip_files.exe");
-            let helper = if helper_path.exists() {
-                helper_path.to_path_buf()
-            } else {
-                Path::new("app/win_clip_files.exe").to_path_buf()
-            };
+            let helper = Self::find_helper("win_clip_files.exe")
+                .context("win_clip_files.exe helper not found")?;
 
             let mut cmd = Command::new(helper);
             cmd.arg("write");

@@ -1,4 +1,4 @@
-//! Universal Clipboard Service for Text, Images, and Files with SHA-256 deduplication.
+//! Universal Clipboard Service for Text, Images, and Files with Deskflow-inspired sequence tracking and Zero-RAM streaming.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -18,6 +18,7 @@ use crate::config::CLIPBOARD_PORT;
 use crate::discovery::DiscoveryManager;
 use super::protocol::{ClipboardMessage, ClipboardPayload, FileMetadata};
 use super::file_helper::FileClipboardHelper;
+use super::os_seq;
 
 fn to_hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -26,15 +27,18 @@ fn to_hex_string(bytes: &[u8]) -> String {
 pub struct ClipboardService {
     discovery: DiscoveryManager,
     last_hash: Arc<RwLock<String>>,
+    last_seq: Arc<RwLock<i64>>,
     file_helper: Arc<FileClipboardHelper>,
 }
 
 impl ClipboardService {
     pub fn new(discovery: DiscoveryManager) -> Result<Self> {
         let file_helper = Arc::new(FileClipboardHelper::new()?);
+        let initial_seq = os_seq::get_clipboard_sequence();
         Ok(Self {
             discovery,
             last_hash: Arc::new(RwLock::new(String::new())),
+            last_seq: Arc::new(RwLock::new(initial_seq)),
             file_helper,
         })
     }
@@ -43,8 +47,9 @@ impl ClipboardService {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CLIPBOARD_PORT)).await?;
         info!("📋 Universal Clipboard Service active on port {}", CLIPBOARD_PORT);
 
-        // Spawn TCP Receiver
+        // 1. Spawn TCP Receiver for incoming remote clipboard items
         let receiver_hash = Arc::clone(&self.last_hash);
+        let receiver_seq = Arc::clone(&self.last_seq);
         let receiver_file_helper = Arc::clone(&self.file_helper);
         tokio::spawn(async move {
             loop {
@@ -52,9 +57,10 @@ impl ClipboardService {
                     Ok((socket, addr)) => {
                         debug!("Incoming clipboard connection from {}", addr);
                         let hash_clone = Arc::clone(&receiver_hash);
+                        let seq_clone = Arc::clone(&receiver_seq);
                         let file_helper_clone = Arc::clone(&receiver_file_helper);
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(socket, hash_clone, file_helper_clone).await {
+                            if let Err(e) = Self::handle_incoming(socket, hash_clone, seq_clone, file_helper_clone).await {
                                 warn!("Error handling clipboard transfer: {}", e);
                             }
                         });
@@ -67,12 +73,13 @@ impl ClipboardService {
             }
         });
 
-        // Spawn Clipboard Monitor Loop
+        // 2. Spawn Clipboard Monitor Loop (checking sequence number)
         let monitor_discovery = self.discovery.clone();
         let monitor_hash = Arc::clone(&self.last_hash);
+        let monitor_seq = Arc::clone(&self.last_seq);
         let monitor_file_helper = Arc::clone(&self.file_helper);
         tokio::spawn(async move {
-            Self::monitor_loop(monitor_discovery, monitor_hash, monitor_file_helper).await;
+            Self::monitor_loop(monitor_discovery, monitor_hash, monitor_seq, monitor_file_helper).await;
         });
 
         Ok(())
@@ -82,6 +89,7 @@ impl ClipboardService {
     async fn handle_incoming(
         mut socket: TcpStream,
         last_hash: Arc<RwLock<String>>,
+        last_seq: Arc<RwLock<i64>>,
         file_helper: Arc<FileClipboardHelper>,
     ) -> Result<()> {
         let header_len = socket.read_u32().await? as usize;
@@ -102,6 +110,10 @@ impl ClipboardService {
                 if let Ok(mut cb) = Clipboard::new() {
                     let _ = cb.set_text(text);
                 }
+                // Record the sequence number immediately after setting clipboard
+                let new_seq = os_seq::get_clipboard_sequence();
+                let mut seq_lock = last_seq.write().await;
+                *seq_lock = new_seq;
             }
             ClipboardPayload::Image { width, height, rgba } => {
                 info!("🖼️ Received remote image ({}x{} px)", width, height);
@@ -113,6 +125,9 @@ impl ClipboardService {
                     };
                     let _ = cb.set_image(img_data);
                 }
+                let new_seq = os_seq::get_clipboard_sequence();
+                let mut seq_lock = last_seq.write().await;
+                *seq_lock = new_seq;
             }
             ClipboardPayload::Files { files } => {
                 info!("📂 Receiving {} remote file(s)...", files.len());
@@ -137,23 +152,44 @@ impl ClipboardService {
                 }
 
                 file_helper.write_copied_files(&staged_paths)?;
-                info!("✅ Staged {} file(s) into clipboard cache", staged_paths.len());
+                let new_seq = os_seq::get_clipboard_sequence();
+                let mut seq_lock = last_seq.write().await;
+                *seq_lock = new_seq;
+                info!("✅ Staged {} file(s) into clipboard cache and set native pasteboard", staged_paths.len());
             }
         }
 
         Ok(())
     }
 
-    /// Continuous loop checking for local clipboard changes.
+    /// Continuous lightweight loop checking for clipboard sequence changes.
     async fn monitor_loop(
         discovery: DiscoveryManager,
         last_hash: Arc<RwLock<String>>,
+        last_seq: Arc<RwLock<i64>>,
         file_helper: Arc<FileClipboardHelper>,
     ) {
         loop {
-            sleep(Duration::from_millis(350)).await;
+            sleep(Duration::from_millis(100)).await;
 
-            // 1. Check for Copied Files First
+            let current_seq = os_seq::get_clipboard_sequence();
+            {
+                let read_lock = last_seq.read().await;
+                if *read_lock == current_seq {
+                    // ZERO overhead - OS clipboard has not been modified
+                    continue;
+                }
+            }
+
+            // Sequence changed! Update last_seq immediately
+            {
+                let mut write_lock = last_seq.write().await;
+                *write_lock = current_seq;
+            }
+
+            debug!("Clipboard sequence updated: {}", current_seq);
+
+            // 1. Check for Copied Files
             let copied_files = file_helper.read_copied_files();
             if !copied_files.is_empty() {
                 let mut hasher = Sha256::new();
@@ -186,33 +222,9 @@ impl ClipboardService {
                 continue;
             }
 
-            // 2. Check for Text & Image via arboard
+            // 2. Check for Image / Text via arboard
             if let Ok(mut cb) = Clipboard::new() {
-                // Check Text
-                if let Ok(text) = cb.get_text() {
-                    if !text.is_empty() {
-                        let mut hasher = Sha256::new();
-                        hasher.update(text.as_bytes());
-                        let hash_hex = to_hex_string(&hasher.finalize());
-
-                        let mut hash_lock = last_hash.write().await;
-                        if *hash_lock != hash_hex {
-                            *hash_lock = hash_hex.clone();
-                            drop(hash_lock);
-
-                            info!("📤 Detected local copied text ({} chars). Sending to peer...", text.len());
-                            if let Some(peer_ip) = discovery.get_peer_ip().await {
-                                let _ = Self::send_payload(&peer_ip, ClipboardMessage {
-                                    hash: hash_hex,
-                                    payload: ClipboardPayload::Text(text),
-                                }).await;
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                // Check Image
+                // Check Image first
                 if let Ok(img) = cb.get_image() {
                     let mut hasher = Sha256::new();
                     hasher.update(&(img.width as u64).to_le_bytes());
@@ -242,6 +254,30 @@ impl ClipboardService {
                         }
                     }
                     continue;
+                }
+
+                // Check Text
+                if let Ok(text) = cb.get_text() {
+                    if !text.is_empty() {
+                        let mut hasher = Sha256::new();
+                        hasher.update(text.as_bytes());
+                        let hash_hex = to_hex_string(&hasher.finalize());
+
+                        let mut hash_lock = last_hash.write().await;
+                        if *hash_lock != hash_hex {
+                            *hash_lock = hash_hex.clone();
+                            drop(hash_lock);
+
+                            info!("📤 Detected local copied text ({} chars). Sending to peer...", text.len());
+                            if let Some(peer_ip) = discovery.get_peer_ip().await {
+                                let _ = Self::send_payload(&peer_ip, ClipboardMessage {
+                                    hash: hash_hex,
+                                    payload: ClipboardPayload::Text(text),
+                                }).await;
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
         }
