@@ -95,8 +95,13 @@ impl FileClipboardHelper {
 
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
             if let Some(helper) = Self::find_helper("win_clip_files.exe") {
-                match Command::new(&helper).arg("read").output() {
+                let mut cmd = Command::new(&helper);
+                cmd.arg("read").creation_flags(CREATE_NO_WINDOW);
+                match cmd.output() {
                     Ok(output) => {
                         if output.status.success() {
                             let text = String::from_utf8_lossy(&output.stdout);
@@ -149,11 +154,14 @@ impl FileClipboardHelper {
 
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
             let helper = Self::find_helper("win_clip_files.exe")
                 .context("win_clip_files.exe helper not found")?;
 
             let mut cmd = Command::new(helper);
-            cmd.arg("write");
+            cmd.arg("write").creation_flags(CREATE_NO_WINDOW);
             for f in files {
                 cmd.arg(f);
             }
