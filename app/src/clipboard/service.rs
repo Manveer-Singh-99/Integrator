@@ -216,7 +216,11 @@ impl ClipboardService {
 
                     info!("📤 Detected local copied files ({} files). Sending to peer...", copied_files.len());
                     if let Some(peer_ip) = discovery.get_peer_ip().await {
-                        let _ = Self::send_files(&peer_ip, hash_hex, meta_list, copied_files).await;
+                        if let Err(e) = Self::send_files(&peer_ip, hash_hex, meta_list, copied_files).await {
+                            warn!("Failed to send files to {}: {}", peer_ip, e);
+                        }
+                    } else {
+                        warn!("No peer IP available to send files");
                     }
                 }
                 continue;
@@ -243,14 +247,18 @@ impl ClipboardService {
 
                         info!("📤 Detected local copied image ({}x{} px). Sending to peer...", img.width, img.height);
                         if let Some(peer_ip) = discovery.get_peer_ip().await {
-                            let _ = Self::send_payload(&peer_ip, ClipboardMessage {
+                            if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
                                 hash: hash_hex,
                                 payload: ClipboardPayload::Image {
                                     width: img.width,
                                     height: img.height,
                                     rgba: img.bytes.into_owned(),
                                 },
-                            }).await;
+                            }).await {
+                                warn!("Failed to send image to {}: {}", peer_ip, e);
+                            }
+                        } else {
+                            warn!("No peer IP available to send image");
                         }
                     }
                     continue;
@@ -270,10 +278,14 @@ impl ClipboardService {
 
                             info!("📤 Detected local copied text ({} chars). Sending to peer...", text.len());
                             if let Some(peer_ip) = discovery.get_peer_ip().await {
-                                let _ = Self::send_payload(&peer_ip, ClipboardMessage {
+                                if let Err(e) = Self::send_payload(&peer_ip, ClipboardMessage {
                                     hash: hash_hex,
                                     payload: ClipboardPayload::Text(text),
-                                }).await;
+                                }).await {
+                                    warn!("Failed to send text to {}: {}", peer_ip, e);
+                                }
+                            } else {
+                                warn!("No peer IP available to send text");
                             }
                         }
                         continue;
@@ -294,7 +306,7 @@ impl ClipboardService {
         stream.write_all(&serialized).await?;
         stream.flush().await?;
 
-        debug!("Sent clipboard payload to {}", addr);
+        info!("✅ Successfully sent clipboard payload to {}", addr);
         Ok(())
     }
 
