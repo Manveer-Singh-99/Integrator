@@ -170,4 +170,109 @@ impl WinDisplayManager {
         }
         false
     }
+
+    /// Reads current GPU preferences for encode and decode on Windows.
+    pub fn get_gpu_preferences() -> (String, String) {
+        #[allow(unused_mut)]
+        let mut encode_gpu = "intel".to_string(); // default encode: Intel Arc 140T (QuickSync)
+        #[allow(unused_mut)]
+        let mut decode_gpu = "nvidia".to_string(); // default decode: NVIDIA RTX 5070 (NVDEC)
+
+        #[cfg(target_os = "windows")]
+        {
+            let conf_path = std::path::PathBuf::from(r"C:\Program Files\Sunshine\config\sunshine.conf");
+            if let Ok(content) = std::fs::read_to_string(&conf_path) {
+                if content.contains("RTX 5070") || content.contains("encoder = nvenc") {
+                    encode_gpu = "nvidia".to_string();
+                } else if content.contains("Intel") || content.contains("encoder = quicksync") {
+                    encode_gpu = "intel".to_string();
+                } else if content.contains("encoder = auto") {
+                    encode_gpu = "auto".to_string();
+                }
+            }
+
+            use std::os::windows::process::CommandExt;
+            if let Ok(output) = Command::new("reg")
+                .args(["query", r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences", "/v", r"C:\Program Files\Moonlight Game Streaming\Moonlight.exe"])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.contains("GpuPreference=1") {
+                    decode_gpu = "intel".to_string();
+                } else if text.contains("GpuPreference=2") {
+                    decode_gpu = "nvidia".to_string();
+                } else if text.contains("GpuPreference=0") {
+                    decode_gpu = "auto".to_string();
+                }
+            }
+        }
+
+        (encode_gpu, decode_gpu)
+    }
+
+    /// Sets GPU preferences on Windows for Sunshine encoder and Moonlight decoder.
+    #[allow(unused_variables)]
+    pub fn set_gpu_preferences(encode_gpu: &str, decode_gpu: &str) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+            // 1. Configure Sunshine encoder in sunshine.conf
+            let conf_path = std::path::PathBuf::from(r"C:\Program Files\Sunshine\config\sunshine.conf");
+            if conf_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&conf_path) {
+                    let mut new_lines = Vec::new();
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("adapter_name") || trimmed.starts_with("encoder") {
+                            continue;
+                        }
+                        new_lines.push(line.to_string());
+                    }
+
+                    match encode_gpu {
+                        "nvidia" => {
+                            new_lines.push("adapter_name = NVIDIA GeForce RTX 5070 Laptop GPU".to_string());
+                            new_lines.push("encoder = nvenc".to_string());
+                        }
+                        "intel" => {
+                            new_lines.push("adapter_name = Intel(R) Arc(TM) 140T GPU (16GB)".to_string());
+                            new_lines.push("encoder = quicksync".to_string());
+                        }
+                        _ => {
+                            // auto
+                        }
+                    }
+                    let _ = std::fs::write(&conf_path, new_lines.join("\r\n"));
+                }
+            }
+
+            // Set Sunshine process GPU preference
+            let pref_val = match encode_gpu {
+                "nvidia" => "GpuPreference=2;",
+                "intel" => "GpuPreference=1;",
+                _ => "GpuPreference=0;",
+            };
+            let _ = Command::new("reg")
+                .args(["add", r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences", "/v", r"C:\Program Files\Sunshine\sunshine.exe", "/t", "REG_SZ", "/d", pref_val, "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+
+            // 2. Configure Moonlight decoder in UserGpuPreferences
+            let dec_pref = match decode_gpu {
+                "nvidia" => "GpuPreference=2;",
+                "intel" => "GpuPreference=1;",
+                _ => "GpuPreference=0;",
+            };
+            let _ = Command::new("reg")
+                .args(["add", r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences", "/v", r"C:\Program Files\Moonlight Game Streaming\Moonlight.exe", "/t", "REG_SZ", "/d", dec_pref, "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+
+            info!("Updated Windows GPU routing: Encode GPU [{}], Decode GPU [{}]", encode_gpu, decode_gpu);
+        }
+        Ok(())
+    }
 }

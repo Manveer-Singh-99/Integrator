@@ -40,11 +40,16 @@ async function updateStatus() {
     // 1. Peer & Link Status
     const connBadge = document.getElementById('connection-badge');
     const connText = document.getElementById('connection-text');
+    const connSpeed = document.getElementById('connection-speed');
     const usbPing = document.getElementById('usb-ping');
 
     if (status.peer_connected) {
       connBadge.className = 'badge badge-connected';
-      connText.innerText = `Connected (${status.peer_ip})`;
+      connText.innerText = status.peer_ip;
+      if (connSpeed) {
+        connSpeed.innerText = `⚡ ${status.link_speed}`;
+        connSpeed.style.display = 'inline-block';
+      }
       if (usbPing) usbPing.innerText = status.rtt_ms ? `${status.rtt_ms.toFixed(1)} ms` : '< 1 ms';
     } else {
       connBadge.className = 'badge';
@@ -52,6 +57,7 @@ async function updateStatus() {
       connBadge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
       connBadge.style.color = '#f87171';
       connText.innerText = 'Searching for Peer...';
+      if (connSpeed) connSpeed.style.display = 'none';
     }
 
     // 2. Display Status & Machine Context
@@ -71,25 +77,38 @@ async function updateStatus() {
     const btnDisp = document.getElementById('btn-toggle-display');
     const btnDispLabel = document.getElementById('btn-display-label');
     const streamArrow = document.getElementById('stream-arrow');
+    const gpuControls = document.getElementById('gpu-controls');
+    const selectEncodeGpu = document.getElementById('select-encode-gpu');
+    const selectDecodeGpu = document.getElementById('select-decode-gpu');
 
     if (isWindows) {
-      if (dispDesc) dispDesc.innerText = 'Stream Windows Desktop to MacBook Pro via VideoToolbox @ 60Hz';
+      if (dispDesc) dispDesc.innerText = 'Stream Windows Desktop to MacBook Pro via Intel QuickSync @ 60Hz';
       if (devLeftIcon) devLeftIcon.innerText = '🎮';
-      if (devLeftName) devLeftName.innerText = 'HP OMEN 16" (RTX 5070)';
-      if (devLeftRole) devLeftRole.innerText = 'Host Desktop';
-      if (streamArrowSpeed) streamArrowSpeed.innerText = '60Hz VideoToolbox';
+      if (devLeftName) devLeftName.innerText = 'HP OMEN 16" (Host)';
+      if (devLeftRole) devLeftRole.innerText = status.encode_gpu === 'nvidia' ? 'NVIDIA RTX 5070 NVENC' : 'Intel Arc 140T QuickSync';
+      if (streamArrowSpeed) streamArrowSpeed.innerText = status.encode_gpu === 'nvidia' ? '60Hz NVIDIA NVENC' : '60Hz Intel QuickSync';
       if (devRightIcon) devRightIcon.innerText = '💻';
       if (devRightName) devRightName.innerText = 'MacBook Pro (M1)';
-      if (devRightRole) devRightRole.innerText = 'Second Screen';
+      if (devRightRole) devRightRole.innerText = 'Second Screen (VideoToolbox)';
+
+      if (gpuControls) gpuControls.style.display = 'flex';
+      if (selectEncodeGpu && !selectEncodeGpu.matches(':focus')) {
+        selectEncodeGpu.value = status.encode_gpu || 'intel';
+      }
+      if (selectDecodeGpu && !selectDecodeGpu.matches(':focus')) {
+        selectDecodeGpu.value = status.decode_gpu || 'nvidia';
+      }
     } else {
-      if (dispDesc) dispDesc.innerText = 'Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz';
+      if (dispDesc) dispDesc.innerText = 'Stream macOS Desktop to HP OMEN via VideoToolbox Hardware Encoder @ 165Hz';
       if (devLeftIcon) devLeftIcon.innerText = '💻';
       if (devLeftName) devLeftName.innerText = 'MacBook Pro (M1)';
-      if (devLeftRole) devLeftRole.innerText = 'Host Desktop';
-      if (streamArrowSpeed) streamArrowSpeed.innerText = '165Hz NVENC';
+      if (devLeftRole) devLeftRole.innerText = 'Host Desktop (VideoToolbox)';
+      if (streamArrowSpeed) streamArrowSpeed.innerText = '165Hz VideoToolbox';
       if (devRightIcon) devRightIcon.innerText = '🎮';
       if (devRightName) devRightName.innerText = 'HP OMEN 16" (RTX 5070)';
-      if (devRightRole) devRightRole.innerText = 'Second Screen';
+      if (devRightRole) devRightRole.innerText = 'Second Screen (HW Decode)';
+
+      if (gpuControls) gpuControls.style.display = 'none';
     }
 
     if (isDisplayActive) {
@@ -102,9 +121,13 @@ async function updateStatus() {
       dispBadge.className = 'pill pill-idle';
       dispBadge.innerText = 'Idle';
       btnDisp.className = 'btn btn-primary';
-      btnDispLabel.innerText = isWindows 
-        ? 'Extend to MacBook Pro (VideoToolbox 60Hz)' 
-        : 'Extend Desktop to HP OMEN (165Hz)';
+      if (isWindows) {
+        btnDispLabel.innerText = status.encode_gpu === 'nvidia'
+          ? 'Extend to MacBook Pro (NVENC 60Hz)'
+          : 'Extend to MacBook Pro (QuickSync 60Hz)';
+      } else {
+        btnDispLabel.innerText = 'Extend Desktop to HP OMEN (VideoToolbox 165Hz)';
+      }
       if (streamArrow) streamArrow.style.opacity = '0.4';
     }
   } catch (e) {
@@ -119,11 +142,30 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnOpenCache = document.getElementById('btn-open-cache');
   const btnClearLogs = document.getElementById('btn-clear-logs');
   const btnHideWindow = document.getElementById('btn-hide-window');
+  const selectEncodeGpu = document.getElementById('select-encode-gpu');
+  const selectDecodeGpu = document.getElementById('select-decode-gpu');
+
+  async function handleGpuChange() {
+    if (!selectEncodeGpu || !selectDecodeGpu) return;
+    try {
+      const res = await invokeCmd('set_gpu_preferences', {
+        encodeGpu: selectEncodeGpu.value,
+        decodeGpu: selectDecodeGpu.value,
+      });
+      appendLog(`⚙️ ${res}`, 'success');
+      await updateStatus();
+    } catch (e) {
+      appendLog(`❌ Failed to update GPU preferences: ${e}`, 'error');
+    }
+  }
+
+  if (selectEncodeGpu) selectEncodeGpu.addEventListener('change', handleGpuChange);
+  if (selectDecodeGpu) selectDecodeGpu.addEventListener('change', handleGpuChange);
 
   if (btnToggleDisplay) {
     btnToggleDisplay.addEventListener('click', async () => {
       try {
-        appendLog(isDisplayActive ? 'Stopping extended display...' : 'Starting extended display (1920x1200 @ 165Hz)...', 'info');
+        appendLog(isDisplayActive ? 'Stopping extended display...' : 'Starting extended display...', 'info');
         btnToggleDisplay.disabled = true;
         const res = await invokeCmd('toggle_display');
         appendLog(`🖥️ ${res}`, 'success');

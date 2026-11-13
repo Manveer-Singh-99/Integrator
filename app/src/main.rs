@@ -36,6 +36,30 @@ pub struct BridgeStatus {
     pub display_active: bool,
     pub local_os: String,
     pub active_mode: Option<String>,
+    pub link_speed: String,
+    pub link_type: String,
+    pub encode_gpu: String,
+    pub decode_gpu: String,
+}
+
+fn detect_link_info(peer_ip: Option<&str>) -> (String, String) {
+    match peer_ip {
+        Some(ip) if ip.starts_with("10.99.99.") => {
+            ("10 Gbps".to_string(), "Thunderbolt / USB-C Direct".to_string())
+        }
+        Some(ip) if ip.starts_with("192.168.137.") => {
+            ("433 Mbps".to_string(), "OMEN Wi-Fi Hotspot".to_string())
+        }
+        Some(ip) if ip.starts_with("192.168.2.") => {
+            ("400 Mbps".to_string(), "Direct Wi-Fi / LAN".to_string())
+        }
+        Some(_) => {
+            ("1 Gbps".to_string(), "Local Network".to_string())
+        }
+        None => {
+            ("--".to_string(), "Searching...".to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -44,6 +68,9 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
     let peer_connected = peer_ip.is_some();
     let display_active = state.display_ctrl.is_active().await;
     let active_mode = state.display_ctrl.get_active_mode().await;
+    let (link_speed, link_type) = detect_link_info(peer_ip.as_deref());
+
+    let (encode_gpu, decode_gpu) = crate::display::WinDisplayManager::get_gpu_preferences();
 
     Ok(BridgeStatus {
         peer_connected,
@@ -52,7 +79,18 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
         display_active,
         local_os: std::env::consts::OS.to_string(),
         active_mode,
+        link_speed,
+        link_type,
+        encode_gpu,
+        decode_gpu,
     })
+}
+
+#[tauri::command]
+async fn set_gpu_preferences(encode_gpu: String, decode_gpu: String) -> Result<String, String> {
+    crate::display::WinDisplayManager::set_gpu_preferences(&encode_gpu, &decode_gpu)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("GPU Preferences set: Encode [{}], Decode [{}]", encode_gpu, decode_gpu))
 }
 
 #[tauri::command]
@@ -207,7 +245,8 @@ fn main() -> Result<()> {
             get_status,
             toggle_display,
             open_cache_folder,
-            hide_window
+            hide_window,
+            set_gpu_preferences
         ])
         .setup(move |app| {
             // Setup Tray Menu

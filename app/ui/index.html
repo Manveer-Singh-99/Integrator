@@ -19,7 +19,8 @@
       </div>
       <div id="connection-badge" class="badge badge-connected">
         <span class="dot"></span>
-        <span id="connection-text">USB-C Locked (10.99.99.1)</span>
+        <span id="connection-text">10.99.99.1</span>
+        <span class="speed-pill" id="connection-speed">⚡ 10 Gbps</span>
       </div>
     </header>
 
@@ -52,6 +53,30 @@
             <span class="device-icon" id="dev-right-icon">🎮</span>
             <span class="device-name" id="dev-right-name">HP OMEN 16" (RTX 5070)</span>
             <span class="device-role" id="dev-right-role">Second Screen</span>
+          </div>
+        </div>
+
+        <!-- GPU Acceleration Routing Controls (Active on PC) -->
+        <div id="gpu-controls" class="gpu-controls-row" style="display: none;">
+          <div class="gpu-select-group">
+            <label class="gpu-label" for="select-encode-gpu">
+              <span>🚀 Encode GPU (Sending):</span>
+            </label>
+            <select id="select-encode-gpu" class="select-dropdown">
+              <option value="intel">Intel Arc 140T (QuickSync)</option>
+              <option value="nvidia">NVIDIA RTX 5070 (NVENC)</option>
+              <option value="auto">Auto (System Default)</option>
+            </select>
+          </div>
+          <div class="gpu-select-group">
+            <label class="gpu-label" for="select-decode-gpu">
+              <span>⚡ Decode GPU (Receiving):</span>
+            </label>
+            <select id="select-decode-gpu" class="select-dropdown">
+              <option value="nvidia">NVIDIA RTX 5070 (NVDEC)</option>
+              <option value="intel">Intel Arc 140T (QuickSync)</option>
+              <option value="auto">Auto (System Default)</option>
+            </select>
           </div>
         </div>
 
