@@ -41,6 +41,9 @@ impl FileClipboardHelper {
         ];
         for c in &candidates {
             if c.exists() {
+                if let Ok(abs) = c.canonicalize() {
+                    return Some(abs);
+                }
                 return Some(c.clone());
             }
         }
@@ -64,44 +67,58 @@ impl FileClipboardHelper {
         #[cfg(target_os = "macos")]
         {
             if let Some(helper) = Self::find_helper("macos_clip_files") {
-                if let Ok(output) = Command::new(helper).arg("read").output() {
-                    if output.status.success() {
-                        let text = String::from_utf8_lossy(&output.stdout);
-                        for line in text.lines() {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let p = PathBuf::from(trimmed);
-                                if p.exists() {
-                                    results.push(p);
+                match Command::new(&helper).arg("read").output() {
+                    Ok(output) => {
+                        if output.status.success() {
+                            let text = String::from_utf8_lossy(&output.stdout);
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    let p = PathBuf::from(trimmed);
+                                    if p.exists() {
+                                        results.push(p);
+                                    }
                                 }
                             }
+                        } else {
+                            warn!("macos_clip_files read returned error: {:?}", output.status);
                         }
+                    }
+                    Err(e) => {
+                        warn!("Failed to execute macos_clip_files at {:?}: {}", helper, e);
                     }
                 }
             } else {
-                debug!("macos_clip_files helper binary not found");
+                warn!("macos_clip_files helper binary not found");
             }
         }
 
         #[cfg(target_os = "windows")]
         {
             if let Some(helper) = Self::find_helper("win_clip_files.exe") {
-                if let Ok(output) = Command::new(helper).arg("read").output() {
-                    if output.status.success() {
-                        let text = String::from_utf8_lossy(&output.stdout);
-                        for line in text.lines() {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let p = PathBuf::from(trimmed);
-                                if p.exists() {
-                                    results.push(p);
+                match Command::new(&helper).arg("read").output() {
+                    Ok(output) => {
+                        if output.status.success() {
+                            let text = String::from_utf8_lossy(&output.stdout);
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    let p = PathBuf::from(trimmed);
+                                    if p.exists() {
+                                        results.push(p);
+                                    }
                                 }
                             }
+                        } else {
+                            warn!("win_clip_files.exe read returned error: {:?}", output.status);
                         }
+                    }
+                    Err(e) => {
+                        warn!("Failed to execute win_clip_files.exe at {:?}: {}", helper, e);
                     }
                 }
             } else {
-                debug!("win_clip_files.exe helper binary not found");
+                warn!("win_clip_files.exe helper binary not found");
             }
         }
 
