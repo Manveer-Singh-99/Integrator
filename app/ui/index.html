@@ -32,26 +32,26 @@
             <span class="card-icon">🖥️</span>
             <div>
               <h2>Extended Second Screen</h2>
-              <p class="card-desc">Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz</p>
+              <p class="card-desc" id="display-desc">Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz</p>
             </div>
           </div>
           <span id="display-status-badge" class="pill pill-idle">Idle</span>
         </div>
 
         <div class="display-visual">
-          <div class="device mac">
-            <span class="device-icon">💻</span>
-            <span class="device-name">MacBook Pro (M1)</span>
-            <span class="device-role">Host Desktop</span>
+          <div class="device" id="dev-left">
+            <span class="device-icon" id="dev-left-icon">💻</span>
+            <span class="device-name" id="dev-left-name">MacBook Pro (M1)</span>
+            <span class="device-role" id="dev-left-role">Host Desktop</span>
           </div>
           <div class="stream-arrow" id="stream-arrow">
             <span class="arrow-line"></span>
-            <span class="arrow-speed">165Hz NVENC</span>
+            <span class="arrow-speed" id="stream-arrow-speed">165Hz NVENC</span>
           </div>
-          <div class="device pc">
-            <span class="device-icon">🎮</span>
-            <span class="device-name">HP OMEN 16" (RTX 5070)</span>
-            <span class="device-role">Second Screen</span>
+          <div class="device" id="dev-right">
+            <span class="device-icon" id="dev-right-icon">🎮</span>
+            <span class="device-name" id="dev-right-name">HP OMEN 16" (RTX 5070)</span>
+            <span class="device-role" id="dev-right-role">Second Screen</span>
           </div>
         </div>
 
@@ -70,7 +70,7 @@
             <span class="card-icon">📋</span>
             <div>
               <h2>Universal Clipboard</h2>
-              <p class="card-desc">Zero-RAM disk streaming for Text, Images & Large Files</p>
+              <p class="card-desc">Zero-RAM disk streaming for Text, Images, Files & Entire Folders</p>
             </div>
           </div>
           <span class="pill pill-active">Zero-RAM Active</span>
@@ -82,8 +82,8 @@
             <span class="stat-value" id="stat-latency">&lt; 15 ms</span>
           </div>
           <div class="stat-box">
-            <span class="stat-label">File Buffer</span>
-            <span class="stat-value">64 KB Streaming</span>
+            <span class="stat-label">Folders & Files</span>
+            <span class="stat-value">Infinite Disk Stream</span>
           </div>
           <div class="stat-box">
             <span class="stat-label">Sequence Checks</span>

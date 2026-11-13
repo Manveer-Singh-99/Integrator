@@ -34,6 +34,8 @@ pub struct BridgeStatus {
     pub peer_ip: String,
     pub rtt_ms: Option<f64>,
     pub display_active: bool,
+    pub local_os: String,
+    pub active_mode: Option<String>,
 }
 
 #[tauri::command]
@@ -41,12 +43,15 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
     let peer_ip = state.discovery.get_peer_ip().await;
     let peer_connected = peer_ip.is_some();
     let display_active = state.display_ctrl.is_active().await;
+    let active_mode = state.display_ctrl.get_active_mode().await;
 
     Ok(BridgeStatus {
         peer_connected,
         peer_ip: peer_ip.unwrap_or_else(|| "Searching...".to_string()),
         rtt_ms: if peer_connected { Some(0.4) } else { None },
         display_active,
+        local_os: std::env::consts::OS.to_string(),
+        active_mode,
     })
 }
 
@@ -207,7 +212,12 @@ fn main() -> Result<()> {
         .setup(move |app| {
             // Setup Tray Menu
             let show_i = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
-            let toggle_i = MenuItem::with_id(app, "toggle_display", "Extend Desktop (165Hz)", true, None::<&str>)?;
+            let toggle_label = if cfg!(target_os = "windows") {
+                "Extend to MacBook Pro (VideoToolbox 60Hz)"
+            } else {
+                "Extend Desktop to HP OMEN (165Hz)"
+            };
+            let toggle_i = MenuItem::with_id(app, "toggle_display", toggle_label, true, None::<&str>)?;
             let cache_i = MenuItem::with_id(app, "open_cache", "Open Clipboard Cache", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Bridge", true, None::<&str>)?;
 

@@ -54,12 +54,43 @@ async function updateStatus() {
       connText.innerText = 'Searching for Peer...';
     }
 
-    // 2. Display Status
+    // 2. Display Status & Machine Context
     isDisplayActive = status.display_active;
+    const isWindows = status.local_os === 'windows';
+
+    const dispDesc = document.getElementById('display-desc');
+    const devLeftIcon = document.getElementById('dev-left-icon');
+    const devLeftName = document.getElementById('dev-left-name');
+    const devLeftRole = document.getElementById('dev-left-role');
+    const streamArrowSpeed = document.getElementById('stream-arrow-speed');
+    const devRightIcon = document.getElementById('dev-right-icon');
+    const devRightName = document.getElementById('dev-right-name');
+    const devRightRole = document.getElementById('dev-right-role');
+
     const dispBadge = document.getElementById('display-status-badge');
     const btnDisp = document.getElementById('btn-toggle-display');
     const btnDispLabel = document.getElementById('btn-display-label');
     const streamArrow = document.getElementById('stream-arrow');
+
+    if (isWindows) {
+      if (dispDesc) dispDesc.innerText = 'Stream Windows Desktop to MacBook Pro via VideoToolbox @ 60Hz';
+      if (devLeftIcon) devLeftIcon.innerText = '🎮';
+      if (devLeftName) devLeftName.innerText = 'HP OMEN 16" (RTX 5070)';
+      if (devLeftRole) devLeftRole.innerText = 'Host Desktop';
+      if (streamArrowSpeed) streamArrowSpeed.innerText = '60Hz VideoToolbox';
+      if (devRightIcon) devRightIcon.innerText = '💻';
+      if (devRightName) devRightName.innerText = 'MacBook Pro (M1)';
+      if (devRightRole) devRightRole.innerText = 'Second Screen';
+    } else {
+      if (dispDesc) dispDesc.innerText = 'Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz';
+      if (devLeftIcon) devLeftIcon.innerText = '💻';
+      if (devLeftName) devLeftName.innerText = 'MacBook Pro (M1)';
+      if (devLeftRole) devLeftRole.innerText = 'Host Desktop';
+      if (streamArrowSpeed) streamArrowSpeed.innerText = '165Hz NVENC';
+      if (devRightIcon) devRightIcon.innerText = '🎮';
+      if (devRightName) devRightName.innerText = 'HP OMEN 16" (RTX 5070)';
+      if (devRightRole) devRightRole.innerText = 'Second Screen';
+    }
 
     if (isDisplayActive) {
       dispBadge.className = 'pill pill-active';
@@ -71,7 +102,9 @@ async function updateStatus() {
       dispBadge.className = 'pill pill-idle';
       dispBadge.innerText = 'Idle';
       btnDisp.className = 'btn btn-primary';
-      btnDispLabel.innerText = 'Extend Desktop to HP OMEN';
+      btnDispLabel.innerText = isWindows 
+        ? 'Extend to MacBook Pro (VideoToolbox 60Hz)' 
+        : 'Extend Desktop to HP OMEN (165Hz)';
       if (streamArrow) streamArrow.style.opacity = '0.4';
     }
   } catch (e) {

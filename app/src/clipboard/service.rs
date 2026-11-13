@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, Context};
@@ -16,7 +16,7 @@ use tracing::{info, debug, warn, error};
 
 use crate::config::CLIPBOARD_PORT;
 use crate::discovery::DiscoveryManager;
-use super::protocol::{ClipboardMessage, ClipboardPayload, FileMetadata};
+use super::protocol::{ClipboardMessage, ClipboardPayload, FileEntry};
 use super::file_helper::FileClipboardHelper;
 use super::os_seq;
 
@@ -110,7 +110,6 @@ impl ClipboardService {
                 if let Ok(mut cb) = Clipboard::new() {
                     let _ = cb.set_text(text);
                 }
-                // Record the sequence number immediately after setting clipboard
                 let new_seq = os_seq::get_clipboard_sequence();
                 let mut seq_lock = last_seq.write().await;
                 *seq_lock = new_seq;
@@ -129,37 +128,100 @@ impl ClipboardService {
                 let mut seq_lock = last_seq.write().await;
                 *seq_lock = new_seq;
             }
-            ClipboardPayload::Files { files } => {
-                info!("📂 Receiving {} remote file(s)...", files.len());
+            ClipboardPayload::Files { root_names, entries } => {
+                info!("📂 Receiving remote files/folders ({} root items, {} total entries)...", root_names.len(), entries.len());
                 let cache_dir = file_helper.get_cache_dir();
-                let mut staged_paths = Vec::new();
 
-                for meta in files {
-                    let dest_path = cache_dir.join(&meta.name);
-                    let mut file = File::create(&dest_path)?;
-
-                    let mut remaining = meta.size;
-                    let mut chunk_buf = vec![0u8; 64 * 1024];
-
-                    while remaining > 0 {
-                        let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
-                        socket.read_exact(&mut chunk_buf[..to_read]).await?;
-                        file.write_all(&chunk_buf[..to_read])?;
-                        remaining -= to_read as u64;
+                // 1. Clean existing root items in cache_dir so we start fresh
+                for root in &root_names {
+                    let target = cache_dir.join(root);
+                    if target.is_dir() {
+                        let _ = std::fs::remove_dir_all(&target);
+                    } else if target.exists() {
+                        let _ = std::fs::remove_file(&target);
                     }
-
-                    staged_paths.push(dest_path);
                 }
 
-                file_helper.write_copied_files(&staged_paths)?;
+                // 2. Iterate through entries and recreate folder structure & stream files
+                for entry in entries {
+                    let mut dest_path = cache_dir.to_path_buf();
+                    for component in entry.rel_path.split('/') {
+                        if !component.is_empty() && component != "." && component != ".." {
+                            dest_path.push(component);
+                        }
+                    }
+
+                    if entry.is_dir {
+                        std::fs::create_dir_all(&dest_path)?;
+                    } else {
+                        if let Some(parent) = dest_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let mut file = File::create(&dest_path)?;
+                        let mut remaining = entry.size;
+                        let mut chunk_buf = vec![0u8; 64 * 1024];
+
+                        while remaining > 0 {
+                            let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
+                            socket.read_exact(&mut chunk_buf[..to_read]).await?;
+                            file.write_all(&chunk_buf[..to_read])?;
+                            remaining -= to_read as u64;
+                        }
+                    }
+                }
+
+                // 3. Register root paths on native OS clipboard
+                let mut staged_roots = Vec::new();
+                for root in &root_names {
+                    let p = cache_dir.join(root);
+                    if p.exists() {
+                        staged_roots.push(p);
+                    }
+                }
+
+                file_helper.write_copied_files(&staged_roots)?;
                 let new_seq = os_seq::get_clipboard_sequence();
                 let mut seq_lock = last_seq.write().await;
                 *seq_lock = new_seq;
-                info!("✅ Staged {} file(s) into clipboard cache and set native pasteboard", staged_paths.len());
+                info!("✅ Staged {} root file/folder(s) into clipboard cache and set native pasteboard", staged_roots.len());
             }
         }
 
         Ok(())
+    }
+
+    /// Recursively collects all files and subdirectories inside a directory.
+    fn collect_dir_entries(
+        _root: &Path,
+        current: &Path,
+        rel_prefix: &str,
+        entries: &mut Vec<FileEntry>,
+        files_to_stream: &mut Vec<PathBuf>,
+    ) {
+        if let Ok(read_dir) = std::fs::read_dir(current) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let rel = format!("{}/{}", rel_prefix, name);
+
+                if path.is_dir() {
+                    entries.push(FileEntry {
+                        rel_path: rel.clone(),
+                        size: 0,
+                        is_dir: true,
+                    });
+                    Self::collect_dir_entries(_root, &path, &rel, entries, files_to_stream);
+                } else if path.is_file() {
+                    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    entries.push(FileEntry {
+                        rel_path: rel,
+                        size: len,
+                        is_dir: false,
+                    });
+                    files_to_stream.push(path);
+                }
+            }
+        }
     }
 
     /// Continuous lightweight loop checking for clipboard sequence changes.
@@ -189,21 +251,18 @@ impl ClipboardService {
 
             debug!("Clipboard sequence updated: {}", current_seq);
 
-            // 1. Check for Copied Files
-            let copied_files = file_helper.read_copied_files();
-            if !copied_files.is_empty() {
+            // 1. Check for Copied Files and Folders
+            let copied_paths = file_helper.read_copied_files();
+            if !copied_paths.is_empty() {
                 let mut hasher = Sha256::new();
-                let mut meta_list = Vec::new();
-
-                for p in &copied_files {
-                    if let Ok(meta) = std::fs::metadata(p) {
-                        hasher.update(p.to_string_lossy().as_bytes());
+                for root in &copied_paths {
+                    hasher.update(root.to_string_lossy().as_bytes());
+                    if let Ok(meta) = std::fs::metadata(root) {
                         hasher.update(&meta.len().to_le_bytes());
-                        if let Some(name) = p.file_name() {
-                            meta_list.push(FileMetadata {
-                                name: name.to_string_lossy().to_string(),
-                                size: meta.len(),
-                            });
+                        if let Ok(mtime) = meta.modified() {
+                            if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                                hasher.update(&dur.as_millis().to_le_bytes());
+                            }
                         }
                     }
                 }
@@ -214,13 +273,46 @@ impl ClipboardService {
                     *hash_lock = hash_hex.clone();
                     drop(hash_lock);
 
-                    info!("📤 Detected local copied files ({} files). Sending to peer...", copied_files.len());
+                    // Collect all entries and files to stream
+                    let mut root_names = Vec::new();
+                    let mut entries = Vec::new();
+                    let mut files_to_stream = Vec::new();
+
+                    for root in &copied_paths {
+                        if let Some(file_name) = root.file_name() {
+                            let name_str = file_name.to_string_lossy().to_string();
+                            root_names.push(name_str.clone());
+
+                            if root.is_dir() {
+                                entries.push(FileEntry {
+                                    rel_path: name_str.clone(),
+                                    size: 0,
+                                    is_dir: true,
+                                });
+                                Self::collect_dir_entries(root, root, &name_str, &mut entries, &mut files_to_stream);
+                            } else if root.is_file() {
+                                let len = std::fs::metadata(root).map(|m| m.len()).unwrap_or(0);
+                                entries.push(FileEntry {
+                                    rel_path: name_str,
+                                    size: len,
+                                    is_dir: false,
+                                });
+                                files_to_stream.push(root.clone());
+                            }
+                        }
+                    }
+
+                    info!(
+                        "📤 Detected local copied file/folder(s) ({} root item(s), {} total entries). Sending to peer...",
+                        root_names.len(),
+                        entries.len()
+                    );
                     if let Some(peer_ip) = discovery.get_peer_ip().await {
-                        if let Err(e) = Self::send_files(&peer_ip, hash_hex, meta_list, copied_files).await {
-                            warn!("Failed to send files to {}: {}", peer_ip, e);
+                        if let Err(e) = Self::send_files(&peer_ip, hash_hex, root_names, entries, files_to_stream).await {
+                            warn!("Failed to send files/folders to {}: {}", peer_ip, e);
                         }
                     } else {
-                        warn!("No peer IP available to send files");
+                        warn!("No peer IP available to send files/folders");
                     }
                 }
                 continue;
@@ -314,8 +406,9 @@ impl ClipboardService {
     async fn send_files(
         peer_ip: &str,
         hash: String,
-        metadata: Vec<FileMetadata>,
-        file_paths: Vec<PathBuf>,
+        root_names: Vec<String>,
+        entries: Vec<FileEntry>,
+        files_to_stream: Vec<PathBuf>,
     ) -> Result<()> {
         let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
         let mut stream = TcpStream::connect(&addr).await
@@ -323,28 +416,31 @@ impl ClipboardService {
 
         let header_msg = ClipboardMessage {
             hash,
-            payload: ClipboardPayload::Files { files: metadata },
+            payload: ClipboardPayload::Files { root_names, entries },
         };
 
         let serialized = serde_json::to_vec(&header_msg)?;
         stream.write_u32(serialized.len() as u32).await?;
         stream.write_all(&serialized).await?;
 
-        // Stream each file directly from disk
+        // Stream each file directly from disk using 64 KB ring buffer
         let mut chunk_buf = vec![0u8; 64 * 1024];
-        for path in file_paths {
-            let mut file = File::open(&path)?;
-            loop {
-                let n = file.read(&mut chunk_buf)?;
-                if n == 0 {
-                    break;
+        for path in files_to_stream {
+            if let Ok(mut file) = File::open(&path) {
+                loop {
+                    let n = file.read(&mut chunk_buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    stream.write_all(&chunk_buf[..n]).await?;
                 }
-                stream.write_all(&chunk_buf[..n]).await?;
+            } else {
+                warn!("Could not open file {:?} for streaming", path);
             }
         }
 
         stream.flush().await?;
-        info!("✅ Finished streaming files to {}", addr);
+        info!("✅ Finished streaming files/folders to {}", addr);
         Ok(())
     }
 }

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use anyhow::{Result, Context};
+#[allow(unused_imports)]
 use tracing::{info, warn};
 
 pub struct WinDisplayManager;

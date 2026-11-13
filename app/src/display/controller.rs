@@ -315,6 +315,11 @@ impl DisplayController {
         }
     }
 
+    /// Returns the currently active display mode, if any.
+    pub async fn get_active_mode(&self) -> Option<String> {
+        self.active_mode.read().await.clone()
+    }
+
     /// Sends an RPC request to a remote peer or localhost over TCP.
     pub async fn send_remote_rpc(peer_ip: &str, req: &DisplayRpcRequest) -> Result<DisplayRpcResponse> {
         let addr = format!("{}:{}", peer_ip, CONTROL_PORT);
