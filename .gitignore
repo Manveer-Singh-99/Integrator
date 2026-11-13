@@ -26,3 +26,8 @@ app/touchbar_hud
 .idea/
 *.swp
 *.swo
+
+# Local-only documentation (excluded from GitHub)
+PROJECT_HISTORY.md
+PROJECT_HISTORY.html
+
