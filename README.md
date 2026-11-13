@@ -1,4 +1,11 @@
-# mac-windows-usbc-bridge
+# Integrator (mac-windows-usbc-bridge)
+
+<div align="center">
+  <img src="app/icons/icon.png" width="160" alt="Integrator App Icon" />
+  <h1>Integrator</h1>
+  <p><strong>Direct USB-C Workstation Fusion Bridge between Apple Silicon Macs and Windows 11 PCs</strong></p>
+  <p>$$\int_{\text{Windows 11}}^{\text{macOS}} (\text{Workstation Fusion})\, dt = \text{\textbf{Integrator}}$$</p>
+</div>
 
 **Direct USB-C to USB-C IP networking (`<1 ms` latency) between Apple Silicon Macs (M1/M2/M3/M4) and Windows 11 PCs — using any standard USB-C cable, with Secure Boot ON and zero reboots.**
 
@@ -152,17 +159,67 @@ In [`extras/moonlight-second-screen/`](extras/moonlight-second-screen/), you'll 
 
 ---
 
-## 🚀 Proposed for the Future (With No Deadlines)
+## ⚡ Integrator: The Unified Desktop Companion App (`v1.0.0` - Current Progress)
 
-> [!NOTE]
-> **Project Evolution: `v0.x` (Prototype) &rarr; `v1.0.0` (Unified App)**  
-> The current codebase (`v0.x.x`) is an open, working Proof-of-Concept built from a collection of shell scripts, PowerShell automation, driver bridges, and scheduled tasks. 
-> 
-> The next major evolution (`v1.0.0`) is envisioned as a **single, unified desktop companion app** for macOS and Windows (with Linux planned later), written in lightweight, memory-safe **Rust (Tauri 2.0)** with an idle footprint of ~30 MB RAM.
-> 
-> **Revitalizing RAM-Limited Macs into "Super-Netbooks":** Offloading heavy compilation, 3D rendering, and high-FPS gaming to a powerful Windows host (e.g. 32GB RAM + dedicated RTX GPU) breathes new life into older or memory-constrained (8GB) MacBooks. The Mac acts as an ultra-efficient, cool-running terminal with pristine hardware (Retina display, trackpad, keyboard, long battery life) while tapping into desktop-grade compute over a $5 cable.
-> 
-> **⚠️ No Deadlines & Feasibility Disclaimer:** This roadmap represents long-term experimental research directions, not a commercial guarantee. Features will be explored progressively in spare time whenever life allows. **Some proposed features (such as Touch Bar takeovers, virtual camera extensions, or low-level input hooks) are heavily dependent on private API restrictions, platform sandboxes, and OS security barriers; any feature may be altered, postponed, or abandoned entirely if deemed technically infeasible or impractical to maintain.** Pull requests and community contributions are always welcome.
+> [!IMPORTANT]
+> **Project Status: Companion App Built & Operational!**  
+> What originally began as a collection of standalone shell scripts and PowerShell drivers has officially evolved into **Integrator**: a single, unified desktop companion application for macOS and Windows 11 built with memory-safe **Rust (Tauri v2)**.
+>
+> * **Icon & Branding**: Features a custom mathematical integration icon ($\int_{\text{Windows 11}}^{\text{macOS}}$) featuring a centered integral sign with pixel-matched Windows 11 (bottom-left) and macOS Finder (top-right) limits separated by a clean 54 px air-gap.
+> * **Zero Ghost Daemons**: Enforces strict single-instance mutual exclusion. Quitting the application cleanly terminates all background threads with zero persistent `launchd` or `schtasks` reload daemons.
+> * **Master ON/OFF Switches**: Every single fusion feature has an independent, persistent master toggle that gracefully winds down active socket streams, unmounts volumes, or dismisses HUDs when disabled.
+> * **Clean Launch at Login**: Autostart is managed natively via macOS Login Items (`System Settings ➔ Login Items`) and Windows `HKCU\...\Run` with `CREATE_NO_WINDOW`.
+
+### Feature Implementation Status Matrix
+
+| Fusion Feature | Platform | Status | Implementation Details |
+| :--- | :---: | :---: | :--- |
+| **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Zero-polling `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, 0.00% idle CPU) |
+| **Dual-Subnet Networking & ICS** | macOS & Win 11 | ✅ **Live** | Bidirectional Internet Sharing simultaneously alongside `10.99.99.x` direct link |
+| **Tauri v2 Glassmorphic UI** | macOS & Win 11 | ✅ **Live** | Real-time latency, peer IP discovery, category filters, and live status pills |
+| **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 echo-loop prevention |
+| **Universal Clipboard (Folders & Files)** | macOS & Win 11 | ✅ **Live** | Multi-GB recursive folder copy-paste streaming over NVMe buffers with LRU pruning |
+| **Live Network Benchmark Engine** | macOS & Win 11 | ✅ **Live** | Built-in real-time throughput benchmark saturating USB-C NVMe transfer speeds |
+| **Touch Bar NVIDIA Performance HUD** | macOS (client) | ✅ **Live** | Liquid Glass OLED HUD with interactive physics and native Control Strip integration |
+| **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Automatic mounting & clean teardown for `/Volumes/PC` $\leftrightarrow$ `M:\` mapped drive |
+| **True Tone & Chromatic Adaptation** | macOS & Win 11 | ✅ **Live** | Mac ambient sensor (Kelvin) $\to$ Bradford CAT GPU gamma ramp injection |
+| **Dynamic Audio Routing** | macOS & Win 11 | ✅ **Live** | System tray topology switcher (Mac Studio Speakers, PC Only, Dual Sync) |
+| **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional 165Hz / 60Hz streaming via Sunshine host + Moonlight client |
+| **Master ON/OFF Feature Switches** | macOS & Win 11 | ✅ **Live** | Independent persistent toggles saved to `~/.usbc_clipboard_cache/features.json` |
+| **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | System Events Login Item (macOS) & `HKCU\...\Run` (Win 11) |
+| **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
+| **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver |
+| **Universal Camera & Virtual Mic** | macOS & Win 11 | 📋 **Planned** | Hardware-accelerated `CMIOExtension` & DirectShow virtual media pipelines |
+| **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover |
+
+---
+
+### Building & Running the Integrator Desktop App
+
+The companion app is located in the [`app/`](app/) directory:
+
+#### On macOS:
+```bash
+cd app
+cargo build --release
+```
+To run the packaged bundle or copy to your Applications folder:
+```bash
+# Executable binary located at:
+./target/release/integrator
+
+# Packaged macOS Application bundle:
+open /Applications/Integrator.app
+```
+
+#### On Windows 11:
+```powershell
+cd app
+cargo build --release
+```
+The compiled release executable with the embedded $\int_{\text{Win11}}^{\text{macOS}}$ multi-resolution icon will be located at `target\release\integrator.exe`.
+
+---
 
 ### The Two Core Operating States
 

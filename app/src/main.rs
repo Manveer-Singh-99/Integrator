@@ -556,7 +556,7 @@ fn main() -> Result<()> {
     } else {
         std::env::var("HOME").unwrap_or_else(|_| ".".into())
     };
-    let log_path = std::path::PathBuf::from(home).join(".mac_windows_bridge.log");
+    let log_path = std::path::PathBuf::from(home).join(".integrator.log");
     let file_opt = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
