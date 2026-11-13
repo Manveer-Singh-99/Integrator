@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Manveer Singh"]
 description = "Integrator: High-Performance macOS & Windows 11 Workstation Fusion"
+repository = "https://github.com/Manveer-Singh-99/Integrator"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
