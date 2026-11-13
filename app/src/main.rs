@@ -10,6 +10,7 @@ mod benchmark;
 mod truetone;
 mod storage;
 mod audio;
+mod features;
 
 use std::sync::Mutex;
 use anyhow::Result;
@@ -49,6 +50,7 @@ pub struct AppState {
     pub display_ctrl: DisplayController,
     #[allow(dead_code)]
     pub clipboard: ClipboardService,
+    pub features: std::sync::Arc<features::FeatureManager>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +141,9 @@ async fn set_gpu_preferences(encode_gpu: String, decode_gpu: String) -> Result<S
 
 #[tauri::command]
 async fn run_speed_test(state: State<'_, AppState>) -> Result<benchmark::SpeedTestResult, String> {
+    if !state.features.is_enabled("benchmark") {
+        return Err("High-Speed Benchmark is disabled by master switch".into());
+    }
     let peer_ip = state.discovery.get_peer_ip().await
         .ok_or_else(|| "No peer connected to run speed test against".to_string())?;
 
@@ -163,6 +168,9 @@ async fn get_gpu_telemetry(state: State<'_, AppState>) -> Result<crate::telemetr
 
 #[tauri::command]
 async fn toggle_touchbar_hud(state: State<'_, AppState>, force: Option<bool>) -> Result<String, String> {
+    if !state.features.is_enabled("touchbar") {
+        return Err("Touch Bar NVIDIA HUD is disabled by master switch".into());
+    }
     #[cfg(target_os = "macos")]
     {
         let is_running = unsafe { is_touchbar_active_in_app() };
@@ -199,6 +207,9 @@ async fn toggle_touchbar_hud(state: State<'_, AppState>, force: Option<bool>) ->
 
 #[tauri::command]
 async fn toggle_display(state: State<'_, AppState>) -> Result<String, String> {
+    if !state.features.is_enabled("display") {
+        return Err("Extended Second Screen is disabled by master switch".into());
+    }
     if cfg!(target_os = "macos") {
         state.display_ctrl.toggle_mac_to_pc().await.map_err(|e| e.to_string())
     } else {
@@ -239,7 +250,55 @@ async fn hide_window(app_handle: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_ambient_light() -> Result<truetone::AmbientLightData, String> {
+async fn get_feature_flags(state: State<'_, AppState>) -> Result<features::FeatureFlags, String> {
+    Ok(state.features.get_flags())
+}
+
+#[tauri::command]
+async fn set_feature_flag(
+    state: State<'_, AppState>,
+    feature: String,
+    enabled: bool,
+) -> Result<features::FeatureFlags, String> {
+    let flags = state.features.set_flag(&feature, enabled);
+    tracing::info!("⚙️ Feature [{}] master switch set to: {}", feature, if enabled { "ENABLED" } else { "DISABLED" });
+
+    if !enabled {
+        match feature.as_str() {
+            "display" => {
+                if state.display_ctrl.is_active().await {
+                    let _ = state.display_ctrl.stop_mac_to_pc().await;
+                    let _ = state.display_ctrl.stop_pc_to_mac().await;
+                }
+            }
+            "storage" => {
+                let _ = storage::StorageManager::unmount();
+            }
+            "truetone" => {
+                let _ = truetone::reset_hardware_gamma_ramp();
+            }
+            "touchbar" => {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    dismiss_touchbar_in_app();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(flags)
+}
+
+#[tauri::command]
+async fn get_ambient_light(state: State<'_, AppState>) -> Result<truetone::AmbientLightData, String> {
+    if !state.features.is_enabled("truetone") {
+        return Ok(truetone::AmbientLightData {
+            lux: 0.0,
+            cct_kelvin: 6500,
+            supported: false,
+            updated_at_secs: 0,
+        });
+    }
     Ok(truetone::read_ambient_light())
 }
 
@@ -249,6 +308,9 @@ async fn apply_truetone_calibration(
     cct: u32,
     comp_factor: f32,
 ) -> Result<String, String> {
+    if !state.features.is_enabled("truetone") {
+        return Err("True Tone & Chromatic Sync is disabled by master switch".into());
+    }
     if cfg!(target_os = "windows") {
         truetone::apply_hardware_gamma_ramp(cct, comp_factor).map_err(|e| e.to_string())?;
         Ok(format!("Injected Bradford CAT Gamma LUT on Windows: {}K ({:.2}x)", cct, comp_factor))
@@ -271,6 +333,9 @@ async fn apply_truetone_calibration(
 
 #[tauri::command]
 async fn mount_shared_storage(state: State<'_, AppState>) -> Result<storage::StorageStatus, String> {
+    if !state.features.is_enabled("storage") {
+        return Err("Auto-Mounted Shared Storage is disabled by master switch".into());
+    }
     let peer_ip = state.discovery.get_peer_ip().await.unwrap_or_else(|| "10.99.99.1".to_string());
     let status = storage::StorageManager::mount(&peer_ip).map_err(|e| e.to_string())?;
     
@@ -302,7 +367,10 @@ async fn get_storage_status(state: State<'_, AppState>) -> Result<storage::Stora
 }
 
 #[tauri::command]
-async fn play_spatial_chime() -> Result<String, String> {
+async fn play_spatial_chime(state: State<'_, AppState>) -> Result<String, String> {
+    if !state.features.is_enabled("audio") {
+        return Err("Dynamic Audio Routing is disabled by master switch".into());
+    }
     audio::AudioManager::play_spatial_test_chime().map_err(|e| e.to_string())
 }
 
@@ -546,10 +614,13 @@ fn main() -> Result<()> {
         (discovery, display_ctrl, clipboard)
     });
 
+    let feature_manager = std::sync::Arc::new(features::FeatureManager::new());
+
     let app_state = AppState {
         discovery,
         display_ctrl,
         clipboard,
+        features: feature_manager.clone(),
     };
 
     // 4. Initialize Tauri GUI & System Tray
@@ -572,7 +643,9 @@ fn main() -> Result<()> {
             mount_shared_storage,
             unmount_shared_storage,
             get_storage_status,
-            play_spatial_chime
+            play_spatial_chime,
+            get_feature_flags,
+            set_feature_flag
         ])
         .setup(move |app| {
             GLOBAL_APP_HANDLE.set(app.handle().clone()).ok();

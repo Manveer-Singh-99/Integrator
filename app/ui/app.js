@@ -563,7 +563,90 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // 7. Master Feature On/Off Switches
+  let activeFeatureFlags = {};
+
+  async function initFeatureFlags() {
+    try {
+      const flags = await invokeCmd('get_feature_flags');
+      if (flags) {
+        activeFeatureFlags = flags;
+        applyFeatureFlagsToUI(flags);
+      }
+    } catch (e) {
+      console.warn('Failed to load feature flags:', e);
+    }
+  }
+
+  function applyFeatureFlagsToUI(flags) {
+    document.querySelectorAll('.feature-master-toggle').forEach(toggle => {
+      const feature = toggle.getAttribute('data-feature');
+      const isEnabled = flags[feature] !== false;
+      toggle.checked = isEnabled;
+
+      const card = toggle.closest('.card');
+      if (!card) return;
+
+      const pill = card.querySelector('.pill');
+      if (pill && !pill.getAttribute('data-original-text')) {
+        pill.setAttribute('data-original-text', pill.innerText);
+      }
+
+      if (isEnabled) {
+        card.classList.remove('card-disabled');
+        if (pill && pill.getAttribute('data-original-text') && pill.innerText === 'Disabled') {
+          pill.innerText = pill.getAttribute('data-original-text');
+        }
+      } else {
+        card.classList.add('card-disabled');
+        if (pill) {
+          pill.innerText = 'Disabled';
+        }
+      }
+    });
+  }
+
+  document.querySelectorAll('.feature-master-toggle').forEach(toggle => {
+    toggle.addEventListener('change', async (e) => {
+      e.stopPropagation();
+      const feature = toggle.getAttribute('data-feature');
+      const enabled = toggle.checked;
+      const card = toggle.closest('.card');
+      const title = card?.querySelector('h2')?.innerText || feature;
+
+      if (enabled) {
+        card?.classList.remove('card-disabled');
+        const pill = card?.querySelector('.pill');
+        if (pill && pill.getAttribute('data-original-text')) {
+          pill.innerText = pill.getAttribute('data-original-text');
+        }
+        appendLog(`🟢 Master Switch: Enabled "${title}"`, 'success');
+      } else {
+        card?.classList.add('card-disabled');
+        const pill = card?.querySelector('.pill');
+        if (pill) {
+          if (!pill.getAttribute('data-original-text')) {
+            pill.setAttribute('data-original-text', pill.innerText);
+          }
+          pill.innerText = 'Disabled';
+        }
+        appendLog(`⚪ Master Switch: Disabled "${title}"`, 'warn');
+      }
+
+      try {
+        const updated = await invokeCmd('set_feature_flag', { feature, enabled });
+        if (updated) {
+          activeFeatureFlags = updated;
+        }
+        await updateStatus();
+      } catch (err) {
+        appendLog(`❌ Failed to set master switch: ${err}`, 'error');
+      }
+    });
+  });
+
   // Poll status every 2 seconds & telemetry every 3 seconds
+  initFeatureFlags();
   updateStatus();
   updateGpuTelemetry();
   setInterval(updateStatus, 2000);

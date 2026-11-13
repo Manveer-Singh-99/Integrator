@@ -169,6 +169,32 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  gap: 12px;
+}
+
+.card-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.card-header-controls .switch {
+  cursor: pointer;
+}
+
+/* Master Switch Disabled State for Card */
+.card.card-disabled > *:not(.card-header) {
+  opacity: 0.35;
+  pointer-events: none;
+  filter: grayscale(0.65);
+  transition: opacity 0.25s ease, filter 0.25s ease;
+}
+
+.card.card-disabled .pill {
+  background: rgba(107, 114, 128, 0.15) !important;
+  color: #6b7280 !important;
+  border-color: rgba(107, 114, 128, 0.25) !important;
 }
 
 .card-title-group {

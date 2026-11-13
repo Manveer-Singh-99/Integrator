@@ -47,7 +47,13 @@
               <p class="card-desc" id="display-desc">Stream macOS Desktop to HP OMEN at native 1920×1200 @ 165Hz</p>
             </div>
           </div>
-          <span id="display-status-badge" class="pill pill-idle">Idle</span>
+          <div class="card-header-controls">
+            <span id="display-status-badge" class="pill pill-idle">Idle</span>
+            <label class="switch" title="Master Switch: Extended Second Screen">
+              <input type="checkbox" class="feature-master-toggle" data-feature="display" id="toggle-feature-display" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="display-visual">
@@ -109,7 +115,13 @@
               <p class="card-desc">Zero-RAM disk streaming for Text, Images, Files & Entire Folders</p>
             </div>
           </div>
-          <span class="pill pill-active">Zero-RAM Active</span>
+          <div class="card-header-controls">
+            <span id="clipboard-status-badge" class="pill pill-active">Zero-RAM Active</span>
+            <label class="switch" title="Master Switch: Universal Clipboard">
+              <input type="checkbox" class="feature-master-toggle" data-feature="clipboard" id="toggle-feature-clipboard" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="stats-row">
@@ -145,7 +157,13 @@
               <p class="card-desc">Border edge-hopping with Precision Touchpad gestures (State 2)</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <div class="card-header-controls">
+            <span id="input-status-badge" class="pill pill-roadmap">Roadmap Preview</span>
+            <label class="switch" title="Master Switch: Universal Input & KVM">
+              <input type="checkbox" class="feature-master-toggle" data-feature="input_kvm" id="toggle-feature-input" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="card-setting-row">
@@ -210,7 +228,13 @@
               <p class="card-desc">AirDrop across screens with zero-RAM disk-to-disk streaming</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <div class="card-header-controls">
+            <span id="dragdrop-status-badge" class="pill pill-roadmap">Roadmap Preview</span>
+            <label class="switch" title="Master Switch: Cross-Screen Drag & Drop">
+              <input type="checkbox" class="feature-master-toggle" data-feature="dragdrop" id="toggle-feature-dragdrop" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="dragdrop-visual-zone">
@@ -260,7 +284,13 @@
               <p class="card-desc">Zero-config network volume mounting over direct USB-C link</p>
             </div>
           </div>
-          <span id="storage-status-pill" class="pill pill-idle">Volume Ready</span>
+          <div class="card-header-controls">
+            <span id="storage-status-pill" class="pill pill-idle">Volume Ready</span>
+            <label class="switch" title="Master Switch: Auto-Mounted Shared Storage">
+              <input type="checkbox" class="feature-master-toggle" data-feature="storage" id="toggle-feature-storage" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="mount-routes-grid">
@@ -313,7 +343,13 @@
               <p class="card-desc">Apple Secure Enclave FIDO2/WebAuthn passkeys & Windows 11 lock screen unlock</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <div class="card-header-controls">
+            <span id="touchid-status-badge" class="pill pill-roadmap">Roadmap Preview</span>
+            <label class="switch" title="Master Switch: Touch ID Authenticator">
+              <input type="checkbox" class="feature-master-toggle" data-feature="touchid" id="toggle-feature-touchid" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="touchid-visual-box">
@@ -357,7 +393,13 @@
               <p class="card-desc">Match screen white points via Mac ambient light sensor & Bradford CAT</p>
             </div>
           </div>
-          <span id="truetone-status-pill" class="pill pill-active">ALS Active</span>
+          <div class="card-header-controls">
+            <span id="truetone-status-pill" class="pill pill-active">ALS Active</span>
+            <label class="switch" title="Master Switch: True Tone & Chromatic Sync">
+              <input type="checkbox" class="feature-master-toggle" data-feature="truetone" id="toggle-feature-truetone" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="cct-meter-box">
@@ -406,7 +448,13 @@
               <p class="card-desc">Mac FaceTime HD camera & beamforming mics into Windows DirectShow</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <div class="card-header-controls">
+            <span id="camera-status-badge" class="pill pill-roadmap">Roadmap Preview</span>
+            <label class="switch" title="Master Switch: Universal Camera & Studio Mic">
+              <input type="checkbox" class="feature-master-toggle" data-feature="camera" id="toggle-feature-camera" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="device-select-grid">
@@ -464,7 +512,13 @@
               <p class="card-desc">High-fidelity 24-bit Spatial Audio soundbar sink & headset routing</p>
             </div>
           </div>
-          <span id="audio-status-pill" class="pill pill-active">Spatial Sink Active</span>
+          <div class="card-header-controls">
+            <span id="audio-status-pill" class="pill pill-active">Spatial Sink Active</span>
+            <label class="switch" title="Master Switch: Dynamic Audio Routing">
+              <input type="checkbox" class="feature-master-toggle" data-feature="audio" id="toggle-feature-audio" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="audio-topology-grid">
@@ -518,7 +572,13 @@
               <p class="card-desc">Off-screen GPU hardware telemetry on MacBook 2170×60 OLED strip</p>
             </div>
           </div>
-          <span id="touchbar-state-badge" class="pill pill-idle">Windows Master Inactive</span>
+          <div class="card-header-controls">
+            <span id="touchbar-state-badge" class="pill pill-idle">Windows Master Inactive</span>
+            <label class="switch" title="Master Switch: Touch Bar NVIDIA HUD">
+              <input type="checkbox" class="feature-master-toggle" data-feature="touchbar" id="toggle-feature-touchbar" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <!-- Mini OLED Touch Bar Visualizer -->
@@ -560,7 +620,13 @@
               <p class="card-desc">Bond Mac Wi-Fi & Windows Ethernet/5G for gaming ping protection & speed</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <div class="card-header-controls">
+            <span id="multiwan-status-badge" class="pill pill-roadmap">Roadmap Preview</span>
+            <label class="switch" title="Master Switch: Multi-WAN Internet Bonding">
+              <input type="checkbox" class="feature-master-toggle" data-feature="multiwan" id="toggle-feature-multiwan" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="multiwan-visual-box">
@@ -619,7 +685,13 @@
               <p class="card-desc">Adaptive multi-subnet route arbitration</p>
             </div>
           </div>
-          <span class="pill pill-active">Link Active</span>
+          <div class="card-header-controls">
+            <span id="benchmark-status-badge" class="pill pill-active">Link Active</span>
+            <label class="switch" title="Master Switch: High-Speed Link & Benchmark">
+              <input type="checkbox" class="feature-master-toggle" data-feature="benchmark" id="toggle-feature-benchmark" checked>
+              <span class="slider-toggle"></span>
+            </label>
+          </div>
         </div>
 
         <div class="network-routes">
