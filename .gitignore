@@ -16,6 +16,10 @@ pnpm-debug.log*
 # Tauri artifacts
 src-tauri/target/
 
+# Helper compiled binaries
+app/macos_clip_files
+app/win_clip_files.exe
+
 # IDE / Editor configs
 .vscode/
 .idea/

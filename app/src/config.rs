@@ -1,34 +1,29 @@
-//! Default network and port configurations for the mac-windows-usbc-bridge companion app.
+//! Dynamic multi-subnet network and port configurations.
+//! Supports USB-C cable (10.99.99.x), Mac Internet Sharing (192.168.2.x),
+//! Windows Wi-Fi Hotspot (192.168.137.x), and local Wi-Fi LANs.
 
-pub const DEFAULT_MAC_IP: &str = "10.99.99.2";
-pub const DEFAULT_WIN_IP: &str = "10.99.99.1";
-pub const CONTROL_PORT: u16 = 58280;
-pub const AUDIO_PORT: u16 = 58281;
-pub const TELEMETRY_PORT: u16 = 58282;
+pub const DISCOVERY_PORT: u16 = 58280;
+pub const CONTROL_PORT: u16 = 58281;
 pub const CLIPBOARD_PORT: u16 = 58283;
+pub const AUDIO_PORT: u16 = 58284;
+pub const TELEMETRY_PORT: u16 = 58285;
 
-#[derive(Debug, Clone)]
-pub struct AppConfig {
-    pub peer_ip: String,
-    pub control_port: u16,
-    pub heartbeat_interval_ms: u64,
-}
+/// Known candidate IP endpoints for peer connection attempts.
+#[cfg(target_os = "macos")]
+pub const CANDIDATE_PEER_IPS: &[&str] = &[
+    "10.99.99.1",      // Direct USB-C NCM (Windows)
+    "192.168.2.2",     // Mac Internet Sharing to PC
+    "192.168.137.1",   // Windows PC Wi-Fi Hotspot Gateway
+];
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        #[cfg(target_os = "macos")]
-        let peer_ip = DEFAULT_WIN_IP.to_string();
+#[cfg(target_os = "windows")]
+pub const CANDIDATE_PEER_IPS: &[&str] = &[
+    "10.99.99.2",      // Direct USB-C NCM (Mac)
+    "192.168.2.1",     // Mac Internet Sharing Gateway
+    "192.168.137.2",   // Common Mac IP on Windows Hotspot
+    "192.168.137.3",
+    "192.168.137.4",
+];
 
-        #[cfg(target_os = "windows")]
-        let peer_ip = DEFAULT_MAC_IP.to_string();
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let peer_ip = "127.0.0.1".to_string();
-
-        Self {
-            peer_ip,
-            control_port: CONTROL_PORT,
-            heartbeat_interval_ms: 1000,
-        }
-    }
-}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const CANDIDATE_PEER_IPS: &[&str] = &["127.0.0.1"];
