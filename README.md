@@ -211,6 +211,10 @@ The unified app is designed around **two primary, mutually exclusive operating s
   * Whichever physical keyboard you type on, the inputs strictly adapt to the operating system where the cursor currently resides:
     * When your cursor crosses the border onto the **Mac**, the active modifier context switches to macOS (`Command ⌘` shortcuts, Mac-specific accents).
     * When your cursor crosses back onto **Windows**, the active modifier context immediately switches to native Windows (`Ctrl` / `Alt` / `Win` shortcuts).
+* **Apple Glass Trackpad &rarr; Windows Precision Touchpad Gestures:**
+  * When controlling Windows from the Mac, raw multi-touch contact points are streamed to a virtual **Windows Precision Touchpad** driver (`vmulti`).
+  * Enables native Windows 11 multi-finger gestures on the Mac trackpad: **3-finger swipe up** for Task View, **3-finger swipe left/right** for Virtual Desktops, and 165Hz smooth inertia scrolling and pinch-to-zoom.
+* **Bi-Directional Input Agnostic:** Seamlessly accepts input whether the user is typing on the MacBook keyboard/trackpad or their Windows gaming mouse and mechanical keyboard.
 * **Edge Detection & Guard Logic:**
   * **Dead Corners:** User-configurable edge margins to prevent accidental switching when clicking the Apple menu, taskbars, or window close buttons (`X`).
   * **Switch Delay & Double-Tap:** Optional threshold buffers (e.g., 50–100ms) requiring an intentional push against the border to initiate the hop.
@@ -224,9 +228,20 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
 * **📋 Universal Clipboard:**
   * Bidirectional clipboard synchronization for plain text, rich text (HTML/RTF), and image bitmaps (PNG/JPEG).
   * Hash-based deduplication (SHA-256) to prevent infinite ping-pong echo loops between devices.
+* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens"):**
+  * Click and drag any file from macOS Finder past the screen boundary onto the Windows desktop (or vice versa).
+  * A semi-transparent ghost thumbnail follows the cursor across operating systems, and releasing the mouse button streams the file buffer over the USB-C link directly into the target folder in milliseconds.
 * **📁 Auto-Mounted Shared Folders:**
   * Designated user folders automatically mount into `/Volumes/PC` on macOS and a mapped drive (e.g., `M:`) on Windows upon link connection.
   * Clean, automated unmounting when the USB-C cable is unplugged—zero hanging Finder or Explorer windows.
+* **🔑 Touch ID as a Windows Security Key & Passkey Authenticator (Virtual FIDO2 / WebAuthn):**
+  * Turns your Mac into a biometric hardware security key (like a YubiKey) for Windows 11.
+  * When Windows prompts for a Passkey or hardware security key (Google, Microsoft, GitHub login), your Mac triggers Touch ID. The Mac's Secure Enclave signs the challenge and authenticates Windows over the encrypted link.
+  * Optionally unlocks the Windows 11 lock screen via Touch ID through a custom Windows Credential Provider.
+* **🎨 True Tone & Chromatic Adaptation Sync (Bradford CAT):**
+  * Reads ambient room lighting (CCT in Kelvin) from the Mac’s bezel ambient sensor.
+  * Applies a **Bradford Chromatic Adaptation Transform (CAT)** with perceptual gamma compensation for matte vs. glossy panel differences.
+  * Injects the resulting curves directly into the Windows GPU hardware Look-Up Table (`SetDeviceGammaRamp`) in `<0.1 ms`, ensuring both screens smoothly transition to the exact same paper-white warmth as ambient room lighting changes.
 * **🎥 Universal Camera & Virtual Microphone:**
   * Stream the MacBook’s FaceTime HD camera and studio mic into Windows as a native DirectShow / Media Foundation webcam.
   * Stream Windows camera or studio audio hardware into macOS via modern `CMIOExtension` virtual camera plugins.
