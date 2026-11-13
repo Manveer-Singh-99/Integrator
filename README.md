@@ -129,13 +129,17 @@ You can now use `10.99.99.1` (Windows) and `10.99.99.2` (Mac) for **Moonlight/Su
 
 ---
 
-## macOS Internet Sharing Support (`192.168.2.x`)
+## Bidirectional Internet Sharing (Mac &harr; Windows)
 
-The bridge supports dual-homed operation with both **direct link-local (`10.99.99.x`)** and **macOS GUI Internet Sharing (`192.168.2.x`)** running simultaneously on the same physical USB-C cable:
+The bridge supports dual-homed operation with **direct link-local (`10.99.99.x`)** running simultaneously alongside native internet sharing in **either direction** over the exact same physical USB-C cable:
 
-* **Share Mac's Internet to Windows:** In macOS **System Settings > General > Sharing > Internet Sharing**, choose *Share your connection from: Wi-Fi* to *computers using: Ethernet Adapter (en3)* (or `en5`).
-* **Zero Configuration on Windows:** `AppleUsbNcmBridge` responds to ARP requests for both `10.99.99.1` and `192.168.2.2`, assigns default gateway `192.168.2.1` and DNS `192.168.2.1` / `1.1.1.1`.
-* **Zero Disruption:** Moonlight, SSH, and SMB continue working seamlessly across either subnet.
+* **Share Mac's Internet to Windows (`192.168.2.x`):** 
+  * In macOS **System Settings > General > Sharing > Internet Sharing**, choose *Share your connection from: Wi-Fi* to *computers using: Ethernet Adapter (en3)* (or `en5`).
+  * `AppleUsbNcmBridge` responds to ARP requests for both `10.99.99.1` and `192.168.2.2`, assigns default gateway `192.168.2.1` and DNS `192.168.2.1` / `1.1.1.1` to Windows automatically.
+* **Share Windows' Internet to Mac (`192.168.137.x`):** 
+  * In Windows **Network Connections (`ncpa.cpl`)**, right-click your active connection (e.g. high-speed physical Ethernet or 5G SIM card) &rarr; **Properties > Sharing > "Allow other network users to connect"** and select **Apple USB-C NCM**.
+  * Windows ICS automatically binds gateway `192.168.137.1` and runs DHCP/NAT. The Mac receives high-speed wired internet directly over the USB-C charging cable without requiring a bulky USB-C Ethernet dongle!
+* **Zero Disruption:** Moonlight, SSH, and SMB continue working seamlessly across either subnet regardless of which machine is sharing internet.
 
 ---
 
@@ -255,6 +259,11 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * Instant mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi.
   * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
   * End-to-end encrypted control channel (TLS 1.3 / Noise Protocol) with a one-time 6-digit PIN pairing handshake.
+* **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing:**
+  * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
+    * **Aggregated Download Bandwidth**: Splits multi-connection downloads (Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput).
+    * **Zero-Downtime Stream & Call Failover**: Transparently reroutes active packets if one connection drops or hiccups during live streaming or critical video calls without disconnecting.
+    * **Traffic Isolation & Ping Protection**: Routes latency-sensitive gaming packets (UDP) exclusively through the stable wired connection while offloading heavy background downloads and 4K video to the secondary link, guaranteeing zero in-game ping spikes.
 
 ---
 
