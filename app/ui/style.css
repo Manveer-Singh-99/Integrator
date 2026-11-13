@@ -519,3 +519,141 @@ body {
   border-color: var(--accent-blue);
   box-shadow: 0 0 8px rgba(59, 130, 246, 0.3);
 }
+
+/* Speed Benchmark Components */
+.btn-quick-speedtest {
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 600;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.35), rgba(37, 99, 235, 0.55));
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  color: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-left: 6px;
+  outline: none;
+}
+
+.btn-quick-speedtest:hover {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.65), rgba(37, 99, 235, 0.85));
+  border-color: #60a5fa;
+  transform: translateY(-0.5px);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.4);
+}
+
+.btn-quick-speedtest:active {
+  transform: translateY(0.5px);
+}
+
+.btn-quick-speedtest:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.speedtest-box {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.speedtest-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.speedtest-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.speedtest-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.speedtest-subtitle {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.btn-benchmark {
+  width: auto;
+  padding: 5px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--accent-blue), #1d4ed8);
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+  cursor: pointer;
+  border: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.15s ease;
+}
+
+.btn-benchmark:hover {
+  background: linear-gradient(135deg, #60a5fa, var(--accent-blue));
+  transform: translateY(-1px);
+}
+
+.btn-benchmark:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.speedtest-results {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.speedtest-cell {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.speedtest-cell-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.speedtest-cell-value {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: ui-monospace, Menlo, Monaco, "Courier New", monospace;
+}
+
+.speedtest-cell-value.highlight {
+  color: #34d399;
+}
+
+@keyframes benchmark-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.45; }
+  100% { opacity: 1; }
+}
+
+.testing-pulse {
+  animation: benchmark-pulse 1.2s infinite ease-in-out;
+}

@@ -21,6 +21,7 @@
         <span class="dot"></span>
         <span id="connection-text">10.99.99.1</span>
         <span class="speed-pill" id="connection-speed">⚡ 10 Gbps</span>
+        <button id="btn-quick-speedtest" class="btn-quick-speedtest" title="Benchmark live link throughput">⚡ Test Speed</button>
       </div>
     </header>
 
@@ -160,6 +161,38 @@
               <span class="route-ip">192.168.2.1 ⇄ 192.168.2.2</span>
             </div>
             <span class="route-ping">Standby</span>
+          </div>
+        </div>
+
+        <!-- Live Bandwidth Benchmark -->
+        <div class="speedtest-box">
+          <div class="speedtest-header">
+            <div class="speedtest-title-group">
+              <span class="speedtest-title">⚡ Live Wire Throughput</span>
+              <span class="speedtest-subtitle" id="speedtest-subtitle">128 KB zero-copy streaming benchmark</span>
+            </div>
+            <button id="btn-run-speedtest" class="btn btn-benchmark">
+              <span id="speedtest-btn-icon">⚡</span>
+              <span id="speedtest-btn-label">Test Speed</span>
+            </button>
+          </div>
+          <div class="speedtest-results">
+            <div class="speedtest-cell">
+              <span class="speedtest-cell-label">Max Speed</span>
+              <span class="speedtest-cell-value" id="metric-max-speed">--</span>
+            </div>
+            <div class="speedtest-cell">
+              <span class="speedtest-cell-label">Upload</span>
+              <span class="speedtest-cell-value" id="metric-upload-speed">--</span>
+            </div>
+            <div class="speedtest-cell">
+              <span class="speedtest-cell-label">Download</span>
+              <span class="speedtest-cell-value" id="metric-download-speed">--</span>
+            </div>
+            <div class="speedtest-cell">
+              <span class="speedtest-cell-label">RTT Latency</span>
+              <span class="speedtest-cell-value" id="metric-latency">--</span>
+            </div>
           </div>
         </div>
       </section>

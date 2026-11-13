@@ -6,6 +6,7 @@ mod discovery;
 mod clipboard;
 mod display;
 mod telemetry;
+mod benchmark;
 
 use std::sync::Mutex;
 use anyhow::Result;
@@ -91,6 +92,15 @@ async fn set_gpu_preferences(encode_gpu: String, decode_gpu: String) -> Result<S
     crate::display::WinDisplayManager::set_gpu_preferences(&encode_gpu, &decode_gpu)
         .map_err(|e| e.to_string())?;
     Ok(format!("GPU Preferences set: Encode [{}], Decode [{}]", encode_gpu, decode_gpu))
+}
+
+#[tauri::command]
+async fn run_speed_test(state: State<'_, AppState>) -> Result<benchmark::SpeedTestResult, String> {
+    let peer_ip = state.discovery.get_peer_ip().await
+        .ok_or_else(|| "No peer connected to run speed test against".to_string())?;
+
+    benchmark::BenchmarkClient::run_test(&peer_ip).await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -227,6 +237,10 @@ fn main() -> Result<()> {
         display_server.start().await.expect("Failed to start display RPC server");
         tracing::info!("🖥️ Native Extended Desktop Controller active (Zero-SSH, Zero-VBScript sub-millisecond IPC enabled)");
 
+        // High-Speed Link Benchmark Server
+        benchmark::BenchmarkServer::start().await.expect("Failed to start benchmark server");
+        tracing::info!("⚡ Live Speed Benchmark Server active on port 58285");
+
         (discovery, display_ctrl, clipboard)
     });
 
@@ -246,7 +260,8 @@ fn main() -> Result<()> {
             toggle_display,
             open_cache_folder,
             hide_window,
-            set_gpu_preferences
+            set_gpu_preferences,
+            run_speed_test
         ])
         .setup(move |app| {
             // Setup Tray Menu

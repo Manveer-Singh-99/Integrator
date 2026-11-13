@@ -1,6 +1,8 @@
 // Mac-Windows Fusion Bridge UI Logic (Tauri v2)
 
 let isDisplayActive = false;
+let isTestingSpeed = false;
+let lastTestedSpeed = null;
 
 // Fallback invoke helper for Tauri v2
 async function invokeCmd(command, args = {}) {
@@ -41,15 +43,17 @@ async function updateStatus() {
     const connBadge = document.getElementById('connection-badge');
     const connText = document.getElementById('connection-text');
     const connSpeed = document.getElementById('connection-speed');
+    const btnQuickSpeed = document.getElementById('btn-quick-speedtest');
     const usbPing = document.getElementById('usb-ping');
 
     if (status.peer_connected) {
       connBadge.className = 'badge badge-connected';
       connText.innerText = status.peer_ip;
       if (connSpeed) {
-        connSpeed.innerText = `⚡ ${status.link_speed}`;
+        connSpeed.innerText = lastTestedSpeed ? `⚡ ${lastTestedSpeed} (Tested)` : `⚡ ${status.link_speed}`;
         connSpeed.style.display = 'inline-block';
       }
+      if (btnQuickSpeed) btnQuickSpeed.style.display = 'inline-block';
       if (usbPing) usbPing.innerText = status.rtt_ms ? `${status.rtt_ms.toFixed(1)} ms` : '< 1 ms';
     } else {
       connBadge.className = 'badge';
@@ -58,6 +62,7 @@ async function updateStatus() {
       connBadge.style.color = '#f87171';
       connText.innerText = 'Searching for Peer...';
       if (connSpeed) connSpeed.style.display = 'none';
+      if (btnQuickSpeed) btnQuickSpeed.style.display = 'none';
     }
 
     // 2. Display Status & Machine Context
@@ -144,6 +149,79 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnHideWindow = document.getElementById('btn-hide-window');
   const selectEncodeGpu = document.getElementById('select-encode-gpu');
   const selectDecodeGpu = document.getElementById('select-decode-gpu');
+  const btnRunSpeedtest = document.getElementById('btn-run-speedtest');
+  const btnQuickSpeedtest = document.getElementById('btn-quick-speedtest');
+
+  async function executeSpeedTest() {
+    if (isTestingSpeed) return;
+    isTestingSpeed = true;
+
+    const btnLabel = document.getElementById('speedtest-btn-label');
+    const btnIcon = document.getElementById('speedtest-btn-icon');
+    const subtitle = document.getElementById('speedtest-subtitle');
+    const metricMax = document.getElementById('metric-max-speed');
+    const metricUp = document.getElementById('metric-upload-speed');
+    const metricDown = document.getElementById('metric-download-speed');
+    const metricLatency = document.getElementById('metric-latency');
+
+    if (btnRunSpeedtest) btnRunSpeedtest.disabled = true;
+    if (btnQuickSpeedtest) btnQuickSpeedtest.disabled = true;
+    if (btnLabel) btnLabel.innerText = 'Testing...';
+    if (btnIcon) {
+      btnIcon.innerText = '⏳';
+      btnIcon.classList.add('testing-pulse');
+    }
+    if (subtitle) subtitle.innerText = 'Streaming 64 MB zero-copy buffers over TCP port 58285...';
+
+    appendLog('⚡ Starting live link throughput benchmark (zero-copy TCP)...', 'info');
+
+    try {
+      const res = await invokeCmd('run_speed_test');
+      if (res && res.success) {
+        const peakGbps = res.max_gbps.toFixed(2);
+        lastTestedSpeed = `${peakGbps} Gbps`;
+
+        if (metricMax) {
+          metricMax.innerText = `${peakGbps} Gbps`;
+          metricMax.classList.add('highlight');
+        }
+        if (metricUp) {
+          metricUp.innerText = `${res.upload_mb_s.toFixed(0)} MB/s`;
+        }
+        if (metricDown) {
+          metricDown.innerText = `${res.download_mb_s.toFixed(0)} MB/s`;
+        }
+        if (metricLatency) {
+          metricLatency.innerText = `${res.latency_ms.toFixed(2)} ms`;
+        }
+
+        const connSpeed = document.getElementById('connection-speed');
+        if (connSpeed) {
+          connSpeed.innerText = `⚡ ${peakGbps} Gbps (Tested)`;
+        }
+
+        if (subtitle) subtitle.innerText = `Tested: ${res.summary}`;
+        appendLog(`⚡ Benchmark Complete: ${res.summary}`, 'success');
+      } else {
+        appendLog('⚠️ Benchmark did not return success', 'warn');
+      }
+    } catch (err) {
+      appendLog(`❌ Speed test failed: ${err}`, 'error');
+      if (subtitle) subtitle.innerText = `Benchmark error: ${err}`;
+    } finally {
+      isTestingSpeed = false;
+      if (btnRunSpeedtest) btnRunSpeedtest.disabled = false;
+      if (btnQuickSpeedtest) btnQuickSpeedtest.disabled = false;
+      if (btnLabel) btnLabel.innerText = 'Test Speed';
+      if (btnIcon) {
+        btnIcon.innerText = '⚡';
+        btnIcon.classList.remove('testing-pulse');
+      }
+    }
+  }
+
+  if (btnRunSpeedtest) btnRunSpeedtest.addEventListener('click', executeSpeedTest);
+  if (btnQuickSpeedtest) btnQuickSpeedtest.addEventListener('click', executeSpeedTest);
 
   async function handleGpuChange() {
     if (!selectEncodeGpu || !selectDecodeGpu) return;
