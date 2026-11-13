@@ -142,7 +142,30 @@ async fn hide_window(app_handle: AppHandle) -> Result<(), String> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // 1. Check for CLI Subcommands (e.g. `mac_windows_bridge display toggle`)
+    // 1. Check for CLI Subcommands (e.g. `mac_windows_bridge display toggle`, `mac_windows_bridge benchmark`)
+    if args.len() > 1 && args[1] == "benchmark" {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async {
+            let target_ip = args.get(2).map(|s| s.as_str()).unwrap_or("10.99.99.1");
+            println!("⚡ Running live speed benchmark against {}...", target_ip);
+            match benchmark::BenchmarkClient::run_test(target_ip).await {
+                Ok(res) => {
+                    println!("\n✅ Live Speed Test Completed Successfully:");
+                    println!("   • Max Bandwidth: {:.2} Gbps", res.max_gbps);
+                    println!("   • Upload:        {:.2} Gbps ({:.0} MB/s)", res.upload_gbps, res.upload_mb_s);
+                    println!("   • Download:      {:.2} Gbps ({:.0} MB/s)", res.download_gbps, res.download_mb_s);
+                    println!("   • RTT Latency:   {:.2} ms", res.latency_ms);
+                    println!("   • Summary:       {}", res.summary);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("❌ Speed benchmark failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     if args.len() > 1 && args[1] == "display" {
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(async {
