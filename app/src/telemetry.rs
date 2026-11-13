@@ -29,3 +29,56 @@ impl Default for GpuTelemetry {
         }
     }
 }
+
+/// Queries live NVIDIA GPU telemetry via nvidia-smi.
+pub fn query_gpu_telemetry() -> Option<GpuTelemetry> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("nvidia-smi")
+            .args(&[
+                "--query-gpu=name,temperature.gpu,power.draw,clocks.current.graphics,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits"
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<&str> = text.trim().split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 7 {
+            let gpu_name = parts[0].to_string();
+            let temperature_c = parts[1].parse::<f32>().unwrap_or(0.0) as u32;
+            let power_usage_watts = parts[2].parse::<f32>().unwrap_or(0.0);
+            let core_clock_mhz = parts[3].parse::<u32>().unwrap_or(0);
+            let memory_used_mb = parts[4].parse::<u64>().unwrap_or(0);
+            let memory_total_mb = parts[5].parse::<u64>().unwrap_or(8151);
+            let gpu_utilization_percent = parts[6].parse::<u32>().unwrap_or(0);
+            let memory_utilization_percent = if memory_total_mb > 0 {
+                ((memory_used_mb as f64 / memory_total_mb as f64) * 100.0) as u32
+            } else {
+                0
+            };
+
+            Some(GpuTelemetry {
+                gpu_name,
+                temperature_c,
+                power_usage_watts,
+                gpu_utilization_percent,
+                memory_utilization_percent,
+                memory_used_mb,
+                memory_total_mb,
+                core_clock_mhz,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}

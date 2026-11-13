@@ -25,6 +25,8 @@ pub enum DisplayRpcRequest {
     StopAll,
     /// Query current display extension status
     GetStatus,
+    /// Query live GPU telemetry (temps, watts, clocks, utilization)
+    GetGpuTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,4 +35,5 @@ pub struct DisplayRpcResponse {
     pub message: String,
     pub is_active: bool,
     pub active_mode: Option<String>,
+    pub gpu_telemetry: Option<crate::telemetry::GpuTelemetry>,
 }

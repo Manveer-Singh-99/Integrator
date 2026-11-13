@@ -104,6 +104,59 @@ async fn run_speed_test(state: State<'_, AppState>) -> Result<benchmark::SpeedTe
 }
 
 #[tauri::command]
+async fn get_gpu_telemetry(state: State<'_, AppState>) -> Result<crate::telemetry::GpuTelemetry, String> {
+    if cfg!(target_os = "windows") {
+        crate::telemetry::query_gpu_telemetry()
+            .ok_or_else(|| "NVIDIA GPU telemetry not available on local Windows host".to_string())
+    } else {
+        let peer_ip = state.discovery.get_peer_ip().await
+            .unwrap_or_else(|| "10.99.99.1".to_string());
+        let resp = DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetGpuTelemetry).await
+            .map_err(|e| format!("Failed to reach peer for GPU telemetry: {}", e))?;
+        resp.gpu_telemetry
+            .ok_or_else(|| "Peer did not return GPU telemetry (is peer a Windows machine with NVIDIA GPU?)".to_string())
+    }
+}
+
+#[tauri::command]
+async fn toggle_touchbar_hud() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Check if touchbar_hud process is running
+        let is_running = std::process::Command::new("pgrep")
+            .arg("touchbar_hud")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if is_running {
+            let _ = std::process::Command::new("pkill").arg("touchbar_hud").spawn();
+            Ok("Touch Bar NVIDIA HUD dismissed".to_string())
+        } else {
+            let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
+            let bin_path = if helper_path.exists() {
+                helper_path
+            } else {
+                std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
+            };
+
+            if !bin_path.exists() {
+                return Err("touchbar_hud helper binary not found. Please compile it first.".into());
+            }
+
+            let _ = std::process::Command::new(bin_path).spawn()
+                .map_err(|e| format!("Failed to spawn touchbar_hud: {}", e))?;
+            Ok("Touch Bar NVIDIA Performance HUD active on physical OLED strip".to_string())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Touch Bar is only available on macOS hardware with a physical Touch Bar".to_string())
+    }
+}
+
+#[tauri::command]
 async fn toggle_display(state: State<'_, AppState>) -> Result<String, String> {
     if cfg!(target_os = "macos") {
         state.display_ctrl.toggle_mac_to_pc().await.map_err(|e| e.to_string())
@@ -164,6 +217,55 @@ fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    if args.len() > 1 && args[1] == "telemetry" {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async {
+            let target_ip = args.get(2).map(|s| s.as_str()).unwrap_or("10.99.99.1");
+            println!("Querying NVIDIA GPU telemetry from {}...", target_ip);
+            match DisplayController::send_remote_rpc(target_ip, &DisplayRpcRequest::GetGpuTelemetry).await {
+                Ok(resp) => {
+                    if let Some(t) = resp.gpu_telemetry {
+                        println!("\n🎮 NVIDIA GPU Telemetry:");
+                        println!("   • GPU:         {}", t.gpu_name);
+                        println!("   • Temperature: {}°C", t.temperature_c);
+                        println!("   • Power:       {:.1} W", t.power_usage_watts);
+                        println!("   • Core Clock:  {} MHz", t.core_clock_mhz);
+                        println!("   • VRAM:        {} / {} MB ({}%)", t.memory_used_mb, t.memory_total_mb, t.memory_utilization_percent);
+                        println!("   • Utilization: {}%", t.gpu_utilization_percent);
+                    } else {
+                        println!("No GPU telemetry returned: {}", resp.message);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to query telemetry: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
+    if args.len() > 1 && args[1] == "touchbar" {
+        #[cfg(target_os = "macos")]
+        {
+            let helper_path = std::path::PathBuf::from("/Applications/MacWindowsBridge.app/Contents/MacOS/touchbar_hud");
+            let bin_path = if helper_path.exists() {
+                helper_path
+            } else {
+                std::path::PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app/touchbar_hud")
+            };
+            println!("Launching Touch Bar HUD ({:?})...", bin_path);
+            let mut child = std::process::Command::new(bin_path).spawn()?;
+            let _ = child.wait();
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("Touch Bar is only available on macOS");
+            return Ok(());
+        }
     }
 
     if args.len() > 1 && args[1] == "display" {
@@ -284,7 +386,9 @@ fn main() -> Result<()> {
             open_cache_folder,
             hide_window,
             set_gpu_preferences,
-            run_speed_test
+            run_speed_test,
+            get_gpu_telemetry,
+            toggle_touchbar_hud
         ])
         .setup(move |app| {
             // Setup Tray Menu

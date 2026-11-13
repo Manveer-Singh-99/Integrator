@@ -212,12 +212,14 @@ impl DisplayController {
                             message: format!("Started Moonlight client on Windows for host {}", host_ip),
                             is_active: true,
                             active_mode: Some("Client".into()),
+                            gpu_telemetry: None,
                         },
                         Err(e) => DisplayRpcResponse {
                             success: false,
                             message: format!("Failed to start Moonlight on Windows: {}", e),
                             is_active: false,
                             active_mode: None,
+                            gpu_telemetry: None,
                         },
                     }
                 } else {
@@ -227,12 +229,14 @@ impl DisplayController {
                             message: format!("Started Moonlight client on Mac for host {}", host_ip),
                             is_active: true,
                             active_mode: Some("Client".into()),
+                            gpu_telemetry: None,
                         },
                         Err(e) => DisplayRpcResponse {
                             success: false,
                             message: format!("Failed to start Moonlight on Mac: {}", e),
                             is_active: false,
                             active_mode: None,
+                            gpu_telemetry: None,
                         },
                     }
                 }
@@ -249,6 +253,7 @@ impl DisplayController {
                     message: "Stopped Moonlight client".into(),
                     is_active: false,
                     active_mode: None,
+                    gpu_telemetry: None,
                 }
             }
             DisplayRpcRequest::ToggleMacToPc => {
@@ -258,12 +263,14 @@ impl DisplayController {
                         message: msg,
                         is_active: *self.is_active.read().await,
                         active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
                     },
                     Err(e) => DisplayRpcResponse {
                         success: false,
                         message: format!("Error toggling Mac-to-PC: {}", e),
                         is_active: false,
                         active_mode: None,
+                        gpu_telemetry: None,
                     },
                 }
             }
@@ -274,12 +281,14 @@ impl DisplayController {
                         message: msg,
                         is_active: *self.is_active.read().await,
                         active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
                     },
                     Err(e) => DisplayRpcResponse {
                         success: false,
                         message: format!("Error toggling PC-to-Mac: {}", e),
                         is_active: false,
                         active_mode: None,
+                        gpu_telemetry: None,
                     },
                 }
             }
@@ -291,6 +300,7 @@ impl DisplayController {
                     message: "All display extensions stopped".into(),
                     is_active: false,
                     active_mode: None,
+                    gpu_telemetry: None,
                 }
             }
             DisplayRpcRequest::GetStatus => {
@@ -301,6 +311,19 @@ impl DisplayController {
                     message: format!("Status: active={}, mode={:?}", active, mode),
                     is_active: active,
                     active_mode: mode,
+                    gpu_telemetry: None,
+                }
+            }
+            DisplayRpcRequest::GetGpuTelemetry => {
+                let telemetry = crate::telemetry::query_gpu_telemetry();
+                let success = telemetry.is_some();
+                let msg = if success { "GPU telemetry retrieved".into() } else { "GPU telemetry unavailable".into() };
+                DisplayRpcResponse {
+                    success,
+                    message: msg,
+                    is_active: *self.is_active.read().await,
+                    active_mode: self.active_mode.read().await.clone(),
+                    gpu_telemetry: telemetry,
                 }
             }
         }
