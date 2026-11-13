@@ -232,6 +232,8 @@ impl DisplayController {
                                 is_active: true,
                                 active_mode: Some("Client".into()),
                                 gpu_telemetry: None,
+                                ambient_light: None,
+                                storage_status: None,
                             }
                         }
                         Err(e) => DisplayRpcResponse {
@@ -240,6 +242,8 @@ impl DisplayController {
                             is_active: false,
                             active_mode: None,
                             gpu_telemetry: None,
+                            ambient_light: None,
+                            storage_status: None,
                         },
                     }
                 } else {
@@ -263,6 +267,8 @@ impl DisplayController {
                                 is_active: true,
                                 active_mode: Some("Client".into()),
                                 gpu_telemetry: None,
+                                ambient_light: None,
+                                storage_status: None,
                             }
                         }
                         Err(e) => DisplayRpcResponse {
@@ -271,6 +277,8 @@ impl DisplayController {
                             is_active: false,
                             active_mode: None,
                             gpu_telemetry: None,
+                            ambient_light: None,
+                            storage_status: None,
                         },
                     }
                 }
@@ -292,6 +300,8 @@ impl DisplayController {
                     is_active: false,
                     active_mode: None,
                     gpu_telemetry: None,
+                    ambient_light: None,
+                    storage_status: None,
                 }
             }
             DisplayRpcRequest::ToggleMacToPc => {
@@ -302,6 +312,8 @@ impl DisplayController {
                         is_active: *self.is_active.read().await,
                         active_mode: self.active_mode.read().await.clone(),
                         gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
                     },
                     Err(e) => DisplayRpcResponse {
                         success: false,
@@ -309,6 +321,8 @@ impl DisplayController {
                         is_active: false,
                         active_mode: None,
                         gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
                     },
                 }
             }
@@ -320,6 +334,8 @@ impl DisplayController {
                         is_active: *self.is_active.read().await,
                         active_mode: self.active_mode.read().await.clone(),
                         gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
                     },
                     Err(e) => DisplayRpcResponse {
                         success: false,
@@ -327,6 +343,8 @@ impl DisplayController {
                         is_active: false,
                         active_mode: None,
                         gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
                     },
                 }
             }
@@ -339,6 +357,8 @@ impl DisplayController {
                     is_active: false,
                     active_mode: None,
                     gpu_telemetry: None,
+                    ambient_light: None,
+                    storage_status: None,
                 }
             }
             DisplayRpcRequest::GetStatus => {
@@ -350,6 +370,8 @@ impl DisplayController {
                     is_active: active,
                     active_mode: mode,
                     gpu_telemetry: None,
+                    ambient_light: None,
+                    storage_status: None,
                 }
             }
             DisplayRpcRequest::GetGpuTelemetry => {
@@ -362,6 +384,8 @@ impl DisplayController {
                     is_active: *self.is_active.read().await,
                     active_mode: self.active_mode.read().await.clone(),
                     gpu_telemetry: telemetry,
+                    ambient_light: None,
+                    storage_status: None,
                 }
             }
             DisplayRpcRequest::PasteRemote => {
@@ -373,6 +397,8 @@ impl DisplayController {
                             is_active: *self.is_active.read().await,
                             active_mode: self.active_mode.read().await.clone(),
                             gpu_telemetry: None,
+                            ambient_light: None,
+                            storage_status: None,
                         },
                         Err(e) => DisplayRpcResponse {
                             success: false,
@@ -380,6 +406,8 @@ impl DisplayController {
                             is_active: *self.is_active.read().await,
                             active_mode: self.active_mode.read().await.clone(),
                             gpu_telemetry: None,
+                            ambient_light: None,
+                            storage_status: None,
                         },
                     }
                 } else {
@@ -389,6 +417,8 @@ impl DisplayController {
                         is_active: false,
                         active_mode: None,
                         gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
                     }
                 }
             }
@@ -407,6 +437,79 @@ impl DisplayController {
                     is_active: *self.is_active.read().await,
                     active_mode: self.active_mode.read().await.clone(),
                     gpu_telemetry: None,
+                    ambient_light: None,
+                    storage_status: None,
+                }
+            }
+            DisplayRpcRequest::SyncTrueTone { lux, cct, gamma_comp } => {
+                let res = crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp);
+                let success = res.is_ok();
+                let message = match res {
+                    Ok(_) => format!("Applied True Tone LUT: CCT={}K, Lux={:.1}, Gamma={:.2}x", cct, lux, gamma_comp),
+                    Err(e) => format!("Failed to apply True Tone LUT: {}", e),
+                };
+                DisplayRpcResponse {
+                    success,
+                    message,
+                    is_active: *self.is_active.read().await,
+                    active_mode: self.active_mode.read().await.clone(),
+                    gpu_telemetry: None,
+                    ambient_light: Some(crate::truetone::AmbientLightData {
+                        lux,
+                        cct_kelvin: cct,
+                        supported: true,
+                        updated_at_secs: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    }),
+                    storage_status: None,
+                }
+            }
+            DisplayRpcRequest::MountStorage => {
+                let peer_ip = self.discovery.get_peer_ip().await
+                    .unwrap_or_else(|| "10.99.99.1".to_string());
+                match crate::storage::StorageManager::mount(&peer_ip) {
+                    Ok(status) => DisplayRpcResponse {
+                        success: status.is_mounted,
+                        message: status.message.clone(),
+                        is_active: *self.is_active.read().await,
+                        active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: Some(status),
+                    },
+                    Err(e) => DisplayRpcResponse {
+                        success: false,
+                        message: format!("Mount request failed: {}", e),
+                        is_active: *self.is_active.read().await,
+                        active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
+                    },
+                }
+            }
+            DisplayRpcRequest::UnmountStorage => {
+                match crate::storage::StorageManager::unmount() {
+                    Ok(status) => DisplayRpcResponse {
+                        success: true,
+                        message: status.message.clone(),
+                        is_active: *self.is_active.read().await,
+                        active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: Some(status),
+                    },
+                    Err(e) => DisplayRpcResponse {
+                        success: false,
+                        message: format!("Unmount request failed: {}", e),
+                        is_active: *self.is_active.read().await,
+                        active_mode: self.active_mode.read().await.clone(),
+                        gpu_telemetry: None,
+                        ambient_light: None,
+                        storage_status: None,
+                    },
                 }
             }
         }

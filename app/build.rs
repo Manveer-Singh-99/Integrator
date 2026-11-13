@@ -11,6 +11,7 @@ fn main() {
                 "-emit-library",
                 "-static",
                 "src/touchbar_hud.swift",
+                "src/ambient_light.swift",
                 "-o",
                 &lib_path,
             ])
@@ -18,12 +19,13 @@ fn main() {
             .expect("Failed to execute swiftc to build touchbar static library");
 
         if !status.success() {
-            panic!("swiftc failed to compile touchbar_hud.swift into static library");
+            panic!("swiftc failed to compile swift sources into static library");
         }
 
         println!("cargo:rustc-link-search=native={}", out_dir);
         println!("cargo:rustc-link-lib=static=touchbar");
         println!("cargo:rerun-if-changed=src/touchbar_hud.swift");
+        println!("cargo:rerun-if-changed=src/ambient_light.swift");
     }
 
     tauri_build::build();

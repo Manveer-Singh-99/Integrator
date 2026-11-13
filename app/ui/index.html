@@ -28,7 +28,7 @@
     <!-- Category & Status Filter Tabs -->
     <nav class="filter-tabs">
       <button class="filter-tab active" data-filter="all">All Features <span class="tab-count">13</span></button>
-      <button class="filter-tab" data-filter="active">🟢 Active <span class="tab-count">4</span></button>
+      <button class="filter-tab" data-filter="active">🟢 Active <span class="tab-count">6</span></button>
       <button class="filter-tab" data-filter="workspace">🖱️ Workspace & KVM <span class="tab-count">5</span></button>
       <button class="filter-tab" data-filter="media">🎥 Audio & Video <span class="tab-count">2</span></button>
       <button class="filter-tab" data-filter="security">🔑 Security & Display <span class="tab-count">2</span></button>
@@ -250,8 +250,8 @@
         </div>
       </section>
 
-      <!-- 5. Auto-Mounted Shared Storage Card (Roadmap) -->
-      <section class="card storage-card" data-category="workspace" data-status="roadmap">
+      <!-- 5. Auto-Mounted Shared Storage Card (Active) -->
+      <section class="card storage-card" data-category="workspace" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">📂</span>
@@ -260,7 +260,7 @@
               <p class="card-desc">Zero-config network volume mounting over direct USB-C link</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <span id="storage-status-pill" class="pill pill-idle">Volume Ready</span>
         </div>
 
         <div class="mount-routes-grid">
@@ -292,9 +292,13 @@
         </div>
 
         <div class="card-actions">
-          <button class="btn btn-secondary btn-mock" data-action="test-mount">
+          <button id="btn-mount-storage" class="btn btn-primary">
             <span class="btn-icon">🔌</span>
-            <span>Mount Shared Network Volumes Now</span>
+            <span>Mount Shared Network Volumes</span>
+          </button>
+          <button id="btn-unmount-storage" class="btn btn-secondary">
+            <span class="btn-icon">⏏️</span>
+            <span>Unmount</span>
           </button>
         </div>
       </section>
@@ -343,8 +347,8 @@
         </div>
       </section>
 
-      <!-- 7. True Tone & Chromatic Adaptation Sync Card (Roadmap) -->
-      <section class="card truetone-card" data-category="security" data-status="roadmap">
+      <!-- 7. True Tone & Chromatic Adaptation Sync Card (Active) -->
+      <section class="card truetone-card" data-category="security" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">🎨</span>
@@ -353,17 +357,17 @@
               <p class="card-desc">Match screen white points via Mac ambient light sensor & Bradford CAT</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <span id="truetone-status-pill" class="pill pill-active">ALS Active</span>
         </div>
 
         <div class="cct-meter-box">
           <div class="cct-gauge">
             <span class="cct-icon">☀️</span>
-            <span class="cct-value" id="val-ambient-cct">5400 K</span>
-            <span class="cct-label">Ambient CCT (Daylight)</span>
+            <span class="cct-value" id="val-ambient-cct">-- K</span>
+            <span class="cct-label">Ambient CCT (Retina Calibrated)</span>
           </div>
           <div class="cct-details">
-            <div class="cct-row"><span>Ambient Illuminance:</span> <strong>340 Lux</strong></div>
+            <div class="cct-row"><span>Ambient Illuminance:</span> <strong id="val-ambient-lux">-- Lux</strong></div>
             <div class="cct-row"><span>Transform Matrix:</span> <strong>Bradford CAT (3×3)</strong></div>
             <div class="cct-row"><span>GPU Hardware LUT:</span> <strong>SetDeviceGammaRamp (&lt;0.1 ms)</strong></div>
           </div>
@@ -385,7 +389,7 @@
         </div>
 
         <div class="card-actions">
-          <button class="btn btn-secondary btn-mock" data-action="test-truetone">
+          <button id="btn-calibrate-truetone" class="btn btn-primary">
             <span class="btn-icon">🎨</span>
             <span>Calibrate & Inject Gamma LUT Ramp</span>
           </button>
@@ -450,8 +454,8 @@
         </div>
       </section>
 
-      <!-- 9. Dynamic Audio Routing Card (Roadmap) -->
-      <section class="card audio-card" data-category="media" data-status="roadmap">
+      <!-- 9. Dynamic Audio Routing Card (Active) -->
+      <section class="card audio-card" data-category="media" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">🔊</span>
@@ -460,7 +464,7 @@
               <p class="card-desc">High-fidelity 24-bit Spatial Audio soundbar sink & headset routing</p>
             </div>
           </div>
-          <span class="pill pill-roadmap">Roadmap Preview</span>
+          <span id="audio-status-pill" class="pill pill-active">Spatial Sink Active</span>
         </div>
 
         <div class="audio-topology-grid">
@@ -497,7 +501,7 @@
         </div>
 
         <div class="card-actions">
-          <button class="btn btn-secondary btn-mock" data-action="test-audio">
+          <button id="btn-test-chime" class="btn btn-primary">
             <span class="btn-icon">🎵</span>
             <span>Play Spatial Audio Test Chime</span>
           </button>

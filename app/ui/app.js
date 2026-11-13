@@ -160,6 +160,28 @@ async function updateStatus() {
         }
       }
     }
+
+    // 4. True Tone & Ambient Light Sensor
+    const valAmbientCct = document.getElementById('val-ambient-cct');
+    const valAmbientLux = document.getElementById('val-ambient-lux');
+    if (status.ambient_cct && valAmbientCct) {
+      valAmbientCct.innerText = `${status.ambient_cct} K`;
+    }
+    if (status.ambient_lux && valAmbientLux) {
+      valAmbientLux.innerText = `${Math.round(status.ambient_lux)} Lux`;
+    }
+
+    // 5. Shared Storage Status
+    const storageStatusPill = document.getElementById('storage-status-pill');
+    if (storageStatusPill) {
+      if (status.storage_mounted) {
+        storageStatusPill.className = 'pill pill-active';
+        storageStatusPill.innerText = 'Mounted Active';
+      } else {
+        storageStatusPill.className = 'pill pill-idle';
+        storageStatusPill.innerText = 'Volume Ready';
+      }
+    }
   } catch (e) {
     // ignore polling error
   }
@@ -383,7 +405,87 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // 5. Mock Action Buttons for Roadmap Preview
+  // 5. Active Feature Event Handlers
+  const btnMountStorage = document.getElementById('btn-mount-storage');
+  const btnUnmountStorage = document.getElementById('btn-unmount-storage');
+  const btnCalibrateTruetone = document.getElementById('btn-calibrate-truetone');
+  const btnTestChime = document.getElementById('btn-test-chime');
+
+  if (btnMountStorage) {
+    btnMountStorage.addEventListener('click', async () => {
+      try {
+        appendLog('📂 Mounting shared network volume over USB-C...', 'info');
+        btnMountStorage.disabled = true;
+        const res = await invokeCmd('mount_shared_storage');
+        if (res && res.is_mounted) {
+          appendLog(`📂 ${res.message}`, 'success');
+        } else if (res) {
+          appendLog(`ℹ️ ${res.message}`, 'info');
+        }
+        await updateStatus();
+      } catch (e) {
+        appendLog(`❌ Storage mount error: ${e}`, 'error');
+      } finally {
+        btnMountStorage.disabled = false;
+      }
+    });
+  }
+
+  if (btnUnmountStorage) {
+    btnUnmountStorage.addEventListener('click', async () => {
+      try {
+        appendLog('⏏️ Unmounting shared network storage...', 'info');
+        btnUnmountStorage.disabled = true;
+        const res = await invokeCmd('unmount_shared_storage');
+        if (res) appendLog(`⏏️ ${res.message}`, 'info');
+        await updateStatus();
+      } catch (e) {
+        appendLog(`❌ Storage unmount error: ${e}`, 'error');
+      } finally {
+        btnUnmountStorage.disabled = false;
+      }
+    });
+  }
+
+  if (btnCalibrateTruetone) {
+    btnCalibrateTruetone.addEventListener('click', async () => {
+      try {
+        appendLog('🎨 Reading Ambient Light Sensor and computing Bradford CAT matrix...', 'info');
+        btnCalibrateTruetone.disabled = true;
+        const als = await invokeCmd('get_ambient_light');
+        const cct = als ? als.cct_kelvin : 5500;
+        const gammaComp = sliderGammaComp ? (sliderGammaComp.value / 100) : 1.05;
+        
+        const res = await invokeCmd('apply_truetone_calibration', {
+          cct: cct,
+          compFactor: gammaComp
+        });
+        appendLog(`🎨 ${res}`, 'success');
+        await updateStatus();
+      } catch (e) {
+        appendLog(`❌ True Tone calibration error: ${e}`, 'error');
+      } finally {
+        btnCalibrateTruetone.disabled = false;
+      }
+    });
+  }
+
+  if (btnTestChime) {
+    btnTestChime.addEventListener('click', async () => {
+      try {
+        appendLog('🎵 Synthesizing 24-bit 48kHz Spatial Audio room chime...', 'info');
+        btnTestChime.disabled = true;
+        const res = await invokeCmd('play_spatial_chime');
+        appendLog(`🔊 ${res}`, 'success');
+      } catch (e) {
+        appendLog(`❌ Audio playback error: ${e}`, 'error');
+      } finally {
+        btnTestChime.disabled = false;
+      }
+    });
+  }
+
+  // 6. Mock Action Buttons for Roadmap Preview
   document.querySelectorAll('.btn-mock').forEach(btn => {
     btn.addEventListener('click', () => {
       const action = btn.getAttribute('data-action');
@@ -394,20 +496,11 @@ document.addEventListener('DOMContentLoaded', () => {
         case 'test-dragdrop':
           appendLog('🪂 Simulated cross-border drop: 120 MB project folder streamed to ~/Downloads in 18ms', 'success');
           break;
-        case 'test-mount':
-          appendLog('📂 Network Volumes mounted: /Volumes/HP-OMEN on macOS and M:\\ on Windows over 10.99.99.x', 'success');
-          break;
         case 'test-touchid':
           appendLog('🔑 Touch ID prompt dispatched to MacBook Secure Enclave (Nonce signed & validated, 118ms)', 'success');
           break;
-        case 'test-truetone':
-          appendLog('🎨 Ambient CCT 5400K read from Mac bezel sensor; Bradford CAT applied to Windows GPU LUT', 'info');
-          break;
         case 'test-camera':
           appendLog('🎥 Camera pipeline preview: MacBook FaceTime HD 1080p60 bridged to Windows DirectShow', 'info');
-          break;
-        case 'test-audio':
-          appendLog('🎵 Played 24-bit test chime via Mac Spatial Audio soundbar sink (offset 0ms)', 'success');
           break;
         case 'test-touchbar':
           appendLog('📊 Off-screen NVIDIA telemetry rendered to MacBook Touch Bar (NVML: 64°C, 115W, 165 FPS)', 'info');

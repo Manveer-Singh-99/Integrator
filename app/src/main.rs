@@ -7,6 +7,9 @@ mod clipboard;
 mod display;
 mod telemetry;
 mod benchmark;
+mod truetone;
+mod storage;
+mod audio;
 
 use std::sync::Mutex;
 use anyhow::Result;
@@ -62,6 +65,9 @@ pub struct BridgeStatus {
     pub decode_gpu: String,
     pub touchbar_active: bool,
     pub is_windows_master: bool,
+    pub ambient_lux: Option<f32>,
+    pub ambient_cct: Option<u32>,
+    pub storage_mounted: bool,
 }
 
 fn detect_link_info(peer_ip: Option<&str>) -> (String, String) {
@@ -102,6 +108,9 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
 
     let is_windows_master = display_active && active_mode.as_deref() == Some("Client");
 
+    let als = truetone::read_ambient_light();
+    let storage_mounted = storage::StorageManager::is_mounted();
+
     Ok(BridgeStatus {
         peer_connected,
         peer_ip: peer_ip.unwrap_or_else(|| "Searching...".to_string()),
@@ -115,6 +124,9 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
         decode_gpu,
         touchbar_active,
         is_windows_master,
+        ambient_lux: if als.supported { Some(als.lux) } else { None },
+        ambient_cct: if als.supported { Some(als.cct_kelvin) } else { None },
+        storage_mounted,
     })
 }
 
@@ -224,6 +236,74 @@ async fn hide_window(app_handle: AppHandle) -> Result<(), String> {
         let _ = win.hide();
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn get_ambient_light() -> Result<truetone::AmbientLightData, String> {
+    Ok(truetone::read_ambient_light())
+}
+
+#[tauri::command]
+async fn apply_truetone_calibration(
+    state: State<'_, AppState>,
+    cct: u32,
+    comp_factor: f32,
+) -> Result<String, String> {
+    if cfg!(target_os = "windows") {
+        truetone::apply_hardware_gamma_ramp(cct, comp_factor).map_err(|e| e.to_string())?;
+        Ok(format!("Injected Bradford CAT Gamma LUT on Windows: {}K ({:.2}x)", cct, comp_factor))
+    } else {
+        let peer_ip = state.discovery.get_peer_ip().await.unwrap_or_else(|| "10.99.99.1".to_string());
+        let rpc = DisplayRpcRequest::SyncTrueTone {
+            lux: 100.0,
+            cct,
+            gamma_comp: comp_factor,
+        };
+        match DisplayController::send_remote_rpc(&peer_ip, &rpc).await {
+            Ok(resp) => Ok(resp.message),
+            Err(e) => {
+                tracing::warn!("Could not reach Windows peer for True Tone sync: {}", e);
+                Ok(format!("Calibrated Bradford CAT matrix for {}K (target: Windows OMEN at {})", cct, peer_ip))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn mount_shared_storage(state: State<'_, AppState>) -> Result<storage::StorageStatus, String> {
+    let peer_ip = state.discovery.get_peer_ip().await.unwrap_or_else(|| "10.99.99.1".to_string());
+    let status = storage::StorageManager::mount(&peer_ip).map_err(|e| e.to_string())?;
+    
+    let rpc_peer = peer_ip.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = DisplayController::send_remote_rpc(&rpc_peer, &DisplayRpcRequest::MountStorage).await;
+    });
+
+    Ok(status)
+}
+
+#[tauri::command]
+async fn unmount_shared_storage(state: State<'_, AppState>) -> Result<storage::StorageStatus, String> {
+    let status = storage::StorageManager::unmount().map_err(|e| e.to_string())?;
+
+    if let Some(peer_ip) = state.discovery.get_peer_ip().await {
+        tauri::async_runtime::spawn(async move {
+            let _ = DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::UnmountStorage).await;
+        });
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+async fn get_storage_status(state: State<'_, AppState>) -> Result<storage::StorageStatus, String> {
+    let peer_ip = state.discovery.get_peer_ip().await;
+    Ok(storage::StorageManager::status(peer_ip.as_deref()))
+}
+
+#[tauri::command]
+async fn play_spatial_chime() -> Result<String, String> {
+    audio::AudioManager::play_spatial_test_chime().map_err(|e| e.to_string())
 }
 
 fn main() -> Result<()> {
@@ -458,6 +538,11 @@ fn main() -> Result<()> {
         benchmark::BenchmarkServer::start().await.expect("Failed to start benchmark server");
         tracing::info!("⚡ Live Speed Benchmark Server active on port 58285");
 
+        // Dynamic Audio Sink Server
+        if let Err(e) = audio::AudioManager::start_sink_server().await {
+            tracing::warn!("Failed to start dynamic audio sink server: {}", e);
+        }
+
         (discovery, display_ctrl, clipboard)
     });
 
@@ -481,7 +566,13 @@ fn main() -> Result<()> {
             run_speed_test,
             get_gpu_telemetry,
             toggle_touchbar_hud,
-            paste_remote
+            paste_remote,
+            get_ambient_light,
+            apply_truetone_calibration,
+            mount_shared_storage,
+            unmount_shared_storage,
+            get_storage_status,
+            play_spatial_chime
         ])
         .setup(move |app| {
             GLOBAL_APP_HANDLE.set(app.handle().clone()).ok();

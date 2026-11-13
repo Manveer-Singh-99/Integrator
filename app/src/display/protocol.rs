@@ -31,6 +31,16 @@ pub enum DisplayRpcRequest {
     PasteRemote,
     /// Show and focus main application window (Single-Instance IPC)
     ShowWindow,
+    /// Sync ambient light sensor telemetry (Lux, CCT Kelvin, gamma comp)
+    SyncTrueTone {
+        lux: f32,
+        cct: u32,
+        gamma_comp: f32,
+    },
+    /// Request peer to mount network shared storage
+    MountStorage,
+    /// Request peer to unmount network shared storage
+    UnmountStorage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,4 +50,6 @@ pub struct DisplayRpcResponse {
     pub is_active: bool,
     pub active_mode: Option<String>,
     pub gpu_telemetry: Option<crate::telemetry::GpuTelemetry>,
+    pub ambient_light: Option<crate::truetone::AmbientLightData>,
+    pub storage_status: Option<crate::storage::StorageStatus>,
 }
