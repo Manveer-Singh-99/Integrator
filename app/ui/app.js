@@ -284,6 +284,118 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // 1. Filter Tabs Logic
+  const filterTabs = document.querySelectorAll('.filter-tab');
+  const allCards = document.querySelectorAll('.grid .card');
+
+  filterTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      filterTabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+
+      const filter = tab.getAttribute('data-filter');
+      allCards.forEach(card => {
+        const cat = card.getAttribute('data-category') || '';
+        const status = card.getAttribute('data-status') || '';
+
+        if (filter === 'all') {
+          card.style.display = 'flex';
+        } else if (filter === 'active') {
+          card.style.display = status === 'active' ? 'flex' : 'none';
+        } else if (cat.includes(filter)) {
+          card.style.display = 'flex';
+        } else {
+          card.style.display = 'none';
+        }
+      });
+    });
+  });
+
+  // 2. Segmented Controls
+  document.querySelectorAll('.segmented-control').forEach(control => {
+    control.querySelectorAll('.segment').forEach(btn => {
+      btn.addEventListener('click', () => {
+        control.querySelectorAll('.segment').forEach(s => s.classList.remove('active'));
+        btn.classList.add('active');
+        const edge = btn.getAttribute('data-edge');
+        appendLog(`🖱️ Edge boundary set to: ${edge === 'right' ? 'Right (Mac ➔ PC)' : 'Left (PC ➔ Mac)'}`, 'info');
+      });
+    });
+  });
+
+  // 3. Audio Topology Selection
+  document.querySelectorAll('.audio-topology-item').forEach(item => {
+    item.addEventListener('click', () => {
+      document.querySelectorAll('.audio-topology-item').forEach(i => i.classList.remove('active'));
+      item.classList.add('active');
+      const title = item.querySelector('.topology-title')?.innerText || 'Audio Sink';
+      appendLog(`🔊 Audio routing topology switched to: ${title}`, 'success');
+    });
+  });
+
+  // 4. Live Sliders
+  const sliderHopDelay = document.getElementById('slider-hop-delay');
+  const valHopDelay = document.getElementById('val-hop-delay');
+  if (sliderHopDelay && valHopDelay) {
+    sliderHopDelay.addEventListener('input', () => {
+      valHopDelay.innerText = `${sliderHopDelay.value} ms`;
+    });
+  }
+
+  const sliderGammaComp = document.getElementById('slider-gamma-comp');
+  const valGammaComp = document.getElementById('val-gamma-comp');
+  if (sliderGammaComp && valGammaComp) {
+    sliderGammaComp.addEventListener('input', () => {
+      valGammaComp.innerText = `${(sliderGammaComp.value / 100).toFixed(2)}×`;
+    });
+  }
+
+  const sliderAudioOffset = document.getElementById('slider-audio-offset');
+  const valAudioOffset = document.getElementById('val-audio-offset');
+  if (sliderAudioOffset && valAudioOffset) {
+    sliderAudioOffset.addEventListener('input', () => {
+      valAudioOffset.innerText = `${sliderAudioOffset.value} ms`;
+    });
+  }
+
+  // 5. Mock Action Buttons for Roadmap Preview
+  document.querySelectorAll('.btn-mock').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.getAttribute('data-action');
+      switch (action) {
+        case 'test-kvm':
+          appendLog('🖱️ Simulated edge-hop: Cursor transitioned across border to HP OMEN (vmulti Precision Touchpad active)', 'info');
+          break;
+        case 'test-dragdrop':
+          appendLog('🪂 Simulated cross-border drop: 120 MB project folder streamed to ~/Downloads in 18ms', 'success');
+          break;
+        case 'test-mount':
+          appendLog('📂 Network Volumes mounted: /Volumes/HP-OMEN on macOS and M:\\ on Windows over 10.99.99.x', 'success');
+          break;
+        case 'test-touchid':
+          appendLog('🔑 Touch ID prompt dispatched to MacBook Secure Enclave (Nonce signed & validated, 118ms)', 'success');
+          break;
+        case 'test-truetone':
+          appendLog('🎨 Ambient CCT 5400K read from Mac bezel sensor; Bradford CAT applied to Windows GPU LUT', 'info');
+          break;
+        case 'test-camera':
+          appendLog('🎥 Camera pipeline preview: MacBook FaceTime HD 1080p60 bridged to Windows DirectShow', 'info');
+          break;
+        case 'test-audio':
+          appendLog('🎵 Played 24-bit test chime via Mac Spatial Audio soundbar sink (offset 0ms)', 'success');
+          break;
+        case 'test-touchbar':
+          appendLog('📊 Off-screen NVIDIA telemetry rendered to MacBook Touch Bar (NVML: 64°C, 115W, 165 FPS)', 'info');
+          break;
+        case 'test-multiwan':
+          appendLog('🌐 Multi-WAN route benchmark: Mac Wi-Fi (100 Mbps) + OMEN (150 Mbps) = 250 Mbps combined', 'success');
+          break;
+        default:
+          appendLog(`⚡ Triggered ${action}`, 'info');
+      }
+    });
+  });
+
   // Poll status every 2 seconds
   updateStatus();
   setInterval(updateStatus, 2000);

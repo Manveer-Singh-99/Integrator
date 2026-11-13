@@ -25,10 +25,20 @@
       </div>
     </header>
 
+    <!-- Category & Status Filter Tabs -->
+    <nav class="filter-tabs">
+      <button class="filter-tab active" data-filter="all">All Features <span class="tab-count">13</span></button>
+      <button class="filter-tab" data-filter="active">🟢 Active <span class="tab-count">4</span></button>
+      <button class="filter-tab" data-filter="workspace">🖱️ Workspace & KVM <span class="tab-count">5</span></button>
+      <button class="filter-tab" data-filter="media">🎥 Audio & Video <span class="tab-count">2</span></button>
+      <button class="filter-tab" data-filter="security">🔑 Security & Display <span class="tab-count">2</span></button>
+      <button class="filter-tab" data-filter="network">🌐 Network & Bonding <span class="tab-count">2</span></button>
+    </nav>
+
     <!-- Main Grid -->
     <main class="grid">
-      <!-- Extended Desktop Card -->
-      <section class="card display-card">
+      <!-- 1. Extended Desktop Card (Active) -->
+      <section class="card display-card" data-category="workspace" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">🖥️</span>
@@ -89,8 +99,8 @@
         </div>
       </section>
 
-      <!-- Universal Clipboard Card -->
-      <section class="card clipboard-card">
+      <!-- 2. Universal Clipboard Card (Active) -->
+      <section class="card clipboard-card" data-category="workspace" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">📋</span>
@@ -125,8 +135,478 @@
         </div>
       </section>
 
-      <!-- Network & System Status Card -->
-      <section class="card network-card">
+      <!-- 3. Universal Input Sharing & KVM Card (Roadmap) -->
+      <section class="card input-card" data-category="workspace" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🖱️</span>
+            <div>
+              <h2>Universal Input & KVM</h2>
+              <p class="card-desc">Border edge-hopping with Precision Touchpad gestures (State 2)</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="card-setting-row">
+          <div class="setting-info">
+            <span class="setting-title">Enable Input Sharing Mode</span>
+            <span class="setting-subtitle">Dynamic Temporary Master switches key context per cursor position</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="toggle-input-sharing">
+            <span class="slider-toggle"></span>
+          </label>
+        </div>
+
+        <div class="form-grid">
+          <div class="setting-item">
+            <label class="setting-label">Switch Edge Boundary:</label>
+            <div class="segmented-control">
+              <button class="segment active" data-edge="right">Right (Mac ➔ PC)</button>
+              <button class="segment" data-edge="left">Left (PC ➔ Mac)</button>
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="slider-header">
+              <label class="setting-label">Edge Hop Delay Threshold:</label>
+              <span class="slider-val" id="val-hop-delay">60 ms</span>
+            </div>
+            <input type="range" class="range-slider" id="slider-hop-delay" min="10" max="250" value="60">
+          </div>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-dead-corners">
+            <span>Dead Corners Guard (Prevents accidental hops near Apple Menu / Taskbar)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-modifier-translation">
+            <span>Smart Modifier Mapping (Auto Cmd ⌘ ⇄ Ctrl conversion)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-precision-touchpad">
+            <span>Glass Trackpad to Windows Precision Touchpad (3-finger Task View via vmulti)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-kvm">
+            <span class="btn-icon">⚡</span>
+            <span>Test Cursor Edge Transition</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 4. Cross-Border File Drag & Drop Card (Roadmap) -->
+      <section class="card dragdrop-card" data-category="workspace" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🪂</span>
+            <div>
+              <h2>Cross-Screen Drag & Drop</h2>
+              <p class="card-desc">AirDrop across screens with zero-RAM disk-to-disk streaming</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="dragdrop-visual-zone">
+          <span class="drag-icon">📁 ➔ 💻</span>
+          <span class="drag-title">Drag any file or folder across the physical monitor edge</span>
+          <span class="drag-subtitle">Semi-transparent ghost thumbnail follows cursor across operating systems</span>
+        </div>
+
+        <div class="card-setting-row">
+          <div class="setting-info">
+            <span class="setting-title">Target Drop Directory</span>
+            <span class="setting-subtitle">Default destination on receiving workstation</span>
+          </div>
+          <select class="select-dropdown" id="select-drop-folder">
+            <option value="downloads">User Downloads (~/Downloads)</option>
+            <option value="desktop">Active Desktop (~/Desktop)</option>
+            <option value="cache">Clipboard Cache Folder</option>
+          </select>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-ghost-thumbnail">
+            <span>Render translucent ghost thumbnail overlay across screen edge</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-qos-clamp">
+            <span>Bandwidth Precedence Clamping (Clamp to 40 Mbps during 165Hz display streaming)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-dragdrop">
+            <span class="btn-icon">📦</span>
+            <span>Simulate Cross-Border Drop Event</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 5. Auto-Mounted Shared Storage Card (Roadmap) -->
+      <section class="card storage-card" data-category="workspace" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">📂</span>
+            <div>
+              <h2>Auto-Mounted Shared Storage</h2>
+              <p class="card-desc">Zero-config network volume mounting over direct USB-C link</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="mount-routes-grid">
+          <div class="mount-box">
+            <span class="mount-badge mac">macOS Mount</span>
+            <span class="mount-path">/Volumes/HP-OMEN</span>
+            <span class="mount-sub">Direct SMB/NFS • 10.99.99.1</span>
+          </div>
+          <div class="mount-box">
+            <span class="mount-badge win">Windows Drive</span>
+            <span class="mount-path">M:\ (MacBook-Pro)</span>
+            <span class="mount-sub">Mapped Network Drive • 10.99.99.2</span>
+          </div>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-automount-connect">
+            <span>Mount volumes automatically on USB-C connection</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-clean-unmount">
+            <span>Clean unmount upon cable disconnect (zero hanging Finder/Explorer windows)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-rw-perms">
+            <span>Grant Read & Write access (Zero-copy file sharing)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-mount">
+            <span class="btn-icon">🔌</span>
+            <span>Mount Shared Network Volumes Now</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 6. Touch ID Windows Authenticator Card (Roadmap) -->
+      <section class="card touchid-card" data-category="security" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🔑</span>
+            <div>
+              <h2>Touch ID Windows Authenticator</h2>
+              <p class="card-desc">Apple Secure Enclave FIDO2/WebAuthn passkeys & Windows 11 lock screen unlock</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="touchid-visual-box">
+          <div class="fingerprint-sensor">
+            <span class="fingerprint-icon">👆</span>
+            <span class="sensor-glow"></span>
+          </div>
+          <div class="sensor-details">
+            <span class="sensor-title">Apple Secure Enclave (kSecAccessControlTouchIDCurrentSet)</span>
+            <span class="sensor-status">Virtual USB/IP HID (0xF1D0) • Ready for Biometric Prompt</span>
+            <span class="sensor-latency">&lt; 150 ms Unlock Response • Zero physical bus renegotiation</span>
+          </div>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-webauthn-fido2">
+            <span>WebAuthn / FIDO2 Hardware Passkeys (Google, GitHub, Microsoft in Chrome/Edge)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-logonui-unlock">
+            <span>Windows 11 Lock Screen Unlock (TouchIdCredentialProvider.dll + DPAPI)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-touchid">
+            <span class="btn-icon">👆</span>
+            <span>Simulate Touch ID Biometric Challenge</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 7. True Tone & Chromatic Adaptation Sync Card (Roadmap) -->
+      <section class="card truetone-card" data-category="security" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🎨</span>
+            <div>
+              <h2>True Tone & Chromatic Sync</h2>
+              <p class="card-desc">Match screen white points via Mac ambient light sensor & Bradford CAT</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="cct-meter-box">
+          <div class="cct-gauge">
+            <span class="cct-icon">☀️</span>
+            <span class="cct-value" id="val-ambient-cct">5400 K</span>
+            <span class="cct-label">Ambient CCT (Daylight)</span>
+          </div>
+          <div class="cct-details">
+            <div class="cct-row"><span>Ambient Illuminance:</span> <strong>340 Lux</strong></div>
+            <div class="cct-row"><span>Transform Matrix:</span> <strong>Bradford CAT (3×3)</strong></div>
+            <div class="cct-row"><span>GPU Hardware LUT:</span> <strong>SetDeviceGammaRamp (&lt;0.1 ms)</strong></div>
+          </div>
+        </div>
+
+        <div class="slider-group">
+          <div class="slider-header">
+            <label class="setting-label">Matte OMEN vs. Glossy Retina Perceptual Gamma:</label>
+            <span class="slider-val" id="val-gamma-comp">1.05×</span>
+          </div>
+          <input type="range" class="range-slider" id="slider-gamma-comp" min="80" max="130" value="105">
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-auto-cct-poll">
+            <span>Continuous ambient sensor polling (500ms smooth fade curve)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-truetone">
+            <span class="btn-icon">🎨</span>
+            <span>Calibrate & Inject Gamma LUT Ramp</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 8. Universal Camera & Studio Microphone Card (Roadmap) -->
+      <section class="card camera-card" data-category="media" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🎥</span>
+            <div>
+              <h2>Universal Camera & Studio Mic</h2>
+              <p class="card-desc">Mac FaceTime HD camera & beamforming mics into Windows DirectShow</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="device-select-grid">
+          <div class="setting-item">
+            <label class="setting-label">Video Camera Source:</label>
+            <select class="select-dropdown" id="select-camera-src">
+              <option value="facetime">MacBook FaceTime HD 1080p</option>
+              <option value="omen">HP OMEN Built-in Webcam</option>
+              <option value="external">External USB-C Camera</option>
+            </select>
+          </div>
+          <div class="setting-item">
+            <label class="setting-label">Microphone Audio Source:</label>
+            <select class="select-dropdown" id="select-mic-src">
+              <option value="mac-studio">MacBook 3-Mic Studio Array (Beamforming)</option>
+              <option value="pc-mic">HP OMEN Dual Array Microphones</option>
+              <option value="headset">Windows USB Gaming Headset</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card-setting-row">
+          <div class="setting-info">
+            <span class="setting-title">Stream Resolution & Framerate</span>
+            <span class="setting-subtitle">Apple M1 Single Media Engine & NVENC coordinated</span>
+          </div>
+          <select class="select-dropdown" id="select-cam-res">
+            <option value="1080p60">1080p @ 60 FPS (HW VideoToolbox)</option>
+            <option value="720p30">720p @ 30 FPS (Low-Bandwidth Mode)</option>
+          </select>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-cam-qos">
+            <span>Apple M1 ASIC Safeguard (Auto-downscale to 720p when 165Hz display is active)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-camera">
+            <span class="btn-icon">📹</span>
+            <span>Test Camera & Microphone Bridge</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 9. Dynamic Audio Routing Card (Roadmap) -->
+      <section class="card audio-card" data-category="media" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🔊</span>
+            <div>
+              <h2>Dynamic Audio Routing</h2>
+              <p class="card-desc">High-fidelity 24-bit Spatial Audio soundbar sink & headset routing</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="audio-topology-grid">
+          <div class="audio-topology-item active" data-topology="mac-soundbar">
+            <span class="topology-icon">💻</span>
+            <span class="topology-title">Mac Studio Speakers</span>
+            <span class="topology-desc">Mutes PC; routes master audio to Mac Spatial Audio (&lt;6ms latency)</span>
+          </div>
+          <div class="audio-topology-item" data-topology="pc-headset">
+            <span class="topology-icon">🎮</span>
+            <span class="topology-title">Windows Headset / DAC</span>
+            <span class="topology-desc">Leaves audio on PC for zero-latency competitive gaming headsets</span>
+          </div>
+          <div class="audio-topology-item" data-topology="dual-sync">
+            <span class="topology-icon">🎧</span>
+            <span class="topology-title">Dual Acoustic Surround</span>
+            <span class="topology-desc">Simultaneous playback with millisecond phase-sync calibration</span>
+          </div>
+        </div>
+
+        <div class="slider-group">
+          <div class="slider-header">
+            <label class="setting-label">Acoustic Room Sync Offset:</label>
+            <span class="slider-val" id="val-audio-offset">0 ms</span>
+          </div>
+          <input type="range" class="range-slider" id="slider-audio-offset" min="-50" max="50" value="0">
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-opus-fallback">
+            <span>Dynamic Opus fallback (Transparent 256kbps when cable link is congested)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-audio">
+            <span class="btn-icon">🎵</span>
+            <span>Play Spatial Audio Test Chime</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 10. Touch Bar NVIDIA Hardware Performance HUD Card (Roadmap) -->
+      <section class="card touchbar-card" data-category="workspace" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">📊</span>
+            <div>
+              <h2>Touch Bar NVIDIA HUD</h2>
+              <p class="card-desc">Off-screen GPU hardware telemetry on MacBook 2170×60 OLED strip</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <!-- Mini OLED Touch Bar Visualizer -->
+        <div class="touchbar-strip-visual">
+          <div class="touchbar-pill oled-logo">🎮 RTX 5070</div>
+          <div class="touchbar-pill oled-temp">🌡️ 64°C</div>
+          <div class="touchbar-pill oled-power">⚡ 115W</div>
+          <div class="touchbar-pill oled-clock">🚀 2450 MHz</div>
+          <div class="touchbar-pill oled-vram">💾 4.8 / 8 GB</div>
+          <div class="touchbar-pill oled-fps">🎯 165 FPS</div>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-touchbar-scope">
+            <span>Strict Scope Isolation (Windows only captures Touch Bar when acting as Master)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-nvml-polling">
+            <span>Zero-Overhead NVML Polling (Streams temps and watts without on-screen overlays)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-touchbar">
+            <span class="btn-icon">📊</span>
+            <span>Render Telemetry to MacBook Touch Bar</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 11. Multi-WAN Internet Bonding Card (Roadmap) -->
+      <section class="card multiwan-card" data-category="network" data-status="roadmap">
+        <div class="card-header">
+          <div class="card-title-group">
+            <span class="card-icon">🌐</span>
+            <div>
+              <h2>Multi-WAN Internet Bonding</h2>
+              <p class="card-desc">Bond Mac Wi-Fi & Windows Ethernet/5G for gaming ping protection & speed</p>
+            </div>
+          </div>
+          <span class="pill pill-roadmap">Roadmap Preview</span>
+        </div>
+
+        <div class="multiwan-visual-box">
+          <div class="wan-links">
+            <div class="wan-link-item">
+              <span class="wan-dot green"></span>
+              <span class="wan-name">MacBook Wi-Fi (WAN 1)</span>
+              <span class="wan-speed">100 Mbps</span>
+            </div>
+            <div class="wan-link-item">
+              <span class="wan-dot green"></span>
+              <span class="wan-name">HP OMEN Ethernet / 5G (WAN 2)</span>
+              <span class="wan-speed">150 Mbps</span>
+            </div>
+          </div>
+          <div class="wan-combined">
+            <span class="wan-combined-badge">⚡ Aggregated Bandwidth</span>
+            <span class="wan-combined-val">250 Mbps Throughput</span>
+          </div>
+        </div>
+
+        <div class="card-setting-row">
+          <div class="setting-info">
+            <span class="setting-title">Traffic Bonding Strategy</span>
+            <span class="setting-subtitle">Dynamic Dual-Gateway route arbitration</span>
+          </div>
+          <select class="select-dropdown" id="select-wan-strategy">
+            <option value="multi-socket">Local Multi-Socket Balancing (Zero Cloud / Chunked HTTP)</option>
+            <option value="gaming-protect">Gaming Ping Protection (UDP via Wired, Web via Wi-Fi)</option>
+            <option value="mptcp-tunnel">True Single-Stream Packet Bonding (MPTCP / VPS Proxy)</option>
+          </select>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" checked id="chk-failover-handover">
+            <span>Seamless Failover (Instantly switch connections if one drops with zero disconnect)</span>
+          </label>
+        </div>
+
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-mock" data-action="test-multiwan">
+            <span class="btn-icon">⚡</span>
+            <span>Run Multi-WAN Route Benchmark</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 12. Network & System Status Card (Active) -->
+      <section class="card network-card" data-category="network" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">🌐</span>
@@ -135,6 +615,7 @@
               <p class="card-desc">Adaptive multi-subnet route arbitration</p>
             </div>
           </div>
+          <span class="pill pill-active">Link Active</span>
         </div>
 
         <div class="network-routes">
@@ -197,14 +678,14 @@
         </div>
       </section>
 
-      <!-- Live Logs Card -->
-      <section class="card logs-card">
+      <!-- 13. Live Logs Card (Active) -->
+      <section class="card logs-card" data-category="workspace media security network" data-status="active">
         <div class="card-header">
           <div class="card-title-group">
             <span class="card-icon">⚡</span>
             <div>
               <h2>Live Event Stream</h2>
-              <p class="card-desc">Sub-millisecond IPC and clipboard events</p>
+              <p class="card-desc">Sub-millisecond IPC, telemetry and clipboard events</p>
             </div>
           </div>
           <button id="btn-clear-logs" class="btn-link">Clear</button>
@@ -221,7 +702,7 @@
     <footer class="footer">
       <span>Mac-Windows Bridge v1.0.0</span>
       <span class="footer-separator">•</span>
-      <span>Background Daemon Active</span>
+      <span>13 Roadmap Services Unified</span>
       <span class="footer-separator">•</span>
       <button id="btn-hide-window" class="btn-link">Hide to Menu Bar</button>
     </footer>
