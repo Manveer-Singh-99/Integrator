@@ -396,7 +396,56 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // Poll status every 2 seconds
+  // Touch Bar HUD Toggle
+  const btnToggleTouchbar = document.getElementById('btn-toggle-touchbar');
+  const btnTouchbarLabel = document.getElementById('btn-touchbar-label');
+
+  if (btnToggleTouchbar) {
+    btnToggleTouchbar.addEventListener('click', async () => {
+      try {
+        appendLog('📊 Toggling Touch Bar NVIDIA Performance HUD on physical OLED strip...', 'info');
+        const res = await invokeCmd('toggle_touchbar_hud');
+        appendLog(`🚀 ${res}`, 'success');
+        if (btnTouchbarLabel) {
+          btnTouchbarLabel.innerText = res.includes('active')
+            ? 'Dismiss Touch Bar NVIDIA Overlay'
+            : 'Bring NVIDIA Overlay to MacBook Touch Bar';
+        }
+      } catch (err) {
+        appendLog(`❌ Touch Bar error: ${err}`, 'error');
+      }
+    });
+  }
+
+  // Periodic GPU Telemetry Updater for Dashboard Visualizer
+  async function updateGpuTelemetry() {
+    try {
+      const data = await invokeCmd('get_gpu_telemetry');
+      if (data) {
+        const visTemp = document.getElementById('tb-vis-temp');
+        const visPower = document.getElementById('tb-vis-power');
+        const visClock = document.getElementById('tb-vis-clock');
+        const visVram = document.getElementById('tb-vis-vram');
+        const visFps = document.getElementById('tb-vis-fps');
+
+        if (visTemp) visTemp.innerText = `🌡️ ${data.temperature_c}°C`;
+        if (visPower) visPower.innerText = `⚡ ${data.power_usage_watts.toFixed(1)}W`;
+        if (visClock) visClock.innerText = `🚀 ${data.core_clock_mhz} MHz`;
+        if (visVram) {
+          const usedGb = (data.memory_used_mb / 1024).toFixed(1);
+          const totalGb = (data.memory_total_mb / 1024).toFixed(1);
+          visVram.innerText = `💾 ${usedGb} / ${totalGb} GB`;
+        }
+        if (visFps) visFps.innerText = `📊 ${data.gpu_utilization_percent}% GPU`;
+      }
+    } catch (_) {
+      // ignore when offline
+    }
+  }
+
+  // Poll status every 2 seconds & telemetry every 3 seconds
   updateStatus();
+  updateGpuTelemetry();
   setInterval(updateStatus, 2000);
+  setInterval(updateGpuTelemetry, 3000);
 });

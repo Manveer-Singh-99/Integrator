@@ -519,12 +519,12 @@
 
         <!-- Mini OLED Touch Bar Visualizer -->
         <div class="touchbar-strip-visual">
-          <div class="touchbar-pill oled-logo">🎮 RTX 5070</div>
-          <div class="touchbar-pill oled-temp">🌡️ 64°C</div>
-          <div class="touchbar-pill oled-power">⚡ 115W</div>
-          <div class="touchbar-pill oled-clock">🚀 2450 MHz</div>
-          <div class="touchbar-pill oled-vram">💾 4.8 / 8 GB</div>
-          <div class="touchbar-pill oled-fps">🎯 165 FPS</div>
+          <div class="touchbar-pill oled-logo" id="tb-vis-logo">🎮 RTX 5070</div>
+          <div class="touchbar-pill oled-temp" id="tb-vis-temp">🌡️ 44°C</div>
+          <div class="touchbar-pill oled-power" id="tb-vis-power">⚡ 17.4W</div>
+          <div class="touchbar-pill oled-clock" id="tb-vis-clock">🚀 0 MHz</div>
+          <div class="touchbar-pill oled-vram" id="tb-vis-vram">💾 0 / 8.1 GB</div>
+          <div class="touchbar-pill oled-fps" id="tb-vis-fps">📊 0% GPU</div>
         </div>
 
         <div class="checkbox-group">
@@ -539,9 +539,9 @@
         </div>
 
         <div class="card-actions">
-          <button class="btn btn-secondary btn-mock" data-action="test-touchbar">
+          <button class="btn btn-primary" id="btn-toggle-touchbar">
             <span class="btn-icon">📊</span>
-            <span>Render Telemetry to MacBook Touch Bar</span>
+            <span id="btn-touchbar-label">Bring NVIDIA Overlay to MacBook Touch Bar</span>
           </button>
         </div>
       </section>

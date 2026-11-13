@@ -19,6 +19,7 @@ src-tauri/target/
 # Helper compiled binaries
 app/macos_clip_files
 app/win_clip_files.exe
+app/touchbar_hud
 
 # IDE / Editor configs
 .vscode/
