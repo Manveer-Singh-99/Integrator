@@ -231,6 +231,11 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * Stream the MacBook’s FaceTime HD camera and studio mic into Windows as a native DirectShow / Media Foundation webcam.
   * Stream Windows camera or studio audio hardware into macOS via modern `CMIOExtension` virtual camera plugins.
   * Hardware-accelerated low latency (Apple VideoToolbox & NVIDIA NVENC).
+* **🔊 Dynamic Audio Routing (System Tray Selector):**
+  * Switch between three distinct audio routing topologies on the fly directly from the macOS Menu Bar or Windows System Tray:
+    * **Mac Studio Speakers Only**: Automatically mutes the PC and pipes uncompressed 24-bit master audio to the MacBook's high-fidelity Spatial Audio sound system (<6ms latency).
+    * **Windows PC / Headset Only**: Leaves audio on the PC (ideal when gaming with a low-latency headset or DAC plugged into Windows).
+    * **Dual Stereo / Surround (Both Simultaneously)**: Plays across both physical machines with an integrated millisecond sync-calibration slider to eliminate room echo and comb-filtering.
 * **📡 Zero-Config Pairing & Automatic Handover:**
   * Instant mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi.
   * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
