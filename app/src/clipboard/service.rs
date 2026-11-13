@@ -25,6 +25,8 @@ use super::protocol::{
 use super::file_helper::FileClipboardHelper;
 use super::os_seq;
 
+const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KB high-throughput buffer for line-rate NVMe transfer
+
 #[cfg(target_os = "macos")]
 extern "C" {
     pub fn init_shortcut_interceptor();
@@ -578,7 +580,7 @@ impl ClipboardService {
         }
 
         // 2. File frames
-        let mut chunk_buf = vec![0u8; 64 * 1024];
+        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE];
         for (rel_path, abs_path) in files {
             let rel_bytes = rel_path.as_bytes();
             if rel_bytes.len() > u16::MAX as usize { continue; }
@@ -732,7 +734,7 @@ impl ClipboardService {
         let mut transferred_bytes: u64 = 0;
         let start_time = std::time::Instant::now();
         let mut last_progress_report = std::time::Instant::now();
-        let mut chunk_buf = vec![0u8; 64 * 1024];
+        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE];
 
         loop {
             let tag = match tokio::time::timeout(Duration::from_secs(30), socket.read_u8()).await {
@@ -916,7 +918,7 @@ impl ClipboardService {
         let mut transferred_bytes: u64 = 0;
         let start_time = std::time::Instant::now();
         let mut last_progress_report = std::time::Instant::now();
-        let mut chunk_buf = vec![0u8; 64 * 1024];
+        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE];
 
         loop {
             let tag = match tokio::time::timeout(Duration::from_secs(30), socket.read_u8()).await {

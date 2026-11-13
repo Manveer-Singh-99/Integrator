@@ -22,11 +22,76 @@ impl FileClipboardHelper {
             std::fs::create_dir_all(&cache_dir)?;
         }
 
-        Ok(Self { cache_dir })
+        let helper = Self { cache_dir };
+        // Prune cache entries older than 3 days or if total cache exceeds 10 GB
+        helper.prune_cache(3, 10 * 1024 * 1024 * 1024);
+
+        Ok(helper)
     }
 
     pub fn get_cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// Prunes stale entries in the cache directory to prevent disk bloat.
+    /// Keeps total cache size under max_bytes (default 10 GB) and removes entries older than max_age_days.
+    pub fn prune_cache(&self, max_age_days: u64, max_bytes: u64) {
+        if !self.cache_dir.exists() {
+            return;
+        }
+
+        let now = std::time::SystemTime::now();
+        let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&self.cache_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if let Ok(meta) = entry.metadata() {
+                    let mtime = meta.modified().unwrap_or(now);
+                    let size = if meta.is_dir() {
+                        Self::calculate_dir_size(&path)
+                    } else {
+                        meta.len()
+                    };
+                    entries.push((path, mtime, size));
+                }
+            }
+        }
+
+        // Sort oldest first
+        entries.sort_by_key(|e| e.1);
+
+        let mut total_size: u64 = entries.iter().map(|e| e.2).sum();
+
+        for (path, mtime, size) in entries {
+            let is_stale = now.duration_since(mtime).map(|d| d > max_age).unwrap_or(false);
+            if is_stale || total_size > max_bytes {
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+                total_size = total_size.saturating_sub(size);
+            }
+        }
+    }
+
+    fn calculate_dir_size(path: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(read_dir) = std::fs::read_dir(path) {
+            for entry in read_dir.flatten() {
+                let p = entry.path();
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        total += Self::calculate_dir_size(&p);
+                    } else {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        total
     }
 
     fn find_helper(name: &str) -> Option<PathBuf> {
