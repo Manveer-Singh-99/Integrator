@@ -1,9 +1,9 @@
 [package]
-name = "mac_windows_bridge"
+name = "integrator"
 version = "0.1.0"
 edition = "2021"
 authors = ["Manveer Singh"]
-description = "High-performance macOS & Windows 11 USB-C Workstation Fusion Bridge"
+description = "Integrator: High-Performance macOS & Windows 11 Workstation Fusion"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -523,7 +523,7 @@ fn main() -> Result<()> {
             let _ = stream.write_all(&bytes);
             let _ = stream.flush();
         }
-        println!("Existing MacWindowsBridge instance is already running. Brought window to front.");
+        println!("Existing Integrator instance is already running. Brought window to front.");
         return Ok(());
     }
 
@@ -680,7 +680,7 @@ fn main() -> Result<()> {
             };
             let toggle_i = MenuItem::with_id(app, "toggle_display", toggle_label, true, None::<&str>)?;
             let cache_i = MenuItem::with_id(app, "open_cache", "Open Clipboard Cache", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Bridge", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Integrator", true, None::<&str>)?;
 
             let menu = Menu::with_items(app, &[&show_i, &paste_i, &toggle_i, &cache_i, &quit_i])?;
 

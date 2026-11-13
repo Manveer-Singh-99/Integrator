@@ -1,15 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MacWindowsBridge",
+  "productName": "Integrator",
   "version": "1.0.0",
-  "identifier": "com.manveersingh.macwindowsbridge",
+  "identifier": "com.manveersingh.integrator",
   "build": {
     "frontendDist": "./ui"
   },
   "app": {
     "windows": [
       {
-        "title": "Mac-Windows Fusion Bridge",
+        "title": "Integrator",
         "label": "main",
         "width": 980,
         "height": 740,
