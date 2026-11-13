@@ -11,6 +11,7 @@ mod truetone;
 mod storage;
 mod audio;
 mod features;
+mod autostart;
 
 use std::sync::Mutex;
 use anyhow::Result;
@@ -70,6 +71,7 @@ pub struct BridgeStatus {
     pub ambient_lux: Option<f32>,
     pub ambient_cct: Option<u32>,
     pub storage_mounted: bool,
+    pub autostart_enabled: bool,
 }
 
 fn detect_link_info(peer_ip: Option<&str>) -> (String, String) {
@@ -129,6 +131,7 @@ async fn get_status(state: State<'_, AppState>) -> Result<BridgeStatus, String> 
         ambient_lux: if als.supported { Some(als.lux) } else { None },
         ambient_cct: if als.supported { Some(als.cct_kelvin) } else { None },
         storage_mounted,
+        autostart_enabled: autostart::AutostartManager::is_enabled(),
     })
 }
 
@@ -372,6 +375,16 @@ async fn play_spatial_chime(state: State<'_, AppState>) -> Result<String, String
         return Err("Dynamic Audio Routing is disabled by master switch".into());
     }
     audio::AudioManager::play_spatial_test_chime().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_autostart() -> Result<bool, String> {
+    Ok(autostart::AutostartManager::is_enabled())
+}
+
+#[tauri::command]
+async fn set_autostart(enabled: bool) -> Result<bool, String> {
+    autostart::AutostartManager::set_enabled(enabled).map_err(|e| e.to_string())
 }
 
 fn main() -> Result<()> {
@@ -645,7 +658,9 @@ fn main() -> Result<()> {
             get_storage_status,
             play_spatial_chime,
             get_feature_flags,
-            set_feature_flag
+            set_feature_flag,
+            get_autostart,
+            set_autostart
         ])
         .setup(move |app| {
             GLOBAL_APP_HANDLE.set(app.handle().clone()).ok();

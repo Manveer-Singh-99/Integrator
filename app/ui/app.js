@@ -182,6 +182,12 @@ async function updateStatus() {
         storageStatusPill.innerText = 'Volume Ready';
       }
     }
+
+    // 6. Launch at Login Sync
+    const toggleAutostart = document.getElementById('toggle-autostart');
+    if (toggleAutostart && !toggleAutostart.matches(':focus')) {
+      toggleAutostart.checked = !!status.autostart_enabled;
+    }
   } catch (e) {
     // ignore polling error
   }
@@ -198,6 +204,22 @@ document.addEventListener('DOMContentLoaded', () => {
   const selectDecodeGpu = document.getElementById('select-decode-gpu');
   const btnRunSpeedtest = document.getElementById('btn-run-speedtest');
   const btnQuickSpeedtest = document.getElementById('btn-quick-speedtest');
+  const toggleAutostart = document.getElementById('toggle-autostart');
+
+  if (toggleAutostart) {
+    toggleAutostart.addEventListener('change', async () => {
+      const enable = toggleAutostart.checked;
+      try {
+        appendLog(enable ? '🚀 Configuring Launch at Login...' : '🚀 Removing Launch at Login...', 'info');
+        const res = await invokeCmd('set_autostart', { enabled: enable });
+        toggleAutostart.checked = res;
+        appendLog(res ? '🚀 Launch at Login ENABLED (registered in System Login Items)' : '🚀 Launch at Login DISABLED', 'success');
+      } catch (e) {
+        appendLog(`❌ Failed to update Launch at Login: ${e}`, 'error');
+        toggleAutostart.checked = !enable;
+      }
+    });
+  }
 
   async function executeSpeedTest() {
     if (isTestingSpeed) return;
