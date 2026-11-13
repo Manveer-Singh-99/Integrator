@@ -238,10 +238,16 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
 * **📁 Auto-Mounted Shared Folders:**
   * Designated user folders automatically mount into `/Volumes/PC` on macOS and a mapped drive (e.g., `M:`) on Windows upon link connection.
   * Clean, automated unmounting when the USB-C cable is unplugged—zero hanging Finder or Explorer windows.
-* **🔑 Touch ID as a Windows Security Key & Passkey Authenticator (Virtual FIDO2 / WebAuthn):**
-  * Turns your Mac into a biometric hardware security key (like a YubiKey) for Windows 11.
-  * When Windows prompts for a Passkey or hardware security key (Google, Microsoft, GitHub login), your Mac triggers Touch ID. The Mac's Secure Enclave signs the challenge and authenticates Windows over the encrypted link.
-  * Optionally unlocks the Windows 11 lock screen via Touch ID through a custom Windows Credential Provider.
+* **🔑 Touch ID as a Windows Security Key & Passkey Authenticator:**
+  * **Browser & Passkey Mode (WebAuthn / FIDO2 over Virtual USB/IP)**:
+    * Turns your Mac into a biometric hardware security key (like a YubiKey) for Windows 11.
+    * When Windows or a browser (Chrome/Edge) prompts for a WebAuthn passkey or hardware security key (Google, Microsoft, GitHub login), the Windows agent exposes a virtual FIDO2 HID device (`0xF1D0`) over `USBIP-Win`.
+    * The Mac prompts Touch ID via `LocalAuthentication`, the Secure Enclave signs the assertion, and Windows completes authentication seamlessly with zero physical driver renegotiation.
+  * **Native Windows 11 Lock Screen Unlock (Custom Credential Provider)**:
+    * Solves the consumer Windows 11 lock screen limitation (where FIDO2 keys are restricted to Microsoft Entra ID / Azure AD) for fingerprint-less laptops like the HP OMEN.
+    * Integrates a custom Windows Credential Provider DLL (`TouchIdCredentialProvider.dll`) directly into `LogonUI.exe`.
+    * User credentials remain sealed with Windows **DPAPI**. When locked, a challenge nonce is transmitted over `10.99.99.x`.
+    * Resting your finger on the MacBook’s Touch ID sensor signs the nonce via the Apple Secure Enclave (`kSecAccessControlTouchIDCurrentSet`). The Credential Provider validates the signature and hands the logon token to **LSASS**, unlocking the Windows desktop in `<150ms`.
 * **🎨 True Tone & Chromatic Adaptation Sync (Bradford CAT):**
   * Reads ambient room lighting (CCT in Kelvin) from the Mac’s bezel ambient sensor.
   * Applies a **Bradford Chromatic Adaptation Transform (CAT)** with perceptual gamma compensation for matte vs. glossy panel differences.
@@ -261,9 +267,40 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * End-to-end encrypted control channel (TLS 1.3 / Noise Protocol) with a one-time 6-digit PIN pairing handshake.
 * **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing:**
   * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
-    * **Aggregated Download Bandwidth**: Splits multi-connection downloads (Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput).
-    * **Zero-Downtime Stream & Call Failover**: Transparently reroutes active packets if one connection drops or hiccups during live streaming or critical video calls without disconnecting.
+    * **Local Multi-Socket Balancing (Zero 3rd Device / Zero Cloud)**: Routes distinct connections and chunked downloads (HTTP range requests, Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput) without session breaking or account lockouts.
     * **Traffic Isolation & Ping Protection**: Routes latency-sensitive gaming packets (UDP) exclusively through the stable wired connection while offloading heavy background downloads and 4K video to the secondary link, guaranteeing zero in-game ping spikes.
+    * **True Packet Bonding (Cloud-Assisted Option)**: For seamless single-stream aggregation (e.g. uninterrupted Zoom calls or live Twitch broadcasts across dropping Wi-Fi), optionally tunnels through an MPTCP / Speedify-style VPS proxy to present a single unified public IP.
+
+---
+
+### 🛡️ Architectural Safeguards & Quality of Service (QoS)
+
+To guarantee that the companion app never causes frame drops, audio stutter, memory thrashing, or connection drops—even under worst-case cable bottlenecks—the system enforces strict hardware safeguards:
+
+#### 1. Bandwidth Precedence & Automatic Degradation Ladder (USB 2.0 Fallback)
+When running all features simultaneously over a standard USB-C charging cable (USB 2.0 physical limit: 480 Mbps half-duplex / ~320 Mbps usable throughput), the daemon's internal packet scheduler enforces a strict **6-Tier QoS Hierarchy**:
+
+```
+[ Tier 0: Strict Priority ]  Mouse, Keyboard, Touch ID, Keepalives    (< 0.5 Mbps)  --> NEVER DELAY / NEVER DROP
+[ Tier 1: Isochronous     ]  Low-Latency Audio (Mac Soundbar Sink)    (~ 0.3 - 2 Mbps) --> DYNAMIC OPUS FALLBACK
+[ Tier 2: Real-Time Stream]  165Hz Display (Sunshine -> Moonlight)    (Adaptive)   --> DYNAMIC BITRATE ABR / FRAME DROP
+[ Tier 3: Secondary Video ]  Universal Webcam Feed                    (Adaptive)   --> DOWNSCALED TO 720p30
+[ Tier 4: Background Bulk ]  File Drag-and-Drop / Large Clipboard     (Elastic)    --> TOKEN-BUCKET CLAMPED
+[ Tier 5: Scavenger       ]  Multi-WAN / Two-Way Internet Sharing     (Elastic)    --> FIRST TO BE CHOKED
+```
+
+* **Automatic Graceful Degradation Ladder**:
+  1. *Link > 220 Mbps*: Audio automatically flips from uncompressed 24-bit PCM to transparent Opus (256 kbps), saving ~2 Mbps with zero audible difference.
+  2. *Link > 250 Mbps*: Background file transfers and internet sharing are clamped to a 40 Mbps ceiling via a token-bucket rate limiter.
+  3. *Queue Delay > 12ms*: Sunshine drops HEVC bitrate dynamically (80 Mbps $\to$ 35 Mbps) via NVENC/VideoToolbox rate control.
+  4. *Persistent Congestion*: Universal Webcam scales down from 1080p60 to 720p30.
+  5. *Critical Saturation*: Display frame rate steps down (165Hz $\to$ 120Hz $\to$ 60Hz), dropping frames rather than buffering latency. **Input (Tier 0) is never delayed.**
+
+#### 2. Hardware Engine & Memory Safeguards (8 GB M1 & RTX 5070 Rules)
+* **Apple M1 Single Media Engine Protection**: The base M1 processor features **only one hardware video encode ASIC**. Running a 165Hz display stream concurrently with a 1080p webcam will time-slice the encoder (spiking display latency from 5ms to 30ms) or drop to CPU software encoding. When the 165Hz display is active, the webcam stream automatically drops to 720p or utilizes uncompressed USB transfer to spare the hardware encoder.
+* **Zero-RAM File Streaming Policy**: On memory-constrained machines (such as 8 GB unified memory MacBooks), the clipboard and drag-and-drop engines are strictly forbidden from buffering files in RAM. All transfers use fixed 64 KB ring buffers streaming directly from disk to disk (`std::fs::File`), guaranteeing an active memory footprint under 35 MB regardless of whether transferring 10 MB or 50 GB.
+* **macOS `WindowServer` 165Hz Idle Throttling**: To prevent `WindowServer` from consuming 40–60% CPU redrawing static frames at 165Hz, the capture engine monitors dirty rectangles. When no screen changes occur for >200ms, frame polling drops to 10 FPS and ramps back to 165 FPS on the first cursor movement.
+* **Dedicated CDC-NCM Cable Integrity**: The physical USB-C connection never re-enumerates or switches device personalities live. The physical wire remains 100% CDC-NCM Ethernet (`10.99.99.x`), and all auxiliary USB devices (FIDO2 keys, virtual gamepads, Precision Trackpad) are virtualized over IP, eliminating physical bus disconnects.
 
 ---
 
