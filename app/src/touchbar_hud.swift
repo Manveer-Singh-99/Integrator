@@ -628,103 +628,18 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     private func sendRpcRequest(host: String, port: UInt16, requestJson: String) -> DisplayRpcResponseData? {
-        guard let reqJson = requestJson.data(using: .utf8) else { return nil }
-
-        var addr4 = sockaddr_in()
-        var addr6 = sockaddr_in6()
-        let isIPv4 = inet_pton(AF_INET, host, &addr4.sin_addr) == 1
-        let isIPv6 = !isIPv4 && inet_pton(AF_INET6, host, &addr6.sin6_addr) == 1
-        guard isIPv4 || isIPv6 else { return nil }
-
-        let clientSocket = socket(isIPv4 ? AF_INET : AF_INET6, SOCK_STREAM, 0)
-        guard clientSocket >= 0 else { return nil }
-        defer { close(clientSocket) }
-
-        var noSigPipe: Int32 = 1
-        setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-
-        var timeout = timeval(tv_sec: 1, tv_usec: 0)
-        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
-        let connectRes: Int32
-        if isIPv4 {
-            addr4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            addr4.sin_family = sa_family_t(AF_INET)
-            addr4.sin_port = port.bigEndian
-            connectRes = withUnsafePointer(to: &addr4) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connect(clientSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        } else {
-            addr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-            addr6.sin6_family = sa_family_t(AF_INET6)
-            addr6.sin6_port = port.bigEndian
-            connectRes = withUnsafePointer(to: &addr6) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connect(clientSocket, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-                }
+        let _ = port
+        let _ = requestJson
+        let bufCap = 65_536
+        var outBuf = [UInt8](repeating: 0, count: bufCap)
+        let n = host.withCString { cHost -> Int in
+            outBuf.withUnsafeMutableBufferPointer { bufPtr -> Int in
+                fetch_rust_gpu_telemetry_json(cHost, bufPtr.baseAddress, bufCap)
             }
         }
-
-        guard connectRes == 0 else { return nil }
-
-        var lenBigEndian = UInt32(reqJson.count).bigEndian
-        let headerSent = withUnsafeBytes(of: &lenBigEndian) { ptr -> Bool in
-            guard let base = ptr.baseAddress else { return false }
-            return sendAll(socket: clientSocket, buffer: base, length: 4)
-        }
-        guard headerSent else { return nil }
-
-        let bodySent = reqJson.withUnsafeBytes { ptr -> Bool in
-            guard let base = ptr.baseAddress else { return false }
-            return sendAll(socket: clientSocket, buffer: base, length: reqJson.count)
-        }
-        guard bodySent else { return nil }
-
-        var respLenBigEndian: UInt32 = 0
-        let headerRead = withUnsafeMutableBytes(of: &respLenBigEndian) { ptr -> Bool in
-            guard let base = ptr.baseAddress else { return false }
-            return recvExact(socket: clientSocket, buffer: base, length: 4)
-        }
-        guard headerRead else { return nil }
-
-        let respLen = Int(UInt32(bigEndian: respLenBigEndian))
-        guard respLen > 0 && respLen <= 65_536 else { return nil }
-
-        var respData = Data(count: respLen)
-        let bodyRead = respData.withUnsafeMutableBytes { ptr -> Bool in
-            guard let base = ptr.baseAddress else { return false }
-            return recvExact(socket: clientSocket, buffer: base, length: respLen)
-        }
-        guard bodyRead else { return nil }
-
+        guard n > 0 && n < bufCap else { return nil }
+        let respData = Data(outBuf.prefix(n))
         return try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData)
-    }
-
-    private func sendAll(socket fd: Int32, buffer: UnsafeRawPointer, length: Int) -> Bool {
-        var totalSent = 0
-        while totalSent < length {
-            let sent = send(fd, buffer.advanced(by: totalSent), length - totalSent, 0)
-            if sent <= 0 {
-                return false
-            }
-            totalSent += sent
-        }
-        return true
-    }
-
-    private func recvExact(socket fd: Int32, buffer: UnsafeMutableRawPointer, length: Int) -> Bool {
-        var totalRead = 0
-        while totalRead < length {
-            let n = recv(fd, buffer.advanced(by: totalRead), length - totalRead, 0)
-            if n <= 0 {
-                return false
-            }
-            totalRead += n
-        }
-        return true
     }
 
     private func compactGpuName(_ raw: String) -> String {
@@ -954,9 +869,12 @@ public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
     CFRunLoopRun()
 }
 
-// MARK: - On-Demand Remote Paste C FFI Bridge
+// MARK: - On-Demand Remote Paste & Telemetry C FFI Bridge
 @_silgen_name("trigger_rust_remote_paste")
 func trigger_rust_remote_paste()
+
+@_silgen_name("fetch_rust_gpu_telemetry_json")
+func fetch_rust_gpu_telemetry_json(_ peerIp: UnsafePointer<CChar>?, _ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int
 
 @_cdecl("notify_touchbar_remote_file")
 public func notify_touchbar_remote_file(namePtr: UnsafePointer<CChar>?, totalBytes: UInt64) {

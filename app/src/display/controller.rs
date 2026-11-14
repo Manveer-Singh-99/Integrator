@@ -378,6 +378,26 @@ impl DisplayController {
         req: DisplayRpcRequest,
         peer_ip: Option<IpAddr>,
     ) -> DisplayRpcResponse {
+        let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+        if matches!(
+            req,
+            DisplayRpcRequest::ToggleMacToPc
+                | DisplayRpcRequest::TogglePcToMac
+                | DisplayRpcRequest::PasteRemote
+                | DisplayRpcRequest::ShowWindow
+                | DisplayRpcRequest::GetPairingPin
+                | DisplayRpcRequest::PairWithPeer { .. }
+        ) && !is_loopback_caller
+        {
+            warn!(
+                "🚫 Rejected local-only DisplayRpcRequest {:?} from non-loopback peer {:?}",
+                req, peer_ip
+            );
+            return self
+                .base_response(false, "Rejected: request is restricted to local loopback CLI")
+                .await;
+        }
+
         match req {
             DisplayRpcRequest::Ping => self.base_response(true, "pong").await,
             DisplayRpcRequest::GetHardwareProfile => {
@@ -732,6 +752,31 @@ impl DisplayController {
                     }
                 }
             }
+            DisplayRpcRequest::GetPairingPin => {
+                let (cfg, _) = trust::get_trust_snapshot();
+                let mut resp = self
+                    .base_response(true, format!("Active Pairing PIN: {}", cfg.pairing_pin))
+                    .await;
+                resp.pairing_token = Some(cfg.pairing_pin);
+                resp
+            }
+            DisplayRpcRequest::PairWithPeer { ip, pin } => {
+                match trust::pair_with_remote_peer_v2(ip.trim(), CONTROL_PORT, pin.trim()).await {
+                    Ok((creds, sas_6)) => {
+                        self.base_response(
+                            true,
+                            format!(
+                                "Paired and mutually authenticated with {} ({}) [SAS: {}]",
+                                creds.hostname,
+                                ip.trim(),
+                                sas_6
+                            ),
+                        )
+                        .await
+                    }
+                    Err(e) => self.base_response(false, e).await,
+                }
+            }
         }
     }
 
@@ -788,3 +833,55 @@ impl DisplayController {
         Ok(resp)
     }
 }
+
+/// C FFI bridge used by the macOS Touch Bar GPU HUD (`touchbar_hud.swift`) to poll
+/// `GetGpuTelemetry` over an authenticated `TransportSessionV2` (`ITR2`) channel.
+#[no_mangle]
+pub extern "C" fn fetch_rust_gpu_telemetry_json(
+    peer_ip_ptr: *const std::os::raw::c_char,
+    out_buf: *mut u8,
+    cap: usize,
+) -> usize {
+    if peer_ip_ptr.is_null() || out_buf.is_null() || cap < 2 {
+        return 0;
+    }
+    let peer_ip = unsafe { std::ffi::CStr::from_ptr(peer_ip_ptr) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if peer_ip.is_empty() {
+        return 0;
+    }
+
+    let fetch_future = async {
+        DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetGpuTelemetry).await
+    };
+
+    let resp_res = if let Some(handle) = crate::clipboard::TOKIO_HANDLE.get() {
+        handle.block_on(fetch_future)
+    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        rt.block_on(fetch_future)
+    } else {
+        return 0;
+    };
+
+    let Ok(resp) = resp_res else {
+        return 0;
+    };
+    let Ok(json_bytes) = serde_json::to_vec(&resp) else {
+        return 0;
+    };
+    if json_bytes.is_empty() || json_bytes.len() >= cap {
+        return 0;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(json_bytes.as_ptr(), out_buf, json_bytes.len());
+        *out_buf.add(json_bytes.len()) = 0;
+    }
+    json_bytes.len()
+}
+

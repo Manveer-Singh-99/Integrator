@@ -37,6 +37,11 @@ pub enum DisplayRpcRequest {
         channels: u8,
         bit_depth: u8,
     },
+    GetPairingPin,
+    PairWithPeer {
+        ip: String,
+        pin: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

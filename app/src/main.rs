@@ -1086,17 +1086,74 @@ fn main() -> Result<()> {
         });
     }
 
+    if args.len() > 1 && args[1] == "pin" {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async {
+            match DisplayController::send_remote_rpc("127.0.0.1", &DisplayRpcRequest::GetPairingPin)
+                .await
+            {
+                Ok(resp) => {
+                    if let Some(pin) = resp.pairing_token {
+                        println!("{}", pin);
+                    } else {
+                        println!("{}", resp.message);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to query pairing PIN from local daemon: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
+    if args.len() > 1 && args[1] == "pair" {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async {
+            let Some(ip) = args.get(2).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+                eprintln!("Usage: integrator pair <peer_ip> <6_digit_pin>");
+                std::process::exit(1);
+            };
+            let Some(pin) = args.get(3).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+                eprintln!("Usage: integrator pair <peer_ip> <6_digit_pin>");
+                std::process::exit(1);
+            };
+            match DisplayController::send_remote_rpc(
+                "127.0.0.1",
+                &DisplayRpcRequest::PairWithPeer { ip, pin },
+            )
+            .await
+            {
+                Ok(resp) => {
+                    println!("{}", resp.message);
+                    if !resp.success {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to pair via local daemon: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     // 2. Single Instance Check: if already running, focus existing window and exit
-    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+    if let Ok(stream) = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], config::CONTROL_PORT)),
         std::time::Duration::from_millis(150),
     ) {
-        let req = DisplayRpcRequest::ShowWindow;
-        if let Ok(bytes) = serde_json::to_vec(&req) {
-            use std::io::Write;
-            let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
-            let _ = stream.write_all(&bytes);
-            let _ = stream.flush();
+        drop(stream);
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = rt.block_on(DisplayController::send_remote_rpc(
+                "127.0.0.1",
+                &DisplayRpcRequest::ShowWindow,
+            ));
         }
         println!("Existing Integrator instance is already running. Brought window to front.");
         return Ok(());
