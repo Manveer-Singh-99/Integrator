@@ -931,6 +931,8 @@ fn macos_keychain_load_or_create_kek(
         static kSecMatchLimitOne: CFTypeRef;
         static kSecAttrAccessible: CFTypeRef;
         static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFTypeRef;
+        static kSecUseAuthenticationUI: CFTypeRef;
+        static kSecUseAuthenticationUIFail: CFTypeRef;
 
         fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> c_int;
         fn SecItemAdd(attributes: CFTypeRef, result: *mut CFTypeRef) -> c_int;
@@ -954,6 +956,7 @@ fn macos_keychain_load_or_create_kek(
         query.set(kSecAttrAccount, account.as_CFTypeRef());
         query.set(kSecReturnData, CFBoolean::true_value().as_CFTypeRef());
         query.set(kSecMatchLimit, kSecMatchLimitOne);
+        query.set(kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
 
         let mut result: CFTypeRef = std::ptr::null();
         let status = SecItemCopyMatching(query.as_CFTypeRef(), &mut result);
@@ -1245,6 +1248,17 @@ static GLOBAL_KEYSTORE_V2: OnceLock<Mutex<KeystoreV2>> = OnceLock::new();
 
 pub fn global_keystore() -> &'static Mutex<KeystoreV2> {
     GLOBAL_KEYSTORE_V2.get_or_init(|| {
+        #[cfg(test)]
+        let ks = {
+            let test_dir = std::env::temp_dir().join(format!(
+                "integrator_global_ks_test_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&test_dir);
+            KeystoreV2::open_with_provider(test_dir, &FixedKekProvider::new([0xA5u8; 32]))
+                .expect("Failed to initialize test KeystoreV2")
+        };
+        #[cfg(not(test))]
         let ks = KeystoreV2::open_default().unwrap_or_else(|e| {
             panic!("Failed to initialize Integrator v2 security keystore: {}", e)
         });

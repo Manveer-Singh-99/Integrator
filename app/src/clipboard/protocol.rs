@@ -2,16 +2,19 @@ use serde::{Deserialize, Serialize};
 
 pub const FRAME_DIR: u8 = 0x01;
 pub const FRAME_FILE: u8 = 0x02;
+pub const FRAME_FILE_DATA: u8 = 0x03;
+pub const FRAME_FILE_HASH: u8 = 0x04;
 pub const FRAME_END: u8 = 0xFF;
 
-// Maximum safe in-memory and transfer limits
-pub const MAX_TEXT_CHARS: usize = 10 * 1024 * 1024;               // 10 MB text
-pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;              // 64 MB uncompressed RGBA
-pub const MAX_IMAGE_DIMENSION: usize = 16_384;                    // Max 16384x16384 px
-pub const MAX_CLIPBOARD_HEADER_BYTES: usize = 128 * 1024 * 1024;  // Max serialized envelope size
-pub const MAX_TRANSFER_FILES: usize = 10_000;                     // Max files in a single copy
-pub const MAX_SINGLE_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;   // 10 GiB per file
-pub const MAX_TOTAL_TRANSFER_BYTES: u64 = 10 * 1024 * 1024 * 1024;// 10 GiB total per copy
+// Maximum safe in-memory and transfer limits (Integrator v2.0 Security Specification Section 8)
+pub const MAX_TEXT_CHARS: usize = 10 * 1024 * 1024;               // 10 MiB text
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;              // 64 MiB uncompressed RGBA
+pub const MAX_IMAGE_DIMENSION: usize = 8_192;                     // Max 8192x8192 px (checked pre-allocation)
+pub const MAX_CLIPBOARD_HEADER_BYTES: usize = 256 * 1024 * 1024;  // Max serialized message size
+pub const MAX_TRANSFER_FILES: usize = 1_000;                      // Max 1,000 files in a single copy
+pub const MAX_DIRECTORY_DEPTH: usize = 16;                        // Max 16 directory depth levels
+pub const MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;   // 16 GiB per file
+pub const MAX_TOTAL_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;// 32 GiB total per copy
 pub const MAX_AUTO_STAGE_BYTES: u64 = 128 * 1024 * 1024;          // 128 MiB background auto-stage cap
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

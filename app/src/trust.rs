@@ -21,10 +21,6 @@ use crate::security::{
     transport::{derive_loopback_self_credentials, ServiceId, TransportSessionV2},
 };
 use crate::system_info;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -608,128 +604,6 @@ pub fn verify_discovery_beacon_v2(
     }
 
     true
-}
-
-// ============================================================================
-// Authenticated Paired-Only Frame Envelope (Used by Clipboard until Milestone 5)
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PairedAeadEnvelopeV2 {
-    version: u8,
-    sender_device_id_hex: String,
-    key_id_hex: String,
-    timestamp_ms: u64,
-    nonce_hex: String,
-    ciphertext_hex: String,
-}
-
-/// Seals a frame exclusively for an already-paired peer using `ChaCha20Poly1305` under the peer's `K_root`.
-/// Fails closed if the peer is not cryptographically paired in `KeystoreV2` (zero static fallback).
-pub fn seal_envelope_for_ip(peer_ip: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let peer = lookup_verified_peer_for_ip(peer_ip).ok_or_else(|| {
-        format!(
-            "Refusing to send unauthenticated data to unpaired peer {}",
-            peer_ip
-        )
-    })?;
-    let sender_device_id_hex = system_info::get_or_create_device_id();
-    let key_id_hex = security::hex_encode(&peer.key_id);
-    let timestamp_ms = security::unix_epoch_millis();
-    let nonce_bytes = security::csprng_array::<12>();
-    let nonce_hex = security::hex_encode(&nonce_bytes);
-
-    let mut aad = Vec::new();
-    aad.extend_from_slice(b"integrator-paired-env-v2|");
-    aad.extend_from_slice(sender_device_id_hex.as_bytes());
-    aad.extend_from_slice(&peer.key_id);
-    aad.extend_from_slice(&timestamp_ms.to_be_bytes());
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*peer.root_key));
-    let ct = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "ChaCha20Poly1305 encryption failed".to_string())?;
-
-    let env = PairedAeadEnvelopeV2 {
-        version: 2,
-        sender_device_id_hex,
-        key_id_hex,
-        timestamp_ms,
-        nonce_hex,
-        ciphertext_hex: security::hex_encode(&ct),
-    };
-    serde_json::to_vec(&env).map_err(|e| e.to_string())
-}
-
-/// Opens and authenticates a `PairedAeadEnvelopeV2` exclusively using the sender's pinned `K_root` in `KeystoreV2`.
-pub fn open_envelope_from_ip(
-    peer_ip: IpAddr,
-    frame: &[u8],
-) -> Result<(Option<String>, Vec<u8>), String> {
-    let env: PairedAeadEnvelopeV2 = serde_json::from_slice(frame)
-        .map_err(|_| "Rejected non-v2 or malformed encrypted frame".to_string())?;
-    if env.version != 2 {
-        return Err(format!("Unsupported envelope version {}", env.version));
-    }
-
-    let now_ms = security::unix_epoch_millis();
-    if now_ms.abs_diff(env.timestamp_ms) > 120_000 {
-        return Err("Rejected expired or skewed v2 envelope".into());
-    }
-
-    let sender_id = env.sender_device_id_hex.trim().to_ascii_lowercase();
-    let peer = {
-        let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = ks.get_peer(&sender_id) {
-            p.clone()
-        } else if peer_ip.is_loopback() && sender_id == ks.local_device_id_hex() {
-            derive_loopback_self_credentials(&ks)
-        } else {
-            return Err(format!(
-                "Rejected envelope from unpaired peer '{}' ({})",
-                sender_id, peer_ip
-            ));
-        }
-    };
-
-    let Some(rx_key_id) = security::hex_decode_array::<16>(&env.key_id_hex) else {
-        return Err("Invalid key_id_hex in v2 envelope".into());
-    };
-    if !constant_time_eq(&rx_key_id, &peer.key_id) {
-        return Err("Envelope key_id mismatch against pinned peer".into());
-    }
-
-    let Some(nonce_bytes) = security::hex_decode_array::<12>(&env.nonce_hex) else {
-        return Err("Invalid nonce_hex in v2 envelope".into());
-    };
-    let Some(ct_bytes) = security::hex_decode(&env.ciphertext_hex) else {
-        return Err("Invalid ciphertext_hex in v2 envelope".into());
-    };
-
-    let mut aad = Vec::new();
-    aad.extend_from_slice(b"integrator-paired-env-v2|");
-    aad.extend_from_slice(sender_id.as_bytes());
-    aad.extend_from_slice(&peer.key_id);
-    aad.extend_from_slice(&env.timestamp_ms.to_be_bytes());
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*peer.root_key));
-    let pt = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: &ct_bytes,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "ChaCha20Poly1305 tag verification failed on v2 envelope".to_string())?;
-
-    Ok((Some(sender_id), pt))
 }
 
 #[cfg(test)]

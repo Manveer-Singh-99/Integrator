@@ -878,6 +878,65 @@ where
         }
     }
 
+    /// Sends a potentially multi-megabyte payload (e.g. a clipboard image or large JSON envelope)
+    /// segmented into `<= max_plaintext_frame_bytes()` AEAD records preceded by an 8-byte length record.
+    pub async fn send_chunked_payload(
+        &mut self,
+        payload: &[u8],
+        max_total_len: usize,
+    ) -> Result<(), TransportError> {
+        if payload.is_empty() || payload.len() > max_total_len {
+            return Err(TransportError::OversizedFrame {
+                len: payload.len(),
+                max: max_total_len,
+            });
+        }
+        let max_chunk = self.service_id.max_plaintext_frame_bytes();
+        let len_bytes = (payload.len() as u64).to_be_bytes();
+        self.send_message(&len_bytes).await?;
+        for chunk in payload.chunks(max_chunk) {
+            self.send_message(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Receives a potentially multi-megabyte payload segmented into AEAD records, verifying
+    /// `total_len <= max_total_len` before allocating the output buffer.
+    pub async fn recv_chunked_payload(
+        &mut self,
+        max_total_len: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        let hdr_rec = self.recv_message().await?;
+        if hdr_rec.len() != 8 {
+            return Err(TransportError::OversizedFrame {
+                len: hdr_rec.len(),
+                max: 8,
+            });
+        }
+        let mut len_arr = [0u8; 8];
+        len_arr.copy_from_slice(&hdr_rec);
+        let total_len = usize::try_from(u64::from_be_bytes(len_arr)).unwrap_or(usize::MAX);
+        if total_len == 0 || total_len > max_total_len {
+            return Err(TransportError::OversizedFrame {
+                len: total_len,
+                max: max_total_len,
+            });
+        }
+
+        let mut out = Vec::with_capacity(total_len.min(1024 * 1024));
+        while out.len() < total_len {
+            let chunk = self.recv_message().await?;
+            if chunk.is_empty() || out.len().saturating_add(chunk.len()) > total_len {
+                return Err(TransportError::OversizedFrame {
+                    len: out.len().saturating_add(chunk.len()),
+                    max: total_len,
+                });
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
     /// Sends an authenticated `CloseNotify` frame before closing the session.
     pub async fn close_notify(&mut self) -> Result<(), TransportError> {
         let frame = self.tx_state.seal_record(

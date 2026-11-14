@@ -1,7 +1,8 @@
-//! Universal Clipboard Service with Authenticated & Encrypted Transport,
-//! Strict Bounds, Integrity Verification, and Safe File Streaming.
+//! Universal Clipboard Service with Mutually Authenticated `TransportSessionV2` (`ITR2`),
+//! Strict Quotas, Path Traversal & Symlink Protections, Per-File + Manifest SHA-256 Verification,
+//! and Isolated Staging with Atomic Commits.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arboard::{Clipboard, ImageData};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
@@ -18,18 +18,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::CLIPBOARD_PORT;
 use crate::discovery::DiscoveryManager;
+use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
 use super::file_helper::FileClipboardHelper;
 use super::os_seq;
 use super::protocol::{
     ClipboardMessage, ClipboardPayload, LazyAnnouncement, StreamRequest,
-    FRAME_DIR, FRAME_END, FRAME_FILE,
-    MAX_AUTO_STAGE_BYTES, MAX_CLIPBOARD_HEADER_BYTES, MAX_IMAGE_BYTES,
-    MAX_IMAGE_DIMENSION, MAX_SINGLE_FILE_BYTES, MAX_TEXT_CHARS,
+    FRAME_DIR, FRAME_END, FRAME_FILE, FRAME_FILE_DATA, FRAME_FILE_HASH,
+    MAX_AUTO_STAGE_BYTES, MAX_CLIPBOARD_HEADER_BYTES, MAX_DIRECTORY_DEPTH,
+    MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_SINGLE_FILE_BYTES, MAX_TEXT_CHARS,
     MAX_TOTAL_TRANSFER_BYTES, MAX_TRANSFER_FILES,
 };
 
-const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB high-throughput buffer
+const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB high-throughput AEAD chunk
 const MAX_CONCURRENT_CLIPBOARD_CONNS: usize = 8;
 const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -93,57 +94,120 @@ fn validate_image_bounds(width: usize, height: usize, rgba_len: usize) -> bool {
     }
 }
 
+/// Checks whether a path component is a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`..`COM9`, `LPT1`..`LPT9`, with or without extension).
+fn is_windows_reserved_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Validates a single path component against traversal, control chars, Windows forbidden chars,
+/// trailing spaces/dots, and Windows reserved device names.
+fn validate_single_path_component(comp: &str) -> Result<()> {
+    if comp.is_empty() || comp == "." || comp == ".." {
+        anyhow::bail!("Rejected traversal or empty path component '{}'", comp);
+    }
+    if comp.len() > 255 {
+        anyhow::bail!("Rejected path component exceeding 255 bytes");
+    }
+    if comp.ends_with(' ') || comp.ends_with('.') {
+        anyhow::bail!(
+            "Rejected path component '{}' ending with trailing space or dot",
+            comp
+        );
+    }
+    if comp.chars().any(|c| {
+        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0')
+    }) {
+        anyhow::bail!(
+            "Rejected path component '{}' containing forbidden or control characters",
+            comp
+        );
+    }
+    if is_windows_reserved_device_name(comp) {
+        anyhow::bail!(
+            "Rejected Windows reserved device name '{}' in file transfer path",
+            comp
+        );
+    }
+    Ok(())
+}
+
 fn safe_root_entry_name(raw: &str) -> String {
-    let cleaned = raw
+    let candidate = raw
         .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .last()
+        .find(|s| !s.is_empty() && *s != "." && *s != "..")
         .unwrap_or("clipboard_item");
-    if cleaned.contains(':')
-        || cleaned.is_empty()
-        || cleaned.chars().any(|c| c.is_control())
-    {
-        "clipboard_item".to_string()
+    if validate_single_path_component(candidate).is_ok() {
+        candidate.to_string()
     } else {
-        cleaned.to_string()
+        "clipboard_item".to_string()
     }
 }
 
-#[allow(dead_code)]
-fn join_safe_rel_path(base: &Path, rel_path: &str) -> PathBuf {
-    let mut dest = base.to_path_buf();
-    for comp in rel_path.split(['/', '\\']) {
-        if !comp.is_empty()
-            && comp != "."
-            && comp != ".."
-            && !comp.contains(':')
-            && !comp.chars().any(|c| c.is_control())
-        {
-            dest.push(comp);
-        }
-    }
-    dest
-}
-
-/// Ensures `rel_path` resolves strictly inside `dest_base` and rejects any symlink
-/// along the destination path hierarchy.
+/// Strictly validates `rel_path` (rejecting leading slashes, `..`, `.`, empty segments,
+/// depth > `MAX_DIRECTORY_DEPTH`, Windows reserved names, and symlinks) and resolves it
+/// inside `dest_base`.
 fn ensure_safe_contained_path(dest_base: &Path, rel_path: &str) -> Result<PathBuf> {
+    if rel_path.is_empty()
+        || rel_path.starts_with('/')
+        || rel_path.starts_with('\\')
+        || rel_path.contains('\0')
+    {
+        anyhow::bail!(
+            "Security violation: rejected absolute or malformed relative path '{}'",
+            rel_path
+        );
+    }
+
     std::fs::create_dir_all(dest_base)?;
     let canon_base = dest_base
         .canonicalize()
         .with_context(|| format!("Failed to canonicalize destination base {:?}", dest_base))?;
 
     let mut current = canon_base.clone();
-    let mut added_any = false;
+    let mut depth = 0usize;
+
     for comp in rel_path.split(['/', '\\']) {
-        if comp.is_empty() || comp == "." || comp == ".." || comp.contains(':') {
-            continue;
-        }
-        if comp.chars().any(|c| c.is_control()) {
-            anyhow::bail!("Rejected relative path component containing control characters");
+        validate_single_path_component(comp)?;
+        depth += 1;
+        if depth > MAX_DIRECTORY_DEPTH {
+            anyhow::bail!(
+                "Security violation: relative path '{}' exceeds maximum directory depth ({})",
+                rel_path,
+                MAX_DIRECTORY_DEPTH
+            );
         }
         current.push(comp);
-        added_any = true;
         if let Ok(meta) = std::fs::symlink_metadata(&current) {
             if meta.file_type().is_symlink() {
                 anyhow::bail!(
@@ -154,7 +218,7 @@ fn ensure_safe_contained_path(dest_base: &Path, rel_path: &str) -> Result<PathBu
         }
     }
 
-    if !added_any {
+    if depth == 0 {
         anyhow::bail!("Rejected empty relative path in file stream");
     }
     if !current.starts_with(&canon_base) {
@@ -165,6 +229,29 @@ fn ensure_safe_contained_path(dest_base: &Path, rel_path: &str) -> Result<PathBu
         );
     }
     Ok(current)
+}
+
+/// Creates a new staged file exclusively (`create_new(true)`) with `O_NOFOLLOW` on Unix so a
+/// symlink or pre-existing file at `dest_path` can never be followed or overwritten.
+fn open_staged_file_create_new(dest_path: &Path) -> Result<File> {
+    if let Ok(meta) = std::fs::symlink_metadata(dest_path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Security violation: target file {:?} is a symbolic link",
+                dest_path
+            );
+        }
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    opts.open(dest_path)
+        .with_context(|| format!("Failed to exclusively create staged file {:?}", dest_path))
 }
 
 /// Picks a non-destructive destination path in `target_dir` so existing files/folders
@@ -193,7 +280,11 @@ fn resolve_non_colliding_dest(target_dir: &Path, safe_name: &str) -> PathBuf {
             return next;
         }
     }
-    target_dir.join(format!("{}_{}", safe_name, trust::generate_random_token_hex(4)))
+    target_dir.join(format!(
+        "{}_{}",
+        safe_name,
+        trust::generate_random_token_hex(4)
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -268,7 +359,10 @@ impl ClipboardService {
 
     pub async fn start(&self) -> Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CLIPBOARD_PORT)).await?;
-        info!("📋 Universal Clipboard Service active on port {}", CLIPBOARD_PORT);
+        info!(
+            "📋 Universal Clipboard Service (TransportV2 ITR2) active on port {}",
+            CLIPBOARD_PORT
+        );
 
         // 1. Spawn TCP Receiver with bounded concurrency
         let s_clone = self.clone();
@@ -288,11 +382,6 @@ impl ClipboardService {
                         let handler = s_clone.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if !Self::has_paired_peer(addr.ip()).await {
-                                warn!("🚫 Rejected untrusted clipboard connection from {}", addr);
-                                drop(socket);
-                                return;
-                            }
                             debug!("Incoming clipboard connection from {}", addr);
                             if let Err(e) = handler.handle_incoming(socket, addr).await {
                                 warn!("Error handling clipboard transfer from {}: {}", addr, e);
@@ -321,34 +410,26 @@ impl ClipboardService {
         Ok(())
     }
 
-    /// Handles incoming encrypted/authenticated clipboard payloads and stream requests from peer.
-    async fn handle_incoming(&self, mut socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
-        let header_len = tokio::time::timeout(Duration::from_secs(10), socket.read_u32())
-            .await
-            .context("Timed out reading header length")?? as usize;
+    /// Handles incoming mutually authenticated `TransportSessionV2` (`ServiceId::ClipboardTransfer`)
+    /// clipboard payloads and stream requests from a paired peer.
+    async fn handle_incoming(&self, socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
+        let _ = socket.set_nodelay(true);
+        let mut session = trust::accept_transport_from_stream(
+            socket,
+            peer_addr.ip(),
+            None,
+            ServiceId::ClipboardTransfer,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Clipboard TransportV2 handshake rejected: {}", e))?;
 
-        if header_len == 0 || header_len > MAX_CLIPBOARD_HEADER_BYTES {
-            anyhow::bail!(
-                "Rejected clipboard header length {} bytes (max {}) from {}",
-                header_len,
-                MAX_CLIPBOARD_HEADER_BYTES,
-                peer_addr
-            );
-        }
-
-        let mut header_buf = vec![0u8; header_len];
-        tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut header_buf))
-            .await
-            .context("Timed out reading header body")??;
-
-        let (auth_dev, plaintext) = trust::open_envelope_from_ip(peer_addr.ip(), &header_buf)
-            .map_err(|e| anyhow::anyhow!("Clipboard envelope verification failed: {}", e))?;
-        if auth_dev.is_none() {
-            anyhow::bail!(
-                "Clipboard sender from {} is not an authenticated trusted peer",
-                peer_addr
-            );
-        }
+        let plaintext = tokio::time::timeout(
+            FRAME_IO_TIMEOUT,
+            session.recv_chunked_payload(MAX_CLIPBOARD_HEADER_BYTES),
+        )
+        .await
+        .context("Timed out reading clipboard message over TransportV2")?
+        .map_err(|e| anyhow::anyhow!("Failed reading clipboard message over TransportV2: {}", e))?;
 
         let msg: ClipboardMessage = serde_json::from_slice(&plaintext)?;
 
@@ -516,12 +597,12 @@ impl ClipboardService {
                         )
                     {
                         info!(
-                            "🚀 Peer requested on-demand stream for '{}' ({} files, {:.1} MB). Streaming from disk...",
+                            "🚀 Peer requested on-demand stream for '{}' ({} files, {:.1} MB). Streaming over TransportV2...",
                             copy.root_name,
                             copy.total_files,
                             copy.total_bytes as f64 / (1024.0 * 1024.0)
                         );
-                        Self::stream_files_to_socket(&mut socket, copy.directories, copy.files)
+                        Self::stream_files_over_session(&mut session, copy.directories, copy.files)
                             .await?;
                     } else {
                         warn!("Stream request session_id does not match active local copy");
@@ -536,17 +617,21 @@ impl ClipboardService {
     }
 
     /// Recursively collects regular files and subdirectories while skipping symlinks
-    /// and enforcing `MAX_TRANSFER_FILES` / `MAX_TOTAL_TRANSFER_BYTES`.
+    /// and enforcing `MAX_TRANSFER_FILES`, `MAX_DIRECTORY_DEPTH`, and `MAX_TOTAL_TRANSFER_BYTES`.
     fn collect_dir_entries(
         _root: &Path,
         current: &Path,
         rel_prefix: &str,
+        depth: usize,
         directories: &mut Vec<String>,
         files: &mut Vec<(String, PathBuf)>,
         total_bytes: &mut u64,
         total_files: &mut usize,
     ) {
-        if *total_files >= MAX_TRANSFER_FILES || *total_bytes >= MAX_TOTAL_TRANSFER_BYTES {
+        if depth >= MAX_DIRECTORY_DEPTH
+            || *total_files >= MAX_TRANSFER_FILES
+            || *total_bytes >= MAX_TOTAL_TRANSFER_BYTES
+        {
             return;
         }
         if let Ok(read_dir) = std::fs::read_dir(current) {
@@ -564,19 +649,25 @@ impl ClipboardService {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
+                if validate_single_path_component(&name).is_err() {
+                    continue;
+                }
                 let rel = format!("{}/{}", rel_prefix, name);
 
                 if meta.is_dir() {
-                    directories.push(rel.clone());
-                    Self::collect_dir_entries(
-                        _root,
-                        &path,
-                        &rel,
-                        directories,
-                        files,
-                        total_bytes,
-                        total_files,
-                    );
+                    if depth + 1 < MAX_DIRECTORY_DEPTH {
+                        directories.push(rel.clone());
+                        Self::collect_dir_entries(
+                            _root,
+                            &path,
+                            &rel,
+                            depth + 1,
+                            directories,
+                            files,
+                            total_bytes,
+                            total_files,
+                        );
+                    }
                 } else if meta.is_file() {
                     let len = meta.len();
                     if len <= MAX_SINGLE_FILE_BYTES
@@ -684,6 +775,9 @@ impl ClipboardService {
                         }
                         if let Some(file_name) = root.file_name() {
                             let name_str = file_name.to_string_lossy().to_string();
+                            if validate_single_path_component(&name_str).is_err() {
+                                continue;
+                            }
                             if root_name.is_empty() {
                                 root_name = name_str.clone();
                             }
@@ -693,6 +787,7 @@ impl ClipboardService {
                                     root,
                                     root,
                                     &name_str,
+                                    1,
                                     &mut directories,
                                     &mut files,
                                     &mut total_bytes,
@@ -700,7 +795,8 @@ impl ClipboardService {
                                 );
                             } else if meta.is_file() {
                                 let len = meta.len();
-                                if len <= MAX_SINGLE_FILE_BYTES
+                                if total_files < MAX_TRANSFER_FILES
+                                    && len <= MAX_SINGLE_FILE_BYTES
                                     && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
                                 {
                                     total_bytes += len;
@@ -882,60 +978,69 @@ impl ClipboardService {
         }
     }
 
-    /// Sends an encrypted, authenticated JSON payload over TCP with write timeouts.
+    /// Sends an encrypted, mutually authenticated `ClipboardMessage` over `TransportSessionV2`.
     async fn send_payload(peer_ip: &str, msg: ClipboardMessage) -> Result<()> {
         let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-            .await
-            .with_context(|| format!("Timed out connecting to clipboard peer at {}", addr))?
-            .with_context(|| format!("Failed to connect to peer at {}", addr))?;
-        let _ = stream.set_nodelay(true);
+        let mut session = trust::connect_transport_to_ip(
+            peer_ip,
+            CLIPBOARD_PORT,
+            ServiceId::ClipboardTransfer,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to establish Clipboard TransportV2 to {}: {}", addr, e))?;
 
         let serialized = serde_json::to_vec(&msg)?;
-        let sealed = trust::seal_envelope_for_ip(peer_ip, &serialized)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        tokio::time::timeout(FRAME_IO_TIMEOUT, async {
-            stream.write_u32(sealed.len() as u32).await?;
-            stream.write_all(&sealed).await?;
-            stream.flush().await
-        })
+        tokio::time::timeout(
+            FRAME_IO_TIMEOUT,
+            session.send_chunked_payload(&serialized, MAX_CLIPBOARD_HEADER_BYTES),
+        )
         .await
-        .with_context(|| format!("Timed out sending clipboard payload to {}", addr))??;
+        .with_context(|| format!("Timed out sending clipboard payload to {}", addr))?
+        .map_err(|e| anyhow::anyhow!("Clipboard TransportV2 send error to {}: {}", addr, e))?;
 
-        info!("✅ Sent encrypted clipboard message to {}", addr);
+        info!("✅ Sent TransportV2 encrypted clipboard message to {}", addr);
         Ok(())
     }
 
-    /// Streams directory structure and file contents directly from disk over socket.
+    /// Streams directory structure, file contents, per-file SHA-256 digests, and a final manifest
+    /// SHA-256 digest over an authenticated `TransportSessionV2`.
     /// Aborts cleanly if any source file is modified/truncated mid-transfer instead of zero-padding.
-    async fn stream_files_to_socket(
-        stream: &mut TcpStream,
+    pub(crate) async fn stream_files_over_session<S>(
+        session: &mut TransportSessionV2<S>,
         directories: Vec<String>,
         files: Vec<(String, PathBuf)>,
-    ) -> Result<()> {
-        let _ = stream.set_nodelay(true);
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut manifest_hasher = Sha256::new();
+        manifest_hasher.update(b"INTEGRATOR-FILE-MANIFEST-V2");
 
-        // 1. Directory frames
+        // 1. Directory frames: [FRAME_DIR(1B) || path_len_be(2B) || rel_path_utf8]
         for dir_rel in &directories {
             let rel_bytes = dir_rel.as_bytes();
-            if rel_bytes.is_empty() || rel_bytes.len() > u16::MAX as usize {
+            if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
                 continue;
             }
-            tokio::time::timeout(FRAME_IO_TIMEOUT, async {
-                stream.write_u8(FRAME_DIR).await?;
-                stream.write_u16(rel_bytes.len() as u16).await?;
-                stream.write_all(rel_bytes).await
-            })
-            .await
-            .context("Timed out writing directory frame")??;
+            let mut rec = Vec::with_capacity(3 + rel_bytes.len());
+            rec.push(FRAME_DIR);
+            rec.extend_from_slice(&(rel_bytes.len() as u16).to_be_bytes());
+            rec.extend_from_slice(rel_bytes);
+
+            tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&rec))
+                .await
+                .context("Timed out writing directory frame")?
+                .map_err(|e| anyhow::anyhow!("Directory frame TransportV2 error: {}", e))?;
         }
 
         // 2. File frames
-        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE];
+        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE + 1];
+        chunk_buf[0] = FRAME_FILE_DATA;
+
         for (rel_path, abs_path) in files {
             let rel_bytes = rel_path.as_bytes();
-            if rel_bytes.is_empty() || rel_bytes.len() > u16::MAX as usize {
+            if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
                 continue;
             }
 
@@ -948,19 +1053,23 @@ impl ClipboardService {
             let mut file = File::open(&abs_path)
                 .with_context(|| format!("Could not open {:?} for streaming", abs_path))?;
 
-            tokio::time::timeout(FRAME_IO_TIMEOUT, async {
-                stream.write_u8(FRAME_FILE).await?;
-                stream.write_u16(rel_bytes.len() as u16).await?;
-                stream.write_all(rel_bytes).await?;
-                stream.write_u64(actual_len).await
-            })
-            .await
-            .context("Timed out writing file header frame")??;
+            // Header record: [FRAME_FILE(1B) || path_len_be(2B) || rel_bytes || actual_len_be(8B)]
+            let mut hdr_rec = Vec::with_capacity(11 + rel_bytes.len());
+            hdr_rec.push(FRAME_FILE);
+            hdr_rec.extend_from_slice(&(rel_bytes.len() as u16).to_be_bytes());
+            hdr_rec.extend_from_slice(rel_bytes);
+            hdr_rec.extend_from_slice(&actual_len.to_be_bytes());
 
+            tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&hdr_rec))
+                .await
+                .context("Timed out writing file header frame")?
+                .map_err(|e| anyhow::anyhow!("File header TransportV2 error: {}", e))?;
+
+            let mut file_hasher = Sha256::new();
             let mut remaining = actual_len;
             while remaining > 0 {
-                let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
-                let n = file.read(&mut chunk_buf[..to_read])?;
+                let to_read = std::cmp::min(remaining, STREAM_CHUNK_SIZE as u64) as usize;
+                let n = file.read(&mut chunk_buf[1..1 + to_read])?;
                 if n == 0 {
                     anyhow::bail!(
                         "Source file {:?} was truncated during transfer ({} bytes remaining); aborting stream to prevent corruption",
@@ -968,21 +1077,53 @@ impl ClipboardService {
                         remaining
                     );
                 }
-                tokio::time::timeout(FRAME_IO_TIMEOUT, stream.write_all(&chunk_buf[..n]))
-                    .await
-                    .context("Timed out writing file chunk to socket")??;
+                file_hasher.update(&chunk_buf[1..1 + n]);
+                tokio::time::timeout(
+                    FRAME_IO_TIMEOUT,
+                    session.send_message(&chunk_buf[..1 + n]),
+                )
+                .await
+                .context("Timed out writing file chunk to TransportV2 session")?
+                .map_err(|e| anyhow::anyhow!("File chunk TransportV2 error: {}", e))?;
                 remaining -= n as u64;
             }
+
+            // Ensure the file did not grow while being read
+            let mut extra_byte = [0u8; 1];
+            if file.read(&mut extra_byte)? > 0 {
+                anyhow::bail!(
+                    "Source file {:?} was modified/appended during transfer; aborting stream",
+                    abs_path
+                );
+            }
+
+            let file_sha256: [u8; 32] = file_hasher.finalize().into();
+            manifest_hasher.update(&(rel_bytes.len() as u32).to_be_bytes());
+            manifest_hasher.update(rel_bytes);
+            manifest_hasher.update(&actual_len.to_be_bytes());
+            manifest_hasher.update(&file_sha256);
+
+            let mut hash_rec = [0u8; 33];
+            hash_rec[0] = FRAME_FILE_HASH;
+            hash_rec[1..33].copy_from_slice(&file_sha256);
+
+            tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&hash_rec))
+                .await
+                .context("Timed out writing file SHA-256 frame")?
+                .map_err(|e| anyhow::anyhow!("File hash TransportV2 error: {}", e))?;
         }
 
-        tokio::time::timeout(FRAME_IO_TIMEOUT, async {
-            stream.write_u8(FRAME_END).await?;
-            stream.flush().await
-        })
-        .await
-        .context("Timed out writing FRAME_END")??;
+        let manifest_sha256: [u8; 32] = manifest_hasher.finalize().into();
+        let mut end_rec = [0u8; 33];
+        end_rec[0] = FRAME_END;
+        end_rec[1..33].copy_from_slice(&manifest_sha256);
 
-        info!("✅ Finished on-demand streaming to peer");
+        tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&end_rec))
+            .await
+            .context("Timed out writing FRAME_END")?
+            .map_err(|e| anyhow::anyhow!("FRAME_END TransportV2 error: {}", e))?;
+
+        info!("✅ Finished authenticated streaming to peer");
         Ok(())
     }
 
@@ -1083,13 +1224,19 @@ impl ClipboardService {
         anyhow::bail!("No trusted peer connected for clipboard stream")
     }
 
-    async fn connect_and_request_stream(peer_ip: &str, session_id: &str) -> Result<TcpStream> {
+    async fn connect_and_request_stream(
+        peer_ip: &str,
+        session_id: &str,
+    ) -> Result<TransportSessionV2<TcpStream>> {
         let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
-        let mut socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-            .await
-            .with_context(|| format!("Timed out connecting to peer at {}", addr))?
-            .with_context(|| format!("Failed to connect to peer at {}", addr))?;
-        let _ = socket.set_nodelay(true);
+        let mut session = trust::connect_transport_to_ip(
+            peer_ip,
+            CLIPBOARD_PORT,
+            ServiceId::ClipboardTransfer,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect TransportV2 to {}: {}", addr, e))?;
 
         let req_msg = ClipboardMessage {
             hash: String::new(),
@@ -1099,27 +1246,29 @@ impl ClipboardService {
         };
 
         let serialized = serde_json::to_vec(&req_msg)?;
-        let sealed = trust::seal_envelope_for_ip(peer_ip, &serialized)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        tokio::time::timeout(FRAME_IO_TIMEOUT, async {
-            socket.write_u32(sealed.len() as u32).await?;
-            socket.write_all(&sealed).await?;
-            socket.flush().await
-        })
+        tokio::time::timeout(
+            FRAME_IO_TIMEOUT,
+            session.send_chunked_payload(&serialized, MAX_CLIPBOARD_HEADER_BYTES),
+        )
         .await
-        .context("Timed out sending stream request header")??;
+        .context("Timed out sending stream request header")?
+        .map_err(|e| anyhow::anyhow!("Stream request TransportV2 send error: {}", e))?;
 
-        Ok(socket)
+        Ok(session)
     }
 
-    async fn receive_stream_frames(
-        socket: &mut TcpStream,
+    /// Receives and verifies directory frames, file frames, per-file SHA-256 digests, and the
+    /// overall manifest SHA-256 digest into an isolated staging directory (`dest_base`).
+    pub(crate) async fn receive_stream_frames_from_session<S>(
+        session: &mut TransportSessionV2<S>,
         dest_base: &Path,
         expected_total_bytes: u64,
         expected_total_files: usize,
         root_remap: Option<(&str, &str)>,
-    ) -> Result<(u64, std::time::Instant)> {
+    ) -> Result<(u64, std::time::Instant)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         if expected_total_files == 0 || expected_total_files > MAX_TRANSFER_FILES {
             anyhow::bail!(
                 "Invalid announced file count {} (max {})",
@@ -1139,31 +1288,47 @@ impl ClipboardService {
         let mut received_files: usize = 0;
         let start_time = std::time::Instant::now();
         let mut last_progress_report = std::time::Instant::now();
-        let mut chunk_buf = vec![0u8; STREAM_CHUNK_SIZE];
+        let mut manifest_hasher = Sha256::new();
+        manifest_hasher.update(b"INTEGRATOR-FILE-MANIFEST-V2");
 
         loop {
-            let tag = tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_u8())
+            let rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
                 .await
-                .context("Timed out waiting for next stream frame tag from peer")?
-                .context("Stream closed before FRAME_END was received")?;
+                .context("Timed out waiting for next stream frame from peer")?
+                .map_err(|e| anyhow::anyhow!("Stream closed or failed before FRAME_END: {}", e))?;
+
+            if rec.is_empty() {
+                anyhow::bail!("Received empty stream record from peer");
+            }
+            let tag = rec[0];
 
             if tag == FRAME_END {
-                debug!("Received FRAME_END from peer");
+                if rec.len() != 33 {
+                    anyhow::bail!(
+                        "Invalid FRAME_END record length {} (expected 33 bytes with manifest SHA-256)",
+                        rec.len()
+                    );
+                }
+                let expected_manifest_sha256 = &rec[1..33];
+                let computed_manifest_sha256: [u8; 32] = manifest_hasher.finalize().into();
+                if !trust::constant_time_eq(&computed_manifest_sha256, expected_manifest_sha256) {
+                    anyhow::bail!(
+                        "Security violation: file transfer manifest SHA-256 mismatch; aborting commit"
+                    );
+                }
+                debug!("Verified FRAME_END and manifest SHA-256 from peer");
                 break;
             } else if tag == FRAME_DIR {
-                let path_len = tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_u16())
-                    .await
-                    .context("Timed out reading directory path length")??
-                    as usize;
-                if path_len == 0 || path_len > 4096 {
+                if rec.len() < 3 {
+                    anyhow::bail!("Malformed FRAME_DIR record (len {})", rec.len());
+                }
+                let path_len = u16::from_be_bytes([rec[1], rec[2]]) as usize;
+                if path_len == 0 || path_len > 4096 || rec.len() != 3 + path_len {
                     anyhow::bail!("Invalid directory path length {} in stream", path_len);
                 }
-                let mut path_bytes = vec![0u8; path_len];
-                tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_exact(&mut path_bytes))
-                    .await
-                    .context("Timed out reading directory path bytes")??;
-                let raw_rel = String::from_utf8_lossy(&path_bytes);
-                let rel_path = Self::remap_rel_root(&raw_rel, root_remap);
+                let raw_rel = std::str::from_utf8(&rec[3..3 + path_len])
+                    .context("Directory relative path is not valid UTF-8")?;
+                let rel_path = Self::remap_rel_root(raw_rel, root_remap);
                 let dest_path = ensure_safe_contained_path(dest_base, &rel_path)?;
                 std::fs::create_dir_all(&dest_path)?;
             } else if tag == FRAME_FILE {
@@ -1175,24 +1340,22 @@ impl ClipboardService {
                         expected_total_files
                     );
                 }
-
-                let path_len = tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_u16())
-                    .await
-                    .context("Timed out reading file path length")??
-                    as usize;
-                if path_len == 0 || path_len > 4096 {
+                if rec.len() < 11 {
+                    anyhow::bail!("Malformed FRAME_FILE header record (len {})", rec.len());
+                }
+                let path_len = u16::from_be_bytes([rec[1], rec[2]]) as usize;
+                if path_len == 0 || path_len > 4096 || rec.len() != 11 + path_len {
                     anyhow::bail!("Invalid file path length {} in stream", path_len);
                 }
-                let mut path_bytes = vec![0u8; path_len];
-                tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_exact(&mut path_bytes))
-                    .await
-                    .context("Timed out reading file path bytes")??;
-                let raw_rel = String::from_utf8_lossy(&path_bytes);
-                let rel_path = Self::remap_rel_root(&raw_rel, root_remap);
+                let raw_rel_bytes = &rec[3..3 + path_len];
+                let raw_rel = std::str::from_utf8(raw_rel_bytes)
+                    .context("File relative path is not valid UTF-8")?;
+                let rel_path = Self::remap_rel_root(raw_rel, root_remap);
 
-                let file_size = tokio::time::timeout(FRAME_IO_TIMEOUT, socket.read_u64())
-                    .await
-                    .context("Timed out reading file size")??;
+                let mut sz_bytes = [0u8; 8];
+                sz_bytes.copy_from_slice(&rec[3 + path_len..11 + path_len]);
+                let file_size = u64::from_be_bytes(sz_bytes);
+
                 if file_size > MAX_SINGLE_FILE_BYTES {
                     anyhow::bail!(
                         "File '{}' size {} exceeds single-file limit {}",
@@ -1215,21 +1378,46 @@ impl ClipboardService {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                let mut file = File::create(&dest_path)?;
+                let mut file = open_staged_file_create_new(&dest_path)?;
+                let mut file_hasher = Sha256::new();
                 let mut remaining = file_size;
+
                 while remaining > 0 {
-                    let to_read = std::cmp::min(remaining, chunk_buf.len() as u64) as usize;
-                    tokio::time::timeout(
-                        FRAME_IO_TIMEOUT,
-                        socket.read_exact(&mut chunk_buf[..to_read]),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("Timed out reading file data chunk for '{}'", rel_path)
-                    })??;
-                    file.write_all(&chunk_buf[..to_read])?;
-                    remaining -= to_read as u64;
-                    transferred_bytes += to_read as u64;
+                    let data_rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
+                        .await
+                        .with_context(|| {
+                            format!("Timed out reading file data chunk for '{}'", rel_path)
+                        })?
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Stream closed prematurely while reading '{}' ({} bytes remaining): {}",
+                                rel_path,
+                                remaining,
+                                e
+                            )
+                        })?;
+
+                    if data_rec.len() < 2 || data_rec[0] != FRAME_FILE_DATA {
+                        anyhow::bail!(
+                            "Expected FRAME_FILE_DATA (0x03) for '{}', got len={}",
+                            rel_path,
+                            data_rec.len()
+                        );
+                    }
+                    let chunk = &data_rec[1..];
+                    if (chunk.len() as u64) > remaining {
+                        anyhow::bail!(
+                            "File '{}' chunk size {} exceeds remaining bytes {}",
+                            rel_path,
+                            chunk.len(),
+                            remaining
+                        );
+                    }
+
+                    file_hasher.update(chunk);
+                    file.write_all(chunk)?;
+                    remaining -= chunk.len() as u64;
+                    transferred_bytes += chunk.len() as u64;
 
                     if last_progress_report.elapsed() >= Duration::from_millis(100) {
                         last_progress_report = std::time::Instant::now();
@@ -1252,11 +1440,42 @@ impl ClipboardService {
                     }
                 }
                 file.flush()?;
+
+                // Read and verify mandatory per-file SHA-256 commit frame
+                let hash_rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
+                    .await
+                    .with_context(|| format!("Timed out reading SHA-256 frame for '{}'", rel_path))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed reading SHA-256 frame for '{}': {}", rel_path, e)
+                    })?;
+                if hash_rec.len() != 33 || hash_rec[0] != FRAME_FILE_HASH {
+                    anyhow::bail!("Missing or malformed FRAME_FILE_HASH for '{}'", rel_path);
+                }
+                let expected_file_sha256 = &hash_rec[1..33];
+                let computed_file_sha256: [u8; 32] = file_hasher.finalize().into();
+                if !trust::constant_time_eq(&computed_file_sha256, expected_file_sha256) {
+                    anyhow::bail!(
+                        "Security violation: SHA-256 integrity mismatch for file '{}'",
+                        rel_path
+                    );
+                }
+
+                manifest_hasher.update(&(raw_rel_bytes.len() as u32).to_be_bytes());
+                manifest_hasher.update(raw_rel_bytes);
+                manifest_hasher.update(&file_size.to_be_bytes());
+                manifest_hasher.update(&computed_file_sha256);
             } else {
                 anyhow::bail!("Unexpected frame tag 0x{:02x} in file stream", tag);
             }
         }
 
+        if received_files != expected_total_files {
+            anyhow::bail!(
+                "Transferred file count ({}) did not match announced total_files ({})",
+                received_files,
+                expected_total_files
+            );
+        }
         if transferred_bytes != expected_total_bytes {
             anyhow::bail!(
                 "Transferred byte count ({}) did not match announced total_bytes ({})",
@@ -1293,8 +1512,9 @@ impl ClipboardService {
         }
     }
 
-    /// Streams the peer's announced files into the local staging cache and registers them
-    /// onto the native OS clipboard only after the full transfer is verified.
+    /// Streams the peer's announced files into an isolated staging directory inside the local cache,
+    /// verifies per-file and manifest SHA-256 hashes, atomically commits the verified root entry,
+    /// and updates the native OS clipboard only after full verification succeeds.
     pub async fn stream_to_cache(&self, ann: LazyAnnouncement) -> Result<()> {
         self.stream_to_cache_from(ann, None).await
     }
@@ -1309,24 +1529,32 @@ impl ClipboardService {
         let safe_name = safe_root_entry_name(&ann.root_name);
         let dest_root = cache_dir.join(&safe_name);
 
-        // Stage into an isolated session subdirectory first so failed transfers never clobber cache
+        // Stage into a unique isolated staging directory first so failed transfers never clobber cache
         let stage_dir = cache_dir.join(format!(
-            ".staging_{}",
-            safe_root_entry_name(&ann.session_id)
+            ".staging_{}_{}",
+            safe_root_entry_name(&ann.session_id),
+            trust::generate_random_token_hex(6)
         ));
         let _ = std::fs::remove_dir_all(&stage_dir);
         std::fs::create_dir_all(&stage_dir)?;
 
         info!(
-            "📥 Streaming announced item '{}' ({:.1} MB) from {} into staging cache...",
+            "📥 Streaming announced item '{}' ({:.1} MB) from {} into isolated staging cache...",
             ann.root_name,
             ann.total_bytes as f64 / (1024.0 * 1024.0),
             peer_ip
         );
 
-        let mut socket = Self::connect_and_request_stream(&peer_ip, &ann.session_id).await?;
-        let stream_res = Self::receive_stream_frames(
-            &mut socket,
+        let mut session = match Self::connect_and_request_stream(&peer_ip, &ann.session_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return Err(e);
+            }
+        };
+
+        let stream_res = Self::receive_stream_frames_from_session(
+            &mut session,
             &stage_dir,
             ann.total_bytes,
             ann.total_files,
@@ -1361,7 +1589,7 @@ impl ClipboardService {
         }
         let _ = std::fs::remove_dir_all(&stage_dir);
 
-        // Only replace the native OS clipboard AFTER the staged file exists and passed size verification
+        // Only replace the native OS clipboard AFTER the staged file exists and passed SHA-256 verification
         if dest_root.exists() {
             let helper = Arc::clone(&self.file_helper);
             let root_for_cb = dest_root.clone();
@@ -1393,7 +1621,8 @@ impl ClipboardService {
         Ok(())
     }
 
-    /// Executes On-Demand Remote Paste with non-destructive collision naming.
+    /// Executes On-Demand Remote Paste with isolated staging, SHA-256 verification, atomic commit,
+    /// and non-destructive collision naming.
     pub async fn paste_remote(&self, custom_target: Option<PathBuf>) -> Result<String> {
         let ann = {
             let lock = self.pending_remote.read().await;
@@ -1410,12 +1639,12 @@ impl ClipboardService {
             .unwrap_or(&safe_name)
             .to_string();
 
-        // If the item is already present in the staging cache, copy to non-colliding destination
+        // If the item is already present and verified in the staging cache, copy to non-colliding destination
         let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
         let cached_item = cache_dir.join(&safe_name);
         if cached_item.exists() && target_dir != cache_dir {
             info!(
-                "📋 Item '{}' already present in staging cache. Copying to {:?}...",
+                "📋 Item '{}' already present in verified cache. Copying to {:?}...",
                 ann.root_name, dest_root
             );
             Self::copy_entry_all(&cached_item, &dest_root)?;
@@ -1458,20 +1687,53 @@ impl ClipboardService {
         let last_ip = *self.last_remote_ip.read().await;
         let peer_ip = self.resolve_stream_peer_ip(last_ip).await?;
 
+        // Stage inside an isolated hidden directory in `target_dir` so partial/corrupted files
+        // never appear in the user's destination folder unless SHA-256 verification succeeds.
+        let stage_dir = target_dir.join(format!(
+            ".integrator_staging_{}",
+            trust::generate_random_token_hex(8)
+        ));
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        std::fs::create_dir_all(&stage_dir)?;
+
         info!(
-            "📥 Initiating on-demand stream of '{}' from {} into {:?}",
+            "📥 Initiating on-demand stream of '{}' from {} via isolated staging into {:?}",
             ann.root_name, peer_ip, dest_root
         );
 
-        let mut socket = Self::connect_and_request_stream(&peer_ip, &ann.session_id).await?;
-        let (transferred_bytes, start_time) = Self::receive_stream_frames(
-            &mut socket,
-            &target_dir,
+        let mut session = match Self::connect_and_request_stream(&peer_ip, &ann.session_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return Err(e);
+            }
+        };
+
+        let stream_res = Self::receive_stream_frames_from_session(
+            &mut session,
+            &stage_dir,
             ann.total_bytes,
             ann.total_files,
             Some((&safe_name, &final_name)),
         )
-        .await?;
+        .await;
+
+        let (transferred_bytes, start_time) = match stream_res {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return Err(e);
+            }
+        };
+
+        // Atomically commit the verified item from `stage_dir` into `dest_root`
+        let staged_item = stage_dir.join(&final_name);
+        if staged_item.exists() {
+            if std::fs::rename(&staged_item, &dest_root).is_err() {
+                Self::copy_entry_all(&staged_item, &dest_root)?;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&stage_dir);
 
         {
             let mut lock = self.pending_remote.write().await;
@@ -1506,15 +1768,21 @@ impl ClipboardService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::keystore::{FixedKekProvider, KeystoreV2};
+    use zeroize::Zeroizing;
 
     #[test]
     fn image_dimension_and_byte_bounds_are_enforced() {
         assert!(validate_image_bounds(100, 100, 100 * 100 * 4));
         // Mismatched byte length vs width * height * 4 must be rejected
         assert!(!validate_image_bounds(100, 100, 100 * 100 * 3));
-        // Zero or oversized dimensions must be rejected
+        // Zero or oversized dimensions (> 8192) must be rejected
         assert!(!validate_image_bounds(0, 100, 0));
-        assert!(!validate_image_bounds(MAX_IMAGE_DIMENSION + 1, 10, (MAX_IMAGE_DIMENSION + 1) * 40));
+        assert!(!validate_image_bounds(
+            MAX_IMAGE_DIMENSION + 1,
+            10,
+            (MAX_IMAGE_DIMENSION + 1) * 40
+        ));
     }
 
     #[test]
@@ -1529,6 +1797,45 @@ mod tests {
 
         let next = resolve_non_colliding_dest(&tmp, "report.pdf");
         assert_eq!(next.file_name().unwrap().to_str().unwrap(), "report (2).pdf");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn traversal_windows_reserved_names_and_depth_limits_are_rejected() {
+        let tmp = std::env::temp_dir().join(format!(
+            "integrator_traversal_test_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Path traversal attempts must be explicitly rejected (never silently stripped)
+        assert!(ensure_safe_contained_path(&tmp, "../outside.txt").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "folder/../../outside.txt").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "/etc/passwd").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "\\\\server\\share\\file.txt").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "C:\\Windows\\System32\\cmd.exe").is_err());
+
+        // Windows reserved device names (with or without extensions) must be rejected
+        assert!(ensure_safe_contained_path(&tmp, "CON").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "dir/nul.txt").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "dir/com1.tar.gz").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "lpt9").is_err());
+
+        // Trailing spaces or dots must be rejected
+        assert!(ensure_safe_contained_path(&tmp, "folder /file.txt").is_err());
+        assert!(ensure_safe_contained_path(&tmp, "file.txt.").is_err());
+
+        // Directory depth > 16 must be rejected
+        let deep = (0..=MAX_DIRECTORY_DEPTH)
+            .map(|i| format!("d{}", i))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(ensure_safe_contained_path(&tmp, &deep).is_err());
+
+        // Valid relative path must succeed
+        let valid = ensure_safe_contained_path(&tmp, "project/src/main.rs").unwrap();
+        assert!(valid.ends_with("project/src/main.rs"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1552,7 +1859,167 @@ mod tests {
 
         assert!(ensure_safe_contained_path(&tmp, "escape/pwned.txt").is_err());
 
+        let file_link = tmp.join("symlink_file.txt");
+        std::os::unix::fs::symlink(outside.join("target.txt"), &file_link).unwrap();
+        assert!(open_staged_file_create_new(&file_link).is_err());
+
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn test_file_stream_over_transport_v2_sha256_verification_and_truncation_abort() {
+        let src_dir = std::env::temp_dir().join(format!(
+            "integrator_stream_src_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        let dst_dir = std::env::temp_dir().join(format!(
+            "integrator_stream_dst_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        std::fs::create_dir_all(src_dir.join("bundle/sub")).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let f1_path = src_dir.join("bundle/hello.txt");
+        let f2_path = src_dir.join("bundle/sub/data.bin");
+        let f1_bytes = b"Integrator v2.0 authenticated file stream test";
+        let f2_bytes = vec![0x3Cu8; 300_000]; // spans multiple TransportV2 records
+        std::fs::write(&f1_path, f1_bytes).unwrap();
+        std::fs::write(&f2_path, &f2_bytes).unwrap();
+
+        // Setup paired KeystoreV2 instances for TransportSessionV2
+        let ks_dir_c = src_dir.join("ks_c");
+        let ks_dir_s = src_dir.join("ks_s");
+        let mut ks_c =
+            KeystoreV2::open_with_provider(ks_dir_c, &FixedKekProvider::new([0x21u8; 32])).unwrap();
+        let mut ks_s =
+            KeystoreV2::open_with_provider(ks_dir_s, &FixedKekProvider::new([0x22u8; 32])).unwrap();
+        let k_root = [0x88u8; 32];
+        ks_c.commit_paired_peer(
+            ks_s.local_device_id(),
+            ks_s.local_ed25519_pubkey(),
+            Zeroizing::new(k_root),
+            "Server".into(),
+            "macOS".into(),
+            "10.99.99.1".into(),
+            true,
+        )
+        .unwrap();
+        ks_s.commit_paired_peer(
+            ks_c.local_device_id(),
+            ks_c.local_ed25519_pubkey(),
+            Zeroizing::new(k_root),
+            "Client".into(),
+            "Windows".into(),
+            "10.99.99.2".into(),
+            true,
+        )
+        .unwrap();
+        let peer_s = ks_c.get_peer(&ks_s.local_device_id_hex()).unwrap().clone();
+
+        // 1. Valid multi-file stream with per-file and manifest SHA-256 verification
+        let (c_io, s_io) = tokio::io::duplex(512 * 1024);
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(
+                c_io,
+                &ks_c,
+                &peer_s,
+                ServiceId::ClipboardTransfer
+            ),
+            TransportSessionV2::accept_server(
+                s_io,
+                &ks_s,
+                ServiceId::ClipboardTransfer,
+                false
+            )
+        );
+        let mut client_sess = c_res.unwrap();
+        let mut server_sess = s_res.unwrap();
+
+        let dirs = vec!["bundle".to_string(), "bundle/sub".to_string()];
+        let files = vec![
+            ("bundle/hello.txt".to_string(), f1_path.clone()),
+            ("bundle/sub/data.bin".to_string(), f2_path.clone()),
+        ];
+        let total_bytes = (f1_bytes.len() + f2_bytes.len()) as u64;
+
+        let (send_res, recv_res) = tokio::join!(
+            ClipboardService::stream_files_over_session(&mut server_sess, dirs, files),
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess,
+                &dst_dir,
+                total_bytes,
+                2,
+                None
+            )
+        );
+        send_res.expect("sender stream must succeed");
+        let (rx_bytes, _) = recv_res.expect("receiver stream and SHA-256 checks must succeed");
+        assert_eq!(rx_bytes, total_bytes);
+        assert_eq!(
+            std::fs::read(dst_dir.join("bundle/hello.txt")).unwrap(),
+            f1_bytes
+        );
+        assert_eq!(
+            std::fs::read(dst_dir.join("bundle/sub/data.bin")).unwrap(),
+            f2_bytes
+        );
+
+        // 2. Corrupted per-file SHA-256 frame must be rejected by receiver
+        let (c_io2, s_io2) = tokio::io::duplex(128 * 1024);
+        let (c_res2, s_res2) = tokio::join!(
+            TransportSessionV2::connect_client(
+                c_io2,
+                &ks_c,
+                &peer_s,
+                ServiceId::ClipboardTransfer
+            ),
+            TransportSessionV2::accept_server(
+                s_io2,
+                &ks_s,
+                ServiceId::ClipboardTransfer,
+                false
+            )
+        );
+        let mut client_sess2 = c_res2.unwrap();
+        let mut server_sess2 = s_res2.unwrap();
+        let dst_corrupt = src_dir.join("dst_corrupt");
+        std::fs::create_dir_all(&dst_corrupt).unwrap();
+
+        let corrupt_sender = async move {
+            let rel = b"bundle/hello.txt";
+            let mut hdr = Vec::new();
+            hdr.push(FRAME_FILE);
+            hdr.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(rel);
+            hdr.extend_from_slice(&(5u64).to_be_bytes());
+            server_sess2.send_message(&hdr).await.unwrap();
+
+            let mut data = vec![FRAME_FILE_DATA];
+            data.extend_from_slice(b"hello");
+            server_sess2.send_message(&data).await.unwrap();
+
+            // Send bogus SHA-256 digest
+            let mut bad_hash = [0xAAu8; 33];
+            bad_hash[0] = FRAME_FILE_HASH;
+            server_sess2.send_message(&bad_hash).await.unwrap();
+        };
+        let (_, corrupt_rx_res) = tokio::join!(
+            corrupt_sender,
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess2,
+                &dst_corrupt,
+                5,
+                1,
+                None
+            )
+        );
+        assert!(
+            corrupt_rx_res.is_err(),
+            "corrupted file SHA-256 must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 }
