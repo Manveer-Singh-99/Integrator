@@ -909,6 +909,243 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
 // ============================================================================
 
 #[cfg(target_os = "macos")]
+struct NoUiKeychainGuard {
+    prev_allowed: u8,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(target_os = "macos")]
+impl NoUiKeychainGuard {
+    fn acquire() -> Self {
+        use std::os::raw::c_int;
+        use std::sync::OnceLock;
+
+        #[link(name = "Security", kind = "framework")]
+        extern "C" {
+            fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> c_int;
+            fn SecKeychainSetUserInteractionAllowed(state: u8) -> c_int;
+        }
+
+        static KC_UI_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = KC_UI_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut prev_allowed: u8 = 1;
+        unsafe {
+            let _ = SecKeychainGetUserInteractionAllowed(&mut prev_allowed);
+            let _ = SecKeychainSetUserInteractionAllowed(0);
+        }
+        Self {
+            prev_allowed,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NoUiKeychainGuard {
+    fn drop(&mut self) {
+        use std::os::raw::c_int;
+        #[link(name = "Security", kind = "framework")]
+        extern "C" {
+            fn SecKeychainSetUserInteractionAllowed(state: u8) -> c_int;
+        }
+        unsafe {
+            let _ = SecKeychainSetUserInteractionAllowed(self.prev_allowed);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
+    use core_foundation::base::{kCFAllocatorDefault, CFGetTypeID, CFTypeRef, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::os::raw::c_char;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> CFTypeRef;
+        fn IOServiceGetMatchingService(main_port: u32, matching: CFTypeRef) -> u32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: CFTypeRef,
+            allocator: CFTypeRef,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+
+    let mut binding = Vec::with_capacity(96);
+    unsafe {
+        let matching = IOServiceMatching(b"IOPlatformExpertDevice\0".as_ptr() as *const c_char);
+        if !matching.is_null() {
+            let service = IOServiceGetMatchingService(0, matching);
+            if service != 0 {
+                for key_name in ["IOPlatformUUID", "IOPlatformSerialNumber"] {
+                    let cf_key = CFString::new(key_name);
+                    let prop = IORegistryEntryCreateCFProperty(
+                        service,
+                        cf_key.as_CFTypeRef(),
+                        kCFAllocatorDefault,
+                        0,
+                    );
+                    if !prop.is_null() {
+                        if CFGetTypeID(prop) == CFString::type_id() {
+                            let val: CFString =
+                                TCFType::wrap_under_create_rule(prop as CFStringRef);
+                            let s = val.to_string();
+                            if !s.trim().is_empty() {
+                                binding.extend_from_slice(key_name.as_bytes());
+                                binding.push(b'=');
+                                binding.extend_from_slice(s.trim().as_bytes());
+                                binding.push(b'|');
+                            }
+                        } else {
+                            core_foundation::base::CFRelease(prop);
+                        }
+                    }
+                }
+                let _ = IOObjectRelease(service);
+            }
+        }
+    }
+
+    if !binding.is_empty() {
+        return Ok(binding);
+    }
+
+    if let Ok(out) = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            for line in txt.lines() {
+                if line.contains("IOPlatformUUID") || line.contains("IOPlatformSerialNumber") {
+                    binding.extend_from_slice(line.trim().as_bytes());
+                    binding.push(b'|');
+                }
+            }
+        }
+    }
+
+    if binding.is_empty() {
+        return Err(KeystoreError::OsKeystoreFailure(
+            "Unable to query macOS IOPlatformUUID/SerialNumber for hardware-bound KEK".into(),
+        ));
+    }
+    Ok(binding)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_hw_bound_load_or_create_kek(
+    storage_dir: &Path,
+) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    extern "C" {
+        fn getuid() -> u32;
+    }
+
+    fs::create_dir_all(storage_dir)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("create keystore dir: {}", e)))?;
+    let _ = fs::set_permissions(storage_dir, fs::Permissions::from_mode(0o700));
+
+    let seed_path = storage_dir.join(".master_kek_v2.seed");
+    let mut seed = Zeroizing::new(Vec::new());
+
+    match fs::read(&seed_path) {
+        Ok(existing) => {
+            if existing.len() == 32 {
+                *seed = existing;
+            } else {
+                let _ = fs::remove_file(&seed_path);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(KeystoreError::OsKeystoreFailure(format!(
+                "read macOS sealed KEK seed {}: {}",
+                seed_path.display(),
+                e
+            )));
+        }
+    }
+
+    if seed.len() != 32 {
+        let mut fresh = Zeroizing::new([0u8; 32]);
+        super::csprng_fill(&mut *fresh);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&seed_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(&*fresh).map_err(|e| {
+                    KeystoreError::OsKeystoreFailure(format!(
+                        "write macOS sealed KEK seed {}: {}",
+                        seed_path.display(),
+                        e
+                    ))
+                })?;
+                let _ = fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600));
+                *seed = fresh.to_vec();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(&seed_path).map_err(|e2| {
+                    KeystoreError::OsKeystoreFailure(format!(
+                        "read existing macOS sealed KEK seed {}: {}",
+                        seed_path.display(),
+                        e2
+                    ))
+                })?;
+                if existing.len() != 32 {
+                    return Err(KeystoreError::OsKeystoreFailure(
+                        "Invalid macOS sealed KEK seed length".into(),
+                    ));
+                }
+                *seed = existing;
+            }
+            Err(e) => {
+                return Err(KeystoreError::OsKeystoreFailure(format!(
+                    "create macOS sealed KEK seed {}: {}",
+                    seed_path.display(),
+                    e
+                )));
+            }
+        }
+    } else {
+        let _ = fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600));
+    }
+
+    let hw_id = macos_read_platform_hardware_identity()?;
+    let mut ikm = Zeroizing::new(Vec::with_capacity(seed.len() + 1 + hw_id.len()));
+    ikm.extend_from_slice(&seed);
+    ikm.push(b'|');
+    ikm.extend_from_slice(&hw_id);
+
+    let dir_canonical = fs::canonicalize(storage_dir).unwrap_or_else(|_| storage_dir.to_path_buf());
+    let mut salt = Vec::from(&b"integrator-macos-hw-kek-salt-v2|"[..]);
+    salt.extend_from_slice(&super::sha256_digest(
+        dir_canonical.to_string_lossy().as_bytes(),
+    ));
+
+    let uid = unsafe { getuid() };
+    let info = format!("integrator-macos-hw-kek-v2:uid={}", uid);
+
+    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(info.as_bytes(), &mut *kek)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("macOS HKDF-SHA256 expand failed: {}", e)))?;
+    Ok(kek)
+}
+
+#[cfg(target_os = "macos")]
 fn macos_keychain_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
@@ -925,22 +1162,25 @@ fn macos_keychain_load_or_create_kek(
         static kSecClassGenericPassword: CFTypeRef;
         static kSecAttrService: CFTypeRef;
         static kSecAttrAccount: CFTypeRef;
-        static kSecValueData: CFTypeRef;
         static kSecReturnData: CFTypeRef;
         static kSecMatchLimit: CFTypeRef;
         static kSecMatchLimitOne: CFTypeRef;
-        static kSecAttrAccessible: CFTypeRef;
-        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFTypeRef;
         static kSecUseAuthenticationUI: CFTypeRef;
         static kSecUseAuthenticationUIFail: CFTypeRef;
 
         fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> c_int;
-        fn SecItemAdd(attributes: CFTypeRef, result: *mut CFTypeRef) -> c_int;
-        fn SecItemDelete(query: CFTypeRef) -> c_int;
     }
 
     const ERR_SEC_SUCCESS: c_int = 0;
     const ERR_SEC_ITEM_NOT_FOUND: c_int = -25300;
+    const ERR_SEC_AUTH_FAILED: c_int = -25293;
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: c_int = -25308;
+
+    // Fast path: once a hardware+UID-bound sealed KEK seed exists, derive K_kek directly
+    // without touching login.keychain-db so rebuilds/ad-hoc runs never trigger password dialogs.
+    if storage_dir.join(".master_kek_v2.seed").is_file() {
+        return macos_hw_bound_load_or_create_kek(storage_dir);
+    }
 
     let service = CFString::new("com.integrator.security.keystore.v2");
     // Scope the account name by storage_dir hash so custom paths don't collide.
@@ -949,6 +1189,9 @@ fn macos_keychain_load_or_create_kek(
     )[0..8]);
     let account = CFString::new(&format!("master-kek-v2-{}", account_hash));
 
+    // Strictly suppress legacy SecKeychain interactive UI dialogs while checking for an
+    // existing Keychain item that is already silently readable by this code signature.
+    let _no_ui_guard = NoUiKeychainGuard::acquire();
     unsafe {
         let mut query: CFMutableDictionary<CFTypeRef, CFTypeRef> = CFMutableDictionary::new();
         query.set(kSecClass, kSecClassGenericPassword);
@@ -967,47 +1210,23 @@ fn macos_keychain_load_or_create_kek(
                 kek.copy_from_slice(data.bytes());
                 return Ok(kek);
             }
-            // Invalid length in keychain; delete and recreate.
-            let mut del_q: CFMutableDictionary<CFTypeRef, CFTypeRef> = CFMutableDictionary::new();
-            del_q.set(kSecClass, kSecClassGenericPassword);
-            del_q.set(kSecAttrService, service.as_CFTypeRef());
-            del_q.set(kSecAttrAccount, account.as_CFTypeRef());
-            let _ = SecItemDelete(del_q.as_CFTypeRef());
         }
 
-        if status != ERR_SEC_SUCCESS && status != ERR_SEC_ITEM_NOT_FOUND {
+        if status != ERR_SEC_ITEM_NOT_FOUND
+            && status != ERR_SEC_AUTH_FAILED
+            && status != ERR_SEC_INTERACTION_NOT_ALLOWED
+        {
             warn!(
-                "macOS Keychain SecItemCopyMatching returned OSStatus {}; falling back to hardware-UUID derived envelope key",
+                "macOS Keychain non-interactive check returned OSStatus {}; using hardware-bound sealed KEK",
                 status
             );
-            return unix_fallback_load_or_create_kek(storage_dir);
-        }
-
-        let mut new_kek = Zeroizing::new([0u8; 32]);
-        super::csprng_fill(&mut *new_kek);
-        let cf_data = CFData::from_buffer(&*new_kek);
-
-        let mut add_attrs: CFMutableDictionary<CFTypeRef, CFTypeRef> = CFMutableDictionary::new();
-        add_attrs.set(kSecClass, kSecClassGenericPassword);
-        add_attrs.set(kSecAttrService, service.as_CFTypeRef());
-        add_attrs.set(kSecAttrAccount, account.as_CFTypeRef());
-        add_attrs.set(kSecValueData, cf_data.as_CFTypeRef());
-        add_attrs.set(
-            kSecAttrAccessible,
-            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        );
-
-        let add_status = SecItemAdd(add_attrs.as_CFTypeRef(), std::ptr::null_mut());
-        if add_status == ERR_SEC_SUCCESS {
-            Ok(new_kek)
-        } else {
-            warn!(
-                "macOS Keychain SecItemAdd returned OSStatus {} (e.g. locked headless keychain); using machine-bound 0600 key envelope",
-                add_status
-            );
-            unix_fallback_load_or_create_kek(storage_dir)
         }
     }
+    drop(_no_ui_guard);
+
+    // Do not create new ad-hoc CDHash-pinned items in login.keychain-db (which prompt for the
+    // user's macOS password on every rebuild). Bind K_kek via IOPlatformUUID + UID + 0600 seed.
+    macos_hw_bound_load_or_create_kek(storage_dir)
 }
 
 /// Removes the OS-stored master KEK for a specific `storage_dir` (used during test cleanup or full reset).
@@ -1028,6 +1247,7 @@ pub fn delete_os_kek_for_dir(storage_dir: &Path) {
             fn SecItemDelete(query: CFTypeRef) -> c_int;
         }
 
+        let _no_ui_guard = NoUiKeychainGuard::acquire();
         let service = CFString::new("com.integrator.security.keystore.v2");
         let account_hash = super::hex_encode(
             &super::sha256_digest(storage_dir.to_string_lossy().as_bytes())[0..8],
@@ -1194,7 +1414,7 @@ fn windows_dpapi_load_or_create_kek(
     Ok(new_kek)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn unix_fallback_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {

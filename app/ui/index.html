@@ -149,14 +149,14 @@
               <button type="button" id="btn-regenerate-pin" class="btn-inline btn-inline-muted">New PIN</button>
             </div>
           </div>
-          <div class="checkbox-group">
-            <label class="checkbox-label">
-              <input type="checkbox" checked id="chk-auto-trust-cable">
-              <span>Auto-trust direct USB-C / Thunderbolt cable links</span>
+          <div class="checkbox-group" title="Enforced by Integrator v2.0 security policy">
+            <label class="checkbox-label checkbox-label-locked">
+              <input type="checkbox" id="chk-auto-trust-cable" disabled>
+              <span>Bypass PIN on direct USB-C / Thunderbolt cables <small class="badge-inline">(Disabled in v2.0 — pair once)</small></span>
             </label>
-            <label class="checkbox-label">
-              <input type="checkbox" checked id="chk-require-lan-pairing">
-              <span>Require pairing approval on LAN / Wi-Fi</span>
+            <label class="checkbox-label checkbox-label-locked">
+              <input type="checkbox" checked id="chk-require-lan-pairing" disabled>
+              <span>Require one-time PIN pairing on all links <small class="badge-inline">(Enforced; paired links reconnect automatically)</small></span>
             </label>
           </div>
         </div>

@@ -1429,6 +1429,17 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
         LinkTransport::Unknown
     };
 
+    // macOS presents direct host-to-host USB-C NCM links (`AppleUSBDeviceNCM11Data`) as generic
+    // "Ethernet Adapter (enN)" with `100baseTX` media. Confirm NCM backing via IORegistry so
+    // USB-C links get DirectUsb prioritization and full streaming bitrates.
+    if !lower_friendly.contains("wi-fi")
+        && !lower_friendly.contains("airport")
+        && !lower_friendly.contains("thunderbolt")
+        && mac_is_usb_ncm_interface(iface)
+    {
+        transport = LinkTransport::DirectUsb;
+    }
+
     let mut speed_mbps = None;
     if let Ok(out) = Command::new("ifconfig").arg(iface).output() {
         if out.status.success() {
@@ -1461,6 +1472,61 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
     }
 
     (transport, speed_mbps)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_is_usb_ncm_interface(iface: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static CACHE: OnceLock<Mutex<Option<(Instant, HashSet<String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some((captured_at, ifaces)) = &*guard {
+        if now.duration_since(*captured_at) < Duration::from_secs(3) {
+            return ifaces.contains(iface);
+        }
+    }
+
+    let mut fresh = HashSet::new();
+    if let Ok(out) = Command::new("ioreg")
+        .args(["-r", "-c", "AppleUSBDeviceNCMData", "-l"])
+        .output()
+    {
+        if out.status.success() {
+            fresh = parse_ioreg_usb_ncm_bsd_names(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    let matched = fresh.contains(iface);
+    *guard = Some((now, fresh));
+    matched
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ioreg_usb_ncm_bsd_names(ioreg_output: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut in_ncm_node = false;
+    for line in ioreg_output.lines() {
+        let trimmed = line.trim();
+        let is_top_level_node =
+            line.starts_with("+-o ") || trimmed.starts_with("+-o ") && !line.starts_with(' ') && !line.starts_with('|');
+        if is_top_level_node {
+            in_ncm_node = trimmed.contains("AppleUSBDeviceNCM");
+        }
+        if in_ncm_node {
+            if let Some(rest) = trimmed.split("\"BSD Name\"").nth(1) {
+                if let Some(eq_rest) = rest.split('=').nth(1) {
+                    let bsd = eq_rest.trim().trim_matches('"').trim();
+                    if !bsd.is_empty() && !bsd.starts_with("anpi") {
+                        names.insert(bsd.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 #[cfg(target_os = "windows")]
@@ -1658,4 +1724,33 @@ pub fn is_valid_ipv4(ip: &str) -> bool {
 #[allow(dead_code)]
 pub fn is_local_file_path(path: &Path) -> bool {
     path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ioreg_usb_ncm_bsd_names;
+
+    #[test]
+    fn test_parse_ioreg_usb_ncm_bsd_names() {
+        let sample = r#"
++-o AppleUSBDeviceNCM11Data  <class AppleUSBDeviceNCM11Data, id 0x1>
+  |   "IOClass" = "AppleUSBDeviceNCM11Data"
+  +-o en3  <class IOEthernetInterface, id 0x1a>
+    |   "BSD Name" = "en3"
++-o AppleUSBDeviceNCM11Data  <class AppleUSBDeviceNCM11Data, id 0x2>
+  +-o anpi0  <class AppleUSBDeviceNCMPrivateEthernetInterface, id 0x3>
+    |   "BSD Name" = "anpi0"
++-o AppleUSBDeviceNCM11Data  <class AppleUSBDeviceNCM11Data, id 0x4>
+  +-o en5  <class IOEthernetInterface, id 0x4a>
+    |   "BSD Name" = "en5"
++-o AppleBCMWLANCore  <class AppleBCMWLANCore, id 0x5>
+  +-o en0  <class IO80211Interface, id 0x5a>
+    |   "BSD Name" = "en0"
+"#;
+        let parsed = parse_ioreg_usb_ncm_bsd_names(sample);
+        assert!(parsed.contains("en3"));
+        assert!(parsed.contains("en5"));
+        assert!(!parsed.contains("anpi0"));
+        assert!(!parsed.contains("en0"));
+    }
 }

@@ -260,6 +260,7 @@ impl WinDisplayManager {
     }
 
     /// Checks if a Virtual Display Driver session/slot is currently active on Windows.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn is_vdd_active() -> bool {
         #[cfg(target_os = "windows")]
         {

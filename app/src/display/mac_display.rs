@@ -169,25 +169,83 @@ impl MacDisplayManager {
 
         let log_dir = system_info::user_home_dir().join("Library/Logs");
         let _ = std::fs::create_dir_all(&log_dir);
-        let log_file = std::fs::File::create(log_dir.join("sunshine.log"))?;
+        let log_path = log_dir.join("sunshine.log");
+        let err_log_path = log_dir.join("sunshine.err.log");
+        let conf_path = system_info::find_sunshine_conf().filter(|p| p.is_file());
 
-        let mut cmd = Command::new(&sunshine_bin);
-        if let Some(conf_path) = system_info::find_sunshine_conf() {
-            if conf_path.is_file() {
-                cmd.arg(&conf_path);
+        // Launch Sunshine.app via LaunchServices (`open`) when packaged inside a .app bundle
+        // so macOS attributes Screen Recording TCC permissions to Sunshine.app itself rather than
+        // inheriting Integrator.app's TCC context.
+        if let Some(app_bundle) = sunshine_bin
+            .ancestors()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        {
+            let _ = std::fs::File::create(&log_path);
+            let _ = std::fs::File::create(&err_log_path);
+            let mut cmd = Command::new("/usr/bin/open");
+            cmd.arg("-g")
+                .arg("-n")
+                .arg("-a")
+                .arg(app_bundle)
+                .arg("-o")
+                .arg(&log_path)
+                .arg("--stderr")
+                .arg(&err_log_path);
+            if let Some(conf) = &conf_path {
+                cmd.arg("--args").arg(conf);
             }
-        }
-        cmd.stdout(Stdio::from(log_file.try_clone()?))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
+            let status = cmd
+                .status()
+                .with_context(|| format!("Failed to launch {} via open", app_bundle.display()))?;
+            if !status.success() {
+                anyhow::bail!(
+                    "`open` exited with status {} while starting {}",
+                    status,
+                    app_bundle.display()
+                );
+            }
+            info!("Launched Sunshine bundle ({}) via LaunchServices", app_bundle.display());
+        } else {
+            let log_file = std::fs::File::create(&log_path)?;
+            let mut cmd = Command::new(&sunshine_bin);
+            if let Some(conf) = &conf_path {
+                cmd.arg(conf);
+            }
+            cmd.stdout(Stdio::from(log_file.try_clone()?))
+                .stderr(Stdio::from(log_file))
+                .spawn()
+                .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
 
-        info!("Launched Sunshine server ({})", sunshine_bin.display());
+            info!("Launched Sunshine server ({})", sunshine_bin.display());
+        }
         Ok(())
     }
 
     pub fn stop_sunshine() -> Result<()> {
-        let _ = Command::new("killall").arg("sunshine").status();
+        let is_running = || {
+            ["Sunshine", "sunshine"].iter().any(|proc_name| {
+                Command::new("pgrep")
+                    .args(["-x", proc_name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
+        };
+
+        let _ = Command::new("killall")
+            .args(["-q", "-TERM", "Sunshine", "sunshine"])
+            .status();
+        for _ in 0..10 {
+            if !is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if is_running() {
+            let _ = Command::new("killall")
+                .args(["-q", "-KILL", "Sunshine", "sunshine"])
+                .status();
+        }
         info!("Stopped Sunshine server on macOS");
         Ok(())
     }

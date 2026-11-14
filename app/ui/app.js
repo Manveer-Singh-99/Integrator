@@ -1090,11 +1090,13 @@ async function updateStatus() {
 
     const chkAutoTrustCable = document.getElementById('chk-auto-trust-cable');
     const chkRequireLanPairing = document.getElementById('chk-require-lan-pairing');
-    if (chkAutoTrustCable && document.activeElement !== chkAutoTrustCable && typeof trust.auto_trust_direct_cable === 'boolean') {
+    if (chkAutoTrustCable && typeof trust.auto_trust_direct_cable === 'boolean') {
       chkAutoTrustCable.checked = trust.auto_trust_direct_cable;
+      chkAutoTrustCable.disabled = true;
     }
-    if (chkRequireLanPairing && document.activeElement !== chkRequireLanPairing && typeof trust.require_pairing_on_lan === 'boolean') {
+    if (chkRequireLanPairing && typeof trust.require_pairing_on_lan === 'boolean') {
       chkRequireLanPairing.checked = trust.require_pairing_on_lan;
+      chkRequireLanPairing.disabled = true;
     }
 
     // 8. Launch at Login Sync
@@ -1459,22 +1461,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function handleTrustPolicyChange() {
-    if (!chkAutoTrustCable || !chkRequireLanPairing) return;
-    try {
-      const res = await invokeCmd('set_trust_policy', {
-        autoTrustCable: chkAutoTrustCable.checked,
-        requireLanPairing: chkRequireLanPairing.checked,
-      });
-      if (res) appendLog(`🛡️ ${res}`, 'success');
-      await updateStatus();
-    } catch (e) {
-      appendLog(`❌ Failed to update trust policy: ${e}`, 'error');
-    }
-  }
-
-  if (chkAutoTrustCable) chkAutoTrustCable.addEventListener('change', handleTrustPolicyChange);
-  if (chkRequireLanPairing) chkRequireLanPairing.addEventListener('change', handleTrustPolicyChange);
+  // Security policy checkboxes are read-only indicators of v2.0 invariants
+  // (one-time SPAKE2+PIN pairing on all links; paired links reconnect automatically).
 
   if (btnAddManualIp) {
     btnAddManualIp.addEventListener('click', async () => {

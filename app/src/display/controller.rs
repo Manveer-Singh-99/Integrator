@@ -133,21 +133,61 @@ impl DisplayController {
         (final_w, final_h, final_fps, final_hostname)
     }
 
+    fn read_secondary_sunshine_name() -> Option<String> {
+        let conf_path = system_info::find_sunshine_conf()?
+            .parent()?
+            .join("sunshine_mac2.conf");
+        let content = std::fs::read_to_string(conf_path).ok()?;
+        for line in content.lines() {
+            let t = line.trim();
+            if t.starts_with('#') || !t.contains('=') {
+                continue;
+            }
+            let (k, v) = t.split_once('=')?;
+            if k.trim().eq_ignore_ascii_case("sunshine_name") {
+                let name = v.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// Toggles Mac-as-Host extended desktop to the discovered peer.
+    /// When invoked on Windows, forwards the toggle request over authenticated TransportV2 to the Mac peer.
     pub async fn toggle_mac_to_pc(&self) -> Result<String> {
-        let is_running = MacDisplayManager::is_virtual_display_active();
-        if is_running {
-            self.stop_mac_to_pc().await?;
-            Ok("Stopped Mac-to-PC extended display".into())
-        } else {
-            self.start_mac_to_pc().await?;
-            let mode = self
-                .active_mode
-                .read()
+        #[cfg(not(target_os = "macos"))]
+        {
+            let peer = self
+                .discovery
+                .get_best_peer()
                 .await
-                .clone()
-                .unwrap_or_else(|| "Extended display".to_string());
-            Ok(format!("Started {}", mode))
+                .context("No active Mac peer discovered. Connect a direct cable or add a peer IP in Settings.")?;
+            let peer_ip = peer.addr.ip().to_string();
+            let resp = Self::send_remote_rpc(&peer_ip, &DisplayRpcRequest::ToggleMacToPc).await?;
+            if !resp.success {
+                anyhow::bail!("{}", resp.message);
+            }
+            return Ok(resp.message);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let is_running = MacDisplayManager::is_virtual_display_active();
+            if is_running {
+                self.stop_mac_to_pc().await?;
+                Ok("Stopped Mac-to-PC extended display".into())
+            } else {
+                self.start_mac_to_pc().await?;
+                let mode = self
+                    .active_mode
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| "Extended display".to_string());
+                Ok(format!("Started {}", mode))
+            }
         }
     }
 
@@ -183,9 +223,13 @@ impl DisplayController {
 
         let (my_sunshine_name, my_sunshine_port, _) = system_info::read_sunshine_config_info();
         info!("Waiting for Sunshine server on port {}...", my_sunshine_port);
-        if !MacDisplayManager::wait_for_sunshine_ready(Duration::from_secs(5)).await {
-            warn!(
-                "Sunshine port {} not responding yet; attempting client launch anyway",
+        if !MacDisplayManager::wait_for_sunshine_ready(Duration::from_secs(10)).await {
+            let _ = MacDisplayManager::stop_virtual_display();
+            let _ = MacDisplayManager::stop_sunshine();
+            *self.is_active.write().await = false;
+            *self.active_mode.write().await = None;
+            anyhow::bail!(
+                "Mac Sunshine server failed to listen on port {} within 10s (check Screen Recording permission for Sunshine.app and ~/Library/Logs/sunshine.log)",
                 my_sunshine_port
             );
         }
@@ -255,20 +299,39 @@ impl DisplayController {
     }
 
     /// Toggles PC-as-Host extended desktop to the discovered Mac peer.
+    /// When invoked on macOS, forwards the toggle request over authenticated TransportV2 to the Windows peer.
     pub async fn toggle_pc_to_mac(&self) -> Result<String> {
-        let is_running = *self.is_active.read().await || WinDisplayManager::is_vdd_active();
-        if is_running {
-            self.stop_pc_to_mac().await?;
-            Ok("Stopped PC-to-Mac extended display".into())
-        } else {
-            self.start_pc_to_mac().await?;
-            let mode = self
-                .active_mode
-                .read()
+        #[cfg(not(target_os = "windows"))]
+        {
+            let peer = self
+                .discovery
+                .get_best_peer()
                 .await
-                .clone()
-                .unwrap_or_else(|| "Extended display".to_string());
-            Ok(format!("Started {}", mode))
+                .context("No active Windows peer discovered. Connect a direct cable or add a peer IP in Settings.")?;
+            let peer_ip = peer.addr.ip().to_string();
+            let resp = Self::send_remote_rpc(&peer_ip, &DisplayRpcRequest::TogglePcToMac).await?;
+            if !resp.success {
+                anyhow::bail!("{}", resp.message);
+            }
+            return Ok(resp.message);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let is_running = *self.is_active.read().await || WinDisplayManager::is_vdd_active();
+            if is_running {
+                self.stop_pc_to_mac().await?;
+                Ok("Stopped PC-to-Mac extended display".into())
+            } else {
+                self.start_pc_to_mac().await?;
+                let mode = self
+                    .active_mode
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| "Extended display".to_string());
+                Ok(format!("Started {}", mode))
+            }
         }
     }
 
@@ -296,14 +359,14 @@ impl DisplayController {
         let (my_sunshine_name, configured_port, _) = system_info::read_sunshine_config_info();
         let mut active_port = configured_port;
         let mut ready = false;
-        for attempt in 0..20 {
+        for attempt in 0..40 {
             if configured_port != 48989 && Self::is_tcp_port_open("127.0.0.1", 48989).await {
                 active_port = 48989;
                 ready = true;
                 break;
             }
             if Self::is_tcp_port_open("127.0.0.1", configured_port).await
-                && (attempt >= 2 || configured_port == 48989)
+                && (attempt >= 3 || configured_port == 48989)
             {
                 active_port = configured_port;
                 ready = true;
@@ -312,13 +375,20 @@ impl DisplayController {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         if !ready {
-            warn!(
-                "Sunshine port {} not yet responding; proceeding with RPC anyway",
-                active_port
+            let _ = WinDisplayManager::disable_vdd_device();
+            anyhow::bail!(
+                "Windows Sunshine server failed to listen on port {} (or secondary 48989) within 8s",
+                configured_port
             );
         }
 
-        let host_name = my_sunshine_name
+        let secondary_name = if active_port == 48989 {
+            Self::read_secondary_sunshine_name()
+        } else {
+            None
+        };
+        let host_name = secondary_name
+            .or(my_sunshine_name)
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(system_info::get_hostname);
         let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
@@ -379,6 +449,11 @@ impl DisplayController {
         peer_ip: Option<IpAddr>,
     ) -> DisplayRpcResponse {
         let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+        let is_authorized_remote_toggle = match req {
+            DisplayRpcRequest::ToggleMacToPc => cfg!(target_os = "macos") && peer_ip.is_some(),
+            DisplayRpcRequest::TogglePcToMac => cfg!(target_os = "windows") && peer_ip.is_some(),
+            _ => false,
+        };
         if matches!(
             req,
             DisplayRpcRequest::ToggleMacToPc
@@ -388,6 +463,7 @@ impl DisplayController {
                 | DisplayRpcRequest::GetPairingPin
                 | DisplayRpcRequest::PairWithPeer { .. }
         ) && !is_loopback_caller
+            && !is_authorized_remote_toggle
         {
             warn!(
                 "🚫 Rejected local-only DisplayRpcRequest {:?} from non-loopback peer {:?}",
@@ -587,6 +663,11 @@ impl DisplayController {
                 } else if cfg!(target_os = "windows") {
                     let _ = self.stop_pc_to_mac().await;
                     let _ = WinDisplayManager::stop_moonlight_client();
+                }
+                if is_loopback_caller {
+                    if let Some(remote_ip) = self.discovery.get_peer_ip().await {
+                        let _ = Self::send_remote_rpc(&remote_ip, &DisplayRpcRequest::StopAll).await;
+                    }
                 }
                 *self.is_active.write().await = false;
                 *self.active_mode.write().await = None;
