@@ -36,6 +36,7 @@ impl Default for GpuTelemetry {
     }
 }
 
+#[allow(dead_code)]
 fn parse_optional_u32(raw: &str) -> u32 {
     let clean = raw.trim();
     clean
@@ -45,6 +46,7 @@ fn parse_optional_u32(raw: &str) -> u32 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn parse_optional_u64(raw: &str) -> u64 {
     let clean = raw.trim();
     clean
@@ -54,6 +56,7 @@ fn parse_optional_u64(raw: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn parse_optional_f32(raw: &str) -> f32 {
     raw.trim().parse::<f32>().unwrap_or(0.0).max(0.0)
 }

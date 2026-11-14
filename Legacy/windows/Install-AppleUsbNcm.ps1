@@ -236,8 +236,14 @@ $wintunDll = Join-Path $dir "wintun.dll"
 if (-not (Test-Path $wintunDll)) {
     $zipPath = Join-Path $dir "wintun.zip"
     Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $zipPath -UseBasicParsing
+    $expectedSha256 = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+    $actualSha256 = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($actualSha256 -ne $expectedSha256) {
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        throw "Wintun archive SHA-256 verification failed (expected $expectedSha256, got $actualSha256)."
+    }
     Expand-Archive -Path $zipPath -DestinationPath (Join-Path $dir "wintun_extracted") -Force
-    $arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "x86" }
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } elseif ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "x86" }
     Copy-Item (Join-Path $dir "wintun_extracted\wintun\bin\$arch\wintun.dll") $wintunDll -Force
 }
 
@@ -251,7 +257,15 @@ Stop-ScheduledTask -TaskName "AppleUsbNcmBridge" -ErrorAction SilentlyContinue
 Stop-Process -Name "AppleUsbNcmBridge" -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
-& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /unsafe /optimize+ /platform:x64 /out:$exeDest $csDest
+$cscPath = Get-ChildItem "$env:WINDIR\Microsoft.NET\Framework64\v4.0*\csc.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+if (-not $cscPath) {
+    $cscPath = Get-ChildItem "$env:WINDIR\Microsoft.NET\Framework\v4.0*\csc.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $cscPath) {
+    throw "Could not find .NET Framework csc.exe compiler under $env:WINDIR\Microsoft.NET"
+}
+$platformFlag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "/platform:arm64" } elseif ([Environment]::Is64BitOperatingSystem) { "/platform:x64" } else { "/platform:x86" }
+& $cscPath /nologo /unsafe /optimize+ $platformFlag /out:$exeDest $csDest
 
 $action = New-ScheduledTaskAction -Execute $exeDest -WorkingDirectory $dir
 $trigger1 = New-ScheduledTaskTrigger -AtStartup
@@ -262,7 +276,7 @@ Register-ScheduledTask -TaskName "AppleUsbNcmBridge" -Action $action -Trigger @(
 Start-ScheduledTask -TaskName "AppleUsbNcmBridge"
 
 if (-not (Get-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -Direction Inbound -Action Allow -RemoteAddress 10.99.99.0/24,192.168.2.0/24 -Profile Any | Out-Null
+    New-NetFirewallRule -DisplayName "Apple USB-C Direct Link" -Direction Inbound -Action Allow -LocalAddress 10.99.99.1,192.168.2.2 -RemoteAddress 10.99.99.0/24,192.168.2.0/24 -Profile Any | Out-Null
 }
 
 Start-Sleep -Seconds 3

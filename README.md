@@ -175,22 +175,24 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 | Fusion Feature | Platform | Status | Implementation Details |
 | :--- | :---: | :---: | :--- |
 | **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Zero-polling `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, 0.00% idle CPU) |
-| **Dual-Subnet Networking & ICS** | macOS & Win 11 | ✅ **Live** | Bidirectional Internet Sharing simultaneously alongside `10.99.99.x` direct link |
+| **Dual-Subnet Networking & ICS** | macOS & Win 11 | ✅ **Live** | Bidirectional Internet Sharing simultaneously alongside direct USB-C link |
 | **Tauri v2 Glassmorphic UI** | macOS & Win 11 | ✅ **Live** | Real-time latency, peer IP discovery, category filters, and live status pills |
-| **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 echo-loop prevention |
+| **Cryptographic Pairing & Transport** | macOS & Win 11 | ✅ **Live** | OS CSPRNG 6-digit PIN pairing with rate-limiting/lockout + ChaCha20 & HMAC-SHA256 authenticated transport |
+| **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 verification and echo-loop prevention |
 | **Universal Clipboard (Folders & Files)** | macOS & Win 11 | ✅ **Live** | Multi-GB recursive folder copy-paste streaming over NVMe buffers with LRU pruning |
 | **Live Network Benchmark Engine** | macOS & Win 11 | ✅ **Live** | Built-in real-time throughput benchmark saturating USB-C NVMe transfer speeds |
 | **Touch Bar NVIDIA Performance HUD** | macOS (client) | ✅ **Live** | Liquid Glass OLED HUD with interactive physics and native Control Strip integration |
-| **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Automatic mounting & clean teardown for `/Volumes/PC` $\leftrightarrow$ `M:\` mapped drive |
+| **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Dynamic peer SMB share discovery, mount & clean teardown on macOS (`/Volumes/<Share>`) and Windows |
 | **True Tone & Chromatic Adaptation** | macOS & Win 11 | ✅ **Live** | Mac ambient sensor (Kelvin) $\to$ Bradford CAT GPU gamma ramp injection |
-| **Dynamic Audio Routing** | macOS & Win 11 | ✅ **Live** | System tray topology switcher (Mac Studio Speakers, PC Only, Dual Sync) |
-| **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional 165Hz / 60Hz streaming via Sunshine host + Moonlight client |
+| **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional streaming via Sunshine host + Moonlight client with dynamic resolution & refresh rate |
 | **Master ON/OFF Feature Switches** | macOS & Win 11 | ✅ **Live** | Independent persistent toggles saved to `~/.usbc_clipboard_cache/features.json` |
 | **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | System Events Login Item (macOS) & `HKCU\...\Run` (Win 11) |
+| **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental UDP packet sink (`58284`) & local 24-bit/48kHz spatial test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
-| **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver |
-| **Universal Camera & Virtual Mic** | macOS & Win 11 | 📋 **Planned** | Hardware-accelerated `CMIOExtension` & DirectShow virtual media pipelines |
-| **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover |
+| **Cross-Border File Drag & Drop** | macOS & Win 11 | 📋 **Planned** | Cursor-following cross-screen drag & drop (`dragdrop` feature toggle) |
+| **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver (`input_kvm` feature toggle) |
+| **Universal Camera & Virtual Mic** | macOS & Win 11 | 📋 **Planned** | Hardware-accelerated `CMIOExtension` & DirectShow virtual media pipelines (`camera` feature toggle) |
+| **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover (`multiwan` feature toggle) |
 
 ---
 
@@ -282,20 +284,20 @@ The unified app is designed around **two primary, mutually exclusive operating s
 
 ---
 
-### Independent Modular Features (Toggleable On / Off)
+### Independent Modular Features (Live, Preview, Scaffolded & Planned)
 
-Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mode, all other features operate as independent modular background services that can be enabled or disabled individually:
+Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mode, all other features are organized as modular background services with independent feature flags:
 
-* **📋 Universal Clipboard:**
-  * Bidirectional clipboard synchronization for plain text, rich text (HTML/RTF), and image bitmaps (PNG/JPEG).
-  * Hash-based deduplication (SHA-256) to prevent infinite ping-pong echo loops between devices.
-* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens"):**
+* **📋 Universal Clipboard (✅ Live):**
+  * Bidirectional clipboard synchronization for plain text, image bitmaps (PNG/TIFF), and recursive folder/file trees over authenticated ChaCha20 + HMAC-SHA256 transport.
+  * Cryptographic SHA-256 payload verification and hash-based deduplication to prevent infinite ping-pong echo loops between devices.
+* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens" — 📋 Planned):**
   * Click and drag any file from macOS Finder past the screen boundary onto the Windows desktop (or vice versa).
   * A semi-transparent ghost thumbnail follows the cursor across operating systems, and releasing the mouse button streams the file buffer over the USB-C link directly into the target folder in milliseconds.
-* **📁 Auto-Mounted Shared Folders:**
-  * Designated user folders automatically mount into `/Volumes/PC` on macOS and a mapped drive (e.g., `M:`) on Windows upon link connection.
-  * Clean, automated unmounting when the USB-C cable is unplugged—zero hanging Finder or Explorer windows.
-* **🔑 Touch ID as a Windows Security Key & Passkey Authenticator:**
+* **📁 Auto-Mounted Shared Folders (✅ Live):**
+  * Discovers advertised or enumerated SMB shares on the connected peer and mounts them into `/Volumes/<Share>` on macOS and mapped drives on Windows.
+  * Clean, automated unmounting when the link is disconnected or the storage toggle is turned off.
+* **🔑 Touch ID as a Windows Security Key & Passkey Authenticator (🚧 Scaffolded):**
   * **Browser & Passkey Mode (WebAuthn / FIDO2 over Virtual USB/IP)**:
     * Turns your Mac into a biometric hardware security key (like a YubiKey) for Windows 11.
     * When Windows or a browser (Chrome/Edge) prompts for a WebAuthn passkey or hardware security key (Google, Microsoft, GitHub login), the Windows agent exposes a virtual FIDO2 HID device (`0xF1D0`) over `USBIP-Win`.
@@ -303,26 +305,26 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * **Native Windows 11 Lock Screen Unlock (Custom Credential Provider)**:
     * Solves the consumer Windows 11 lock screen limitation (where FIDO2 keys are restricted to Microsoft Entra ID / Azure AD) for fingerprint-less laptops like the HP OMEN.
     * Integrates a custom Windows Credential Provider DLL (`TouchIdCredentialProvider.dll`) directly into `LogonUI.exe`.
-    * User credentials remain sealed with Windows **DPAPI**. When locked, a challenge nonce is transmitted over `10.99.99.x`.
+    * User credentials remain sealed with Windows **DPAPI**. When locked, a challenge nonce is transmitted over the direct USB-C link.
     * Resting your finger on the MacBook’s Touch ID sensor signs the nonce via the Apple Secure Enclave (`kSecAccessControlTouchIDCurrentSet`). The Credential Provider validates the signature and hands the logon token to **LSASS**, unlocking the Windows desktop in `<150ms`.
-* **🎨 True Tone & Chromatic Adaptation Sync (Bradford CAT):**
+* **🎨 True Tone & Chromatic Adaptation Sync (Bradford CAT — ✅ Live):**
   * Reads ambient room lighting (CCT in Kelvin) from the Mac’s bezel ambient sensor.
   * Applies a **Bradford Chromatic Adaptation Transform (CAT)** with perceptual gamma compensation for matte vs. glossy panel differences.
   * Injects the resulting curves directly into the Windows GPU hardware Look-Up Table (`SetDeviceGammaRamp`) in `<0.1 ms`, ensuring both screens smoothly transition to the exact same paper-white warmth as ambient room lighting changes.
-* **🎥 Universal Camera & Virtual Microphone:**
+* **🎥 Universal Camera & Virtual Microphone (📋 Planned):**
   * Stream the MacBook’s FaceTime HD camera and studio mic into Windows as a native DirectShow / Media Foundation webcam.
   * Stream Windows camera or studio audio hardware into macOS via modern `CMIOExtension` virtual camera plugins.
   * Hardware-accelerated low latency (Apple VideoToolbox & NVIDIA NVENC).
-* **🔊 Dynamic Audio Routing (System Tray Selector):**
-  * Switch between three distinct audio routing topologies on the fly directly from the macOS Menu Bar or Windows System Tray:
+* **🔊 Dynamic Audio Routing (System Tray Selector — 🧪 Experimental Preview):**
+  * Currently implements an experimental UDP audio packet validator/sink (`58284`), topology state persistence, and a local 24-bit/48kHz spatial stereo test chime. Full cross-machine CoreAudio/WASAPI duplex playback is planned across three topologies:
     * **Mac Studio Speakers Only**: Automatically mutes the PC and pipes uncompressed 24-bit master audio to the MacBook's high-fidelity Spatial Audio sound system (<6ms latency).
     * **Windows PC / Headset Only**: Leaves audio on the PC (ideal when gaming with a low-latency headset or DAC plugged into Windows).
     * **Dual Stereo / Surround (Both Simultaneously)**: Plays across both physical machines with an integrated millisecond sync-calibration slider to eliminate room echo and comb-filtering.
-* **📡 Zero-Config Pairing & Automatic Handover:**
-  * Instant mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi.
+* **📡 Cryptographic Pairing & Automatic Handover (✅ Live):**
+  * Mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi/LAN with HMAC-SHA256 beacon verification for paired peers.
   * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
-  * End-to-end encrypted control channel (TLS 1.3 / Noise Protocol) with a one-time 6-digit PIN pairing handshake.
-* **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing:**
+  * ChaCha20 + HMAC-SHA256 authenticated and encrypted control (`58281`) and clipboard (`58283`) channels with replay protection and an OS CSPRNG 6-digit PIN pairing handshake with per-IP/global rate-limiting and lockout.
+* **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing (📋 Planned):**
   * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
     * **Local Multi-Socket Balancing (Zero 3rd Device / Zero Cloud)**: Routes distinct connections and chunked downloads (HTTP range requests, Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput) without session breaking or account lockouts.
     * **Traffic Isolation & Ping Protection**: Routes latency-sensitive gaming packets (UDP) exclusively through the stable wired connection while offloading heavy background downloads and 4K video to the secondary link, guaranteeing zero in-game ping spikes.

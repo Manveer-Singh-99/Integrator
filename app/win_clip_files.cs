@@ -1,30 +1,47 @@
 using System;
-using System.IO;
-using System.Windows.Forms;
 using System.Collections.Specialized;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
 
 class Program {
     [STAThread]
-    static void Main(string[] args) {
-        if (args.Length > 1 && args[0] == "write") {
-            StringCollection sc = new StringCollection();
-            for (int i = 1; i < args.Length; i++) {
-                if (File.Exists(args[i]) || Directory.Exists(args[i])) {
-                    sc.Add(Path.GetFullPath(args[i]));
+    static int Main(string[] args) {
+        Console.OutputEncoding = new UTF8Encoding(false);
+        Console.InputEncoding = new UTF8Encoding(false);
+
+        if (args.Length == 0) return 0;
+
+        for (int attempt = 0; attempt < 6; attempt++) {
+            try {
+                if (args[0] == "read") {
+                    if (Clipboard.ContainsFileDropList()) {
+                        StringCollection files = Clipboard.GetFileDropList();
+                        foreach (string f in files) {
+                            Console.WriteLine(f);
+                        }
+                    }
+                    return 0;
+                } else if (args[0] == "write") {
+                    StringCollection files = new StringCollection();
+                    for (int i = 1; i < args.Length; i++) {
+                        if (System.IO.File.Exists(args[i]) || System.IO.Directory.Exists(args[i])) {
+                            files.Add(args[i]);
+                        }
+                    }
+                    if (files.Count > 0) {
+                        Clipboard.SetFileDropList(files);
+                    }
+                    return 0;
+                } else if (args[0] == "clear") {
+                    Clipboard.Clear();
+                    return 0;
                 }
+                return 0;
+            } catch (Exception) {
+                Thread.Sleep(20);
             }
-            if (sc.Count > 0) {
-                Clipboard.Clear();
-                Clipboard.SetFileDropList(sc);
-            }
-        } else if (args.Length > 0 && args[0] == "read") {
-            if (Clipboard.ContainsFileDropList()) {
-                foreach (string f in Clipboard.GetFileDropList()) {
-                    Console.WriteLine(f);
-                }
-            }
-        } else if (args.Length > 0 && args[0] == "clear") {
-            Clipboard.Clear();
         }
+        return 1;
     }
 }

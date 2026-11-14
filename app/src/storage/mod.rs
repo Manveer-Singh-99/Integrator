@@ -27,34 +27,74 @@ struct ActiveMountRecord {
 
 pub struct StorageManager;
 
+/// Validates an SMB share name against path-traversal, shell/AppleScript metacharacters,
+/// administrative `$` shares, and length bounds.
+pub fn validate_smb_share_name(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("SMB share name cannot be empty".into());
+    }
+    if trimmed.len() > 80 {
+        return Err("SMB share name exceeds maximum length (80 characters)".into());
+    }
+    if trimmed == "." || trimmed == ".." || trimmed.contains("..") {
+        return Err("SMB share name cannot contain '..'".into());
+    }
+    if trimmed.ends_with('$') {
+        return Err("Administrative '$' SMB shares are not permitted".into());
+    }
+    let forbidden = ['/', '\\', ':', '"', ';', '|', '<', '>', '*', '?'];
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || forbidden.contains(&c))
+    {
+        return Err(format!("SMB share name '{}' contains invalid characters", trimmed));
+    }
+    Ok(trimmed.to_string())
+}
+
 impl StorageManager {
     pub fn set_preferred_peer_share(share: Option<&str>) -> std::io::Result<()> {
+        let validated = match share.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(
+                validate_smb_share_name(raw)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+            ),
+            None => None,
+        };
         let mut prefs = system_info::load_path_preferences();
-        prefs.peer_smb_share_name = share
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        prefs.peer_smb_share_name = validated;
         system_info::save_path_preferences(&prefs)
     }
 
     pub fn get_preferred_peer_share() -> Option<String> {
-        system_info::load_path_preferences().peer_smb_share_name
+        system_info::load_path_preferences()
+            .peer_smb_share_name
+            .and_then(|s| validate_smb_share_name(&s).ok())
     }
 
+    #[allow(dead_code)]
     pub fn is_mounted() -> bool {
         detect_active_mount(None).is_some()
     }
 
+    #[allow(dead_code)]
     pub fn mount(peer_ip: &str) -> Result<StorageStatus> {
         Self::mount_with_share(peer_ip, None)
     }
 
     pub fn mount_with_share(peer_ip: &str, share_hint: Option<&str>) -> Result<StorageStatus> {
-        if let Some(existing) = detect_active_mount(Some(peer_ip)) {
+        let clean_ip = peer_ip.trim();
+        if !system_info::is_valid_ipv4(clean_ip) {
+            anyhow::bail!("Invalid peer IPv4 address for SMB mount: '{}'", peer_ip);
+        }
+
+        if let Some(existing) = detect_active_mount(Some(clean_ip)) {
             return Ok(StorageStatus {
                 is_mounted: true,
                 mount_path: existing.mount_path.clone(),
                 remote_ip: if existing.peer_ip.is_empty() {
-                    peer_ip.to_string()
+                    clean_ip.to_string()
                 } else {
                     existing.peer_ip
                 },
@@ -63,20 +103,22 @@ impl StorageManager {
             });
         }
 
-        let target_share = resolve_remote_share(peer_ip, share_hint);
+        let target_share = resolve_remote_share(clean_ip, share_hint);
 
         #[cfg(target_os = "macos")]
         {
-            let Some(share) = target_share else {
+            let Some(raw_share) = target_share else {
                 anyhow::bail!(
                     "No SMB share discovered on {} — set a peer share name in Settings or enable Windows File Sharing.",
-                    peer_ip
+                    clean_ip
                 );
             };
+            let share = validate_smb_share_name(&raw_share)
+                .map_err(|e| anyhow::anyhow!("Rejected SMB share name: {}", e))?;
 
             let encoded_share = percent_encode_path_segment(&share);
-            let smb_url = format!("smb://{}/{}", peer_ip, encoded_share);
-            let escaped_url = smb_url.replace('"', "\\\"");
+            let smb_url = format!("smb://{}/{}", clean_ip, encoded_share);
+            let escaped_url = smb_url.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!("mount volume \"{}\"", escaped_url);
 
             tracing::info!("📂 Mounting macOS SMB volume via NetFS: {}", smb_url);
@@ -85,8 +127,8 @@ impl StorageManager {
                 .output()?;
 
             if output.status.success() {
-                let detected = detect_active_mount(Some(peer_ip)).unwrap_or(ActiveMountRecord {
-                    peer_ip: peer_ip.to_string(),
+                let detected = detect_active_mount(Some(clean_ip)).unwrap_or(ActiveMountRecord {
+                    peer_ip: clean_ip.to_string(),
                     remote_share: share.clone(),
                     mount_path: format!("/Volumes/{}", share),
                 });
@@ -94,9 +136,9 @@ impl StorageManager {
                 return Ok(StorageStatus {
                     is_mounted: true,
                     mount_path: detected.mount_path.clone(),
-                    remote_ip: peer_ip.to_string(),
+                    remote_ip: clean_ip.to_string(),
                     remote_share: detected.remote_share.clone(),
-                    message: format!("Mounted //{} / {} at {}", peer_ip, share, detected.mount_path),
+                    message: format!("Mounted //{}/{} at {}", clean_ip, share, detected.mount_path),
                 });
             }
 
@@ -105,7 +147,7 @@ impl StorageManager {
             anyhow::bail!(
                 "Failed to mount SMB share '{}' on {}: {}. Verify the share name in Settings and peer SMB sharing permissions.",
                 share,
-                peer_ip,
+                clean_ip,
                 err
             );
         }
@@ -115,14 +157,16 @@ impl StorageManager {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-            let Some(share) = target_share else {
+            let Some(raw_share) = target_share else {
                 anyhow::bail!(
                     "No SMB share discovered on {} — enable SMB File Sharing on Mac or set peer share name in Settings.",
-                    peer_ip
+                    clean_ip
                 );
             };
+            let share = validate_smb_share_name(&raw_share)
+                .map_err(|e| anyhow::anyhow!("Rejected SMB share name: {}", e))?;
 
-            let unc_path = format!(r"\\{}\{}", peer_ip, share);
+            let unc_path = format!(r"\\{}\{}", clean_ip, share);
             tracing::info!("📂 Mounting Windows network drive via dynamic letter: {}", unc_path);
 
             let mut cmd = Command::new("net");
@@ -248,6 +292,7 @@ impl StorageManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn status(peer_ip: Option<&str>) -> StorageStatus {
         Self::status_with_share(peer_ip, None)
     }
@@ -297,13 +342,46 @@ fn load_active_mount() -> Option<ActiveMountRecord> {
 }
 
 fn save_active_mount(rec: &ActiveMountRecord) {
+    let path = active_mount_file();
     if let Ok(json) = serde_json::to_string_pretty(rec) {
-        let _ = std::fs::write(active_mount_file(), json);
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)) {
+            tracing::warn!("Failed to persist active mount state to {}: {}", path.display(), e);
+        }
     }
 }
 
 fn clear_active_mount() {
-    let _ = std::fs::remove_file(active_mount_file());
+    let path = active_mount_file();
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("Failed to remove active mount state {}: {}", path.display(), e);
+        }
+    }
+}
+
+fn parse_smbutil_disk_shares(stdout: &str) -> Vec<String> {
+    let mut shares = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.is_empty()
+            || (t.starts_with("Share ") && t.contains("Type"))
+            || t.starts_with("---")
+            || t.contains("shares listed")
+        {
+            continue;
+        }
+        // `smbutil view` formats rows as: `<Share Name>   Disk   <Comment>`
+        for marker in ["  Disk", "\tDisk"] {
+            if let Some((name_part, _rest)) = t.split_once(marker) {
+                if let Ok(valid) = validate_smb_share_name(name_part) {
+                    shares.push(valid);
+                }
+                break;
+            }
+        }
+    }
+    shares
 }
 
 fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<String> {
@@ -311,34 +389,23 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
         return Some(pref);
     }
     if let Some(hint) = share_hint {
-        let trimmed = hint.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+        if let Ok(valid) = validate_smb_share_name(hint) {
+            return Some(valid);
         }
     }
 
     // Dynamic remote SMB browse if no hint/override was set
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = Command::new("smbutil")
-            .args(["view", "-N", &format!("//guest@{}", peer_ip)])
-            .output()
-        {
-            if out.status.success() {
-                let txt = String::from_utf8_lossy(&out.stdout);
-                for line in txt.lines() {
-                    let t = line.trim();
-                    if t.is_empty()
-                        || t.starts_with("Share")
-                        || t.starts_with("---")
-                        || t.contains("IPC$")
-                    {
-                        continue;
-                    }
-                    if let Some(name) = t.split_whitespace().next() {
-                        if !name.ends_with('$') {
-                            return Some(name.to_string());
-                        }
+        for target in [format!("//{}", peer_ip), format!("//guest@{}", peer_ip)] {
+            if let Ok(out) = Command::new("smbutil")
+                .args(["view", "-N", &target])
+                .output()
+            {
+                if out.status.success() {
+                    let txt = String::from_utf8_lossy(&out.stdout);
+                    if let Some(first) = parse_smbutil_disk_shares(&txt).into_iter().next() {
+                        return Some(first);
                     }
                 }
             }
@@ -355,22 +422,8 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 let txt = String::from_utf8_lossy(&out.stdout);
-                let mut rows = false;
-                for line in txt.lines() {
-                    let t = line.trim();
-                    if t.starts_with("----") {
-                        rows = true;
-                        continue;
-                    }
-                    if !rows || t.is_empty() || t.starts_with("The command") {
-                        continue;
-                    }
-                    if let Some((name, _rest)) = t.split_once("Disk") {
-                        let clean = name.trim();
-                        if !clean.is_empty() && !clean.ends_with('$') {
-                            return Some(clean.to_string());
-                        }
-                    }
+                if let Some(first) = parse_smbutil_disk_shares(&txt).into_iter().next() {
+                    return Some(first);
                 }
             }
         }
@@ -568,3 +621,42 @@ fn find_windows_drive_for_unc(unc: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smb_share_validator_rejects_traversal_and_admin_shares() {
+        assert!(validate_smb_share_name("Users").is_ok());
+        assert!(validate_smb_share_name("Public Folder").is_ok());
+        assert!(validate_smb_share_name("C$").is_err());
+        assert!(validate_smb_share_name("IPC$").is_err());
+        assert!(validate_smb_share_name("../etc").is_err());
+        assert!(validate_smb_share_name("foo/bar").is_err());
+        assert!(validate_smb_share_name("foo\"bar").is_err());
+    }
+
+    #[test]
+    fn smbutil_parser_preserves_spaces_and_skips_admin_and_footer() {
+        let sample = "\
+Share                                           Type    Comments
+----------------------------------------------------------------
+IPC$                                            Pipe    Remote IPC
+ADMIN$                                          Disk    Remote Admin
+Shared Public Folder                            Disk    macOS Public Share
+Workspace Drive                                 Disk    Shared SSD
+
+4 shares listed from 4 available
+";
+        let shares = parse_smbutil_disk_shares(sample);
+        assert_eq!(
+            shares,
+            vec![
+                "Shared Public Folder".to_string(),
+                "Workspace Drive".to_string()
+            ]
+        );
+    }
+}
+

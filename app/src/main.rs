@@ -630,7 +630,7 @@ async fn set_feature_flag(
     feature: String,
     enabled: bool,
 ) -> Result<features::FeatureFlags, String> {
-    let flags = state.features.set_flag(&feature, enabled);
+    let flags = state.features.set_flag_checked(&feature, enabled)?;
     tracing::info!(
         "⚙️ Feature [{}] master switch set to: {}",
         feature,
@@ -863,8 +863,12 @@ async fn trust_peer_device(
     if clean_id.is_empty() {
         return Err("Device ID cannot be empty".into());
     }
-    trust::trust_device(clean_id, hostname.trim(), ip.trim(), via_cable);
-    Ok(format!("Trusted peer {} ({})", hostname.trim(), ip.trim()))
+    let clean_ip = ip.trim();
+    if !clean_ip.is_empty() && !system_info::is_valid_ipv4(clean_ip) {
+        return Err(format!("Invalid peer IPv4 address: {}", ip));
+    }
+    trust::trust_device(clean_id, hostname.trim(), clean_ip, via_cable);
+    Ok(format!("Trusted peer {} ({})", hostname.trim(), clean_ip))
 }
 
 #[tauri::command]
@@ -908,15 +912,43 @@ async fn pair_with_peer(ip: String, pin: String) -> Result<String, String> {
     if trimmed_pin.len() != 6 || !trimmed_pin.chars().all(|c| c.is_ascii_digit()) {
         return Err("Pairing PIN must be 6 digits".into());
     }
+    let my_device_id = system_info::get_or_create_device_id();
+    let my_hostname = system_info::get_hostname();
+    let client_nonce = trust::generate_random_token_hex(16);
+    let client_token = trust::generate_random_token_hex(32);
+    let auth_mac = trust::compute_pairing_request_mac(
+        &trimmed_pin,
+        &my_device_id,
+        &my_hostname,
+        &client_nonce,
+        &client_token,
+    );
+
     let req = DisplayRpcRequest::PairRequest {
-        device_id: system_info::get_or_create_device_id(),
-        hostname: system_info::get_hostname(),
-        pin: trimmed_pin,
+        device_id: my_device_id,
+        hostname: my_hostname,
+        pin: trimmed_pin.clone(),
+        client_nonce: client_nonce.clone(),
+        client_token: client_token.clone(),
+        auth_mac,
     };
     let resp = DisplayController::send_remote_rpc(&trimmed_ip, &req)
         .await
         .map_err(|e| format!("Failed to reach peer {} for pairing: {}", trimmed_ip, e))?;
     if resp.success {
+        let host_id = resp
+            .host_device_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("peer-{}", trimmed_ip));
+        let host_name = resp
+            .host_name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| trimmed_ip.clone());
+        let shared_secret = resp.pairing_token.as_deref().map(|srv_tok| {
+            trust::derive_pairing_shared_secret(&trimmed_pin, &client_token, srv_tok, &client_nonce)
+        });
+        let cable = system_info::is_direct_cable_route(&trimmed_ip);
+        trust::trust_device_with_secret(&host_id, &host_name, &trimmed_ip, cable, shared_secret);
         Ok(resp.message)
     } else {
         Err(resp.message)
@@ -1197,7 +1229,7 @@ fn main() -> Result<()> {
     };
 
     // 5. Initialize Tauri GUI & System Tray
-    let is_hidden_init = std::env::args().any(|a| a == "--hidden" || a == "--daemon");
+    let is_hidden_init = std::env::args().any(|a| a == "--hidden" || a == "--daemon" || a == "--minimized");
 
     tauri::Builder::default()
         .manage(app_state)
@@ -1345,9 +1377,10 @@ fn main() -> Result<()> {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| match event {
+        .run(|_app_handle, event| match event {
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
-                if let Some(win) = app_handle.get_webview_window("main") {
+                if let Some(win) = _app_handle.get_webview_window("main") {
                     let _ = win.show();
                     let _ = win.unminimize();
                     let _ = win.set_focus();

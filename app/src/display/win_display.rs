@@ -138,10 +138,10 @@ impl WinDisplayManager {
                 for dev in &vdd_devices {
                     if !dev.status.eq_ignore_ascii_case("OK") {
                         let ps = format!(
-                            "Enable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction SilentlyContinue",
+                            "Enable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction Stop",
                             ps_single_quote(&dev.instance_id)
                         );
-                        let _ = hidden_cmd("powershell.exe")
+                        match hidden_cmd("powershell.exe")
                             .args([
                                 "-NoProfile",
                                 "-NonInteractive",
@@ -150,9 +150,20 @@ impl WinDisplayManager {
                                 "-Command",
                                 &ps,
                             ])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                            .output()
+                        {
+                            Ok(out) if !out.status.success() => {
+                                warn!(
+                                    "Enable-PnpDevice for {} exited with non-zero status (Administrator privileges may be required): {}",
+                                    dev.instance_id,
+                                    String::from_utf8_lossy(&out.stderr).trim()
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to invoke Enable-PnpDevice for {}: {}", dev.instance_id, e);
+                            }
+                            _ => {}
+                        }
                     }
                     info!(
                         "Virtual display adapter ready: {} ({})",
@@ -862,20 +873,30 @@ struct VddPnpDevice {
 
 #[cfg(any(target_os = "windows", test))]
 fn is_virtual_display_adapter(instance_id: &str, friendly_name: &str, name: &str) -> bool {
-    if instance_id.to_ascii_uppercase().starts_with(r"ROOT\DISPLAY") {
-        return true;
-    }
     let combined = format!("{} {}", friendly_name, name).to_ascii_lowercase();
-    [
+    if combined.contains("basic display") {
+        return false;
+    }
+    let has_vdd_keyword = [
         "virtual display",
         "iddsampledriver",
         "mttvdd",
         "parsec",
         "sudovda",
         "apollo",
+        "amyuni",
+        "usbmmidd",
+        "spacedesk",
+        "indirectdisplay",
     ]
     .iter()
-    .any(|pat| combined.contains(pat))
+    .any(|pat| combined.contains(pat));
+
+    if has_vdd_keyword {
+        return true;
+    }
+    instance_id.to_ascii_uppercase().starts_with(r"ROOT\DISPLAY")
+        && (combined.contains("virtual") || combined.contains("vdd") || combined.trim().is_empty())
 }
 
 #[cfg(any(target_os = "windows", test))]

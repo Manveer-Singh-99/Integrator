@@ -333,8 +333,8 @@ class GoopyLiquidGlassPillView: NSView {
             }
         }
 
-        if let matchT2 = IOServiceMatching("AppleEmbeddedOSSupportHost") {
-            let service = IOServiceGetMatchingService(mainPort, matchT2)
+        if let matchDfr = IOServiceMatching("AppleDFR") {
+            let service = IOServiceGetMatchingService(mainPort, matchDfr)
             if service != 0 {
                 IOObjectRelease(service)
                 return true
@@ -1091,3 +1091,43 @@ public func set_has_pending_remote_file(pending: Bool) {
 public func clear_pasteboard_in_app() {
     NSPasteboard.general.clearContents()
 }
+
+@_cdecl("read_pasteboard_files_in_app")
+public func read_pasteboard_files_in_app(_ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int {
+    guard let outBuf = outBuf, cap > 1 else { return 0 }
+    let pb = NSPasteboard.general
+    let options: [NSPasteboard.ReadingOptionKey: Any] = [
+        .urlReadingFileURLsOnly: true
+    ]
+    guard let urls = pb.readObjects(forClasses: [NSURL.self], options: options) as? [URL], !urls.isEmpty else {
+        return 0
+    }
+    let joined = urls
+        .filter { $0.isFileURL }
+        .map { $0.path }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
+    let utf8 = Array(joined.utf8)
+    guard !utf8.isEmpty && utf8.count < cap else { return 0 }
+    for i in 0..<utf8.count {
+        outBuf[i] = utf8[i]
+    }
+    outBuf[utf8.count] = 0
+    return utf8.count
+}
+
+@_cdecl("write_pasteboard_files_in_app")
+public func write_pasteboard_files_in_app(_ pathsPtr: UnsafePointer<CChar>?) -> Bool {
+    guard let pathsPtr = pathsPtr else { return false }
+    let joined = String(cString: pathsPtr)
+    let urls: [NSURL] = joined
+        .split(separator: "\n")
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .map { URL(fileURLWithPath: $0) as NSURL }
+    guard !urls.isEmpty else { return false }
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    return pb.writeObjects(urls)
+}
+

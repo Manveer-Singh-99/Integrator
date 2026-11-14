@@ -51,6 +51,52 @@ impl DisplayController {
         )
     }
 
+    async fn wait_for_tcp_port(ip: &str, port: u16, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if Self::is_tcp_port_open(ip, port).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        false
+    }
+
+    fn compute_optimal_bitrate_kbps(peer: &PeerCandidate, fps: u32) -> u32 {
+        let high_fps = fps >= 120;
+        if peer.transport.is_direct_cable() {
+            return if high_fps { 150_000 } else { 100_000 };
+        }
+        match peer.link_speed_mbps {
+            Some(mbps) if mbps >= 2500 => {
+                if high_fps {
+                    150_000
+                } else {
+                    100_000
+                }
+            }
+            Some(mbps) if mbps >= 1000 => {
+                if high_fps {
+                    85_000
+                } else {
+                    65_000
+                }
+            }
+            Some(mbps) if mbps > 0 => (mbps.saturating_mul(350)).clamp(15_000, 55_000),
+            _ => match peer.transport {
+                system_info::LinkTransport::Ethernet => {
+                    if high_fps {
+                        80_000
+                    } else {
+                        60_000
+                    }
+                }
+                system_info::LinkTransport::Wifi => 35_000,
+                _ => 60_000,
+            },
+        }
+    }
+
     /// Resolves the target peer's real display `(width, height, fps)` and hostname,
     /// querying `GetHardwareProfile` over RPC if beacon fields are incomplete,
     /// clamping refresh rate to `30..=240`, and falling back to the local primary display.
@@ -148,6 +194,7 @@ impl DisplayController {
         let host_name = my_sunshine_name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(system_info::get_hostname);
+        let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
         // 3. Send RPC to peer to launch Moonlight in fullscreen at peer native resolution/refresh
         let rpc = DisplayRpcRequest::StartMoonlight {
@@ -157,7 +204,7 @@ impl DisplayController {
             width: w,
             height: h,
             fps,
-            bitrate_kbps: 150_000,
+            bitrate_kbps,
             audio_on_host: false,
         };
 
@@ -275,7 +322,7 @@ impl DisplayController {
         let host_name = my_sunshine_name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(system_info::get_hostname);
-        let bitrate_kbps = if fps >= 120 { 150_000 } else { 100_000 };
+        let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
         // 3. Send RPC to peer to launch Moonlight client
         let rpc = DisplayRpcRequest::StartMoonlight {
@@ -346,6 +393,9 @@ impl DisplayController {
                 device_id,
                 hostname,
                 pin,
+                client_nonce,
+                client_token,
+                auth_mac,
             } => {
                 let Some(ip_str) = peer_ip.map(|ip| ip.to_string()) else {
                     return self
@@ -357,23 +407,38 @@ impl DisplayController {
                         .base_response(false, "Pairing rejected: missing device_id")
                         .await;
                 }
-                if trust::verify_pin_and_trust(&device_id, &hostname, &ip_str, &pin) {
-                    info!(
-                        "🔐 Paired and trusted peer '{}' ({}) at {}",
-                        hostname, device_id, ip_str
-                    );
-                    self.base_response(true, format!("Paired and trusted {} ({})", hostname, ip_str))
-                        .await
-                } else {
-                    warn!(
-                        "🚫 Rejected pairing request from '{}' ({}) at {}: invalid PIN",
-                        hostname, device_id, ip_str
-                    );
-                    self.base_response(
-                        false,
-                        "Invalid pairing PIN. Check the 6-digit PIN shown in Integrator on this host.",
-                    )
-                    .await
+                match trust::verify_pin_and_establish_session(
+                    &device_id,
+                    &hostname,
+                    &ip_str,
+                    &pin,
+                    &client_nonce,
+                    &client_token,
+                    &auth_mac,
+                ) {
+                    Ok(server_token) => {
+                        info!(
+                            "🔐 Paired and established cryptographic session with '{}' ({}) at {}",
+                            hostname, device_id, ip_str
+                        );
+                        let mut resp = self
+                            .base_response(
+                                true,
+                                format!("Paired and trusted {} ({})", hostname, ip_str),
+                            )
+                            .await;
+                        resp.pairing_token = Some(server_token);
+                        resp.host_device_id = Some(system_info::get_or_create_device_id());
+                        resp.host_name = Some(system_info::get_hostname());
+                        resp
+                    }
+                    Err(reason) => {
+                        warn!(
+                            "🚫 Rejected pairing request from '{}' ({}) at {}: {}",
+                            hostname, device_id, ip_str, reason
+                        );
+                        self.base_response(false, reason).await
+                    }
                 }
             }
             DisplayRpcRequest::StartMoonlight {
@@ -386,26 +451,54 @@ impl DisplayController {
                 bitrate_kbps,
                 audio_on_host,
             } => {
-                let effective_host_ip = if host_ip.trim().is_empty() {
-                    peer_ip.map(|ip| ip.to_string()).unwrap_or_default()
-                } else {
-                    host_ip
-                };
-                if effective_host_ip.is_empty() {
+                let caller_ip_str = peer_ip.map(|ip| ip.to_string()).unwrap_or_default();
+                let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+                let trimmed_host_ip = host_ip.trim();
+
+                if !is_loopback_caller
+                    && !trimmed_host_ip.is_empty()
+                    && !caller_ip_str.is_empty()
+                    && trimmed_host_ip != caller_ip_str
+                {
+                    warn!(
+                        "🚫 Rejected StartMoonlight from {}: tried to redirect client to third-party host {}",
+                        caller_ip_str, trimmed_host_ip
+                    );
                     return self
-                        .base_response(false, "Missing host_ip in StartMoonlight request")
+                        .base_response(
+                            false,
+                            "Rejected StartMoonlight: host_ip must match the authenticated peer address",
+                        )
+                        .await;
+                }
+
+                let effective_host_ip = if !is_loopback_caller && !caller_ip_str.is_empty() {
+                    caller_ip_str
+                } else if !trimmed_host_ip.is_empty() {
+                    trimmed_host_ip.to_string()
+                } else {
+                    caller_ip_str
+                };
+                if effective_host_ip.is_empty() || !system_info::is_valid_ipv4(&effective_host_ip) {
+                    return self
+                        .base_response(false, "Missing or invalid host_ip in StartMoonlight request")
+                        .await;
+                }
+                if host_port > 0 && host_port < 1024 {
+                    return self
+                        .base_response(false, "Rejected StartMoonlight: invalid privileged host_port")
                         .await;
                 }
 
                 info!("Handling StartMoonlight RPC from host {}", effective_host_ip);
 
-                let port = if host_port > 0 {
+                let port = if host_port >= 1024 {
                     host_port
                 } else if Self::is_tcp_port_open(&effective_host_ip, 47989).await {
                     47989
                 } else if Self::is_tcp_port_open(&effective_host_ip, 48989).await {
                     48989
-                } else if MacDisplayManager::wait_for_port(
+                } else if Self::wait_for_tcp_port(
                     &effective_host_ip,
                     47989,
                     Duration::from_secs(2),
@@ -413,7 +506,7 @@ impl DisplayController {
                 .await
                 {
                     47989
-                } else if MacDisplayManager::wait_for_port(
+                } else if Self::wait_for_tcp_port(
                     &effective_host_ip,
                     48989,
                     Duration::from_secs(2),
@@ -673,7 +766,7 @@ impl DisplayController {
         self.active_mode.read().await.clone()
     }
 
-    /// Sends an RPC request to a remote peer or localhost over TCP.
+    /// Sends an encrypted, authenticated RPC request to a remote peer or localhost over TCP.
     pub async fn send_remote_rpc(
         peer_ip: &str,
         req: &DisplayRpcRequest,
@@ -683,11 +776,19 @@ impl DisplayController {
             .await
             .with_context(|| format!("Timed out connecting to display control RPC at {}", addr))?
             .with_context(|| format!("Failed to connect to display control RPC at {}", addr))?;
+        let _ = stream.set_nodelay(true);
 
         let payload = serde_json::to_vec(req)?;
-        stream.write_u32(payload.len() as u32).await?;
-        stream.write_all(&payload).await?;
-        stream.flush().await?;
+        let wire_req = trust::seal_envelope_for_ip(peer_ip, &payload)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            stream.write_u32(wire_req.len() as u32).await?;
+            stream.write_all(&wire_req).await?;
+            stream.flush().await
+        })
+        .await
+        .with_context(|| format!("Timed out sending RPC request to {}", addr))??;
 
         let resp_len = tokio::time::timeout(Duration::from_secs(15), stream.read_u32())
             .await
@@ -705,7 +806,14 @@ impl DisplayController {
             .await
             .with_context(|| format!("Timed out reading RPC response body from {}", addr))??;
 
-        let resp: DisplayRpcResponse = serde_json::from_slice(&resp_buf)?;
+        let remote_ip: IpAddr = peer_ip
+            .trim()
+            .parse()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let (_, plain_resp) = trust::open_envelope_from_ip(remote_ip, &resp_buf)
+            .map_err(|e| anyhow::anyhow!("RPC response verification failed from {}: {}", addr, e))?;
+
+        let resp: DisplayRpcResponse = serde_json::from_slice(&plain_resp)?;
         Ok(resp)
     }
 }

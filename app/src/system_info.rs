@@ -480,17 +480,14 @@ pub fn has_touch_bar_hardware() -> bool {
     {
         static HAS_TB: OnceLock<bool> = OnceLock::new();
         *HAS_TB.get_or_init(|| {
-            for proc_name in ["ControlStrip", "TouchBarServer"] {
-                if let Ok(out) = Command::new("pgrep").args(["-x", proc_name]).output() {
+            for class_name in ["AppleDFR", "AppleTouchBar"] {
+                if let Ok(out) = Command::new("ioreg").args(["-rc", class_name]).output() {
                     if out.status.success() && !out.stdout.is_empty() {
                         return true;
                     }
                 }
             }
-            if let Ok(out) = Command::new("ioreg")
-                .args(["-rc", "AppleEmbeddedOSSupportHost"])
-                .output()
-            {
+            if let Ok(out) = Command::new("ioreg").args(["-n", "dispdfr", "-r"]).output() {
                 if out.status.success() && !out.stdout.is_empty() {
                     return true;
                 }
@@ -598,6 +595,7 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
             i_mode_num: u32,
             lp_dev_mode: *mut DevModeW,
         ) -> i32;
+        fn GetDpiForSystem() -> u32;
     }
 
     const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
@@ -605,15 +603,18 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     dm.dm_size = std::mem::size_of::<DevModeW>() as u16;
     let ok = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) };
     if ok != 0 && dm.dm_pels_width > 0 && dm.dm_pels_height > 0 {
+        let sys_dpi = unsafe { GetDpiForSystem() };
         let scale = if dm.dm_log_pixels >= 96 {
             dm.dm_log_pixels as f64 / 96.0
+        } else if sys_dpi >= 96 {
+            sys_dpi as f64 / 96.0
         } else {
             1.0
         };
         Some(PrimaryDisplayInfo {
             width: dm.dm_pels_width,
             height: dm.dm_pels_height,
-            fps: if dm.dm_display_frequency > 0 {
+            fps: if dm.dm_display_frequency > 1 {
                 dm.dm_display_frequency
             } else {
                 60
@@ -672,8 +673,14 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
                                 .get("sppci_bus")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let is_discrete = !bus.contains("Built-In")
-                                && !name.to_ascii_lowercase().contains("apple m");
+                            let bus_lower = bus.to_ascii_lowercase();
+                            let name_lower = name.to_ascii_lowercase();
+                            let is_discrete = !bus_lower.contains("built-in")
+                                && !bus_lower.contains("builtin")
+                                && !name_lower.contains("apple m")
+                                && !name_lower.contains("intel hd")
+                                && !name_lower.contains("intel iris")
+                                && !name_lower.contains("intel uhd");
                             let vram_mb = item
                                 .get("spdisplays_vram")
                                 .or_else(|| item.get("spdisplays_vram_shared"))
@@ -797,6 +804,7 @@ fn infer_vendor(name: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn parse_vram_mb(s: &str) -> Option<u64> {
     let mut digits = String::new();
     for ch in s.chars() {
@@ -825,18 +833,21 @@ pub fn find_app_helper(name: &str) -> Option<PathBuf> {
             if let Some(contents) = dir.parent() {
                 candidates.push(contents.join("Resources").join(name));
             }
-            // Cargo target/{debug,release}/exe -> app/<name>
+            #[cfg(debug_assertions)]
             for ancestor in dir.ancestors().take(4) {
                 candidates.push(ancestor.join(name));
                 candidates.push(ancestor.join("app").join(name));
             }
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(name));
-        candidates.push(cwd.join("app").join(name));
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join(name));
+            candidates.push(cwd.join("app").join(name));
+        }
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name));
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name));
 
     for path in candidates {
         if path.is_file() {
@@ -1028,6 +1039,7 @@ pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
 }
 
 /// Update `adapter_name` inside `sunshine.conf` safely; returns `Ok(true)` if changed.
+#[allow(dead_code)]
 pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     let conf_path = find_sunshine_conf()
         .ok_or_else(|| anyhow::anyhow!("sunshine.conf not found on this machine"))?;
@@ -1417,22 +1429,28 @@ fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
 #[cfg(target_os = "macos")]
 fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option<u32>) {
     let lower_friendly = friendly.to_ascii_lowercase();
-    let lower_iface = iface.to_ascii_lowercase();
+    let _lower_iface = iface.to_ascii_lowercase();
 
+    // Only classify as Thunderbolt if `networksetup` explicitly maps this device to Thunderbolt.
+    // Never classify arbitrary `bridge*` (e.g., Internet Sharing `bridge100` or VM bridges) as Thunderbolt.
+    // Likewise, only classify as DirectUsb for genuine point-to-point USB CDC/NCM/RNDIS/Apple bridges,
+    // not generic USB-to-RJ45 Ethernet LAN adapters.
     let mut transport = if lower_friendly.contains("wi-fi") || lower_friendly.contains("airport") {
         LinkTransport::Wifi
-    } else if lower_friendly.contains("thunderbolt") || lower_iface.starts_with("bridge") {
+    } else if lower_friendly.contains("thunderbolt") {
         LinkTransport::Thunderbolt
-    } else if lower_friendly.contains("usb")
-        || lower_friendly.contains("cdc")
+    } else if lower_friendly.contains("cdc")
         || lower_friendly.contains("ncm")
         || lower_friendly.contains("rndis")
         || lower_friendly.contains("iphone")
         || lower_friendly.contains("ipad")
-        || lower_friendly.contains("ethernet adapter")
+        || lower_friendly.contains("useth")
     {
         LinkTransport::DirectUsb
-    } else if lower_friendly.contains("ethernet") || lower_friendly.contains("lan") {
+    } else if lower_friendly.contains("ethernet")
+        || lower_friendly.contains("lan")
+        || lower_friendly.contains("usb")
+    {
         LinkTransport::Ethernet
     } else {
         LinkTransport::Unknown
@@ -1459,20 +1477,14 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
                     } else if ml.contains("10base") {
                         speed_mbps = Some(10);
                     }
-                    if ml.contains("cdc") && transport == LinkTransport::Unknown {
+                    if (ml.contains("cdc") || ml.contains("ncm"))
+                        && matches!(transport, LinkTransport::Unknown | LinkTransport::Ethernet)
+                    {
                         transport = LinkTransport::DirectUsb;
                     }
                 }
             }
         }
-    }
-
-    if speed_mbps.is_none() {
-        speed_mbps = match transport {
-            LinkTransport::Thunderbolt => Some(10000),
-            LinkTransport::DirectUsb => Some(5000),
-            _ => None,
-        };
     }
 
     (transport, speed_mbps)
@@ -1519,6 +1531,10 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             break;
         }
         let row = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const MibIpAddrRow) };
+        // Skip disconnected (0x0008) or being-deleted (0x0040) IPv4 rows
+        if (row.w_type & (0x0008 | 0x0040)) != 0 {
+            continue;
+        }
         let ip = Ipv4Addr::from(row.dw_addr.to_ne_bytes());
         if ip.is_loopback() || ip.is_unspecified() {
             continue;
@@ -1626,7 +1642,8 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
                 } else if combined.contains("ncm")
                     || combined.contains("cdc")
                     || combined.contains("rndis")
-                    || combined.contains("usb")
+                    || combined.contains("apple mobile")
+                    || combined.contains("wintun")
                 {
                     LinkTransport::DirectUsb
                 } else {
@@ -1645,15 +1662,15 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
 
 #[cfg(target_os = "windows")]
 fn parse_windows_link_speed(raw: &str) -> Option<u32> {
-    let lower = raw.to_ascii_lowercase();
+    let lower = raw.to_ascii_lowercase().replace(',', ".");
     let num_str: String = lower
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
     let val: f64 = num_str.parse().ok()?;
-    if lower.contains("gbps") {
+    if lower.contains("gbps") || lower.contains("gbit") {
         Some((val * 1000.0).round() as u32)
-    } else if lower.contains("mbps") {
+    } else if lower.contains("mbps") || lower.contains("mbit") {
         Some(val.round() as u32)
     } else {
         None
@@ -1665,6 +1682,7 @@ pub fn is_valid_ipv4(ip: &str) -> bool {
     ip.trim().parse::<Ipv4Addr>().is_ok()
 }
 
+#[allow(dead_code)]
 pub fn is_local_file_path(path: &Path) -> bool {
     path.exists()
 }

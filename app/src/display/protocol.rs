@@ -8,6 +8,12 @@ pub enum DisplayRpcRequest {
         device_id: String,
         hostname: String,
         pin: String,
+        #[serde(default)]
+        client_nonce: String,
+        #[serde(default)]
+        client_token: String,
+        #[serde(default)]
+        auth_mac: String,
     },
     StartMoonlight {
         host_ip: String,
@@ -49,4 +55,10 @@ pub struct DisplayRpcResponse {
     pub storage_status: Option<crate::storage::StorageStatus>,
     #[serde(default)]
     pub hardware_profile: Option<crate::system_info::LocalHardwareProfile>,
+    #[serde(default)]
+    pub pairing_token: Option<String>,
+    #[serde(default)]
+    pub host_device_id: Option<String>,
+    #[serde(default)]
+    pub host_name: Option<String>,
 }

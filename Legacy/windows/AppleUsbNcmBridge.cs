@@ -50,6 +50,9 @@ namespace AppleUsbNcmBridge {
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool SetEvent(IntPtr hEvent);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool SetDllDirectory(string lpPathName);
+
         [StructLayout(LayoutKind.Sequential)]
         public unsafe struct CM_NOTIFY_FILTER {
             public uint cbSize;
@@ -93,38 +96,39 @@ namespace AppleUsbNcmBridge {
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_ResetPipe(IntPtr InterfaceHandle, byte PipeID);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("wintun.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr WintunCreateAdapter(string Name, string TunnelType, ref Guid RequestedGUID);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("wintun.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr WintunOpenAdapter(string Name);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern void WintunCloseAdapter(IntPtr Adapter);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern IntPtr WintunStartSession(IntPtr Adapter, uint Capacity);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern void WintunEndSession(IntPtr Session);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern IntPtr WintunGetReadWaitEvent(IntPtr Session);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern IntPtr WintunReceivePacket(IntPtr Session, out uint PacketSize);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern void WintunReleaseReceivePacket(IntPtr Session, IntPtr Packet);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern IntPtr WintunAllocateSendPacket(IntPtr Session, uint PacketSize);
 
-        [DllImport("C:\\ProgramData\\AppleUsbNcm\\wintun.dll", SetLastError = true)]
+        [DllImport("wintun.dll", SetLastError = true)]
         public static extern void WintunSendPacket(IntPtr Session, IntPtr Packet);
 
         static volatile bool running = false;
-        static byte[] macPeerAddr = new byte[] { 0x62, 0xD6, 0x7D, 0x44, 0x48, 0x0F };
+        // Initialized to Ethernet broadcast until the connected Mac's MAC is learned from incoming frames
+        static byte[] macPeerAddr = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         static readonly byte[] winVirtualMac = new byte[] { 0x02, 0x00, 0x5E, 0x99, 0x99, 0x01 };
         static ushort txSeq = 0;
         static readonly object txLock = new object();
@@ -168,10 +172,13 @@ namespace AppleUsbNcmBridge {
                     if (reqSize > 0) {
                         IntPtr detail = Marshal.AllocHGlobal((int)reqSize);
                         try {
-                            Marshal.WriteInt32(detail, 8);
+                            Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
                             if (SetupDiGetDeviceInterfaceDetail(devs, ref ifData, detail, reqSize, out reqSize, IntPtr.Zero)) {
                                 string path = Marshal.PtrToStringUni(new IntPtr(detail.ToInt64() + 4));
-                                if (path != null && path.ToLowerInvariant().Contains("vid_05ac&pid_1902")) {
+                                string customHwid = Environment.GetEnvironmentVariable("APPLE_USB_NCM_HWID");
+                                string lower = path != null ? path.ToLowerInvariant() : "";
+                                if (lower.Contains("vid_05ac&pid_1902")
+                                    || (!string.IsNullOrEmpty(customHwid) && lower.Contains(customHwid.ToLowerInvariant()))) {
                                     return path;
                                 }
                             }
@@ -187,6 +194,7 @@ namespace AppleUsbNcmBridge {
         }
 
         static void SendSingleEthernetFrame(IntPtr hIntf1, byte[] frame, int frameLen) {
+            if (frame == null || frameLen < 14 || frameLen > 1536 || frameLen > frame.Length) return;
             lock (txLock) {
                 int totalLen = 28 + frameLen;
                 if (totalLen < 64) totalLen = 64;
@@ -224,14 +232,22 @@ namespace AppleUsbNcmBridge {
 
         // Consumes UDP hints from the macOS daemon ("ON" = sharing started, "OFF" = sharing stopped).
         static bool HandleControlHint(byte[] b, int ip, int ipLen) {
-            if (ipLen < 28 || b[ip + 9] != 17) return false;
+            if (b == null || ip < 0 || ipLen < 28 || ip + ipLen > b.Length || b[ip + 9] != 17) return false;
+            // Only accept control hints from local USB-C link subnets (10.99.99.x, 192.168.2.x, 169.254.x.x)
+            byte s0 = b[ip + 12], s1 = b[ip + 13], s2 = b[ip + 14];
+            bool validSrc = (s0 == 10 && s1 == 99 && s2 == 99)
+                || (s0 == 192 && s1 == 168 && s2 == 2)
+                || (s0 == 169 && s1 == 254);
+            if (!validSrc) return false;
             int ihl = (b[ip] & 0x0F) * 4;
             if (ihl < 20 || ihl + 8 > ipLen) return false;
             int udp = ip + ihl;
+            if (udp + 8 > b.Length) return false;
             int dport = (b[udp + 2] << 8) | b[udp + 3];
             if (dport != HintPort) return false;
             int ulen = (b[udp + 4] << 8) | b[udp + 5];
-            int plen = Math.Min(ulen - 8, ipLen - ihl - 8);
+            int maxAvail = Math.Min(ipLen - ihl - 8, b.Length - (udp + 8));
+            int plen = Math.Min(ulen - 8, maxAvail);
             string msg = plen > 0 ? Encoding.ASCII.GetString(b, udp + 8, Math.Min(plen, 16)).Trim() : "";
             if (msg == "ON") {
                 gwProbeWake.Set(); // probe 192.168.2.1 right away; the ARP reply confirms sharing
@@ -452,9 +468,9 @@ namespace AppleUsbNcmBridge {
             gwApplied = false;
             gwAppliedKnown = true;
 
-            // Exactly one firewall rule: delete stale duplicates from older versions, then add
+            // Exactly one firewall rule scoped to the local USB-C adapter IPs
             Netsh("advfirewall firewall delete rule name=\"Apple USB-C NCM Allow All\"");
-            Netsh("advfirewall firewall add rule name=\"Apple USB-C NCM Allow All\" dir=in action=allow remoteip=10.99.99.0/24,192.168.2.0/24");
+            Netsh("advfirewall firewall add rule name=\"Apple USB-C NCM Allow All\" dir=in action=allow localip=10.99.99.1,192.168.2.2 remoteip=10.99.99.0/24,192.168.2.0/24");
         }
 
         // Applies gateway/DNS changes off the packet path (netsh can take a few hundred ms).
@@ -505,6 +521,14 @@ namespace AppleUsbNcmBridge {
         }
 
         static void Main(string[] args) {
+            try {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                if (!string.IsNullOrEmpty(baseDir) && File.Exists(Path.Combine(baseDir, "wintun.dll"))) {
+                    SetDllDirectory(baseDir);
+                } else if (Directory.Exists("C:\\ProgramData\\AppleUsbNcm")) {
+                    SetDllDirectory("C:\\ProgramData\\AppleUsbNcm");
+                }
+            } catch {}
             try {
                 Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
                 Thread.CurrentThread.Priority = ThreadPriority.Highest;
@@ -575,7 +599,7 @@ namespace AppleUsbNcmBridge {
                         uint transferred = 0;
                         WinUsb_ControlTransfer(hIntf0, pkt, ntbParams, 28, out transferred, IntPtr.Zero);
                         uint maxIn = BitConverter.ToUInt32(ntbParams, 4);
-                        if (maxIn == 0) maxIn = 32764;
+                        if (maxIn < 2048 || maxIn > 65536) maxIn = 32764;
 
                         WinUsb_GetAssociatedInterface(hIntf0, 0, out hIntf1);
                         WinUsb_SetCurrentAlternateSetting(hIntf1, 0);
@@ -607,8 +631,9 @@ namespace AppleUsbNcmBridge {
                         UsbTxLoop(hIntf1, session);
                         rxThread.Join(2000);
 
-                        // Link is down: stop probing and drop any gateway via the Mac
+                        // Link is down: stop probing, reset peer MAC to broadcast, and drop any gateway via the Mac
                         running = false;
+                        for (int m = 0; m < 6; m++) macPeerAddr[m] = 0xFF;
                         linkGen++;
                         gwProbeWake.Set();
                         gwMonThread.Join(1000);

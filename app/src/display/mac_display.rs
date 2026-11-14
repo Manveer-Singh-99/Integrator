@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::info;
 
+#[allow(dead_code)]
 const INTEGRATOR_VD_VENDOR: u32 = 0x494E; // 'IN'
+#[allow(dead_code)]
 const INTEGRATOR_VD_PRODUCT: u32 = 0x0165;
 
 #[cfg(target_os = "macos")]
@@ -59,6 +61,7 @@ impl MacDisplayManager {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
     pub fn get_active_virtual_display() -> Option<u32> {
         None
     }
@@ -168,8 +171,13 @@ impl MacDisplayManager {
         let _ = std::fs::create_dir_all(&log_dir);
         let log_file = std::fs::File::create(log_dir.join("sunshine.log"))?;
 
-        Command::new(&sunshine_bin)
-            .stdout(Stdio::from(log_file.try_clone()?))
+        let mut cmd = Command::new(&sunshine_bin);
+        if let Some(conf_path) = system_info::find_sunshine_conf() {
+            if conf_path.is_file() {
+                cmd.arg(&conf_path);
+            }
+        }
+        cmd.stdout(Stdio::from(log_file.try_clone()?))
             .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
@@ -198,6 +206,7 @@ impl MacDisplayManager {
         false
     }
 
+    #[allow(dead_code)]
     pub async fn wait_for_port(ip: &str, port: u16, timeout: Duration) -> bool {
         let addr = format!("{}:{}", ip, port);
         let start = std::time::Instant::now();

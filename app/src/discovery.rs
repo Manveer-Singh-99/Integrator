@@ -1,8 +1,9 @@
 //! Dynamic UDP Peer Discovery over any active interface (USB-C CDC-NCM,
 //! Thunderbolt Bridge, Wired Ethernet, Wi-Fi, or user-configured peer IP).
 //!
-//! Zero hardcoded IPs or subnets: broadcast targets come directly from the OS
-//! interface table and routes are classified dynamically via the routing table.
+//! Validates incoming beacons for protocol version, timestamp freshness (±60s),
+//! HMAC integrity, port bounds, and field lengths, and runs synchronous OS queries
+//! on the blocking thread pool so Tokio async worker threads are never stalled.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,12 @@ use crate::config::{CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT};
 use crate::system_info::{self, LinkTransport};
 use crate::trust;
 
+pub const DISCOVERY_PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryBeacon {
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u16,
     #[serde(default)]
     pub device_id: String,
     pub sender_name: String,
@@ -42,6 +47,12 @@ pub struct DiscoveryBeacon {
     #[serde(default)]
     pub gpus: Vec<String>,
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub beacon_mac: String,
+}
+
+fn default_protocol_version() -> u16 {
+    DISCOVERY_PROTOCOL_VERSION
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +108,9 @@ impl DiscoveryManager {
     }
 
     pub async fn get_peer_ip(&self) -> Option<String> {
-        self.best_candidate_inner().await.map(|c| c.addr.ip().to_string())
+        self.best_candidate_inner()
+            .await
+            .map(|c| c.addr.ip().to_string())
     }
 
     pub async fn get_best_peer(&self) -> Option<PeerCandidate> {
@@ -174,30 +187,84 @@ impl DiscoveryManager {
                 match listener_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         if let Ok(beacon) = serde_json::from_slice::<DiscoveryBeacon>(&buf[..len]) {
+                            if beacon.protocol_version == 0 || beacon.protocol_version > 10 {
+                                continue;
+                            }
                             let peer_ip = addr.ip().to_string();
-                            let is_self_id =
-                                !beacon.device_id.is_empty() && beacon.device_id == my_device_id;
-                            let is_self_name_and_ip = beacon.device_id.is_empty()
-                                && beacon.sender_name == my_name
-                                && is_own_local_ip(&peer_ip);
-                            if is_self_id || is_self_name_and_ip || addr.ip().is_loopback() {
+                            let dev_id = if beacon.device_id.trim().is_empty() {
+                                continue;
+                            } else {
+                                beacon.device_id.trim().to_string()
+                            };
+
+                            if dev_id == my_device_id || addr.ip().is_loopback() {
                                 continue;
                             }
 
-                            let (transport, speed_mbps, link_desc, local_ip) =
-                                system_info::describe_route_to_peer(&peer_ip);
-                            let dev_id = if beacon.device_id.is_empty() {
-                                format!("legacy-{}", peer_ip)
+                            let valid_control_port = if beacon.control_port >= 1024 {
+                                beacon.control_port
                             } else {
-                                beacon.device_id.clone()
+                                CONTROL_PORT
+                            };
+                            let valid_clipboard_port = if beacon.clipboard_port >= 1024 {
+                                beacon.clipboard_port
+                            } else {
+                                CLIPBOARD_PORT
                             };
 
-                            let trusted = trust::observe_discovered_peer(
+                            if !trust::verify_discovery_beacon_fields(
                                 &dev_id,
                                 &beacon.sender_name,
-                                &peer_ip,
-                                transport.is_direct_cable(),
-                            );
+                                beacon.timestamp_ms,
+                                valid_control_port,
+                                valid_clipboard_port,
+                                &beacon.beacon_mac,
+                            ) {
+                                tracing::debug!(
+                                    "Dropped invalid or stale discovery beacon from {}",
+                                    peer_ip
+                                );
+                                continue;
+                            }
+
+                            let peer_ip_for_route = peer_ip.clone();
+                            let my_name_clone = my_name.clone();
+                            let sender_name_clone = beacon.sender_name.clone();
+                            let dev_id_clone = dev_id.clone();
+
+                            let Ok((is_self_ip, transport, speed_mbps, link_desc, local_ip, trusted)) =
+                                tokio::task::spawn_blocking(move || {
+                                    let is_self = sender_name_clone == my_name_clone
+                                        && is_own_local_ip(&peer_ip_for_route);
+                                    if is_self {
+                                        return (
+                                            true,
+                                            LinkTransport::Unknown,
+                                            None,
+                                            String::new(),
+                                            None,
+                                            false,
+                                        );
+                                    }
+                                    let (transport, speed_mbps, link_desc, local_ip) =
+                                        system_info::describe_route_to_peer(&peer_ip_for_route);
+                                    let trusted = trust::observe_discovered_peer(
+                                        &dev_id_clone,
+                                        &sender_name_clone,
+                                        &peer_ip_for_route,
+                                        transport.is_direct_cable(),
+                                    );
+                                    record_recent_peer_ip(&peer_ip_for_route);
+                                    (false, transport, speed_mbps, link_desc, local_ip, trusted)
+                                })
+                                .await
+                            else {
+                                continue;
+                            };
+
+                            if is_self_ip {
+                                continue;
+                            }
 
                             // Refresh real TCP RTT in background at most once every 3s per IP
                             let cached_rtt = {
@@ -208,17 +275,17 @@ impl DiscoveryManager {
                                 Some((age, r)) if age < Duration::from_secs(4) => Some(r),
                                 _ => {
                                     let probe_ip = peer_ip.clone();
-                                    let probe_port = beacon.control_port.max(1);
+                                    let probe_port = valid_control_port;
                                     let rtt_map = Arc::clone(&rtt_cache);
                                     let cands_ref = Arc::clone(&candidates);
                                     tokio::spawn(async move {
                                         if let Some(measured) =
                                             measure_tcp_connect_rtt(&probe_ip, probe_port).await
                                         {
-                                            rtt_map
-                                                .write()
-                                                .await
-                                                .insert(probe_ip.clone(), (Instant::now(), measured));
+                                            rtt_map.write().await.insert(
+                                                probe_ip.clone(),
+                                                (Instant::now(), measured),
+                                            );
                                             let mut list = cands_ref.write().await;
                                             for c in list.iter_mut() {
                                                 if c.addr.ip().to_string() == probe_ip {
@@ -231,30 +298,41 @@ impl DiscoveryManager {
                                 }
                             };
 
-                            record_recent_peer_ip(&peer_ip);
+                            let sanitized_share = beacon
+                                .share_name
+                                .as_deref()
+                                .and_then(|s| crate::storage::validate_smb_share_name(s).ok());
+                            let sanitized_gpus: Vec<String> = beacon
+                                .gpus
+                                .into_iter()
+                                .take(8)
+                                .map(|g| g.chars().take(128).collect())
+                                .collect();
 
                             let mut list = candidates.write().await;
                             let now = Instant::now();
                             list.retain(|c| now.duration_since(c.last_seen) < Duration::from_secs(8));
 
                             let candidate = PeerCandidate {
-                                addr: SocketAddr::new(addr.ip(), beacon.control_port),
+                                addr: SocketAddr::new(addr.ip(), valid_control_port),
                                 last_seen: now,
-                                os: beacon.os.clone(),
+                                os: beacon.os.chars().take(64).collect(),
                                 device_id: dev_id,
-                                device_name: beacon.sender_name.clone(),
-                                hardware_model: beacon.hardware_model.clone(),
-                                display_width: beacon.display_width,
-                                display_height: beacon.display_height,
-                                display_fps: beacon.display_fps,
-                                share_name: beacon.share_name.clone(),
-                                sunshine_name: beacon.sunshine_name.clone(),
-                                sunshine_port: if beacon.sunshine_port > 0 {
+                                device_name: beacon.sender_name.chars().take(128).collect(),
+                                hardware_model: beacon.hardware_model.chars().take(128).collect(),
+                                display_width: beacon.display_width.clamp(0, 7680),
+                                display_height: beacon.display_height.clamp(0, 4320),
+                                display_fps: beacon.display_fps.clamp(0, 240),
+                                share_name: sanitized_share,
+                                sunshine_name: beacon
+                                    .sunshine_name
+                                    .map(|s| s.chars().take(128).collect()),
+                                sunshine_port: if beacon.sunshine_port >= 1024 {
                                     beacon.sunshine_port
                                 } else {
                                     47989
                                 },
-                                gpus: beacon.gpus.clone(),
+                                gpus: sanitized_gpus,
                                 transport,
                                 link_speed_mbps: speed_mbps,
                                 link_description: link_desc,
@@ -263,7 +341,8 @@ impl DiscoveryManager {
                                 trusted,
                             };
 
-                            if let Some(existing) = list.iter_mut().find(|c| c.addr.ip() == addr.ip())
+                            if let Some(existing) =
+                                list.iter_mut().find(|c| c.addr.ip() == addr.ip())
                             {
                                 *existing = candidate;
                             } else {
@@ -300,47 +379,64 @@ impl DiscoveryManager {
 
         tokio::spawn(async move {
             loop {
-                let profile = system_info::collect_local_profile();
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let manual_snapshot = manual_ips_ref.read().await.clone();
+                let fallback_clone = fallback_name.clone();
+                let dev_id_clone = dev_id.clone();
 
-                let beacon = DiscoveryBeacon {
-                    device_id: dev_id.clone(),
-                    sender_name: if profile.hostname.is_empty() {
-                        fallback_name.clone()
-                    } else {
-                        profile.hostname.clone()
-                    },
-                    os: profile.os.clone(),
-                    hardware_model: profile.hardware_model.clone(),
-                    control_port: CONTROL_PORT,
-                    clipboard_port: CLIPBOARD_PORT,
-                    display_width: profile.primary_display.width,
-                    display_height: profile.primary_display.height,
-                    display_fps: profile.primary_display.fps,
-                    share_name: profile.default_share_names.first().cloned(),
-                    sunshine_name: profile.sunshine_name.clone(),
-                    sunshine_port: profile.sunshine_port,
-                    gpus: profile.gpus.iter().map(|g| g.name.clone()).collect(),
-                    timestamp_ms: ts,
-                };
+                if let Ok((bytes, targets)) = tokio::task::spawn_blocking(move || {
+                    let profile = system_info::collect_local_profile();
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mac = trust::sign_discovery_beacon(
+                        &dev_id_clone,
+                        ts,
+                        CONTROL_PORT,
+                        CLIPBOARD_PORT,
+                    );
 
-                if let Ok(bytes) = serde_json::to_vec(&beacon) {
+                    let beacon = DiscoveryBeacon {
+                        protocol_version: DISCOVERY_PROTOCOL_VERSION,
+                        device_id: dev_id_clone,
+                        sender_name: if profile.hostname.is_empty() {
+                            fallback_clone
+                        } else {
+                            profile.hostname.clone()
+                        },
+                        os: profile.os.clone(),
+                        hardware_model: profile.hardware_model.clone(),
+                        control_port: CONTROL_PORT,
+                        clipboard_port: CLIPBOARD_PORT,
+                        display_width: profile.primary_display.width,
+                        display_height: profile.primary_display.height,
+                        display_fps: profile.primary_display.fps,
+                        share_name: profile.default_share_names.first().cloned(),
+                        sunshine_name: profile.sunshine_name.clone(),
+                        sunshine_port: profile.sunshine_port,
+                        gpus: profile.gpus.iter().map(|g| g.name.clone()).collect(),
+                        timestamp_ms: ts,
+                        beacon_mac: mac,
+                    };
+
+                    let bytes = serde_json::to_vec(&beacon).unwrap_or_default();
                     let mut targets: Vec<String> = system_info::discovery_broadcast_targets();
                     let hist = load_peer_history();
-                    let manual = manual_ips_ref.read().await;
                     let mut seen: HashSet<String> = targets.iter().cloned().collect();
-                    for ip in manual.iter().chain(hist.recent_ips.iter()) {
+                    for ip in manual_snapshot.iter().chain(hist.recent_ips.iter()) {
                         if seen.insert(ip.clone()) {
                             targets.push(ip.clone());
                         }
                     }
-
-                    for ip in targets {
-                        let target = format!("{}:{}", ip, DISCOVERY_PORT);
-                        let _ = broadcaster_socket.send_to(&bytes, &target).await;
+                    (bytes, targets)
+                })
+                .await
+                {
+                    if !bytes.is_empty() {
+                        for ip in targets {
+                            let target = format!("{}:{}", ip, DISCOVERY_PORT);
+                            let _ = broadcaster_socket.send_to(&bytes, &target).await;
+                        }
                     }
                 }
 
@@ -359,7 +455,7 @@ fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
             // 1. Trusted peers strictly first
             b.trusted
                 .cmp(&a.trusted)
-                // 2. Physical / wired / faster transport first (DirectUsb < Thunderbolt < Ethernet < Wifi < Unknown)
+                // 2. Physical / wired / faster transport first
                 .then_with(|| a.transport.cmp(&b.transport))
                 // 3. Lower measured RTT if available
                 .then_with(|| {
@@ -386,22 +482,24 @@ async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
         tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(&target)).await
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let payload = b"\"Ping\"";
-        if stream.write_u32(payload.len() as u32).await.is_ok()
-            && stream.write_all(payload).await.is_ok()
-        {
-            let mut hdr = [0u8; 4];
-            if let Ok(Ok(_)) =
-                tokio::time::timeout(Duration::from_millis(300), stream.read_exact(&mut hdr)).await
+        if let Ok(wire_ping) = trust::seal_envelope_for_ip(ip, b"\"Ping\"") {
+            if stream.write_u32(wire_ping.len() as u32).await.is_ok()
+                && stream.write_all(&wire_ping).await.is_ok()
             {
-                let len = u32::from_be_bytes(hdr) as usize;
-                if len > 0 && len <= 65_536 {
-                    let mut resp = vec![0u8; len];
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(300),
-                        stream.read_exact(&mut resp),
-                    )
-                    .await;
+                let mut hdr = [0u8; 4];
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_millis(300), stream.read_exact(&mut hdr))
+                        .await
+                {
+                    let len = u32::from_be_bytes(hdr) as usize;
+                    if len > 0 && len <= 65_536 {
+                        let mut resp = vec![0u8; len];
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(300),
+                            stream.read_exact(&mut resp),
+                        )
+                        .await;
+                    }
                 }
             }
         }

@@ -29,7 +29,29 @@ send_hint() {
     fi
 }
 
+discover_usb_ncm_ifaces() {
+    local discovered
+    discovered=$(networksetup -listallhardwareports 2>/dev/null | awk '
+        /Hardware Port:/ {
+            port = tolower($0)
+            is_tb_usb = (port ~ /thunderbolt/ && port !~ /bridge/) || (port ~ /usb/)
+        }
+        /Device:/ {
+            if (is_tb_usb && $2 ~ /^en[0-9]+$/) {
+                print $2
+            }
+        }
+    ' | tr '\n' ' ')
+    if [ -n "$discovered" ]; then
+        echo "$discovered"
+    else
+        echo "en3 en5"
+    fi
+}
+
 sync_network() {
+    local usb_ifaces
+    usb_ifaces=$(discover_usb_ncm_ifaces)
     local bridge_up=0
     if ifconfig bridge100 >/dev/null 2>&1; then
         local st
@@ -47,7 +69,7 @@ sync_network() {
         fi
 
         # Remove stale aliases from enslaved or inactive physical interfaces
-        for iface in en3 en5; do
+        for iface in $usb_ifaces; do
             if ifconfig "$iface" 2>/dev/null | grep -q "10.99.99.2"; then
                 ifconfig "$iface" -alias 10.99.99.2 2>/dev/null || true
             fi
@@ -62,7 +84,7 @@ sync_network() {
     else
         # Case B: Direct USB-C Link (Internet Sharing is OFF, bridge100 absent/inactive)
         local active_nic=""
-        for iface in en3 en5; do
+        for iface in $usb_ifaces; do
             if ifconfig "$iface" 2>/dev/null | grep -q "status: active"; then
                 active_nic="$iface"
                 break
@@ -76,14 +98,14 @@ sync_network() {
             fi
 
             # Internet sharing is off: ensure 192.168.2.1 is stripped
-            for iface in en3 en5 bridge100; do
+            for iface in $usb_ifaces bridge100; do
                 if ifconfig "$iface" 2>/dev/null | grep -q "192.168.2.1"; then
                     ifconfig "$iface" -alias 192.168.2.1 2>/dev/null || true
                 fi
             done
 
             # Strip 10.99.99.2 from any inactive physical port
-            for iface in en3 en5; do
+            for iface in $usb_ifaces; do
                 if [ "$iface" != "$active_nic" ] && ifconfig "$iface" 2>/dev/null | grep -q "10.99.99.2"; then
                     ifconfig "$iface" -alias 10.99.99.2 2>/dev/null || true
                 fi
@@ -104,7 +126,7 @@ sync_network
 # Event loop: listen to macOS configd dynamic store notifications
 while true; do
     (
-        echo "n.add State:/Network/Interface/(en3|en5|bridge100)/.*"
+        echo "n.add State:/Network/Interface/(en[0-9]+|bridge100)/.*"
         echo "n.watch"
         while true; do sleep 86400; done
     ) | scutil | while read -r line; do
