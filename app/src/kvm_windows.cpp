@@ -45,6 +45,32 @@ static std::atomic<bool> g_physical_left_down{false};
 static std::atomic<bool> g_remote_drag_left_down{false};
 static std::atomic<bool> g_ole_drag_active{false};
 static std::atomic<bool> g_drag_cancelled{false};
+static std::atomic<uint32_t> g_swallowed_mod_keys{0};
+
+enum SwallowedModBit : uint32_t {
+    kModLShift = 1u << 0,
+    kModRShift = 1u << 1,
+    kModLCtrl  = 1u << 2,
+    kModRCtrl  = 1u << 3,
+    kModLAlt   = 1u << 4,
+    kModRAlt   = 1u << 5,
+    kModLWin   = 1u << 6,
+    kModRWin   = 1u << 7,
+};
+
+static uint32_t swallowed_mod_bit_for_vk(DWORD vk) {
+    switch (vk) {
+        case VK_LSHIFT:   case VK_SHIFT:   return kModLShift;
+        case VK_RSHIFT:                    return kModRShift;
+        case VK_LCONTROL: case VK_CONTROL: return kModLCtrl;
+        case VK_RCONTROL:                  return kModRCtrl;
+        case VK_LMENU:    case VK_MENU:    return kModLAlt;
+        case VK_RMENU:                     return kModRAlt;
+        case VK_LWIN:                      return kModLWin;
+        case VK_RWIN:                      return kModRWin;
+        default:                           return 0;
+    }
+}
 
 static std::atomic<int32_t> g_park_x{400};
 static std::atomic<int32_t> g_park_y{300};
@@ -128,14 +154,19 @@ static std::string json_escape(const std::string& src) {
     return out;
 }
 
-static uint64_t read_current_modifiers() {
+static uint64_t read_current_modifiers_with_swallowed(uint32_t sw) {
     uint64_t m = 0;
-    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) m |= 1ULL;
-    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) m |= 2ULL;
-    if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0) m |= 4ULL;
+    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 || (sw & (kModLShift | kModRShift)) != 0) m |= 1ULL;
+    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 || (sw & (kModLCtrl | kModRCtrl)) != 0) m |= 2ULL;
+    if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || (sw & (kModLAlt | kModRAlt)) != 0) m |= 4ULL;
     if (((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
-        ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0)) m |= 8ULL;
+        ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0) ||
+        (sw & (kModLWin | kModRWin)) != 0) m |= 8ULL;
     return m;
+}
+
+static uint64_t read_current_modifiers() {
+    return read_current_modifiers_with_swallowed(g_swallowed_mod_keys.load());
 }
 
 static void position_edge_window(HWND hwnd) {
@@ -412,6 +443,11 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
         bool pressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        uint32_t sw_bit = swallowed_mod_bit_for_vk(ks->vkCode);
+        uint32_t preview_sw = g_swallowed_mod_keys.load();
+        if (sw_bit != 0 && g_controlling_peer.load()) {
+            preview_sw = pressed ? (preview_sw | sw_bit) : (preview_sw & ~sw_bit);
+        }
         if (g_kvm_cb) {
             int32_t decision = g_kvm_cb(
                 4,
@@ -419,10 +455,19 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
                 pressed ? 1.0 : 0.0,
                 0.0,
                 0.0,
-                read_current_modifiers()
+                read_current_modifiers_with_swallowed(preview_sw)
             );
             if (decision != 0) {
+                if (sw_bit != 0) {
+                    if (pressed) {
+                        g_swallowed_mod_keys.fetch_or(sw_bit);
+                    } else {
+                        g_swallowed_mod_keys.fetch_and(~sw_bit);
+                    }
+                }
                 return 1;
+            } else if (!pressed && sw_bit != 0) {
+                g_swallowed_mod_keys.fetch_and(~sw_bit);
             }
         }
     }
@@ -787,6 +832,7 @@ void integrator_kvm_win_set_controlling(
     int32_t restore_x,
     int32_t restore_y
 ) {
+    g_swallowed_mod_keys.store(0);
     g_park_x.store(park_x);
     g_park_y.store(park_y);
     g_park_pending.store(controlling);

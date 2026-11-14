@@ -628,7 +628,7 @@ impl KvmService {
                 drag_offer,
             } => {
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
-                let (ex, ey) = resolve_entry_point(local_rect, entry_edge, norm_pos, 10.0);
+                let (ex, ey) = resolve_entry_point(local_rect, entry_edge, norm_pos, 24.0);
 
                 let allow_drag = drag_offer.is_some() && self.features.is_enabled("dragdrop");
                 let offer_opt = if allow_drag { drag_offer } else { None };
@@ -647,6 +647,15 @@ impl KvmService {
                         native_drag_started: false,
                     };
                 }
+                *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Instant::now();
+                info!(
+                    "➡️ KVM entered local screen on {:?} edge at ({:.0}, {:.0}) [drag={}]",
+                    entry_edge,
+                    ex,
+                    ey,
+                    drag_sid.is_some()
+                );
                 *self
                     .pending_drag_drop_label
                     .write()
@@ -723,7 +732,7 @@ impl KvmService {
             } => {
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
                 let layout_cfg = self.get_layout();
-                let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, 10.0);
+                let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, 16.0);
 
                 let old_drag_sid = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
@@ -746,6 +755,10 @@ impl KvmService {
                     .unwrap_or_else(|e| e.into_inner()) = None;
                 *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
                     Instant::now();
+                info!(
+                    "↩️ KVM control returned from peer at ({:.0}, {:.0})",
+                    rx, ry
+                );
                 Self::platform_set_controlling(false, 400.0, 300.0, rx, ry);
             }
             KvmWireMessage::MouseMoveDelta { dx, dy } => {
@@ -773,7 +786,14 @@ impl KvmService {
                         ScreenEdge::Bottom => next_y > local_rect.max_y(),
                     };
 
-                    if crossed && active_drag_session.is_none() {
+                    let cooldown_elapsed = self
+                        .last_edge_transition
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .elapsed()
+                        >= Duration::from_millis(180);
+
+                    if crossed && active_drag_session.is_none() && cooldown_elapsed {
                         let dead = {
                             let cfg = self.get_layout();
                             cfg.dead_corners && is_in_dead_corner(local_rect, entry_edge, next_x, next_y)
@@ -811,6 +831,10 @@ impl KvmService {
                 };
 
                 if let Some((exit_edge, norm_pos)) = crossed_back {
+                    info!(
+                        "⬅️ Returning KVM control across {:?} edge (next={:.0},{:.0})",
+                        exit_edge, new_x, new_y
+                    );
                     self.release_all_injected_inputs(new_x, new_y);
                     Self::platform_hide_ghost();
                     Self::platform_set_controlled(false, new_x, new_y);
@@ -871,7 +895,7 @@ impl KvmService {
                 if !is_controlled {
                     return;
                 }
-                {
+                if key != LogicalKey::CapsLock {
                     let mut held = self
                         .held_remote_keys
                         .lock()
@@ -1166,6 +1190,10 @@ impl KvmService {
                 }
                 *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
                     Instant::now();
+                info!(
+                    "➡️ Handing KVM control to peer across {:?} edge from ({:.0}, {:.0})",
+                    layout_cfg.peer_edge, x, y
+                );
 
                 if !drag_paths.is_empty() {
                     Self::platform_cancel_local_drag();

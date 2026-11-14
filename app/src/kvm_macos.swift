@@ -2,6 +2,8 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import IOKit
+import IOKit.hid
 
 // Tag attached to all synthetic CGEvents injected by Integrator so our CGEventTap
 // passes them through immediately without re-capturing or feedback-looping.
@@ -39,8 +41,91 @@ private var gSyntheticInjectorActive: Bool = false
 
 private var gParkX: Double = 400.0
 private var gParkY: Double = 300.0
+private var gControllingEnteredAt: Double = 0.0
+
+private var gRemoteShiftLeft: Bool = false
+private var gRemoteShiftRight: Bool = false
+private var gRemoteCtrlLeft: Bool = false
+private var gRemoteCtrlRight: Bool = false
+private var gRemoteAltLeft: Bool = false
+private var gRemoteAltRight: Bool = false
+private var gRemoteMetaLeft: Bool = false
+private var gRemoteMetaRight: Bool = false
 
 private let gStateLock = NSLock()
+private var gBgCursorConfigured: Bool = false
+private var gAtExitRegistered: Bool = false
+
+private func enableBackgroundCursorHiding() {
+    gStateLock.lock()
+    let already = gBgCursorConfigured
+    if !already {
+        gBgCursorConfigured = true
+    }
+    gStateLock.unlock()
+    if already { return }
+
+    typealias CGSDefaultConnFn = @convention(c) () -> UInt32
+    typealias CGSSetConnPropFn = @convention(c) (UInt32, UInt32, CFString, CFTypeRef) -> Int32
+    guard let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+          let connSym = dlsym(handle, "CGSMainConnectionID"),
+          let propSym = dlsym(handle, "CGSSetConnectionProperty")
+    else { return }
+    let cid = unsafeBitCast(connSym, to: CGSDefaultConnFn.self)()
+    let setProp = unsafeBitCast(propSym, to: CGSSetConnPropFn.self)
+    _ = setProp(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+}
+
+private func toggleMacCapsLock() -> Bool? {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
+    guard service != 0 else { return nil }
+    defer { IOObjectRelease(service) }
+
+    var conn: io_connect_t = 0
+    guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
+        return nil
+    }
+    defer { IOServiceClose(conn) }
+
+    var cur = false
+    guard IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS else {
+        return nil
+    }
+    let next = !cur
+    if IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), next) == KERN_SUCCESS {
+        return next
+    }
+    return nil
+}
+
+private func currentMacCapsLockOn() -> Bool {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
+    guard service != 0 else { return false }
+    defer { IOObjectRelease(service) }
+
+    var conn: io_connect_t = 0
+    guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
+        return false
+    }
+    defer { IOServiceClose(conn) }
+
+    var cur = false
+    if IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS {
+        return cur
+    }
+    return false
+}
+
+private func clearRemoteModStateLocked() {
+    gRemoteShiftLeft = false
+    gRemoteShiftRight = false
+    gRemoteCtrlLeft = false
+    gRemoteCtrlRight = false
+    gRemoteAltLeft = false
+    gRemoteAltRight = false
+    gRemoteMetaLeft = false
+    gRemoteMetaRight = false
+}
 
 // MARK: - Primary Screen Geometry
 
@@ -72,22 +157,40 @@ public func integrator_kvm_macos_set_controlling(
     gControllingPeer = controlling
     gParkX = parkX
     gParkY = parkY
+    if controlling {
+        gControllingEnteredAt = CFAbsoluteTimeGetCurrent()
+    }
     gStateLock.unlock()
 
-    DispatchQueue.main.async {
-        if controlling {
-            if !gCursorHidden {
-                CGDisplayHideCursor(CGMainDisplayID())
+    if controlling {
+        enableBackgroundCursorHiding()
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+        CGWarpMouseCursorPosition(CGPoint(x: parkX, y: parkY))
+        DispatchQueue.main.async {
+            gStateLock.lock()
+            let stillControlling = gControllingPeer
+            let needHide = stillControlling && !gCursorHidden
+            if needHide {
                 gCursorHidden = true
             }
-            CGWarpMouseCursorPosition(CGPoint(x: parkX, y: parkY))
-            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        } else {
-            CGWarpMouseCursorPosition(CGPoint(x: restoreX, y: restoreY))
-            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-            if gCursorHidden {
-                CGDisplayShowCursor(CGMainDisplayID())
+            gStateLock.unlock()
+            if needHide {
+                CGDisplayHideCursor(CGMainDisplayID())
+            }
+        }
+    } else {
+        CGWarpMouseCursorPosition(CGPoint(x: restoreX, y: restoreY))
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        DispatchQueue.main.async {
+            gStateLock.lock()
+            let stillNotControlling = !gControllingPeer
+            let needShow = stillNotControlling && gCursorHidden
+            if needShow {
                 gCursorHidden = false
+            }
+            gStateLock.unlock()
+            if needShow {
+                CGDisplayShowCursor(CGMainDisplayID())
             }
         }
     }
@@ -99,14 +202,20 @@ public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double
     gControlledByPeer = controlled
     if !controlled {
         gLeftButtonHeldRemote = false
+        clearRemoteModStateLocked()
     }
     gStateLock.unlock()
 
     DispatchQueue.main.async {
         if controlled {
-            if gCursorHidden {
-                CGDisplayShowCursor(CGMainDisplayID())
+            gStateLock.lock()
+            let needShow = gCursorHidden
+            if needShow {
                 gCursorHidden = false
+            }
+            gStateLock.unlock()
+            if needShow {
+                CGDisplayShowCursor(CGMainDisplayID())
             }
             CGWarpMouseCursorPosition(CGPoint(x: entryX, y: entryY))
         }
@@ -268,14 +377,74 @@ public func integrator_kvm_macos_inject_scroll(dx: Double, dy: Double) {
 @_cdecl("integrator_kvm_macos_inject_key")
 public func integrator_kvm_macos_inject_key(keyCode: UInt16, pressed: Bool, shift: Bool, ctrl: Bool, alt: Bool, meta: Bool) {
     let src = CGEventSource(stateID: .hidSystemState)
+
+    // CapsLock (macOS virtualKey 57) must toggle the IOHID CapsLock lock state + emit flagsChanged.
+    if keyCode == 57 {
+        guard pressed else { return }
+        let newCaps = toggleMacCapsLock() ?? !currentMacCapsLockOn()
+        gStateLock.lock()
+        let sOn = shift || gRemoteShiftLeft || gRemoteShiftRight
+        let cOn = ctrl || gRemoteCtrlLeft || gRemoteCtrlRight
+        let aOn = alt || gRemoteAltLeft || gRemoteAltRight
+        let mOn = meta || gRemoteMetaLeft || gRemoteMetaRight
+        gStateLock.unlock()
+
+        if let ev = CGEvent(keyboardEventSource: src, virtualKey: 57, keyDown: true) {
+            ev.type = .flagsChanged
+            var flags: CGEventFlags = [.maskNonCoalesced]
+            if newCaps { flags.insert(.maskAlphaShift) }
+            if sOn { flags.insert(.maskShift) }
+            if cOn { flags.insert(.maskControl) }
+            if aOn { flags.insert(.maskAlternate) }
+            if mOn { flags.insert(.maskCommand) }
+            ev.flags = flags
+            ev.setIntegerValueField(.eventSourceUserData, value: kIntegratorEventTag)
+            ev.post(tap: .cghidEventTap)
+        }
+        return
+    }
+
+    let isModifierKey: Bool
+    gStateLock.lock()
+    switch keyCode {
+    case 56: gRemoteShiftLeft = pressed; isModifierKey = true
+    case 60: gRemoteShiftRight = pressed; isModifierKey = true
+    case 59: gRemoteCtrlLeft = pressed; isModifierKey = true
+    case 62: gRemoteCtrlRight = pressed; isModifierKey = true
+    case 58: gRemoteAltLeft = pressed; isModifierKey = true
+    case 61: gRemoteAltRight = pressed; isModifierKey = true
+    case 55: gRemoteMetaLeft = pressed; isModifierKey = true
+    case 54: gRemoteMetaRight = pressed; isModifierKey = true
+    default: isModifierKey = false
+    }
+    let effectiveShift = shift || gRemoteShiftLeft || gRemoteShiftRight
+    let effectiveCtrl = ctrl || gRemoteCtrlLeft || gRemoteCtrlRight
+    let effectiveAlt = alt || gRemoteAltLeft || gRemoteAltRight
+    let effectiveMeta = meta || gRemoteMetaLeft || gRemoteMetaRight
+    gStateLock.unlock()
+
     guard let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: pressed) else {
         return
     }
-    var flags: CGEventFlags = []
-    if shift { flags.insert(.maskShift) }
-    if ctrl { flags.insert(.maskControl) }
-    if alt { flags.insert(.maskAlternate) }
-    if meta { flags.insert(.maskCommand) }
+    if isModifierKey {
+        ev.type = .flagsChanged
+    }
+
+    var flags: CGEventFlags = [.maskNonCoalesced]
+    if ev.flags.contains(.maskAlphaShift) || currentMacCapsLockOn() {
+        flags.insert(.maskAlphaShift)
+    }
+    if ev.flags.contains(.maskNumericPad) {
+        flags.insert(.maskNumericPad)
+    }
+    if ev.flags.contains(.maskSecondaryFn) {
+        flags.insert(.maskSecondaryFn)
+    }
+    if effectiveShift { flags.insert(.maskShift) }
+    if effectiveCtrl { flags.insert(.maskControl) }
+    if effectiveAlt { flags.insert(.maskAlternate) }
+    if effectiveMeta { flags.insert(.maskCommand) }
+
     ev.flags = flags
     ev.setIntegerValueField(.eventSourceUserData, value: kIntegratorEventTag)
     ev.post(tap: .cghidEventTap)
@@ -563,8 +732,18 @@ private func handleTapEvent(
 
     switch type {
     case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-        let dx = event.getDoubleValueField(.mouseEventDeltaX)
-        let dy = event.getDoubleValueField(.mouseEventDeltaY)
+        var dx = event.getDoubleValueField(.mouseEventDeltaX)
+        var dy = event.getDoubleValueField(.mouseEventDeltaY)
+        gStateLock.lock()
+        let controllingNow = gControllingPeer
+        let enteredAt = gControllingEnteredAt
+        gStateLock.unlock()
+        if controllingNow && (CFAbsoluteTimeGetCurrent() - enteredAt) < 0.08 {
+            if abs(dx) > 220.0 || abs(dy) > 220.0 {
+                dx = 0.0
+                dy = 0.0
+            }
+        }
         let leftDown: UInt64 = (type == .leftMouseDragged) ? 1 : 0
         decision = cb(1, Double(loc.x), Double(loc.y), dx, dy, leftDown)
 
@@ -644,6 +823,19 @@ public func integrator_kvm_macos_start_tap(
 ) -> Bool {
     gKvmCallback = cb
     gDragEndedCallback = dragEndedCb
+
+    enableBackgroundCursorHiding()
+    gStateLock.lock()
+    let reg = gAtExitRegistered
+    if !reg {
+        gAtExitRegistered = true
+    }
+    gStateLock.unlock()
+    if !reg {
+        atexit {
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        }
+    }
 
     if gEventTap != nil {
         return AXIsProcessTrusted()

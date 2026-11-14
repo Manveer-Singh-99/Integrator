@@ -334,7 +334,12 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
         5 => {
             let kc = a as u16;
             let mods = cg_flags_to_modifiers(extra);
-            if let Some((key, pressed)) = macos_flags_changed_key(kc, mods) {
+            if kc == 57 {
+                // CapsLock flagsChanged fires once per lock toggle; emit a tap so peers toggle in sync.
+                let decision = svc.on_local_key_event(LogicalKey::CapsLock, true, mods);
+                let _ = svc.on_local_key_event(LogicalKey::CapsLock, false, mods);
+                decision
+            } else if let Some((key, pressed)) = macos_flags_changed_key(kc, extra, mods) {
                 svc.on_local_key_event(key, pressed, mods)
             } else {
                 HookDecision::PassThrough
@@ -359,16 +364,34 @@ fn cg_flags_to_modifiers(raw: u64) -> ModifierMask {
     }
 }
 
-fn macos_flags_changed_key(kc: u16, mods: ModifierMask) -> Option<(LogicalKey, bool)> {
+/// Resolves which modifier key changed state using NX device-dependent left/right bits when
+/// present (so releasing one side while the other is held still reports `pressed = false`),
+/// falling back to the generic modifier flag otherwise.
+fn macos_flags_changed_key(kc: u16, raw_flags: u64, mods: ModifierMask) -> Option<(LogicalKey, bool)> {
+    let side_pressed = |this_mask: u64, pair_mask: u64, generic: bool| -> bool {
+        if (raw_flags & pair_mask) != 0 {
+            (raw_flags & this_mask) != 0
+        } else {
+            generic
+        }
+    };
+    const L_SHIFT: u64 = 0x0000_0002;
+    const R_SHIFT: u64 = 0x0000_0004;
+    const L_CTRL: u64 = 0x0000_0001;
+    const R_CTRL: u64 = 0x0000_2000;
+    const L_ALT: u64 = 0x0000_0020;
+    const R_ALT: u64 = 0x0000_0040;
+    const L_CMD: u64 = 0x0000_0008;
+    const R_CMD: u64 = 0x0000_0010;
     match kc {
-        56 => Some((LogicalKey::ShiftLeft, mods.shift)),
-        60 => Some((LogicalKey::ShiftRight, mods.shift)),
-        59 => Some((LogicalKey::ControlLeft, mods.control)),
-        62 => Some((LogicalKey::ControlRight, mods.control)),
-        58 => Some((LogicalKey::AltLeft, mods.alt)),
-        61 => Some((LogicalKey::AltRight, mods.alt)),
-        55 => Some((LogicalKey::MetaLeft, mods.meta)),
-        54 => Some((LogicalKey::MetaRight, mods.meta)),
+        56 => Some((LogicalKey::ShiftLeft, side_pressed(L_SHIFT, L_SHIFT | R_SHIFT, mods.shift))),
+        60 => Some((LogicalKey::ShiftRight, side_pressed(R_SHIFT, L_SHIFT | R_SHIFT, mods.shift))),
+        59 => Some((LogicalKey::ControlLeft, side_pressed(L_CTRL, L_CTRL | R_CTRL, mods.control))),
+        62 => Some((LogicalKey::ControlRight, side_pressed(R_CTRL, L_CTRL | R_CTRL, mods.control))),
+        58 => Some((LogicalKey::AltLeft, side_pressed(L_ALT, L_ALT | R_ALT, mods.alt))),
+        61 => Some((LogicalKey::AltRight, side_pressed(R_ALT, L_ALT | R_ALT, mods.alt))),
+        55 => Some((LogicalKey::MetaLeft, side_pressed(L_CMD, L_CMD | R_CMD, mods.meta))),
+        54 => Some((LogicalKey::MetaRight, side_pressed(R_CMD, L_CMD | R_CMD, mods.meta))),
         _ => None,
     }
 }
@@ -548,4 +571,40 @@ pub fn logical_to_macos_keycode(key: LogicalKey) -> Option<u16> {
         F11 => 103,
         F12 => 111,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_flags_changed_key_tracks_simultaneous_left_and_right_modifiers() {
+        // Holding Right Shift (`0x4`) while releasing Left Shift still has generic shift (`0x2_0000`).
+        let flags = 0x0002_0000 | 0x0000_0004;
+        let mods = cg_flags_to_modifiers(flags);
+        assert!(mods.shift);
+        assert_eq!(
+            macos_flags_changed_key(56, flags, mods),
+            Some((LogicalKey::ShiftLeft, false))
+        );
+        assert_eq!(
+            macos_flags_changed_key(60, flags, mods),
+            Some((LogicalKey::ShiftRight, true))
+        );
+    }
+
+    #[test]
+    fn macos_flags_changed_key_falls_back_to_generic_mask_without_device_bits() {
+        let flags = 0x0008_0000 | 0x0010_0000;
+        let mods = cg_flags_to_modifiers(flags);
+        assert_eq!(
+            macos_flags_changed_key(58, flags, mods),
+            Some((LogicalKey::AltLeft, true))
+        );
+        assert_eq!(
+            macos_flags_changed_key(54, flags, mods),
+            Some((LogicalKey::MetaRight, true))
+        );
+        assert_eq!(macos_flags_changed_key(57, flags, mods), None);
+    }
 }
