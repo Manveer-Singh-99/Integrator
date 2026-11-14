@@ -939,10 +939,12 @@ async function updateStatus() {
 
     if (tbStateBadge && btnTb && btnTbLabel) {
       if (!status.has_touch_bar) {
-        setCardPill(tbStateBadge, 'Not detected on this Mac', 'pill-idle');
+        const isMacLocal = (status.local_os || '').toLowerCase() === 'macos';
+        const unsupportedLabel = isMacLocal ? 'Not detected on this Mac' : 'macOS Touch Bar Only';
+        setCardPill(tbStateBadge, unsupportedLabel, 'pill-idle');
         btnTb.className = 'btn btn-primary';
         btnTb.disabled = true;
-        btnTbLabel.textContent = 'Not detected on this Mac';
+        btnTbLabel.textContent = unsupportedLabel;
         if (chkTbScope) chkTbScope.disabled = true;
         if (chkTbGlass) chkTbGlass.disabled = true;
       } else {
