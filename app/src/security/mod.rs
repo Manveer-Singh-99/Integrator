@@ -644,4 +644,231 @@ mod tests {
             &[&banned_transport_key, &banned_beacon_key, &banned_ip_auth],
         );
     }
+
+    #[tokio::test]
+    async fn test_complete_9_stage_pairing_to_transport_and_audio_transition_over_tcp() {
+        use crate::security::audio_udp::{
+            derive_audio_session_keys, AudioSessionRegistry, AudioSessionSender,
+            AUDIO_FLAG_PCM_FRAME,
+        };
+        use crate::security::pairing::{
+            handle_server_pairing_with_shared_locks, run_client_pairing_with_shared_keystore,
+            PairingCoordinatorV2, PAIRING_WIRE_MAGIC,
+        };
+        use crate::security::transport::{
+            ServiceId, TransportError, TransportSessionV2, TRANSPORT_WIRE_MAGIC,
+        };
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let dir_client = unique_temp_dir("m6_client_ks");
+        let dir_server = unique_temp_dir("m6_server_ks");
+        let kek_c = FixedKekProvider::new([0x31u8; 32]);
+        let kek_s = FixedKekProvider::new([0x32u8; 32]);
+
+        let ks_client = Arc::new(Mutex::new(
+            KeystoreV2::open_with_provider(dir_client.clone(), &kek_c).unwrap(),
+        ));
+        let ks_server = Arc::new(Mutex::new(
+            KeystoreV2::open_with_provider(dir_server.clone(), &kek_s).unwrap(),
+        ));
+
+        let coord_server = Arc::new(Mutex::new(PairingCoordinatorV2::new(
+            "ServerHost".into(),
+            "macOS".into(),
+        )));
+        let active_pin = {
+            let mut c = coord_server.lock().unwrap();
+            c.open_pairing_window(unix_epoch_secs())
+        };
+
+        // Bind a real TCP server multiplexing IPR2 (pairing) and ITR2 (TransportSessionV2)
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = listener.local_addr().unwrap();
+
+        // Stage 1: Initial unpaired communication attempt MUST be rejected
+        {
+            let mut fake_peer_ks =
+                KeystoreV2::open_with_provider(unique_temp_dir("m6_fake"), &kek_c).unwrap();
+            let srv_id = ks_server.lock().unwrap().local_device_id();
+            let srv_pk = ks_server.lock().unwrap().local_ed25519_pubkey();
+            fake_peer_ks
+                .commit_paired_peer(
+                    srv_id,
+                    srv_pk,
+                    Zeroizing::new([0xEEu8; 32]),
+                    "ServerHost".into(),
+                    "macOS".into(),
+                    "127.0.0.1".into(),
+                    true,
+                )
+                .unwrap();
+            let fake_creds = fake_peer_ks.get_peer(&hex_encode(&srv_id)).unwrap().clone();
+
+            let ks_srv_clone = Arc::clone(&ks_server);
+            let listener_clone = Arc::clone(&listener);
+            let srv_task = tokio::spawn(async move {
+                let (mut sock, _) = listener_clone.accept().await.unwrap();
+                let mut magic = [0u8; 4];
+                sock.read_exact(&mut magic).await.unwrap();
+                assert_eq!(magic, TRANSPORT_WIRE_MAGIC);
+                TransportSessionV2::accept_server_with_shared_keystore(
+                    sock,
+                    Some(magic),
+                    &ks_srv_clone,
+                    ServiceId::DisplayRpc,
+                    false, // do not allow loopback self-bypass so unpaired client is tested
+                )
+                .await
+            });
+
+            let cli_sock = TcpStream::connect(server_addr).await.unwrap();
+            let cli_res =
+                TransportSessionV2::connect_client(cli_sock, &fake_peer_ks, &fake_creds, ServiceId::DisplayRpc)
+                    .await;
+            let srv_res = srv_task.await.unwrap();
+            assert!(
+                matches!(srv_res, Err(TransportError::UntrustedPeer(_))),
+                "Unpaired client must be rejected with UntrustedPeer before pairing"
+            );
+            assert!(cli_res.is_err());
+        }
+
+        // Stages 2-7: Execute full 4-message IPR2 SPAKE2 + Ed25519 pairing over TCP
+        {
+            let ks_srv_clone = Arc::clone(&ks_server);
+            let coord_clone = Arc::clone(&coord_server);
+            let listener_clone = Arc::clone(&listener);
+            let srv_pair_task = tokio::spawn(async move {
+                let (mut sock, addr) = listener_clone.accept().await.unwrap();
+                let mut magic = [0u8; 4];
+                sock.read_exact(&mut magic).await.unwrap();
+                assert_eq!(magic, PAIRING_WIRE_MAGIC);
+                handle_server_pairing_with_shared_locks(
+                    &mut sock,
+                    Some(magic),
+                    &coord_clone,
+                    &ks_srv_clone,
+                    addr.ip(),
+                    true,
+                )
+                .await
+            });
+
+            let mut cli_sock = TcpStream::connect(server_addr).await.unwrap();
+            let (cli_creds, cli_sas) = run_client_pairing_with_shared_keystore(
+                &mut cli_sock,
+                &ks_client,
+                &active_pin,
+                "ClientHost",
+                "Windows",
+                "127.0.0.1",
+                true,
+            )
+            .await
+            .expect("Client IPR2 pairing must succeed");
+
+            let (srv_creds, srv_sas) = srv_pair_task
+                .await
+                .unwrap()
+                .expect("Server IPR2 pairing must succeed");
+
+            assert_eq!(cli_sas, srv_sas, "Both peers must derive identical 6-digit SAS");
+            assert_eq!(cli_creds.key_id, srv_creds.key_id);
+            assert_eq!(*cli_creds.root_key, *srv_creds.root_key);
+        }
+
+        // Stage 8: Verify persistent trust establishment by reopening both KeystoreV2 instances from disk
+        let reopened_client_ks =
+            KeystoreV2::open_with_provider(dir_client.clone(), &kek_c).unwrap();
+        let reopened_server_ks =
+            KeystoreV2::open_with_provider(dir_server.clone(), &kek_s).unwrap();
+        let pinned_srv_on_cli = reopened_client_ks
+            .get_peer(&reopened_server_ks.local_device_id_hex())
+            .expect("Server must be persisted in Client KeystoreV2")
+            .clone();
+        let pinned_cli_on_srv = reopened_server_ks
+            .get_peer(&reopened_client_ks.local_device_id_hex())
+            .expect("Client must be persisted in Server KeystoreV2")
+            .clone();
+        assert_eq!(*pinned_srv_on_cli.root_key, *pinned_cli_on_srv.root_key);
+
+        // Stage 9a: Subsequent authenticated communication over TransportSessionV2 (DisplayRpc)
+        {
+            let ks_srv_clone = Arc::clone(&ks_server);
+            let listener_clone = Arc::clone(&listener);
+            let srv_rpc_task = tokio::spawn(async move {
+                let (mut sock, _) = listener_clone.accept().await.unwrap();
+                let mut magic = [0u8; 4];
+                sock.read_exact(&mut magic).await.unwrap();
+                assert_eq!(magic, TRANSPORT_WIRE_MAGIC);
+                let mut sess = TransportSessionV2::accept_server_with_shared_keystore(
+                    sock,
+                    Some(magic),
+                    &ks_srv_clone,
+                    ServiceId::DisplayRpc,
+                    false,
+                )
+                .await
+                .expect("Paired TransportV2 server handshake must succeed");
+                let req = sess.recv_message().await.unwrap();
+                assert_eq!(req, b"{\"cmd\":\"GetStatus\"}");
+                sess.send_message(b"{\"ok\":true}").await.unwrap();
+            });
+
+            let cli_sock = TcpStream::connect(server_addr).await.unwrap();
+            let mut cli_sess = TransportSessionV2::connect_client_with_shared_keystore(
+                cli_sock,
+                &ks_client,
+                &pinned_srv_on_cli,
+                ServiceId::DisplayRpc,
+            )
+            .await
+            .expect("Paired TransportV2 client handshake must succeed");
+
+            cli_sess.send_message(b"{\"cmd\":\"GetStatus\"}").await.unwrap();
+            let resp = cli_sess.recv_message().await.unwrap();
+            assert_eq!(resp, b"{\"ok\":true}");
+            srv_rpc_task.await.unwrap();
+        }
+
+        // Stage 9b: Subsequent authenticated UDP Audio session (IUA2) derived from the paired K_root
+        {
+            let now = unix_epoch_secs();
+            let sender_nonce = csprng_array::<32>();
+            let mut reg = AudioSessionRegistry::new();
+            let wire = reg
+                .negotiate_receiver_session(
+                    pinned_cli_on_srv.device_id,
+                    &pinned_cli_on_srv.root_key,
+                    &sender_nonce,
+                    48_000,
+                    2,
+                    24,
+                    now,
+                )
+                .unwrap();
+            let sess_id = hex_decode_array::<8>(&wire.session_id_hex).unwrap();
+            let rx_nonce = hex_decode_array::<32>(&wire.receiver_nonce_hex).unwrap();
+            let (k_audio, nonce_salt) = derive_audio_session_keys(
+                &pinned_srv_on_cli.root_key,
+                &sender_nonce,
+                &rx_nonce,
+                &sess_id,
+            );
+            let mut sender =
+                AudioSessionSender::new(sess_id, *k_audio, nonce_salt, now + wire.expires_in_secs);
+            let dgram = sender
+                .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x7Fu8; 288], now)
+                .unwrap();
+            let (auth_peer, hdr, pcm) = reg.open_incoming_datagram(&dgram, now).unwrap();
+            assert_eq!(auth_peer, pinned_cli_on_srv.device_id);
+            assert_eq!(hdr.pkt_seq, 1);
+            assert_eq!(pcm.len(), 288);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir_client);
+        let _ = std::fs::remove_dir_all(&dir_server);
+    }
 }

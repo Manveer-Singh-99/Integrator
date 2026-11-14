@@ -4,12 +4,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::{config, system_info};
+use crate::system_info;
 
 #[allow(dead_code)]
 pub struct LinkMonitor {
@@ -42,40 +41,17 @@ impl LinkMonitor {
 
     /// Measures TCP round-trip time (RTT) to the peer endpoint.
     ///
-    /// When targeting [`config::CONTROL_PORT`], sends a `"Ping"` RPC frame and
-    /// drains the response so the peer's display RPC server completes cleanly
-    /// without logging unexpected EOF errors.
+    /// Performs a clean TCP connect and immediate socket close (which `DisplayServer`
+    /// recognizes as a probe via clean EOF on the 4-byte magic read).
     pub async fn measure_rtt(&self, timeout_dur: Duration) -> Option<Duration> {
         let start = Instant::now();
-        let Ok(Ok(mut stream)) =
+        let Ok(Ok(stream)) =
             tokio::time::timeout(timeout_dur, TcpStream::connect(self.peer_addr)).await
         else {
             return None;
         };
         let connect_elapsed = start.elapsed();
-
-        if self.peer_addr.port() == config::CONTROL_PORT {
-            let remaining = timeout_dur.saturating_sub(connect_elapsed);
-            let probe_timeout = remaining.min(Duration::from_millis(250));
-            if !probe_timeout.is_zero() {
-                let payload = b"\"Ping\"";
-                let _ = tokio::time::timeout(probe_timeout, async {
-                    if stream.write_u32(payload.len() as u32).await.is_ok()
-                        && stream.write_all(payload).await.is_ok()
-                    {
-                        let resp_len = match stream.read_u32().await {
-                            Ok(len) if len > 0 && len <= 65_536 => len as usize,
-                            _ => return,
-                        };
-                        let mut sink = vec![0u8; resp_len];
-                        let _ = stream.read_exact(&mut sink).await;
-                    }
-                })
-                .await;
-            }
-            return Some(start.elapsed());
-        }
-
+        drop(stream);
         Some(connect_elapsed)
     }
 
