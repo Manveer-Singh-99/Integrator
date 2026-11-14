@@ -15,8 +15,8 @@ use crate::security::{
     self,
     keystore::{global_keystore, KeystoreV2, VerifiedPeerCredentials},
     pairing::{
-        generate_unbiased_6digit_pin, handle_server_pairing_with_shared_locks,
-        is_valid_6digit_pin, run_client_pairing_with_shared_keystore, PairingCoordinatorV2,
+        handle_server_pairing_with_shared_locks, is_valid_6digit_pin,
+        run_client_pairing_with_shared_keystore, PairingCoordinatorV2,
     },
     transport::{derive_loopback_self_credentials, ServiceId, TransportSessionV2},
 };
@@ -308,7 +308,17 @@ pub fn lookup_verified_peer_for_ip(peer_ip: &str) -> Option<VerifiedPeerCredenti
             return Some(creds.clone());
         }
     }
-    ks.find_peer_by_ip(trimmed).cloned()
+    if let Some(found) = ks.find_peer_by_ip(trimmed) {
+        return Some(found.clone());
+    }
+    let all_peers = ks.list_peers();
+    if all_peers.len() == 1 {
+        let single = &all_peers[0];
+        if !ks.is_device_or_ip_blocked(&single.device_id_hex, trimmed) {
+            return Some(single.clone());
+        }
+    }
+    None
 }
 
 pub fn get_trust_snapshot() -> (TrustConfigFile, Vec<PendingPeerInfo>) {
@@ -609,6 +619,7 @@ pub fn verify_discovery_beacon_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::pairing::generate_unbiased_6digit_pin;
 
     #[test]
     fn csprng_pin_is_six_digits_and_non_constant() {
