@@ -10,6 +10,7 @@
 //!   pinning, and automatic quarantine of legacy v1 `trusted_peers.json` files.
 
 pub mod keystore;
+pub mod pairing;
 pub mod spake2_rfc9382;
 
 use sha2::{Digest, Sha256};
