@@ -2,16 +2,18 @@ use anyhow::{Context, Result};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::config::CONTROL_PORT;
+use crate::security::pairing::PAIRING_WIRE_MAGIC;
+use crate::security::transport::{ServiceId, TRANSPORT_WIRE_MAGIC};
 use crate::trust;
 
 use super::controller::DisplayController;
-use super::protocol::{DisplayRpcRequest, DisplayRpcResponse};
+use super::protocol::DisplayRpcRequest;
 
 const MAX_RPC_BYTES: usize = 65_536;
 const MAX_CONCURRENT_RPC_CONNS: usize = 32;
@@ -72,67 +74,71 @@ impl DisplayServer {
     ) -> Result<()> {
         let _ = socket.set_nodelay(true);
 
-        let req_len = tokio::time::timeout(RPC_IO_TIMEOUT, socket.read_u32())
-            .await
-            .context("Timed out reading Display RPC frame length")?? as usize;
-
-        if req_len == 0 || req_len > MAX_RPC_BYTES {
-            anyhow::bail!("Rejected RPC frame size {} bytes from {}", req_len, peer_ip);
+        let mut magic = [0u8; 4];
+        match tokio::time::timeout(RPC_IO_TIMEOUT, socket.read_exact(&mut magic)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Clean TCP connect probe (e.g. discovery RTT measurement)
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                return Err(e).context("Failed reading wire magic on Display RPC port");
+            }
+            Err(_) => {
+                anyhow::bail!("Timed out reading wire magic from {}", peer_ip);
+            }
         }
 
-        let mut buf = vec![0u8; req_len];
-        tokio::time::timeout(RPC_IO_TIMEOUT, socket.read_exact(&mut buf))
+        if magic == PAIRING_WIRE_MAGIC {
+            let (creds, sas_6) =
+                trust::handle_incoming_pairing_stream_v2(&mut socket, peer_ip, Some(magic))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            info!(
+                "🔐 Completed IPR2 pairing with '{}' ({}) at {} [SAS: {}]",
+                creds.hostname, creds.device_id_hex, peer_ip, sas_6
+            );
+            return Ok(());
+        }
+
+        if magic != TRANSPORT_WIRE_MAGIC {
+            warn!(
+                "🚫 Rejected unknown or legacy v1 wire magic {:02x?} from {}",
+                magic, peer_ip
+            );
+            anyhow::bail!("Rejected unsupported wire protocol magic from {}", peer_ip);
+        }
+
+        let mut session = trust::accept_transport_from_stream(
+            socket,
+            peer_ip,
+            Some(magic),
+            ServiceId::DisplayRpc,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        let plaintext = tokio::time::timeout(RPC_IO_TIMEOUT, session.recv_message())
             .await
-            .context("Timed out reading Display RPC frame body")??;
+            .context("Timed out reading Display RPC message over TransportV2")?
+            .map_err(|e| anyhow::anyhow!("Display RPC TransportV2 read error: {}", e))?;
 
-        let is_raw_loopback =
-            peer_ip.is_loopback() && serde_json::from_slice::<DisplayRpcRequest>(&buf).is_ok();
-
-        let (authenticated_dev_id, plaintext) = match trust::open_envelope_from_ip(peer_ip, &buf) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("🚫 Rejected Display RPC envelope from {}: {}", peer_ip, e);
-                anyhow::bail!("{}", e);
-            }
-        };
+        if plaintext.is_empty() || plaintext.len() > MAX_RPC_BYTES {
+            anyhow::bail!(
+                "Rejected Display RPC payload size {} bytes from {}",
+                plaintext.len(),
+                peer_ip
+            );
+        }
 
         let req: DisplayRpcRequest = serde_json::from_slice(&plaintext)?;
-
-        let requires_trust = !matches!(
-            req,
-            DisplayRpcRequest::Ping
-                | DisplayRpcRequest::GetHardwareProfile
-                | DisplayRpcRequest::PairRequest { .. }
-        );
-
-        let is_trusted = authenticated_dev_id.is_some() || trust::is_remote_addr_authorized(peer_ip);
-
-        let resp = if requires_trust && !is_trusted {
-            warn!("🚫 Rejected untrusted Display RPC {:?} from {}", req, peer_ip);
-            DisplayRpcResponse {
-                success: false,
-                message: "Peer is not trusted/paired on this host. Pair using the 6-digit PIN in the Integrator UI.".to_string(),
-                ..Default::default()
-            }
-        } else {
-            controller.handle_rpc(req, Some(peer_ip)).await
-        };
-
+        let resp = controller.handle_rpc(req, Some(peer_ip)).await;
         let resp_json = serde_json::to_vec(&resp)?;
-        let wire_bytes = if is_raw_loopback {
-            resp_json
-        } else {
-            trust::seal_envelope_for_ip(&peer_ip.to_string(), &resp_json)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
 
-        tokio::time::timeout(RPC_IO_TIMEOUT, async {
-            socket.write_u32(wire_bytes.len() as u32).await?;
-            socket.write_all(&wire_bytes).await?;
-            socket.flush().await
-        })
-        .await
-        .context("Timed out writing Display RPC response")??;
+        tokio::time::timeout(RPC_IO_TIMEOUT, session.send_message(&resp_json))
+            .await
+            .context("Timed out writing Display RPC response over TransportV2")?
+            .map_err(|e| anyhow::anyhow!("Display RPC TransportV2 write error: {}", e))?;
 
         Ok(())
     }

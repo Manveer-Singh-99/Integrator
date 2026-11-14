@@ -18,7 +18,7 @@ use crate::config::{CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT};
 use crate::system_info::{self, LinkTransport};
 use crate::trust;
 
-pub const DISCOVERY_PROTOCOL_VERSION: u16 = 1;
+pub const DISCOVERY_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryBeacon {
@@ -26,6 +26,8 @@ pub struct DiscoveryBeacon {
     pub protocol_version: u16,
     #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
+    pub ed25519_pubkey: String,
     pub sender_name: String,
     pub os: String,
     #[serde(default)]
@@ -48,7 +50,7 @@ pub struct DiscoveryBeacon {
     pub gpus: Vec<String>,
     pub timestamp_ms: u64,
     #[serde(default)]
-    pub beacon_mac: String,
+    pub beacon_sig: String,
 }
 
 fn default_protocol_version() -> u16 {
@@ -187,14 +189,14 @@ impl DiscoveryManager {
                 match listener_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         if let Ok(beacon) = serde_json::from_slice::<DiscoveryBeacon>(&buf[..len]) {
-                            if beacon.protocol_version == 0 || beacon.protocol_version > 10 {
+                            if beacon.protocol_version != DISCOVERY_PROTOCOL_VERSION {
                                 continue;
                             }
                             let peer_ip = addr.ip().to_string();
                             let dev_id = if beacon.device_id.trim().is_empty() {
                                 continue;
                             } else {
-                                beacon.device_id.trim().to_string()
+                                beacon.device_id.trim().to_ascii_lowercase()
                             };
 
                             if dev_id == my_device_id || addr.ip().is_loopback() {
@@ -212,13 +214,14 @@ impl DiscoveryManager {
                                 CLIPBOARD_PORT
                             };
 
-                            if !trust::verify_discovery_beacon_fields(
+                            if !trust::verify_discovery_beacon_v2(
                                 &dev_id,
+                                &beacon.ed25519_pubkey,
                                 &beacon.sender_name,
                                 beacon.timestamp_ms,
                                 valid_control_port,
                                 valid_clipboard_port,
-                                &beacon.beacon_mac,
+                                &beacon.beacon_sig,
                             ) {
                                 tracing::debug!(
                                     "Dropped invalid or stale discovery beacon from {}",
@@ -375,13 +378,11 @@ impl DiscoveryManager {
         let broadcaster_socket = Arc::clone(&socket);
         let manual_ips_ref = Arc::clone(&self.manual_ips);
         let fallback_name = self.local_name.clone();
-        let dev_id = self.local_device_id.clone();
 
         tokio::spawn(async move {
             loop {
                 let manual_snapshot = manual_ips_ref.read().await.clone();
                 let fallback_clone = fallback_name.clone();
-                let dev_id_clone = dev_id.clone();
 
                 if let Ok((bytes, targets)) = tokio::task::spawn_blocking(move || {
                     let profile = system_info::collect_local_profile();
@@ -389,16 +390,13 @@ impl DiscoveryManager {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let mac = trust::sign_discovery_beacon(
-                        &dev_id_clone,
-                        ts,
-                        CONTROL_PORT,
-                        CLIPBOARD_PORT,
-                    );
+                    let (signed_dev_id, ed25519_pubkey, sig) =
+                        trust::sign_discovery_beacon_v2(ts, CONTROL_PORT, CLIPBOARD_PORT);
 
                     let beacon = DiscoveryBeacon {
                         protocol_version: DISCOVERY_PROTOCOL_VERSION,
-                        device_id: dev_id_clone,
+                        device_id: signed_dev_id,
+                        ed25519_pubkey,
                         sender_name: if profile.hostname.is_empty() {
                             fallback_clone
                         } else {
@@ -416,7 +414,7 @@ impl DiscoveryManager {
                         sunshine_port: profile.sunshine_port,
                         gpus: profile.gpus.iter().map(|g| g.name.clone()).collect(),
                         timestamp_ms: ts,
-                        beacon_mac: mac,
+                        beacon_sig: sig,
                     };
 
                     let bytes = serde_json::to_vec(&beacon).unwrap_or_default();
@@ -478,32 +476,11 @@ fn is_own_local_ip(ip: &str) -> bool {
 async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
     let target = format!("{}:{}", ip, port);
     let start = Instant::now();
-    if let Ok(Ok(mut stream)) =
+    if let Ok(Ok(stream)) =
         tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(&target)).await
     {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        if let Ok(wire_ping) = trust::seal_envelope_for_ip(ip, b"\"Ping\"") {
-            if stream.write_u32(wire_ping.len() as u32).await.is_ok()
-                && stream.write_all(&wire_ping).await.is_ok()
-            {
-                let mut hdr = [0u8; 4];
-                if let Ok(Ok(_)) =
-                    tokio::time::timeout(Duration::from_millis(300), stream.read_exact(&mut hdr))
-                        .await
-                {
-                    let len = u32::from_be_bytes(hdr) as usize;
-                    if len > 0 && len <= 65_536 {
-                        let mut resp = vec![0u8; len];
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(300),
-                            stream.read_exact(&mut resp),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
+        drop(stream);
         return Some((ms * 100.0).round() / 100.0);
     }
     None

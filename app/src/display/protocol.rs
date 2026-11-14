@@ -4,17 +4,6 @@ use serde::{Deserialize, Serialize};
 pub enum DisplayRpcRequest {
     Ping,
     GetHardwareProfile,
-    PairRequest {
-        device_id: String,
-        hostname: String,
-        pin: String,
-        #[serde(default)]
-        client_nonce: String,
-        #[serde(default)]
-        client_token: String,
-        #[serde(default)]
-        auth_mac: String,
-    },
     StartMoonlight {
         host_ip: String,
         #[serde(default)]

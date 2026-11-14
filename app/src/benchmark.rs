@@ -1,24 +1,24 @@
 //! High-performance point-to-point network benchmark service.
 //! Measures active link latency (RTT) and maximum live throughput (Gbps / MB/s)
-//! bidirectionally over TCP with peer authorization, connection limits, and I/O timeouts.
+//! bidirectionally over mutually authenticated `TransportSessionV2` (`ServiceId::Benchmark`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::TELEMETRY_PORT;
+use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
 
 const MODE_PING: u8 = 1;
 const MODE_UPLOAD: u8 = 2;
 const MODE_DOWNLOAD: u8 = 3;
 
-const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
+const CHUNK_SIZE: usize = 256 * 1024; // 256 KiB (matches TransportV2 MAX_RECORD_PLAINTEXT_LEN)
 const DEFAULT_BENCHMARK_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB adaptive baseline
 const MAX_BENCHMARK_BYTES: u64 = 128 * 1024 * 1024; // Hard 128 MiB cap per direction
 const MAX_CONCURRENT_BENCH_CONNS: usize = 4;
@@ -44,7 +44,7 @@ impl BenchmarkServer {
     pub async fn start() -> Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", TELEMETRY_PORT))
             .await
-            .with_context(|| format!("Failed to bind benchmark server on port {}", TELEMETRY_PORT))?;
+            .map_err(|e| anyhow::anyhow!("Failed to bind benchmark server on port {}: {}", TELEMETRY_PORT, e))?;
         info!("⚡ Speed Benchmark Server active on port {}", TELEMETRY_PORT);
 
         let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_BENCH_CONNS));
@@ -62,17 +62,22 @@ impl BenchmarkServer {
                         let _ = socket.set_nodelay(true);
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let authorized = tokio::task::spawn_blocking(move || {
-                                trust::is_remote_addr_authorized(peer_ip)
-                            })
+                            let session = match trust::accept_transport_from_stream(
+                                socket,
+                                peer_ip,
+                                None,
+                                ServiceId::Benchmark,
+                            )
                             .await
-                            .unwrap_or(false);
-                            if !authorized {
-                                warn!("🚫 Rejected unauthorized benchmark connection from {}", addr);
-                                return;
-                            }
-                            debug!("Benchmark connection from {}", addr);
-                            if let Err(e) = Self::handle_connection(socket).await {
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!("🚫 Rejected unauthorized benchmark connection from {}: {}", addr, e);
+                                    return;
+                                }
+                            };
+                            debug!("Authenticated TransportV2 benchmark connection from {}", addr);
+                            if let Err(e) = Self::handle_connection(session).await {
                                 debug!("Benchmark session ended: {}", e);
                             }
                         });
@@ -88,53 +93,48 @@ impl BenchmarkServer {
         Ok(())
     }
 
-    async fn handle_connection(mut socket: TcpStream) -> Result<()> {
+    async fn handle_connection(mut session: TransportSessionV2<TcpStream>) -> Result<()> {
         let dummy_chunk = vec![0xAAu8; CHUNK_SIZE];
-        let mut recv_buf = vec![0u8; CHUNK_SIZE];
 
         loop {
-            let mode = match tokio::time::timeout(BENCH_IO_TIMEOUT, socket.read_u8()).await {
-                Ok(Ok(m)) => m,
+            let cmd = match tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message()).await {
+                Ok(Ok(msg)) if msg.len() == 9 => msg,
                 _ => break,
             };
+            let mode = cmd[0];
+            let mut val_bytes = [0u8; 8];
+            val_bytes.copy_from_slice(&cmd[1..9]);
+            let val = u64::from_be_bytes(val_bytes);
 
             match mode {
                 MODE_PING => {
-                    let timestamp = tokio::time::timeout(BENCH_IO_TIMEOUT, socket.read_u64()).await??;
-                    tokio::time::timeout(BENCH_IO_TIMEOUT, async {
-                        socket.write_u64(timestamp).await?;
-                        socket.flush().await
-                    })
-                    .await??;
+                    tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&val_bytes))
+                        .await?
+                        .map_err(|e| anyhow::anyhow!("Benchmark ping reply error: {}", e))?;
                 }
                 MODE_UPLOAD => {
-                    let total_bytes = tokio::time::timeout(BENCH_IO_TIMEOUT, socket.read_u64()).await??;
+                    let total_bytes = val;
                     if total_bytes == 0 || total_bytes > MAX_BENCHMARK_BYTES {
                         anyhow::bail!("Rejected benchmark upload size {} bytes", total_bytes);
                     }
                     let mut remaining = total_bytes;
 
                     while remaining > 0 {
-                        let to_read = std::cmp::min(remaining, recv_buf.len() as u64) as usize;
-                        let n = tokio::time::timeout(
-                            BENCH_IO_TIMEOUT,
-                            socket.read(&mut recv_buf[..to_read]),
-                        )
-                        .await??;
-                        if n == 0 {
-                            break;
+                        let chunk = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
+                            .await?
+                            .map_err(|e| anyhow::anyhow!("Benchmark upload read error: {}", e))?;
+                        if chunk.is_empty() || (chunk.len() as u64) > remaining {
+                            anyhow::bail!("Invalid benchmark upload chunk length {} (remaining {})", chunk.len(), remaining);
                         }
-                        remaining -= n as u64;
+                        remaining -= chunk.len() as u64;
                     }
 
-                    tokio::time::timeout(BENCH_IO_TIMEOUT, async {
-                        socket.write_u8(1).await?;
-                        socket.flush().await
-                    })
-                    .await??;
+                    tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&[1u8]))
+                        .await?
+                        .map_err(|e| anyhow::anyhow!("Benchmark upload ack error: {}", e))?;
                 }
                 MODE_DOWNLOAD => {
-                    let total_bytes = tokio::time::timeout(BENCH_IO_TIMEOUT, socket.read_u64()).await??;
+                    let total_bytes = val;
                     if total_bytes == 0 || total_bytes > MAX_BENCHMARK_BYTES {
                         anyhow::bail!("Rejected benchmark download size {} bytes", total_bytes);
                     }
@@ -144,13 +144,12 @@ impl BenchmarkServer {
                         let to_write = std::cmp::min(remaining, dummy_chunk.len() as u64) as usize;
                         tokio::time::timeout(
                             BENCH_IO_TIMEOUT,
-                            socket.write_all(&dummy_chunk[..to_write]),
+                            session.send_message(&dummy_chunk[..to_write]),
                         )
-                        .await??;
+                        .await?
+                        .map_err(|e| anyhow::anyhow!("Benchmark download write error: {}", e))?;
                         remaining -= to_write as u64;
                     }
-
-                    tokio::time::timeout(BENCH_IO_TIMEOUT, socket.flush()).await??;
                 }
                 _ => break,
             }
@@ -171,22 +170,34 @@ impl BenchmarkClient {
     }
 
     async fn run_test_internal(peer_ip: &str) -> Result<SpeedTestResult> {
-        let addr = format!("{}:{}", peer_ip, TELEMETRY_PORT);
-        let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr))
-            .await
-            .with_context(|| format!("Timed out connecting to benchmark server at {}", addr))?
-            .with_context(|| format!("Failed to connect to benchmark server at {}", addr))?;
-        stream.set_nodelay(true)?;
+        let mut session = trust::connect_transport_to_ip(
+            peer_ip,
+            TELEMETRY_PORT,
+            ServiceId::Benchmark,
+            Duration::from_secs(4),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to establish authenticated benchmark session with {}: {}", peer_ip, e))?;
 
         // 1. Latency Test (Ping x 5)
         let mut latencies = Vec::new();
-        for _ in 0..5 {
+        for seq in 1u64..=5 {
             let start = Instant::now();
-            stream.write_u8(MODE_PING).await?;
-            stream.write_u64(1).await?;
-            stream.flush().await?;
+            let mut cmd = [0u8; 9];
+            cmd[0] = MODE_PING;
+            cmd[1..9].copy_from_slice(&seq.to_be_bytes());
+            session
+                .send_message(&cmd)
+                .await
+                .map_err(|e| anyhow::anyhow!("Benchmark ping send error: {}", e))?;
 
-            let _ = stream.read_u64().await?;
+            let reply = session
+                .recv_message()
+                .await
+                .map_err(|e| anyhow::anyhow!("Benchmark ping recv error: {}", e))?;
+            if reply.len() != 8 {
+                anyhow::bail!("Invalid benchmark ping reply length {}", reply.len());
+            }
             latencies.push(start.elapsed().as_secs_f64() * 1000.0);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -205,37 +216,55 @@ impl BenchmarkClient {
         // 2. Upload Throughput Test
         let dummy_chunk = vec![0x55u8; CHUNK_SIZE];
         let start_upload = Instant::now();
-        stream.write_u8(MODE_UPLOAD).await?;
-        stream.write_u64(bench_bytes).await?;
+        let mut up_cmd = [0u8; 9];
+        up_cmd[0] = MODE_UPLOAD;
+        up_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
+        session
+            .send_message(&up_cmd)
+            .await
+            .map_err(|e| anyhow::anyhow!("Benchmark upload command error: {}", e))?;
 
         let mut remaining = bench_bytes;
         while remaining > 0 {
             let to_write = std::cmp::min(remaining, dummy_chunk.len() as u64) as usize;
-            stream.write_all(&dummy_chunk[..to_write]).await?;
+            session
+                .send_message(&dummy_chunk[..to_write])
+                .await
+                .map_err(|e| anyhow::anyhow!("Benchmark upload frame error: {}", e))?;
             remaining -= to_write as u64;
         }
-        stream.flush().await?;
 
-        let _ack = stream.read_u8().await?;
+        let ack = session
+            .recv_message()
+            .await
+            .map_err(|e| anyhow::anyhow!("Benchmark upload ack recv error: {}", e))?;
+        if ack.as_slice() != [1u8] {
+            anyhow::bail!("Invalid benchmark upload ACK from {}", peer_ip);
+        }
         let upload_dur = start_upload.elapsed().as_secs_f64().max(0.000_1);
         let upload_mb_s = (bench_bytes as f64 / (1024.0 * 1024.0)) / upload_dur;
         let upload_gbps = (bench_bytes as f64 * 8.0) / (upload_dur * 1_000_000_000.0);
 
         // 3. Download Throughput Test
-        let mut recv_buf = vec![0u8; CHUNK_SIZE];
         let start_download = Instant::now();
-        stream.write_u8(MODE_DOWNLOAD).await?;
-        stream.write_u64(bench_bytes).await?;
-        stream.flush().await?;
+        let mut down_cmd = [0u8; 9];
+        down_cmd[0] = MODE_DOWNLOAD;
+        down_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
+        session
+            .send_message(&down_cmd)
+            .await
+            .map_err(|e| anyhow::anyhow!("Benchmark download command error: {}", e))?;
 
         let mut remaining = bench_bytes;
         while remaining > 0 {
-            let to_read = std::cmp::min(remaining, recv_buf.len() as u64) as usize;
-            let n = stream.read(&mut recv_buf[..to_read]).await?;
-            if n == 0 {
-                anyhow::bail!("Benchmark download stream closed prematurely");
+            let chunk = session
+                .recv_message()
+                .await
+                .map_err(|e| anyhow::anyhow!("Benchmark download frame error: {}", e))?;
+            if chunk.is_empty() || (chunk.len() as u64) > remaining {
+                anyhow::bail!("Benchmark download invalid chunk size {}", chunk.len());
             }
-            remaining -= n as u64;
+            remaining -= chunk.len() as u64;
         }
 
         let download_dur = start_download.elapsed().as_secs_f64().max(0.000_1);

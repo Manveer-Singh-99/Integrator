@@ -245,21 +245,21 @@ impl ClipboardService {
         Arc::clone(&self.pending_remote)
     }
 
-    async fn is_ip_authorized(ip: IpAddr) -> bool {
-        tokio::task::spawn_blocking(move || crate::trust::is_remote_addr_authorized(ip))
+    async fn has_paired_peer(ip: IpAddr) -> bool {
+        tokio::task::spawn_blocking(move || crate::trust::has_paired_peer_at_ip(ip))
             .await
             .unwrap_or(false)
     }
 
-    /// Returns an authorized peer IP (preferring the discovery-selected best peer).
+    /// Returns a paired peer IP (preferring the discovery-selected best peer).
     async fn get_authorized_peer_ip(&self) -> Option<String> {
         if let Some(best) = self.discovery.get_best_peer().await {
-            if Self::is_ip_authorized(best.addr.ip()).await {
+            if Self::has_paired_peer(best.addr.ip()).await {
                 return Some(best.addr.ip().to_string());
             }
         }
         for peer in self.discovery.get_all_peers().await {
-            if Self::is_ip_authorized(peer.addr.ip()).await {
+            if Self::has_paired_peer(peer.addr.ip()).await {
                 return Some(peer.addr.ip().to_string());
             }
         }
@@ -288,7 +288,7 @@ impl ClipboardService {
                         let handler = s_clone.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if !Self::is_ip_authorized(addr.ip()).await {
+                            if !Self::has_paired_peer(addr.ip()).await {
                                 warn!("🚫 Rejected untrusted clipboard connection from {}", addr);
                                 drop(socket);
                                 return;
@@ -343,7 +343,7 @@ impl ClipboardService {
 
         let (auth_dev, plaintext) = trust::open_envelope_from_ip(peer_addr.ip(), &header_buf)
             .map_err(|e| anyhow::anyhow!("Clipboard envelope verification failed: {}", e))?;
-        if auth_dev.is_none() && !trust::is_remote_addr_authorized(peer_addr.ip()) {
+        if auth_dev.is_none() {
             anyhow::bail!(
                 "Clipboard sender from {} is not an authenticated trusted peer",
                 peer_addr
@@ -1073,7 +1073,7 @@ impl ClipboardService {
 
     async fn resolve_stream_peer_ip(&self, source_ip: Option<IpAddr>) -> Result<String> {
         if let Some(ip) = source_ip {
-            if Self::is_ip_authorized(ip).await {
+            if Self::has_paired_peer(ip).await {
                 return Ok(ip.to_string());
             }
         }

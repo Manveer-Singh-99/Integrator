@@ -114,7 +114,7 @@ impl SenderAuthFilter {
         }
         self.unknown_probes_in_window += 1;
 
-        let allowed = tokio::task::spawn_blocking(move || trust::is_remote_addr_authorized(ip))
+        let allowed = tokio::task::spawn_blocking(move || trust::has_paired_peer_at_ip(ip))
             .await
             .unwrap_or(false);
 
@@ -330,9 +330,8 @@ impl AudioManager {
 
     /// Starts the experimental UDP audio preview sink receiver on [`AUDIO_PORT`].
     ///
-    /// Enforces peer trust via [`trust::is_remote_addr_authorized`] and checks
-    /// datagram byte bounds while rate-limiting warnings so LAN floods cannot
-    /// spam logs.
+    /// Enforces peer pairing and checks datagram byte bounds while rate-limiting
+    /// warnings so LAN floods cannot spam logs.
     pub async fn start_sink_server() -> Result<()> {
         if SINK_LISTENING.load(Ordering::Acquire) {
             return Ok(());

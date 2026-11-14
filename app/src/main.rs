@@ -858,7 +858,7 @@ async fn trust_peer_device(
     device_id: String,
     hostname: String,
     ip: String,
-    via_cable: bool,
+    _via_cable: bool,
 ) -> Result<String, String> {
     let clean_id = device_id.trim();
     if clean_id.is_empty() {
@@ -868,8 +868,13 @@ async fn trust_peer_device(
     if !clean_ip.is_empty() && !system_info::is_valid_ipv4(clean_ip) {
         return Err(format!("Invalid peer IPv4 address: {}", ip));
     }
-    trust::trust_device(clean_id, hostname.trim(), clean_ip, via_cable);
-    Ok(format!("Trusted peer {} ({})", hostname.trim(), clean_ip))
+    if !trust::is_device_trusted(clean_id) {
+        return Err(
+            "Integrator v2.0 requires cryptographic PIN pairing (SPAKE2 + Ed25519) before trusting a peer. Enter the 6-digit PIN to pair."
+                .into(),
+        );
+    }
+    Ok(format!("Verified paired peer {} ({})", hostname.trim(), clean_ip))
 }
 
 #[tauri::command]
@@ -897,10 +902,10 @@ async fn set_trust_policy(
     require_lan_pairing: bool,
 ) -> Result<String, String> {
     trust::set_trust_policy(auto_trust_cable, require_lan_pairing);
-    Ok(format!(
-        "Trust policy updated (direct-cable auto-trust: {}, require LAN pairing: {})",
-        auto_trust_cable, require_lan_pairing
-    ))
+    Ok(
+        "Integrator v2.0 enforces mandatory cryptographic pairing on all interfaces (including direct USB-C / Thunderbolt cables)"
+            .to_string(),
+    )
 }
 
 #[tauri::command]
@@ -913,47 +918,12 @@ async fn pair_with_peer(ip: String, pin: String) -> Result<String, String> {
     if trimmed_pin.len() != 6 || !trimmed_pin.chars().all(|c| c.is_ascii_digit()) {
         return Err("Pairing PIN must be 6 digits".into());
     }
-    let my_device_id = system_info::get_or_create_device_id();
-    let my_hostname = system_info::get_hostname();
-    let client_nonce = trust::generate_random_token_hex(16);
-    let client_token = trust::generate_random_token_hex(32);
-    let auth_mac = trust::compute_pairing_request_mac(
-        &trimmed_pin,
-        &my_device_id,
-        &my_hostname,
-        &client_nonce,
-        &client_token,
-    );
-
-    let req = DisplayRpcRequest::PairRequest {
-        device_id: my_device_id,
-        hostname: my_hostname,
-        pin: trimmed_pin.clone(),
-        client_nonce: client_nonce.clone(),
-        client_token: client_token.clone(),
-        auth_mac,
-    };
-    let resp = DisplayController::send_remote_rpc(&trimmed_ip, &req)
-        .await
-        .map_err(|e| format!("Failed to reach peer {} for pairing: {}", trimmed_ip, e))?;
-    if resp.success {
-        let host_id = resp
-            .host_device_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("peer-{}", trimmed_ip));
-        let host_name = resp
-            .host_name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| trimmed_ip.clone());
-        let shared_secret = resp.pairing_token.as_deref().map(|srv_tok| {
-            trust::derive_pairing_shared_secret(&trimmed_pin, &client_token, srv_tok, &client_nonce)
-        });
-        let cable = system_info::is_direct_cable_route(&trimmed_ip);
-        trust::trust_device_with_secret(&host_id, &host_name, &trimmed_ip, cable, shared_secret);
-        Ok(resp.message)
-    } else {
-        Err(resp.message)
-    }
+    let (creds, sas_6) =
+        trust::pair_with_remote_peer_v2(&trimmed_ip, config::CONTROL_PORT, &trimmed_pin).await?;
+    Ok(format!(
+        "Paired and mutually authenticated with {} ({}) [SAS: {}]",
+        creds.hostname, trimmed_ip, sas_6
+    ))
 }
 
 fn main() -> Result<()> {

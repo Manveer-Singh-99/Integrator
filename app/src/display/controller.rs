@@ -4,7 +4,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -389,58 +388,6 @@ impl DisplayController {
                 resp.hardware_profile = Some(profile);
                 resp
             }
-            DisplayRpcRequest::PairRequest {
-                device_id,
-                hostname,
-                pin,
-                client_nonce,
-                client_token,
-                auth_mac,
-            } => {
-                let Some(ip_str) = peer_ip.map(|ip| ip.to_string()) else {
-                    return self
-                        .base_response(false, "Cannot verify pairing without peer network address")
-                        .await;
-                };
-                if device_id.trim().is_empty() {
-                    return self
-                        .base_response(false, "Pairing rejected: missing device_id")
-                        .await;
-                }
-                match trust::verify_pin_and_establish_session(
-                    &device_id,
-                    &hostname,
-                    &ip_str,
-                    &pin,
-                    &client_nonce,
-                    &client_token,
-                    &auth_mac,
-                ) {
-                    Ok(server_token) => {
-                        info!(
-                            "🔐 Paired and established cryptographic session with '{}' ({}) at {}",
-                            hostname, device_id, ip_str
-                        );
-                        let mut resp = self
-                            .base_response(
-                                true,
-                                format!("Paired and trusted {} ({})", hostname, ip_str),
-                            )
-                            .await;
-                        resp.pairing_token = Some(server_token);
-                        resp.host_device_id = Some(system_info::get_or_create_device_id());
-                        resp.host_name = Some(system_info::get_hostname());
-                        resp
-                    }
-                    Err(reason) => {
-                        warn!(
-                            "🚫 Rejected pairing request from '{}' ({}) at {}: {}",
-                            hostname, device_id, ip_str, reason
-                        );
-                        self.base_response(false, reason).await
-                    }
-                }
-            }
             DisplayRpcRequest::StartMoonlight {
                 host_ip,
                 host_port,
@@ -766,52 +713,39 @@ impl DisplayController {
         self.active_mode.read().await.clone()
     }
 
-    /// Sends an encrypted, authenticated RPC request to a remote peer or localhost over TCP.
+    /// Sends an encrypted, mutually authenticated RPC request to a remote peer or localhost over TransportSessionV2.
     pub async fn send_remote_rpc(
         peer_ip: &str,
         req: &DisplayRpcRequest,
     ) -> Result<DisplayRpcResponse> {
         let addr = format!("{}:{}", peer_ip, CONTROL_PORT);
-        let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr))
-            .await
-            .with_context(|| format!("Timed out connecting to display control RPC at {}", addr))?
-            .with_context(|| format!("Failed to connect to display control RPC at {}", addr))?;
-        let _ = stream.set_nodelay(true);
+        let mut session = trust::connect_transport_to_ip(
+            peer_ip,
+            CONTROL_PORT,
+            crate::security::transport::ServiceId::DisplayRpc,
+            Duration::from_secs(4),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to establish TransportV2 session to {}: {}", addr, e))?;
 
         let payload = serde_json::to_vec(req)?;
-        let wire_req = trust::seal_envelope_for_ip(peer_ip, &payload)
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            stream.write_u32(wire_req.len() as u32).await?;
-            stream.write_all(&wire_req).await?;
-            stream.flush().await
-        })
-        .await
-        .with_context(|| format!("Timed out sending RPC request to {}", addr))??;
-
-        let resp_len = tokio::time::timeout(Duration::from_secs(15), stream.read_u32())
+        tokio::time::timeout(Duration::from_secs(10), session.send_message(&payload))
             .await
-            .with_context(|| format!("Timed out waiting for RPC response header from {}", addr))??
-            as usize;
-        if resp_len == 0 || resp_len > 1_048_576 {
+            .with_context(|| format!("Timed out sending RPC request to {}", addr))?
+            .map_err(|e| anyhow::anyhow!("TransportV2 send error to {}: {}", addr, e))?;
+
+        let plain_resp = tokio::time::timeout(Duration::from_secs(15), session.recv_message())
+            .await
+            .with_context(|| format!("Timed out waiting for RPC response from {}", addr))?
+            .map_err(|e| anyhow::anyhow!("TransportV2 receive error from {}: {}", addr, e))?;
+
+        if plain_resp.is_empty() || plain_resp.len() > 1_048_576 {
             anyhow::bail!(
                 "Invalid RPC response size {} bytes from {}",
-                resp_len,
+                plain_resp.len(),
                 addr
             );
         }
-        let mut resp_buf = vec![0u8; resp_len];
-        tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut resp_buf))
-            .await
-            .with_context(|| format!("Timed out reading RPC response body from {}", addr))??;
-
-        let remote_ip: IpAddr = peer_ip
-            .trim()
-            .parse()
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let (_, plain_resp) = trust::open_envelope_from_ip(remote_ip, &resp_buf)
-            .map_err(|e| anyhow::anyhow!("RPC response verification failed from {}: {}", addr, e))?;
 
         let resp: DisplayRpcResponse = serde_json::from_slice(&plain_resp)?;
         Ok(resp)

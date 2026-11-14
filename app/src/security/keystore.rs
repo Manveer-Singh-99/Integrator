@@ -550,6 +550,58 @@ impl KeystoreV2 {
         Ok(removed)
     }
 
+    /// Removes a peer from trust and optionally adds its `device_id` (and known IP) to the blocklist.
+    pub fn untrust_or_block_peer(
+        &mut self,
+        device_id_hex: &str,
+        block: bool,
+        known_ip: Option<&str>,
+    ) -> Result<(), KeystoreError> {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        let removed_peer = self.peers.remove(&canonical);
+        if block {
+            if !self.blocked_device_ids.iter().any(|b| b == &canonical) {
+                self.blocked_device_ids.push(canonical.clone());
+            }
+            if let Some(peer) = removed_peer {
+                if !peer.last_ip.is_empty()
+                    && !self.blocked_ips.iter().any(|ip| ip == &peer.last_ip)
+                {
+                    self.blocked_ips.push(peer.last_ip);
+                }
+            }
+            if let Some(ip) = known_ip.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if !self.blocked_ips.iter().any(|bip| bip == ip) {
+                    self.blocked_ips.push(ip.to_string());
+                }
+            }
+        } else {
+            self.blocked_device_ids.retain(|b| b != &canonical);
+        }
+        self.persist_to_disk()
+    }
+
+    pub fn blocked_device_ids(&self) -> &[String] {
+        &self.blocked_device_ids
+    }
+
+    pub fn is_device_or_ip_blocked(&self, device_id_hex: &str, ip: &str) -> bool {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        let clean_ip = ip.trim();
+        self.blocked_device_ids.iter().any(|b| b == &canonical)
+            || (!clean_ip.is_empty() && self.blocked_ips.iter().any(|bip| bip == clean_ip))
+    }
+
+    pub fn find_peer_by_ip(&self, ip: &str) -> Option<&VerifiedPeerCredentials> {
+        let clean_ip = ip.trim();
+        if clean_ip.is_empty() || self.blocked_ips.iter().any(|bip| bip == clean_ip) {
+            return None;
+        }
+        self.peers.values().find(|p| {
+            p.last_ip == clean_ip && !self.blocked_device_ids.iter().any(|b| b == &p.device_id_hex)
+        })
+    }
+
     pub fn get_peer(&self, device_id_hex: &str) -> Option<&VerifiedPeerCredentials> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
         if self.blocked_device_ids.iter().any(|b| b == &canonical) {

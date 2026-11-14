@@ -880,24 +880,45 @@ pub async fn recv_pairing_frame<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut hdr = [0u8; 8];
-    reader
-        .read_exact(&mut hdr)
-        .await
-        .map_err(|e| PairingError::IoFailure(e.to_string()))?;
+    recv_pairing_frame_with_prefixed_magic(reader, None).await
+}
 
-    let mut magic = [0u8; 4];
-    magic.copy_from_slice(&hdr[0..4]);
+/// Reads a bounded `IPR2` frame when the 4-byte magic has optionally already been read from `reader`.
+pub async fn recv_pairing_frame_with_prefixed_magic<R>(
+    reader: &mut R,
+    already_read_magic: Option<[u8; 4]>,
+) -> Result<(PairingMsgType, Vec<u8>), PairingError>
+where
+    R: AsyncRead + Unpin,
+{
+    let magic = match already_read_magic {
+        Some(m) => m,
+        None => {
+            let mut m = [0u8; 4];
+            reader
+                .read_exact(&mut m)
+                .await
+                .map_err(|e| PairingError::IoFailure(e.to_string()))?;
+            m
+        }
+    };
     if magic != PAIRING_WIRE_MAGIC {
         return Err(PairingError::InvalidFrameMagic(magic));
     }
-    if hdr[4] != PAIRING_HEADER_VERSION_BYTE {
-        return Err(PairingError::UnsupportedVersion(hdr[4] as u16));
+
+    let mut rest_hdr = [0u8; 4];
+    reader
+        .read_exact(&mut rest_hdr)
+        .await
+        .map_err(|e| PairingError::IoFailure(e.to_string()))?;
+
+    if rest_hdr[0] != PAIRING_HEADER_VERSION_BYTE {
+        return Err(PairingError::UnsupportedVersion(rest_hdr[0] as u16));
     }
 
     let msg_type =
-        PairingMsgType::from_u8(hdr[5]).ok_or(PairingError::InvalidMessageType(hdr[5]))?;
-    let payload_len = u16::from_be_bytes([hdr[6], hdr[7]]) as usize;
+        PairingMsgType::from_u8(rest_hdr[1]).ok_or(PairingError::InvalidMessageType(rest_hdr[1]))?;
+    let payload_len = u16::from_be_bytes([rest_hdr[2], rest_hdr[3]]) as usize;
     if payload_len == 0 || payload_len > MAX_PAIRING_FRAME_BYTES {
         return Err(PairingError::OversizedFrame(payload_len));
     }
@@ -964,6 +985,156 @@ where
     awaiting.finalize_and_commit(keystore, &complete_msg, server_ip, via_direct_cable)
 }
 
+/// Executes the 4-message Client (`Initiator A`) pairing flow using a shared `&std::sync::Mutex<KeystoreV2>`,
+/// never holding the mutex across `.await` points so the returned future is `Send`.
+pub async fn run_client_pairing_with_shared_keystore<S>(
+    stream: &mut S,
+    keystore_mutex: &std::sync::Mutex<KeystoreV2>,
+    pin: &str,
+    local_device_name: &str,
+    local_platform: &str,
+    server_ip: &str,
+    via_direct_cable: bool,
+) -> Result<(VerifiedPeerCredentials, String), PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (hs, init_msg) = {
+        let ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        ClientPairingHandshakeV2::initiate(&ks, pin, local_device_name, local_platform)?
+    };
+    send_pairing_frame(stream, PairingMsgType::PairInit, &init_msg).await?;
+
+    let (msg_type, payload) = recv_pairing_frame(stream).await?;
+    if msg_type == PairingMsgType::PairError {
+        let err_msg: PairErrorWireMsg = serde_json::from_slice(&payload)
+            .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
+        return Err(PairingError::RemotePeerRejected {
+            code: err_msg.code,
+            message: err_msg.message,
+        });
+    }
+    if msg_type != PairingMsgType::PairServerShare {
+        return Err(PairingError::InvalidMessageType(msg_type as u8));
+    }
+    let share_msg: PairServerShareMsg = serde_json::from_slice(&payload)
+        .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
+
+    let (awaiting, confirm_msg) = {
+        let ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        hs.process_server_share(&ks, &share_msg)?
+    };
+    send_pairing_frame(stream, PairingMsgType::PairClientConfirm, &confirm_msg).await?;
+
+    let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
+    if msg_type_2 == PairingMsgType::PairError {
+        let err_msg: PairErrorWireMsg = serde_json::from_slice(&payload_2)
+            .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
+        return Err(PairingError::RemotePeerRejected {
+            code: err_msg.code,
+            message: err_msg.message,
+        });
+    }
+    if msg_type_2 != PairingMsgType::PairServerComplete {
+        return Err(PairingError::InvalidMessageType(msg_type_2 as u8));
+    }
+    let complete_msg: PairServerCompleteMsg = serde_json::from_slice(&payload_2)
+        .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
+
+    let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    awaiting.finalize_and_commit(&mut ks, &complete_msg, server_ip, via_direct_cable)
+}
+
+/// Executes the 4-message Server (`Responder B`) pairing flow using shared `&std::sync::Mutex` references,
+/// never holding any mutex guard across `.await` points so the returned future is `Send`.
+pub async fn handle_server_pairing_with_shared_locks<S>(
+    stream: &mut S,
+    already_read_magic: Option<[u8; 4]>,
+    coordinator_mutex: &std::sync::Mutex<PairingCoordinatorV2>,
+    keystore_mutex: &std::sync::Mutex<KeystoreV2>,
+    source_ip: IpAddr,
+    via_direct_cable: bool,
+) -> Result<(VerifiedPeerCredentials, String), PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (msg_type, payload) =
+        recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await?;
+    if msg_type != PairingMsgType::PairInit {
+        let err = PairingError::InvalidMessageType(msg_type as u8);
+        let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+        return Err(err);
+    }
+
+    let init_msg: PairInitMsg = match serde_json::from_slice(&payload) {
+        Ok(m) => m,
+        Err(e) => {
+            let err = PairingError::MalformedMessage(e.to_string());
+            let _ =
+                send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+            return Err(err);
+        }
+    };
+
+    let now_secs = unix_epoch_secs();
+    let share_res = {
+        let ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        coord.handle_pair_init(&ks, source_ip, &init_msg, now_secs)
+    };
+    let share_msg = match share_res {
+        Ok(s) => s,
+        Err(err) => {
+            let _ =
+                send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+            return Err(err);
+        }
+    };
+
+    send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await?;
+
+    let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
+    if msg_type_2 != PairingMsgType::PairClientConfirm {
+        let err = PairingError::InvalidMessageType(msg_type_2 as u8);
+        let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+        return Err(err);
+    }
+
+    let confirm_msg: PairClientConfirmMsg = match serde_json::from_slice(&payload_2) {
+        Ok(m) => m,
+        Err(e) => {
+            let err = PairingError::MalformedMessage(e.to_string());
+            let _ =
+                send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+            return Err(err);
+        }
+    };
+
+    let now_secs_2 = unix_epoch_secs();
+    let confirm_res = {
+        let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        coord.handle_pair_client_confirm(
+            &mut ks,
+            source_ip,
+            &confirm_msg,
+            via_direct_cable,
+            now_secs_2,
+        )
+    };
+    match confirm_res {
+        Ok((complete_msg, creds, sas)) => {
+            send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await?;
+            Ok((creds, sas))
+        }
+        Err(err) => {
+            let _ =
+                send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
+            Err(err)
+        }
+    }
+}
+
 /// Executes the complete 4-message Server (`Responder B`) pairing flow over an async stream.
 pub async fn handle_server_pairing_over_stream<S>(
     stream: &mut S,
@@ -975,7 +1146,31 @@ pub async fn handle_server_pairing_over_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (msg_type, payload) = recv_pairing_frame(stream).await?;
+    handle_server_pairing_with_prefixed_magic(
+        stream,
+        None,
+        coordinator,
+        keystore,
+        source_ip,
+        via_direct_cable,
+    )
+    .await
+}
+
+/// Executes the 4-message Server pairing flow when the 4-byte `IPR2` magic has optionally already been read.
+pub async fn handle_server_pairing_with_prefixed_magic<S>(
+    stream: &mut S,
+    already_read_magic: Option<[u8; 4]>,
+    coordinator: &mut PairingCoordinatorV2,
+    keystore: &mut KeystoreV2,
+    source_ip: IpAddr,
+    via_direct_cable: bool,
+) -> Result<(VerifiedPeerCredentials, String), PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (msg_type, payload) =
+        recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await?;
     if msg_type != PairingMsgType::PairInit {
         let err = PairingError::InvalidMessageType(msg_type as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;

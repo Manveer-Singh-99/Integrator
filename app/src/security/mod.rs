@@ -12,6 +12,7 @@
 pub mod keystore;
 pub mod pairing;
 pub mod spake2_rfc9382;
+pub mod transport;
 
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -555,5 +556,91 @@ mod tests {
 
         crate::security::keystore::delete_os_kek_for_dir(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_discovery_beacon_v2_ed25519_sign_and_verify() {
+        let now_ms = unix_epoch_millis();
+        let (dev_id, pk_hex, sig_hex) =
+            crate::trust::sign_discovery_beacon_v2(now_ms, 58281, 58283);
+
+        assert!(crate::trust::verify_discovery_beacon_v2(
+            &dev_id,
+            &pk_hex,
+            "TestHost",
+            now_ms,
+            58281,
+            58283,
+            &sig_hex,
+        ));
+
+        // Tamper with control port -> signature verification must fail
+        assert!(!crate::trust::verify_discovery_beacon_v2(
+            &dev_id,
+            &pk_hex,
+            "TestHost",
+            now_ms,
+            59999,
+            58283,
+            &sig_hex,
+        ));
+
+        // Tamper with device_id -> derivation check must fail
+        let fake_id = "00000000000000000000000000000000";
+        assert!(!crate::trust::verify_discovery_beacon_v2(
+            fake_id,
+            &pk_hex,
+            "TestHost",
+            now_ms,
+            58281,
+            58283,
+            &sig_hex,
+        ));
+
+        // Stale timestamp (> 60s old) -> freshness check must fail
+        assert!(!crate::trust::verify_discovery_beacon_v2(
+            &dev_id,
+            &pk_hex,
+            "TestHost",
+            now_ms.saturating_sub(120_000),
+            58281,
+            58283,
+            &sig_hex,
+        ));
+    }
+
+    #[test]
+    fn test_no_legacy_v1_public_keys_or_ip_auth_in_source() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let banned_transport_key = ["INTEGRATOR", "TRANSPORT", "CHANNEL", "KEY", "V1"].join("-");
+        let banned_beacon_key = ["INTEGRATOR", "DISCOVERY", "BEACON", "V1"].join("-");
+        let banned_ip_auth = ["is_remote", "addr_authorized"].join("_");
+
+        fn scan_dir(
+            dir: &std::path::Path,
+            banned: &[&str],
+        ) {
+            for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, banned);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let content = std::fs::read_to_string(&path).expect("read .rs file");
+                    for pat in banned {
+                        assert!(
+                            !content.contains(pat),
+                            "Found banned v1 legacy symbol '{}' in {:?}",
+                            pat,
+                            path
+                        );
+                    }
+                }
+            }
+        }
+
+        scan_dir(
+            &src_dir,
+            &[&banned_transport_key, &banned_beacon_key, &banned_ip_auth],
+        );
     }
 }

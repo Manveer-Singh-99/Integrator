@@ -4,13 +4,12 @@
 //! share names, install paths) with live runtime enumeration across macOS and Windows.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PrimaryDisplayInfo {
@@ -303,42 +302,16 @@ fn expand_windows_env_vars(input: &str) -> String {
     out
 }
 
-/// Stable device identifier persisted in `~/.usbc_clipboard_cache/device_id`.
+/// Returns the canonical v2 device identifier (`HEX(SHA256("integrator-device-id-v2" || local_ed25519_pubkey)[0..16])`)
+/// bound to the installation's persistent Ed25519 identity key in `KeystoreV2`.
 pub fn get_or_create_device_id() -> String {
     static DEVICE_ID: OnceLock<String> = OnceLock::new();
     DEVICE_ID
         .get_or_init(|| {
-            let path = app_data_dir().join("device_id");
-            if let Ok(existing) = std::fs::read_to_string(&path) {
-                let clean = existing.trim().to_string();
-                if clean.len() >= 12 {
-                    return clean;
-                }
-            }
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let host = get_hostname();
-            let pid = std::process::id();
-            let mut hasher = Sha256::new();
-            hasher.update(host.as_bytes());
-            hasher.update(now_ns.to_le_bytes());
-            hasher.update(pid.to_le_bytes());
-            hasher.update(std::env::consts::OS.as_bytes());
-            hasher.update(std::env::consts::ARCH.as_bytes());
-            let hash = hasher.finalize();
-            let hex: String = hash[..16].iter().map(|b| format!("{:02x}", b)).collect();
-            let formatted = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[0..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
-            let _ = std::fs::write(&path, &formatted);
-            formatted
+            let guard = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.local_device_id_hex().to_string()
         })
         .clone()
 }
