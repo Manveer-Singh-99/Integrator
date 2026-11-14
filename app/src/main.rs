@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod system_info;
+pub mod security;
 mod trust;
 mod config;
 mod bridge;
