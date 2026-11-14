@@ -695,6 +695,43 @@ impl DisplayController {
                     .base_response(false, format!("Unmount request failed: {}", e))
                     .await,
             },
+            DisplayRpcRequest::NegotiateAudioSession {
+                sender_nonce_hex,
+                sample_rate,
+                channels,
+                bit_depth,
+            } => {
+                let Some(caller_ip) = peer_ip else {
+                    return self
+                        .base_response(false, "Missing peer IP for audio session negotiation")
+                        .await;
+                };
+                match crate::audio::AudioManager::handle_negotiate_session(
+                    caller_ip,
+                    &sender_nonce_hex,
+                    sample_rate,
+                    channels,
+                    bit_depth,
+                ) {
+                    Ok(wire) => {
+                        let mut resp = self
+                            .base_response(
+                                true,
+                                format!(
+                                    "Negotiated authenticated IUA2 UDP audio session ({}Hz, {}ch, {}-bit)",
+                                    sample_rate, channels, bit_depth
+                                ),
+                            )
+                            .await;
+                        resp.audio_session = Some(wire);
+                        resp
+                    }
+                    Err(e) => {
+                        self.base_response(false, format!("Audio session negotiation failed: {}", e))
+                            .await
+                    }
+                }
+            }
         }
     }
 

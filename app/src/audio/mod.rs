@@ -1,11 +1,16 @@
-//! Experimental UDP Audio Sink (Preview) and local speaker chime synthesis.
+//! Experimental Authenticated UDP Audio Sink (`IUA2` on Port `58284`) and local speaker chime synthesis.
 //!
-//! Binds [`AUDIO_PORT`] as an experimental UDP audio preview sink that validates
-//! sender authorization and datagram bounds before draining packets (full
-//! WASAPI <-> CoreAudio duplex streaming is not yet implemented), and provides
-//! local 24-bit 48kHz stereo WAV chime synthesis for speaker verification.
+//! Binds [`AUDIO_PORT`] (`58284/udp`) as an authenticated UDP audio preview sink where:
+//! - Sessions are negotiated over `TransportSessionV2` (`DisplayRpcRequest::NegotiateAudioSession`),
+//!   binding a fresh `audio_session_id` (`[u8; 8]`), `K_audio` (`32B`), and `nonce_salt` (`4B`)
+//!   to the peer's `K_root` and fresh `sender_nonce` / `receiver_nonce` entropy.
+//! - Every UDP datagram is authenticated and decrypted with `ChaCha20-Poly1305` (`IUA2` 32B header as `AAD`,
+//!   `nonce_salt[4B] || pkt_seq[8B]` 96-bit nonce) and checked against a 64-packet sliding-window
+//!   anti-replay bitmask (`ReplayWindow64` updated only after AEAD tag verification succeeds).
+//! - Unauthenticated, replayed, pre-window, or expired datagrams are dropped with rate-limited logging.
+//! - Full WASAPI <-> CoreAudio duplex streaming is not yet implemented (`is_active` remains `false`);
+//!   local 24-bit 48kHz stereo WAV chime synthesis is provided for speaker verification.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::net::IpAddr;
@@ -13,6 +18,7 @@ use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -23,25 +29,27 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use crate::{config, system_info, trust};
+use crate::display::controller::DisplayController;
+use crate::display::protocol::DisplayRpcRequest;
+use crate::security::audio_udp::{
+    derive_audio_session_keys, AudioSessionRegistry, AudioSessionSender,
+    NegotiatedAudioSessionWire, MAX_AUDIO_DATAGRAM_LEN, MIN_AUDIO_DATAGRAM_LEN,
+};
+use crate::{config, security, system_info, trust};
 
 pub const AUDIO_PORT: u16 = config::AUDIO_PORT;
 
-/// Accepted UDP audio preview datagram bounds in bytes (1..=8192 covers
-/// standard 5-20ms PCM frames without accepting empty or oversized packets).
-const MIN_AUDIO_PACKET_BYTES: usize = 1;
-const MAX_AUDIO_PACKET_BYTES: usize = 8192;
-
-const AUTH_CACHE_TTL: Duration = Duration::from_secs(5);
-const AUTH_CACHE_MAX_ENTRIES: usize = 64;
-const UNKNOWN_AUTH_WINDOW: Duration = Duration::from_secs(5);
-const MAX_UNKNOWN_AUTH_PROBES_PER_WINDOW: usize = 16;
 const LOG_RATE_LIMIT: Duration = Duration::from_secs(30);
 const RECENT_PACKET_WINDOW_MS: u64 = 5_000;
 
 static SINK_LISTENING: AtomicBool = AtomicBool::new(false);
 static LAST_PACKET_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
 static PACKETS_DRAINED: AtomicU64 = AtomicU64::new(0);
+static AUDIO_SESSION_REGISTRY: OnceLock<Mutex<AudioSessionRegistry>> = OnceLock::new();
+
+fn global_audio_registry() -> &'static Mutex<AudioSessionRegistry> {
+    AUDIO_SESSION_REGISTRY.get_or_init(|| Mutex::new(AudioSessionRegistry::new()))
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,71 +81,6 @@ impl Drop for SinkListeningGuard {
     }
 }
 
-struct SenderAuthFilter {
-    cache: HashMap<IpAddr, (bool, Instant)>,
-    window_start: Instant,
-    unknown_probes_in_window: usize,
-    last_unauth_log: Option<Instant>,
-    last_bounds_log: Option<Instant>,
-}
-
-impl SenderAuthFilter {
-    fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            window_start: Instant::now(),
-            unknown_probes_in_window: 0,
-            last_unauth_log: None,
-            last_bounds_log: None,
-        }
-    }
-
-    async fn is_authorized(&mut self, ip: IpAddr) -> bool {
-        if ip.is_loopback() {
-            return true;
-        }
-
-        let now = Instant::now();
-        if let Some(&(allowed, cached_at)) = self.cache.get(&ip) {
-            if now.duration_since(cached_at) < AUTH_CACHE_TTL {
-                return allowed;
-            }
-        }
-
-        if now.duration_since(self.window_start) >= UNKNOWN_AUTH_WINDOW {
-            self.window_start = now;
-            self.unknown_probes_in_window = 0;
-        }
-
-        if self.unknown_probes_in_window >= MAX_UNKNOWN_AUTH_PROBES_PER_WINDOW {
-            return false;
-        }
-        self.unknown_probes_in_window += 1;
-
-        let allowed = tokio::task::spawn_blocking(move || trust::has_paired_peer_at_ip(ip))
-            .await
-            .unwrap_or(false);
-
-        if self.cache.len() >= AUTH_CACHE_MAX_ENTRIES {
-            self.cache
-                .retain(|_, &mut (_, ts)| now.duration_since(ts) < AUTH_CACHE_TTL);
-            if self.cache.len() >= AUTH_CACHE_MAX_ENTRIES {
-                self.cache.clear();
-            }
-        }
-        self.cache.insert(ip, (allowed, now));
-        allowed
-    }
-
-    fn should_log_unauth(&mut self) -> bool {
-        rate_limit_allow(&mut self.last_unauth_log)
-    }
-
-    fn should_log_bounds(&mut self) -> bool {
-        rate_limit_allow(&mut self.last_bounds_log)
-    }
-}
-
 fn rate_limit_allow(last_logged: &mut Option<Instant>) -> bool {
     let now = Instant::now();
     match *last_logged {
@@ -156,17 +99,16 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Spawns a background thread to reap a child process when it exits so we do
+/// not accumulate zombie processes or leak OS process handles.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn reap_child(mut child: std::process::Child) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::spawn_blocking(move || {
-            let _ = child.wait();
-        });
-    } else {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+    if let Ok( Some(_) ) = child.try_wait() {
+        return;
     }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 pub struct AudioManager;
@@ -188,9 +130,9 @@ impl AudioManager {
             last_ms > 0 && now_ms.saturating_sub(last_ms) <= RECENT_PACKET_WINDOW_MS;
 
         let topology = if recently_draining {
-            "UDP Audio Sink (Experimental Preview - Draining Packets, No OS Playback)"
+            "UDP Audio Sink (Experimental Preview - Draining Authenticated IUA2 Packets, No OS Playback)"
         } else {
-            "UDP Audio Sink (Experimental Preview - Listening, No OS Playback)"
+            "UDP Audio Sink (Experimental Preview - Listening for Authenticated IUA2 Sessions, No OS Playback)"
         };
 
         AudioRoutingStatus {
@@ -205,6 +147,84 @@ impl AudioManager {
     #[allow(dead_code)]
     pub fn packets_drained() -> u64 {
         PACKETS_DRAINED.load(Ordering::Relaxed)
+    }
+
+    /// Handles an incoming `DisplayRpcRequest::NegotiateAudioSession` over `TransportSessionV2`,
+    /// deriving a fresh `IUA2` session key from the caller's pinned `K_root` and registering it
+    /// in the local `AudioSessionRegistry`.
+    pub fn handle_negotiate_session(
+        caller_ip: IpAddr,
+        sender_nonce_hex: &str,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+    ) -> Result<NegotiatedAudioSessionWire, String> {
+        let Some(sender_nonce) = security::hex_decode_array::<32>(sender_nonce_hex) else {
+            return Err("Invalid 32-byte sender_nonce_hex".into());
+        };
+        let ip_str = caller_ip.to_string();
+        let Some(peer_creds) = trust::lookup_verified_peer_for_ip(&ip_str) else {
+            return Err(format!("No cryptographically paired peer found for {}", ip_str));
+        };
+
+        let now = security::unix_epoch_secs();
+        let mut reg = global_audio_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.negotiate_receiver_session(
+            peer_creds.device_id,
+            &peer_creds.root_key,
+            &sender_nonce,
+            sample_rate,
+            channels,
+            bit_depth,
+            now,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Negotiates an outbound `AudioSessionSender` with `peer_ip` over `TransportSessionV2` (`DisplayRpc`).
+    #[allow(dead_code)]
+    pub async fn negotiate_sender_session(
+        peer_ip: &str,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+    ) -> Result<AudioSessionSender> {
+        let peer_creds = trust::lookup_verified_peer_for_ip(peer_ip)
+            .ok_or_else(|| anyhow::anyhow!("Peer {} is not paired", peer_ip))?;
+        let sender_nonce = security::csprng_array::<32>();
+        let req = DisplayRpcRequest::NegotiateAudioSession {
+            sender_nonce_hex: security::hex_encode(&sender_nonce),
+            sample_rate,
+            channels,
+            bit_depth,
+        };
+        let resp = DisplayController::send_remote_rpc(peer_ip, &req).await?;
+        if !resp.success {
+            anyhow::bail!("Peer rejected audio session negotiation: {}", resp.message);
+        }
+        let wire = resp
+            .audio_session
+            .ok_or_else(|| anyhow::anyhow!("Peer response missing audio_session parameters"))?;
+        let session_id = security::hex_decode_array::<8>(&wire.session_id_hex)
+            .ok_or_else(|| anyhow::anyhow!("Invalid session_id_hex from peer"))?;
+        let receiver_nonce = security::hex_decode_array::<32>(&wire.receiver_nonce_hex)
+            .ok_or_else(|| anyhow::anyhow!("Invalid receiver_nonce_hex from peer"))?;
+
+        let (k_audio, nonce_salt) = derive_audio_session_keys(
+            &peer_creds.root_key,
+            &sender_nonce,
+            &receiver_nonce,
+            &session_id,
+        );
+        let now = security::unix_epoch_secs();
+        Ok(AudioSessionSender::new(
+            session_id,
+            *k_audio,
+            nonce_salt,
+            now.saturating_add(wire.expires_in_secs),
+        ))
     }
 
     /// Generates and plays a 24-bit 48kHz stereo test chime through the local
@@ -328,10 +348,11 @@ impl AudioManager {
         Ok(())
     }
 
-    /// Starts the experimental UDP audio preview sink receiver on [`AUDIO_PORT`].
+    /// Starts the experimental authenticated UDP audio preview sink receiver on [`AUDIO_PORT`].
     ///
-    /// Enforces peer pairing and checks datagram byte bounds while rate-limiting
-    /// warnings so LAN floods cannot spam logs.
+    /// Enforces per-datagram `IUA2` `ChaCha20-Poly1305` authentication, 64-packet sliding-window
+    /// anti-replay protection, and session expiry while rate-limiting warnings so LAN floods
+    /// cannot spam logs.
     pub async fn start_sink_server() -> Result<()> {
         if SINK_LISTENING.load(Ordering::Acquire) {
             return Ok(());
@@ -340,41 +361,29 @@ impl AudioManager {
         let socket = tokio::net::UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).await?;
         SINK_LISTENING.store(true, Ordering::Release);
         tracing::info!(
-            "🔊 Experimental UDP Audio Sink (Preview) listening on port {} (packets validated & drained; OS playback not active)",
+            "🔊 Experimental Authenticated UDP Audio Sink (IUA2 Preview) listening on port {} (AEAD + 64-pkt replay window; OS playback not active)",
             AUDIO_PORT
         );
 
         tokio::spawn(async move {
             let _guard = SinkListeningGuard;
-            // Allocate 1 byte beyond MAX_AUDIO_PACKET_BYTES so oversized datagrams
-            // on Unix are detected via `size > MAX_AUDIO_PACKET_BYTES` rather than
-            // silently passing at the exact boundary.
-            let mut buf = vec![0u8; MAX_AUDIO_PACKET_BYTES + 1];
-            let mut auth_filter = SenderAuthFilter::new();
+            // Allocate 1 byte beyond MAX_AUDIO_DATAGRAM_LEN so oversized datagrams
+            // on Unix are detected via `size > MAX_AUDIO_DATAGRAM_LEN`.
+            let mut buf = vec![0u8; MAX_AUDIO_DATAGRAM_LEN + 1];
+            let mut last_unauth_log: Option<Instant> = None;
+            let mut last_bounds_log: Option<Instant> = None;
             let mut last_err_log: Option<Instant> = None;
 
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((size, peer)) => {
-                        if !auth_filter.is_authorized(peer.ip()).await {
-                            if auth_filter.should_log_unauth() {
+                        if !(MIN_AUDIO_DATAGRAM_LEN..=MAX_AUDIO_DATAGRAM_LEN).contains(&size) {
+                            if rate_limit_allow(&mut last_bounds_log) {
                                 tracing::warn!(
-                                    "🚫 Dropped unauthorized UDP audio packet from {} on port {} (rate-limited {}s)",
-                                    peer.ip(),
-                                    AUDIO_PORT,
-                                    LOG_RATE_LIMIT.as_secs()
-                                );
-                            }
-                            continue;
-                        }
-
-                        if !(MIN_AUDIO_PACKET_BYTES..=MAX_AUDIO_PACKET_BYTES).contains(&size) {
-                            if auth_filter.should_log_bounds() {
-                                tracing::warn!(
-                                    "⚠️ Dropped out-of-bounds UDP audio packet ({} bytes, expected {}..={}) from {} (rate-limited {}s)",
+                                    "⚠️ Dropped out-of-bounds UDP audio datagram ({} bytes, expected {}..={}) from {} (rate-limited {}s)",
                                     size,
-                                    MIN_AUDIO_PACKET_BYTES,
-                                    MAX_AUDIO_PACKET_BYTES,
+                                    MIN_AUDIO_DATAGRAM_LEN,
+                                    MAX_AUDIO_DATAGRAM_LEN,
                                     peer.ip(),
                                     LOG_RATE_LIMIT.as_secs()
                                 );
@@ -382,9 +391,31 @@ impl AudioManager {
                             continue;
                         }
 
-                        // Experimental preview: packet authorized and within bounds; drained cleanly.
-                        PACKETS_DRAINED.fetch_add(1, Ordering::Relaxed);
-                        LAST_PACKET_EPOCH_MS.store(epoch_millis(), Ordering::Relaxed);
+                        let now_secs = security::unix_epoch_secs();
+                        let verify_res = {
+                            let mut reg = global_audio_registry()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            reg.open_incoming_datagram(&buf[..size], now_secs)
+                        };
+
+                        match verify_res {
+                            Ok((_peer_id, _hdr, _plaintext)) => {
+                                PACKETS_DRAINED.fetch_add(1, Ordering::Relaxed);
+                                LAST_PACKET_EPOCH_MS.store(epoch_millis(), Ordering::Relaxed);
+                            }
+                            Err(reason) => {
+                                if rate_limit_allow(&mut last_unauth_log) {
+                                    tracing::warn!(
+                                        "🚫 Dropped unauthenticated/replayed IUA2 UDP audio packet from {} on port {}: {} (rate-limited {}s)",
+                                        peer.ip(),
+                                        AUDIO_PORT,
+                                        reason,
+                                        LOG_RATE_LIMIT.as_secs()
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let raw = e.raw_os_error();
@@ -414,6 +445,7 @@ impl AudioManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::audio_udp::AUDIO_FLAG_PCM_FRAME;
 
     #[test]
     fn default_status_is_honest_experimental_preview() {
@@ -428,13 +460,43 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sender_auth_allows_loopback_and_rate_limits_logs() {
-        let mut filter = SenderAuthFilter::new();
-        assert!(filter.is_authorized("127.0.0.1".parse().unwrap()).await);
-        assert!(filter.should_log_unauth());
-        assert!(!filter.should_log_unauth());
-        assert!(filter.should_log_bounds());
-        assert!(!filter.should_log_bounds());
+    #[test]
+    fn negotiate_and_verify_loopback_iua2_session() {
+        let sender_nonce = security::csprng_array::<32>();
+        let sender_nonce_hex = security::hex_encode(&sender_nonce);
+        let wire = AudioManager::handle_negotiate_session(
+            "127.0.0.1".parse().unwrap(),
+            &sender_nonce_hex,
+            48_000,
+            2,
+            24,
+        )
+        .expect("negotiate loopback audio session");
+
+        let creds = trust::lookup_verified_peer_for_ip("127.0.0.1").unwrap();
+        let session_id = security::hex_decode_array::<8>(&wire.session_id_hex).unwrap();
+        let receiver_nonce = security::hex_decode_array::<32>(&wire.receiver_nonce_hex).unwrap();
+        let (k_audio, nonce_salt) = derive_audio_session_keys(
+            &creds.root_key,
+            &sender_nonce,
+            &receiver_nonce,
+            &session_id,
+        );
+        let now = security::unix_epoch_secs();
+        let mut sender = AudioSessionSender::new(
+            session_id,
+            *k_audio,
+            nonce_salt,
+            now + wire.expires_in_secs,
+        );
+
+        let dgram = sender
+            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x11u8; 144], now)
+            .unwrap();
+        let mut reg = global_audio_registry().lock().unwrap();
+        let (peer_id, hdr, plain) = reg.open_incoming_datagram(&dgram, now).unwrap();
+        assert_eq!(peer_id, creds.device_id);
+        assert_eq!(hdr.pkt_seq, 1);
+        assert_eq!(plain.len(), 144);
     }
 }

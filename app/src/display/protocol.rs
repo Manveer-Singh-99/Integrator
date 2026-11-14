@@ -31,6 +31,12 @@ pub enum DisplayRpcRequest {
     },
     MountStorage,
     UnmountStorage,
+    NegotiateAudioSession {
+        sender_nonce_hex: String,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -50,4 +56,6 @@ pub struct DisplayRpcResponse {
     pub host_device_id: Option<String>,
     #[serde(default)]
     pub host_name: Option<String>,
+    #[serde(default)]
+    pub audio_session: Option<crate::security::audio_udp::NegotiatedAudioSessionWire>,
 }
