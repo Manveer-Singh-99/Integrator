@@ -43,6 +43,8 @@ pub enum ClipboardPayload {
     LazyAnnouncement(LazyAnnouncement),
     /// On-demand streaming request sent when user triggers paste or bounded staging.
     RequestStream(StreamRequest),
+    /// On-demand streaming request for an active Cross-Screen Drag & Drop session.
+    RequestDragStream(StreamRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

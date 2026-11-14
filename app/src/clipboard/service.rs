@@ -2,11 +2,12 @@
 //! Strict Quotas, Path Traversal & Symlink Protections, Per-File + Manifest SHA-256 Verification,
 //! and Isolated Staging with Atomic Commits.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use anyhow::{Context, Result};
 use arboard::{Clipboard, ImageData};
@@ -295,6 +296,7 @@ pub struct LocalPendingCopy {
     pub total_bytes: u64,
     pub directories: Vec<String>,
     pub files: Vec<(String, PathBuf)>,
+    pub top_entries: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -305,8 +307,11 @@ pub struct ClipboardService {
     file_helper: Arc<FileClipboardHelper>,
     pending_local: Arc<RwLock<Option<LocalPendingCopy>>>,
     pending_remote: Arc<RwLock<Option<LazyAnnouncement>>>,
+    pending_drag_sessions: Arc<RwLock<HashMap<String, LocalPendingCopy>>>,
+    pending_drag_order: Arc<RwLock<VecDeque<String>>>,
     last_remote_ip: Arc<RwLock<Option<IpAddr>>>,
     is_pasting: Arc<std::sync::atomic::AtomicBool>,
+    features: Arc<OnceLock<Arc<crate::features::FeatureManager>>>,
 }
 
 impl ClipboardService {
@@ -320,8 +325,11 @@ impl ClipboardService {
             file_helper,
             pending_local: Arc::new(RwLock::new(None)),
             pending_remote: Arc::new(RwLock::new(None)),
+            pending_drag_sessions: Arc::new(RwLock::new(HashMap::new())),
+            pending_drag_order: Arc::new(RwLock::new(VecDeque::new())),
             last_remote_ip: Arc::new(RwLock::new(None)),
             is_pasting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            features: Arc::new(OnceLock::new()),
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -330,6 +338,44 @@ impl ClipboardService {
 
         let _ = CLIPBOARD_INSTANCE.set(service.clone());
         Ok(service)
+    }
+
+    pub fn set_feature_manager(&self, fm: Arc<crate::features::FeatureManager>) {
+        let _ = self.features.set(fm);
+    }
+
+    fn is_clipboard_enabled(&self) -> bool {
+        self.features
+            .get()
+            .map(|f| f.is_enabled("clipboard"))
+            .unwrap_or(true)
+    }
+
+    fn is_dragdrop_enabled(&self) -> bool {
+        self.features
+            .get()
+            .map(|f| f.is_enabled("dragdrop"))
+            .unwrap_or(true)
+    }
+
+    pub async fn clear_pending_state(&self) {
+        {
+            let mut lock = self.pending_remote.write().await;
+            *lock = None;
+        }
+        {
+            let mut lock = self.pending_local.write().await;
+            *lock = None;
+        }
+        {
+            let mut ip_lock = self.last_remote_ip.write().await;
+            *ip_lock = None;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            reset_touchbar_paste_progress();
+            set_has_pending_remote_file(false);
+        }
     }
 
     pub fn get_pending_remote(&self) -> Arc<RwLock<Option<LazyAnnouncement>>> {
@@ -433,8 +479,15 @@ impl ClipboardService {
 
         let msg: ClipboardMessage = serde_json::from_slice(&plaintext)?;
 
+        let allow_clipboard = self.is_clipboard_enabled();
+        let allow_dragdrop = self.is_dragdrop_enabled();
+
         match msg.payload {
             ClipboardPayload::Text(text) => {
+                if !allow_clipboard {
+                    debug!("Ignoring remote clipboard text while Universal Clipboard/KVM is disabled");
+                    return Ok(());
+                }
                 if text.is_empty() || text.len() > MAX_TEXT_CHARS {
                     warn!("Rejected remote text out of bounds ({} bytes)", text.len());
                     return Ok(());
@@ -472,6 +525,10 @@ impl ClipboardService {
                 height,
                 rgba,
             } => {
+                if !allow_clipboard {
+                    debug!("Ignoring remote clipboard image while Universal Clipboard/KVM is disabled");
+                    return Ok(());
+                }
                 if !validate_image_bounds(width, height, rgba.len()) {
                     warn!(
                         "🚫 Rejected remote image from {}: invalid dimensions ({}x{}) or RGBA length ({})",
@@ -516,6 +573,10 @@ impl ClipboardService {
                 *seq_lock = new_seq;
             }
             ClipboardPayload::LazyAnnouncement(ann) => {
+                if !allow_clipboard {
+                    debug!("Ignoring remote file announcement while Universal Clipboard/KVM is disabled");
+                    return Ok(());
+                }
                 if ann.session_id.trim().is_empty()
                     || ann.session_id.len() > 128
                     || ann.total_files == 0
@@ -584,6 +645,10 @@ impl ClipboardService {
                 }
             }
             ClipboardPayload::RequestStream(req) => {
+                if !allow_clipboard {
+                    warn!("Rejected remote clipboard stream request while Universal Clipboard/KVM is disabled");
+                    return Ok(());
+                }
                 let local_copy = {
                     let lock = self.pending_local.read().await;
                     lock.clone()
@@ -609,6 +674,33 @@ impl ClipboardService {
                     }
                 } else {
                     warn!("No local copy pending to stream");
+                }
+            }
+            ClipboardPayload::RequestDragStream(req) => {
+                if !allow_dragdrop {
+                    warn!("Rejected cross-screen drag stream request while Drag & Drop/KVM is disabled");
+                    return Ok(());
+                }
+                let matched_copy = {
+                    let lock = self.pending_drag_sessions.read().await;
+                    lock.iter()
+                        .find(|(k, _)| {
+                            !req.session_id.is_empty()
+                                && trust::constant_time_eq(k.as_bytes(), req.session_id.as_bytes())
+                        })
+                        .map(|(_, v)| v.clone())
+                };
+                if let Some(copy) = matched_copy {
+                    info!(
+                        "🪂 Peer requested cross-screen drag stream for '{}' ({} files, {:.1} MB). Streaming over TransportV2...",
+                        copy.root_name,
+                        copy.total_files,
+                        copy.total_bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    Self::stream_files_over_session(&mut session, copy.directories, copy.files)
+                        .await?;
+                } else {
+                    warn!("Rejected unknown or expired drag stream session_id");
                 }
             }
         }
@@ -698,6 +790,10 @@ impl ClipboardService {
             {
                 let mut write_lock = self.last_seq.write().await;
                 *write_lock = current_seq;
+            }
+
+            if !self.is_clipboard_enabled() {
+                continue;
             }
 
             debug!("Clipboard sequence updated: {}", current_seq);
@@ -827,6 +923,7 @@ impl ClipboardService {
                             total_bytes,
                             directories,
                             files,
+                            top_entries: Vec::new(),
                         });
                     }
 
@@ -1190,7 +1287,7 @@ impl ClipboardService {
         }
     }
 
-    fn copy_entry_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    pub(crate) fn copy_entry_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let meta = std::fs::symlink_metadata(src)?;
         if meta.file_type().is_symlink() {
             return Ok(());
@@ -1228,6 +1325,14 @@ impl ClipboardService {
         peer_ip: &str,
         session_id: &str,
     ) -> Result<TransportSessionV2<TcpStream>> {
+        Self::connect_and_request_stream_kind(peer_ip, session_id, false).await
+    }
+
+    async fn connect_and_request_stream_kind(
+        peer_ip: &str,
+        session_id: &str,
+        is_drag: bool,
+    ) -> Result<TransportSessionV2<TcpStream>> {
         let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
         let mut session = trust::connect_transport_to_ip(
             peer_ip,
@@ -1238,11 +1343,16 @@ impl ClipboardService {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect TransportV2 to {}: {}", addr, e))?;
 
+        let stream_req = StreamRequest {
+            session_id: session_id.to_string(),
+        };
         let req_msg = ClipboardMessage {
             hash: String::new(),
-            payload: ClipboardPayload::RequestStream(StreamRequest {
-                session_id: session_id.to_string(),
-            }),
+            payload: if is_drag {
+                ClipboardPayload::RequestDragStream(stream_req)
+            } else {
+                ClipboardPayload::RequestStream(stream_req)
+            },
         };
 
         let serialized = serde_json::to_vec(&req_msg)?;
@@ -1255,6 +1365,162 @@ impl ClipboardService {
         .map_err(|e| anyhow::anyhow!("Stream request TransportV2 send error: {}", e))?;
 
         Ok(session)
+    }
+
+    /// Indexes local dragged files/folders using the exact security and quota protections used by
+    /// clipboard file streaming (`MAX_TRANSFER_FILES`, `MAX_DIRECTORY_DEPTH`, symlink & reserved-name guards).
+    pub fn collect_drag_items(paths: &[PathBuf]) -> Result<LocalPendingCopy> {
+        let mut root_name = String::new();
+        let mut directories = Vec::new();
+        let mut files = Vec::new();
+        let mut top_entries = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut total_files: usize = 0;
+
+        for root in paths {
+            let Ok(meta) = std::fs::symlink_metadata(root) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let Some(file_name) = root.file_name() else {
+                continue;
+            };
+            let name_str = file_name.to_string_lossy().to_string();
+            if validate_single_path_component(&name_str).is_err() {
+                continue;
+            }
+            if root_name.is_empty() {
+                root_name = name_str.clone();
+            }
+            if meta.is_dir() {
+                directories.push(name_str.clone());
+                top_entries.push(name_str.clone());
+                Self::collect_dir_entries(
+                    root,
+                    root,
+                    &name_str,
+                    1,
+                    &mut directories,
+                    &mut files,
+                    &mut total_bytes,
+                    &mut total_files,
+                );
+            } else if meta.is_file() {
+                let len = meta.len();
+                if total_files < MAX_TRANSFER_FILES
+                    && len <= MAX_SINGLE_FILE_BYTES
+                    && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
+                {
+                    total_bytes += len;
+                    total_files += 1;
+                    top_entries.push(name_str.clone());
+                    files.push((name_str, root.clone()));
+                }
+            }
+        }
+
+        if total_files == 0 || top_entries.is_empty() {
+            anyhow::bail!("No valid non-symlink files found for cross-screen drag");
+        }
+        if top_entries.len() > 1 {
+            root_name = format!("{} (+{} items)", root_name, top_entries.len() - 1);
+        }
+
+        Ok(LocalPendingCopy {
+            session_id: trust::generate_random_token_hex(32),
+            root_name,
+            total_files,
+            total_bytes,
+            directories,
+            files,
+            top_entries,
+        })
+    }
+
+    pub async fn register_drag_session(&self, copy: LocalPendingCopy) {
+        let mut map = self.pending_drag_sessions.write().await;
+        let mut order = self.pending_drag_order.write().await;
+        if map.len() >= 16 {
+            while let Some(oldest) = order.pop_front() {
+                if map.remove(&oldest).is_some() {
+                    break;
+                }
+            }
+        }
+        order.push_back(copy.session_id.clone());
+        map.insert(copy.session_id.clone(), copy);
+    }
+
+    pub async fn remove_drag_session(&self, session_id: &str) {
+        let mut map = self.pending_drag_sessions.write().await;
+        map.remove(session_id);
+    }
+
+    /// Streams an offered cross-screen drag session into an isolated `drag_staging/<session_id>` folder,
+    /// enforcing per-file & manifest SHA-256 verification before returning the staged top-level paths.
+    pub async fn stream_drag_session_to_staging(
+        &self,
+        peer_ip: &str,
+        session_id: &str,
+        expected_total_bytes: u64,
+        expected_total_files: usize,
+        top_entries: &[String],
+    ) -> Result<(PathBuf, Vec<PathBuf>)> {
+        if !self.is_dragdrop_enabled() {
+            anyhow::bail!("Cross-Screen Drag & Drop is disabled");
+        }
+        if session_id.trim().is_empty()
+            || session_id.len() > 128
+            || !session_id.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            anyhow::bail!("Rejected invalid drag session_id");
+        }
+        if top_entries.is_empty() {
+            anyhow::bail!("Rejected drag offer with empty item list");
+        }
+        for entry in top_entries {
+            validate_single_path_component(entry)?;
+        }
+
+        let staging_root = crate::system_info::app_data_dir().join("drag_staging");
+        let session_dir = staging_root.join(format!("drag_{}", session_id));
+        let _ = std::fs::remove_dir_all(&session_dir);
+        std::fs::create_dir_all(&session_dir)?;
+
+        let mut session = Self::connect_and_request_stream_kind(peer_ip, session_id, true)
+            .await
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&session_dir);
+                e
+            })?;
+
+        if let Err(e) = Self::receive_stream_frames_from_session(
+            &mut session,
+            &session_dir,
+            expected_total_bytes,
+            expected_total_files,
+            None,
+        )
+        .await
+        {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            return Err(e);
+        }
+
+        let mut staged_paths = Vec::with_capacity(top_entries.len());
+        for entry in top_entries {
+            let p = ensure_safe_contained_path(&session_dir, entry)?;
+            if p.exists() {
+                staged_paths.push(p);
+            }
+        }
+        if staged_paths.is_empty() {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            anyhow::bail!("Staged drag transfer produced no top-level files");
+        }
+        Ok((session_dir, staged_paths))
     }
 
     /// Receives and verifies directory frames, file frames, per-file SHA-256 digests, and the

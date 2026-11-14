@@ -6,3 +6,4 @@ pub const CONTROL_PORT: u16 = 58281;
 pub const CLIPBOARD_PORT: u16 = 58283;
 pub const AUDIO_PORT: u16 = 58284;
 pub const TELEMETRY_PORT: u16 = 58285;
+pub const INPUT_PORT: u16 = 58286;

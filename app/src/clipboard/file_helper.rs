@@ -51,9 +51,12 @@ impl FileClipboardHelper {
             "app_config.json"
                 | "device_id"
                 | "trusted_peers.json"
+                | "trusted_peers_v2.json"
                 | "peer_history.json"
                 | "active_mount.json"
                 | "features.json"
+                | "kvm_layout.json"
+                | "drag_staging"
                 | "spatial_test_chime.wav"
         ) || name.starts_with("trusted_peers.json.")
             || name.starts_with("features.json.")

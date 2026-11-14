@@ -32,8 +32,8 @@ impl Default for FeatureFlags {
         Self {
             display: true,
             clipboard: true,
-            input_kvm: false,
-            dragdrop: false,
+            input_kvm: true,
+            dragdrop: true,
             storage: true,
             touchid: false,
             truetone: true,
@@ -85,7 +85,13 @@ impl FeatureManager {
         let flags = if config_path.exists() {
             match fs::read_to_string(&config_path) {
                 Ok(data) => match serde_json::from_str::<FeatureFlags>(&data) {
-                    Ok(parsed) => parsed,
+                    Ok(mut parsed) => {
+                        if !parsed.input_kvm {
+                            parsed.clipboard = false;
+                            parsed.dragdrop = false;
+                        }
+                        parsed
+                    }
                     Err(e) => {
                         let epoch = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -129,13 +135,14 @@ impl FeatureManager {
     }
 
     /// Returns whether `feature` is enabled. Fails closed (`false`) for unknown feature names.
+    /// Both `clipboard` and `dragdrop` depend strictly on `input_kvm`.
     pub fn is_enabled(&self, feature: &str) -> bool {
         let f = self.flags.read().unwrap_or_else(|e| e.into_inner());
         match feature.trim() {
             "display" => f.display,
-            "clipboard" => f.clipboard,
+            "clipboard" => f.input_kvm && f.clipboard,
             "input_kvm" | "input" => f.input_kvm,
-            "dragdrop" => f.dragdrop,
+            "dragdrop" => f.input_kvm && f.dragdrop,
             "storage" => f.storage,
             "touchid" => f.touchid,
             "truetone" => f.truetone,
@@ -152,15 +159,38 @@ impl FeatureManager {
     }
 
     /// Updates a known feature flag and persists it atomically to disk, returning an error
-    /// if the feature identifier is unknown or disk persistence fails.
+    /// if the feature identifier is unknown, dependency is unmet, or disk persistence fails.
     pub fn set_flag_checked(&self, feature: &str, enabled: bool) -> Result<FeatureFlags, String> {
         let updated = {
             let mut f = self.flags.write().unwrap_or_else(|e| e.into_inner());
             match feature.trim() {
                 "display" => f.display = enabled,
-                "clipboard" => f.clipboard = enabled,
-                "input_kvm" | "input" => f.input_kvm = enabled,
-                "dragdrop" => f.dragdrop = enabled,
+                "clipboard" => {
+                    if enabled && !f.input_kvm {
+                        return Err(
+                            "Universal Input & KVM must be enabled before turning on Universal Clipboard."
+                                .to_string(),
+                        );
+                    }
+                    f.clipboard = enabled;
+                }
+                "input_kvm" | "input" => {
+                    f.input_kvm = enabled;
+                    if !enabled {
+                        // Auto-disable coupled continuity features when KVM is turned off.
+                        f.clipboard = false;
+                        f.dragdrop = false;
+                    }
+                }
+                "dragdrop" => {
+                    if enabled && !f.input_kvm {
+                        return Err(
+                            "Universal Input & KVM must be enabled before turning on Cross-Screen Drag & Drop."
+                                .to_string(),
+                        );
+                    }
+                    f.dragdrop = enabled;
+                }
                 "storage" => f.storage = enabled,
                 "touchid" => f.touchid = enabled,
                 "truetone" => f.truetone = enabled,
@@ -214,5 +244,47 @@ mod tests {
         };
         assert!(!mgr.is_enabled("nonexistent_feature"));
         assert!(mgr.set_flag_checked("nonexistent_feature", true).is_err());
+    }
+
+    #[test]
+    fn clipboard_and_dragdrop_depend_strictly_on_input_kvm() {
+        let path = std::env::temp_dir().join("integrator_features_kvm_dep_test.json");
+        let _ = fs::remove_file(&path);
+        let mgr = FeatureManager {
+            flags: Arc::new(RwLock::new(FeatureFlags::default())),
+            config_path: path.clone(),
+        };
+
+        assert!(mgr.is_enabled("input_kvm"));
+        assert!(mgr.is_enabled("clipboard"));
+        assert!(mgr.is_enabled("dragdrop"));
+
+        // With KVM on, dragdrop and clipboard toggle independently.
+        mgr.set_flag_checked("dragdrop", false).unwrap();
+        assert!(!mgr.is_enabled("dragdrop"));
+        assert!(mgr.is_enabled("clipboard"));
+        mgr.set_flag_checked("dragdrop", true).unwrap();
+        assert!(mgr.is_enabled("dragdrop"));
+
+        // Turning KVM off auto-disables both clipboard and dragdrop.
+        let off = mgr.set_flag_checked("input_kvm", false).unwrap();
+        assert!(!off.input_kvm);
+        assert!(!off.clipboard);
+        assert!(!off.dragdrop);
+        assert!(!mgr.is_enabled("clipboard"));
+        assert!(!mgr.is_enabled("dragdrop"));
+
+        // Turning clipboard or dragdrop on while KVM is off must fail.
+        assert!(mgr.set_flag_checked("clipboard", true).is_err());
+        assert!(mgr.set_flag_checked("dragdrop", true).is_err());
+
+        // Re-enabling KVM unlocks independent toggling again.
+        mgr.set_flag_checked("input_kvm", true).unwrap();
+        mgr.set_flag_checked("clipboard", true).unwrap();
+        mgr.set_flag_checked("dragdrop", true).unwrap();
+        assert!(mgr.is_enabled("clipboard"));
+        assert!(mgr.is_enabled("dragdrop"));
+
+        let _ = fs::remove_file(&path);
     }
 }

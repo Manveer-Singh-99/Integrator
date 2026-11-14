@@ -711,14 +711,7 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::ShowWindow => {
-                if let Some(app) = crate::GLOBAL_APP_HANDLE.get() {
-                    use tauri::Manager;
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.show();
-                        let _ = win.unminimize();
-                        let _ = win.set_focus();
-                    }
-                }
+                crate::core::request_show_window();
                 self.base_response(true, "Window focused").await
             }
             DisplayRpcRequest::SyncTrueTone {

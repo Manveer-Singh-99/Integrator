@@ -1,0 +1,815 @@
+<Window
+    x:Class="IntegratorUI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Integrator v2.0">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop Kind="BaseAlt" />
+    </Window.SystemBackdrop>
+
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="34" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Seamless Mica Title Bar Drag Strip -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Background="Transparent" Padding="14,0,140,0">
+            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <FontIcon Glyph="&#xE774;" FontSize="13" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                <TextBlock Text="Integrator" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center" />
+                <TextBlock Text="Unified Cross-Device Workspace" FontSize="11" Foreground="{ThemeResource TextFillColorTertiaryBrush}" VerticalAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Main Workspace Split: Fixed 198px Sidebar + Top Bar + Responsive Bento Grid -->
+        <Grid Grid.Row="1" Margin="14,4,14,14" ColumnSpacing="14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="198" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Left Sidebar -->
+            <Border Grid.Column="0" Style="{StaticResource SidebarSurfaceStyle}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Brand Header -->
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="4,4,4,16">
+                        <Border Width="34" Height="34" CornerRadius="10"
+                                Background="{ThemeResource AccentFillColorDefaultBrush}">
+                            <FontIcon Glyph="&#xE774;" FontSize="16" Foreground="White" />
+                        </Border>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="Integrator" FontSize="15" FontWeight="SemiBold" />
+                            <TextBlock Text="v2.0 SECURITY" FontSize="10" FontWeight="SemiBold"
+                                       CharacterSpacing="50"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <!-- Category Nav Pills (exact order matching macOS SwiftUI) -->
+                    <StackPanel Grid.Row="1" Spacing="4">
+                        <Button x:Name="NavAllBtn" Tag="all" Click="NavButton_Click"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="10,8" CornerRadius="8">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE80A;" FontSize="14" />
+                                <TextBlock Text="All Modules" FontSize="13" FontWeight="Medium" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="NavDisplayBtn" Tag="display" Click="NavButton_Click"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="10,8" CornerRadius="8">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE7F4;" FontSize="14" />
+                                <TextBlock Text="Display &amp; GPU" FontSize="13" FontWeight="Medium" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="NavInputBtn" Tag="input" Click="NavButton_Click"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="10,8" CornerRadius="8">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE8B0;" FontSize="14" />
+                                <TextBlock Text="Input &amp; Clipboard" FontSize="13" FontWeight="Medium" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="NavNetworkBtn" Tag="network" Click="NavButton_Click"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="10,8" CornerRadius="8">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xEA18;" FontSize="14" />
+                                <TextBlock Text="Network &amp; Trust" FontSize="13" FontWeight="Medium" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="NavSystemBtn" Tag="system" Click="NavButton_Click"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="10,8" CornerRadius="8">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE713;" FontSize="14" />
+                                <TextBlock Text="System &amp; Audio" FontSize="13" FontWeight="Medium" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Bottom Live Peer Summary Card -->
+                    <Border Grid.Row="3" Padding="12" CornerRadius="12"
+                            Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                        <StackPanel Spacing="4">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <Ellipse x:Name="SidebarPeerDot" Width="8" Height="8" Fill="#E89E1B" />
+                                <TextBlock x:Name="SidebarPeerName" Text="Searching for peer…"
+                                           FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <TextBlock x:Name="SidebarLinkDesc" Text="Searching Ethernet / USB-C / LAN"
+                                       FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       TextTrimming="CharacterEllipsis" />
+                            <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2,0,0">
+                                <TextBlock x:Name="SidebarSpeedText" Text="--" FontSize="11" FontWeight="SemiBold"
+                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                <TextBlock Text="•" FontSize="11" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                <TextBlock x:Name="SidebarTrustText" Text="Pair Required" FontSize="11"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Right Content Area: Top Bar + Responsive Cards ScrollView -->
+            <Grid Grid.Column="1" RowSpacing="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Top Bar -->
+                <Border Grid.Row="0" Style="{StaticResource BentoCardStyle}" Padding="14,10">
+                    <Grid ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Grid.Column="0" VerticalAlignment="Center" Spacing="2">
+                            <TextBlock x:Name="TopHostnameText" Text="Workstation" FontSize="15" FontWeight="SemiBold" />
+                            <TextBlock x:Name="TopSubtitleText" Text="Windows 11 • Initializing core…"
+                                       FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       TextTrimming="CharacterEllipsis" />
+                        </StackPanel>
+
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <Border x:Name="TopPeerPill" Padding="10,4" CornerRadius="12"
+                                    Background="#22E89E1B" BorderBrush="#66E89E1B" BorderThickness="1">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Ellipse x:Name="TopPeerDot" Width="7" Height="7" Fill="#E89E1B" />
+                                    <TextBlock x:Name="TopPeerLabel" Text="Searching" FontSize="11" FontWeight="SemiBold" />
+                                </StackPanel>
+                            </Border>
+
+                            <Button Click="RefreshBtn_Click" Padding="10,5">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE72C;" FontSize="12" />
+                                    <TextBlock Text="Refresh" FontSize="12" />
+                                </StackPanel>
+                            </Button>
+
+                            <Button Click="OpenCacheBtn_Click" Padding="10,5">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE8B7;" FontSize="12" />
+                                    <TextBlock Text="Open Cache" FontSize="12" />
+                                </StackPanel>
+                            </Button>
+
+                            <Button Click="HideWindowBtn_Click" Padding="10,5">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE747;" FontSize="12" />
+                                    <TextBlock Text="Hide" FontSize="12" />
+                                </StackPanel>
+                            </Button>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <!-- Scrollable Bento Grid (1 or 2 columns dynamically matching SwiftUI LazyVGrid) -->
+                <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                    <Grid x:Name="CardsGrid" ColumnSpacing="14" RowSpacing="14" Margin="0,0,4,8" SizeChanged="CardsGrid_SizeChanged">
+
+                        <!-- CARD 1: Extended Screen & GPU Acceleration -->
+                        <Border x:Name="CardDisplay" Tag="display" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE7F4;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Extended Screen &amp; GPU Acceleration" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="DisplayPill" Grid.Column="2" Padding="8,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="DisplayPillDot" Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="DisplayPillText" Text="Standby" FontSize="11" FontWeight="SemiBold" MaxWidth="136" TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchDisplay" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="display" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" Spacing="4">
+                                        <TextBlock Text="Encode GPU" Style="{StaticResource SubCaptionStyle}" />
+                                        <ComboBox x:Name="EncodeGpuCombo" HorizontalAlignment="Stretch" />
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Spacing="4">
+                                        <TextBlock Text="Decode GPU" Style="{StaticResource SubCaptionStyle}" />
+                                        <ComboBox x:Name="DecodeGpuCombo" HorizontalAlignment="Stretch" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <Border x:Name="GpuTelemetryBox" Visibility="Collapsed" Padding="10,8" CornerRadius="8"
+                                        Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}">
+                                    <TextBlock x:Name="GpuTelemetryText" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                                </Border>
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button x:Name="BtnExtendMacToPc" Grid.Column="0" Content="Extend Mac -&gt; PC"
+                                            HorizontalAlignment="Stretch" Click="ExtendMacToPc_Click" />
+                                    <Button x:Name="BtnExtendPcToMac" Grid.Column="1" Content="Extend PC -&gt; Mac"
+                                            HorizontalAlignment="Stretch" Click="ExtendPcToMac_Click" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="BtnApplyGpu" Content="Apply GPU" Click="ApplyGpu_Click" />
+                                    <Button x:Name="BtnQueryGpu" Content="Query GPU" Click="QueryGpu_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 2: Universal Input KVM & Desk Layout -->
+                        <Border x:Name="CardKvm" Tag="input" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE8B0;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Universal Input KVM &amp; Desk Layout" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="KvmPill" Grid.Column="2" Padding="8,4" CornerRadius="10"
+                                            Background="#22E89E1B" BorderBrush="#44E89E1B" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="KvmPillDot" Width="7" Height="7" Fill="#E89E1B" />
+                                            <TextBlock x:Name="KvmPillText" Text="Armed" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchKvm" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="input_kvm" />
+                                </Grid>
+
+                                <!-- Interactive 2D Desk Placement Schematic -->
+                                <Border Padding="10" CornerRadius="10"
+                                        Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                                    <Grid RowSpacing="8" ColumnSpacing="8">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <Button x:Name="EdgeTopBtn" Grid.Row="0" Grid.Column="1" Content="Top" Tag="top"
+                                                Click="EdgeBtn_Click" HorizontalAlignment="Center" Padding="12,4" FontSize="11" />
+                                        <Button x:Name="EdgeLeftBtn" Grid.Row="1" Grid.Column="0" Content="Left" Tag="left"
+                                                Click="EdgeBtn_Click" VerticalAlignment="Center" Padding="10,6" FontSize="11" />
+
+                                        <Grid x:Name="DeskSchematicHost" Grid.Row="1" Grid.Column="1" MinHeight="68"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center" />
+
+                                        <Button x:Name="EdgeRightBtn" Grid.Row="1" Grid.Column="2" Content="Right" Tag="right"
+                                                Click="EdgeBtn_Click" VerticalAlignment="Center" Padding="10,6" FontSize="11" />
+                                        <Button x:Name="EdgeBottomBtn" Grid.Row="2" Grid.Column="1" Content="Bottom" Tag="bottom"
+                                                Click="EdgeBtn_Click" HorizontalAlignment="Center" Padding="12,4" FontSize="11" />
+                                    </Grid>
+                                </Border>
+
+                                <!-- Sliders -->
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="108" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="52" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Alignment Offset" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <Slider x:Name="AlignmentSlider" Grid.Column="1" Minimum="-0.5" Maximum="0.5" StepFrequency="0.02"
+                                            ValueChanged="KvmSlider_ValueChanged" />
+                                    <TextBlock x:Name="AlignmentValueText" Grid.Column="2" Text="0%" FontSize="12"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="108" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="52" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Edge Hop Delay" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <Slider x:Name="HopDelaySlider" Grid.Column="1" Minimum="0" Maximum="300" StepFrequency="5"
+                                            ValueChanged="KvmSlider_ValueChanged" />
+                                    <TextBlock x:Name="HopDelayValueText" Grid.Column="2" Text="35 ms" FontSize="12"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <CheckBox x:Name="ChkDeadCorners" Content="Corner Guard" FontSize="12"
+                                              Checked="KvmCheck_Changed" Unchecked="KvmCheck_Changed" />
+                                    <CheckBox x:Name="ChkModifierTrans" Content="Ctrl &lt;-&gt; Cmd" FontSize="12"
+                                              Checked="KvmCheck_Changed" Unchecked="KvmCheck_Changed" />
+                                    <CheckBox x:Name="ChkTrackpad" Content="Trackpad" FontSize="12"
+                                              Checked="KvmCheck_Changed" Unchecked="KvmCheck_Changed" />
+                                </StackPanel>
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button x:Name="BtnSaveKvm" Grid.Column="0" Content="Save &amp; Sync Layout"
+                                            Style="{StaticResource AccentButtonStyle}" Click="SaveKvmLayout_Click" />
+                                    <Button x:Name="BtnReleaseKvm" Grid.Column="1" Content="Release Lock"
+                                            Click="ReleaseKvm_Click" />
+                                    <TextBlock Grid.Column="2" Text="Panic: Ctrl+Alt+Shift+Esc" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 3: Cross-Screen Drag & Drop -->
+                        <Border x:Name="CardDragDrop" Tag="input" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE8DE;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Cross-Screen Drag &amp; Drop" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="DragDropPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#2220B85A" BorderBrush="#4420B85A" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="DragDropPillDot" Width="7" Height="7" Fill="#20B85A" />
+                                            <TextBlock x:Name="DragDropPillText" Text="Ready" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchDragDrop" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="dragdrop" />
+                                </Grid>
+
+                                <StackPanel x:Name="DragDropKvmWarn" Visibility="Collapsed" Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE72E;" FontSize="12" Foreground="#E89E1B" />
+                                    <TextBlock Text="Enable Universal Input KVM to use Cross-Screen Drag &amp; Drop."
+                                               FontSize="12" Foreground="#E89E1B" TextWrapping="Wrap" />
+                                </StackPanel>
+
+                                <StackPanel Orientation="Horizontal" Spacing="14">
+                                    <CheckBox x:Name="ChkGhostThumb" Content="Translucent Ghost Badge" FontSize="12"
+                                              Checked="KvmCheck_Changed" Unchecked="KvmCheck_Changed" />
+                                    <CheckBox x:Name="ChkQosClamp" Content="QoS Clamp" FontSize="12"
+                                              Checked="KvmCheck_Changed" Unchecked="KvmCheck_Changed" />
+                                </StackPanel>
+
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="168" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Fallback Drop Folder" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <ComboBox x:Name="DropFolderCombo" Grid.Column="1" HorizontalAlignment="Stretch"
+                                              SelectionChanged="DropFolderCombo_SelectionChanged">
+                                        <ComboBoxItem Content="Downloads" Tag="downloads" />
+                                        <ComboBoxItem Content="Desktop" Tag="desktop" />
+                                        <ComboBoxItem Content="Clipboard Cache" Tag="cache" />
+                                    </ComboBox>
+                                </Grid>
+
+                                <TextBlock x:Name="ActiveDragLabel" Visibility="Collapsed" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="BtnSaveDropPrefs" Content="Save Drop Prefs"
+                                            Style="{StaticResource AccentButtonStyle}" Click="SaveKvmLayout_Click" />
+                                    <Button Content="Open Cache" Click="OpenCacheBtn_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 4: Universal Clipboard -->
+                        <Border x:Name="CardClipboard" Tag="input" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE77F;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Universal Clipboard" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="ClipboardPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#2220B85A" BorderBrush="#4420B85A" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="ClipboardPillDot" Width="7" Height="7" Fill="#20B85A" />
+                                            <TextBlock x:Name="ClipboardPillText" Text="Active" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchClipboard" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="clipboard" />
+                                </Grid>
+
+                                <StackPanel x:Name="ClipboardKvmWarn" Visibility="Collapsed" Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE72E;" FontSize="12" Foreground="#E89E1B" />
+                                    <TextBlock Text="Enable Universal Input KVM to unlock Universal Clipboard."
+                                               FontSize="12" Foreground="#E89E1B" TextWrapping="Wrap" />
+                                </StackPanel>
+
+                                <TextBlock Text="Zero-RAM ChaCha20 file streaming with per-file &amp; manifest SHA-256 verification and atomic isolated staging."
+                                           Style="{StaticResource SubCaptionStyle}" />
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="BtnPasteRemote" Content="Paste Remote Item"
+                                            Style="{StaticResource AccentButtonStyle}" Click="PasteRemote_Click" />
+                                    <Button Content="Open Cache" Click="OpenCacheBtn_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 5: Peer Discovery & v2.0 Trust -->
+                        <Border x:Name="CardDiscovery" Tag="network" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xEA18;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Peer Discovery &amp; v2.0 Trust" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="DiscoveryPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#2218B4D4" BorderBrush="#4418B4D4" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="DiscoveryPillDot" Width="7" Height="7" Fill="#18B4D4" />
+                                            <TextBlock x:Name="DiscoveryPillText" Text="PIN: ------" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Pairing PIN:" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="PairingPinText" Grid.Column="1" Text="------" FontSize="14" FontWeight="Bold"
+                                               FontFamily="Consolas" VerticalAlignment="Center" />
+                                    <Button Grid.Column="2" Content="Regenerate PIN" Click="RegenPin_Click" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="ManualIpInput" Grid.Column="0" PlaceholderText="Manual peer IP (e.g. 10.99.99.2)" />
+                                    <Button Grid.Column="1" Content="Add IP" Click="AddManualIp_Click" />
+                                </Grid>
+
+                                <StackPanel x:Name="PeersListPanel" Spacing="6" />
+
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <FontIcon Glyph="&#xE72E;" FontSize="11" Foreground="#20B85A" />
+                                    <TextBlock Text="SPAKE2 + Ed25519 Mutual Auth Enforced on USB-C &amp; LAN (v2.0 Locked)"
+                                               FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 6: Route Telemetry & Link Speed -->
+                        <Border x:Name="CardSpeed" Tag="network" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xEC49;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Route Telemetry &amp; Link Speed" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="SpeedPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="SpeedPillDot" Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="SpeedPillText" Text="--" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="Route" FontSize="11" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                        <TextBlock x:Name="RouteTransportText" Text="Scanning" FontSize="12" FontWeight="SemiBold" />
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="Speed" FontSize="11" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                        <TextBlock x:Name="RouteSpeedText" Text="--" FontSize="12" FontWeight="SemiBold" />
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="RTT" FontSize="11" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                        <TextBlock x:Name="RouteRttText" Text="--" FontSize="12" FontWeight="SemiBold" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock x:Name="InterfacesText" Text="Interfaces: scanning..." Style="{StaticResource SubCaptionStyle}" />
+                                <TextBlock x:Name="SpeedBenchmarkText" Visibility="Collapsed" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="#18B4D4" TextWrapping="Wrap" />
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="BtnSpeedTest" Content="Run Live Speed Test"
+                                            Style="{StaticResource AccentButtonStyle}" Click="RunSpeedTest_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 7: Auto-Mounted Shared Storage -->
+                        <Border x:Name="CardStorage" Tag="network" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xEDA2;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Auto-Mounted Shared Storage" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="StoragePill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="StoragePillDot" Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="StoragePillText" Text="Unmounted" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchStorage" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="storage" />
+                                </Grid>
+
+                                <TextBlock x:Name="StorageSummaryText" Text="SMB volume ready on trusted peer"
+                                           Style="{StaticResource SubCaptionStyle}" />
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="PreferredShareInput" Grid.Column="0" PlaceholderText="Preferred Share Name" />
+                                    <Button Grid.Column="1" Content="Set Share" Click="SetShare_Click" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="BtnToggleMount" Content="Mount Shared Storage"
+                                            Style="{StaticResource AccentButtonStyle}" Click="ToggleMount_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 8: True Tone & Chromatic Sync -->
+                        <Border x:Name="CardTrueTone" Tag="display" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE706;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="True Tone &amp; Chromatic Sync" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="TrueTonePill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22E8C01B" BorderBrush="#44E8C01B" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="TrueTonePillDot" Width="7" Height="7" Fill="#E8C01B" />
+                                            <TextBlock x:Name="TrueTonePillText" Text="Manual" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchTrueTone" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="truetone" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="52" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="56" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="CCT" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <Slider x:Name="CctSlider" Grid.Column="1" Minimum="3500" Maximum="8000" StepFrequency="100" Value="6500"
+                                            ValueChanged="TrueToneSlider_ValueChanged" />
+                                    <TextBlock x:Name="CctValueText" Grid.Column="2" Text="6500K" FontSize="12"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="52" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="56" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Gamma" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
+                                    <Slider x:Name="GammaSlider" Grid.Column="1" Minimum="0.70" Maximum="1.30" StepFrequency="0.05" Value="1.0"
+                                            ValueChanged="TrueToneSlider_ValueChanged" />
+                                    <TextBlock x:Name="GammaValueText" Grid.Column="2" Text="1.00x" FontSize="12"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="BtnSyncCalibration" Content="Sync Calibration"
+                                            Style="{StaticResource AccentButtonStyle}" Click="SyncCalibration_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 9: Touch Bar Hardware HUD -->
+                        <Border x:Name="CardTouchBar" Tag="display" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE93E;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Touch Bar Hardware HUD" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="TouchBarPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="TouchBarPillDot" Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="TouchBarPillText" Text="Unavailable" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchTouchBar" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="touchbar" />
+                                </Grid>
+
+                                <TextBlock x:Name="TouchBarDescText" Text="No Apple Touch Bar hardware detected on this workstation."
+                                           Style="{StaticResource SubCaptionStyle}" />
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="BtnToggleTouchBar" Content="Toggle Touch Bar HUD"
+                                            Style="{StaticResource AccentButtonStyle}" IsEnabled="False" Click="ToggleTouchBar_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 10: Dynamic Audio Routing -->
+                        <Border x:Name="CardAudio" Tag="system" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE767;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Dynamic Audio Routing" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="AudioPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#2220B85A" BorderBrush="#4420B85A" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="AudioPillDot" Width="7" Height="7" Fill="#20B85A" />
+                                            <TextBlock Text="UDP :58284" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                    <ToggleSwitch x:Name="SwitchAudio" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
+                                                  Toggled="FeatureSwitch_Toggled" Tag="audio" />
+                                </Grid>
+
+                                <TextBlock x:Name="AudioTopologyText"
+                                           Text="Authenticated ChaCha20-Poly1305 spatial UDP audio sink ready."
+                                           Style="{StaticResource SubCaptionStyle}" />
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="BtnPlayChime" Content="Play Spatial Test Chime"
+                                            Style="{StaticResource AccentButtonStyle}" Click="PlayChime_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 11: System & Autostart -->
+                        <Border x:Name="CardSystem" Tag="system" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE713;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="System &amp; Autostart" Style="{StaticResource CardTitleStyle}" />
+                                    <Border x:Name="AutostartPill" Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse x:Name="AutostartPillDot" Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="AutostartPillText" Text="Manual Launch" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+
+                                <ToggleSwitch x:Name="SwitchAutostart" Header="Launch Integrator Automatically at Login"
+                                              Toggled="AutostartSwitch_Toggled" />
+
+                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Continuity Camera • Multi-WAN Bonding"
+                                           Style="{StaticResource SubCaptionStyle}" />
+                            </StackPanel>
+                        </Border>
+
+                        <!-- CARD 12: Live Telemetry & Security Logs -->
+                        <Border x:Name="CardLogs" Tag="system" Style="{StaticResource BentoCardStyle}">
+                            <StackPanel Spacing="12">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource IconBadgeStyle}">
+                                        <FontIcon Glyph="&#xE756;" FontSize="14" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                    </Border>
+                                    <TextBlock Grid.Column="1" Text="Live Telemetry &amp; Security Logs" Style="{StaticResource CardTitleStyle}" />
+                                    <Border Grid.Column="2" Padding="10,4" CornerRadius="10"
+                                            Background="#22888888" BorderBrush="#44888888" BorderThickness="1" VerticalAlignment="Center">
+                                        <StackPanel Orientation="Horizontal" Spacing="5">
+                                            <Ellipse Width="7" Height="7" Fill="#888888" />
+                                            <TextBlock x:Name="LogsCountText" Text="0 lines" FontSize="11" FontWeight="SemiBold" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+
+                                <Border Height="175" CornerRadius="8" Padding="10"
+                                        Background="#22000000" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        <StackPanel x:Name="LogsListPanel" Spacing="3" />
+                                    </ScrollViewer>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+
+                    </Grid>
+                </ScrollViewer>
+            </Grid>
+        </Grid>
+
+        <!-- Floating Toast Banner -->
+        <Border x:Name="ToastBanner" Grid.Row="1" Visibility="Collapsed"
+                HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,28,24"
+                Padding="14,10" CornerRadius="18"
+                Background="{ThemeResource AcrylicInAppFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Ellipse x:Name="ToastDot" Width="8" Height="8" Fill="#18B4D4" />
+                <TextBlock x:Name="ToastMessage" FontSize="12" FontWeight="Medium" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

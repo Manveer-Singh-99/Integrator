@@ -38,6 +38,8 @@ fn main() {
             "-static",
             "src/touchbar_hud.swift",
             "src/ambient_light.swift",
+            "src/kvm_macos.swift",
+            "ui-macos/IntegratorApp.swift",
             "-o",
             &lib_path,
         ]);
@@ -83,10 +85,13 @@ fn main() {
                 }
             }
         }
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
         println!("cargo:rustc-link-search=native={}", out_dir);
         println!("cargo:rustc-link-lib=static=touchbar");
         println!("cargo:rerun-if-changed=src/touchbar_hud.swift");
         println!("cargo:rerun-if-changed=src/ambient_light.swift");
+        println!("cargo:rerun-if-changed=src/kvm_macos.swift");
+        println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
         let obj_path = format!("{}/virtual_display.o", out_dir);
@@ -126,9 +131,21 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=SwiftUI");
         println!("cargo:rustc-link-lib=framework=IOKit");
         println!("cargo:rerun-if-changed=src/virtual_display.m");
     }
 
-    tauri_build::build();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cc::Build::new()
+            .cpp(true)
+            .file("src/kvm_windows.cpp")
+            .compile("kvm_windows");
+        println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rustc-link-lib=shell32");
+        println!("cargo:rustc-link-lib=user32");
+        println!("cargo:rustc-link-lib=gdi32");
+        println!("cargo:rustc-link-lib=shlwapi");
+        println!("cargo:rerun-if-changed=src/kvm_windows.cpp");
+    }
 }

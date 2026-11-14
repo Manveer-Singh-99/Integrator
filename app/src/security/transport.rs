@@ -4,6 +4,7 @@
 //! - Display & Control RPC (`Port 58281`, `ServiceId::DisplayRpc = 0x01`)
 //! - Clipboard & File Transfer (`Port 58283`, `ServiceId::ClipboardTransfer = 0x02`)
 //! - Link Speed Benchmark (`Port 58285`, `ServiceId::Benchmark = 0x03`)
+//! - Universal Input KVM & Drag-Drop Control (`Port 58286`, `ServiceId::InputKvm = 0x04`)
 //!
 //! Cryptographic properties:
 //! 1. **Mutual Authentication (`TransportHello` -> `TransportServerHello` -> `TransportClientFinish`)**:
@@ -60,6 +61,7 @@ pub enum ServiceId {
     DisplayRpc = 0x01,
     ClipboardTransfer = 0x02,
     Benchmark = 0x03,
+    InputKvm = 0x04,
 }
 
 impl ServiceId {
@@ -68,6 +70,7 @@ impl ServiceId {
             0x01 => Some(ServiceId::DisplayRpc),
             0x02 => Some(ServiceId::ClipboardTransfer),
             0x03 => Some(ServiceId::Benchmark),
+            0x04 => Some(ServiceId::InputKvm),
             _ => None,
         }
     }
@@ -77,6 +80,7 @@ impl ServiceId {
             ServiceId::DisplayRpc => 64 * 1024,            // 64 KiB
             ServiceId::ClipboardTransfer => 2 * 1024 * 1024, // 2 MiB (1 MiB chunk + metadata)
             ServiceId::Benchmark => 1024 * 1024,           // 1 MiB
+            ServiceId::InputKvm => 128 * 1024,             // 128 KiB (input + drag preview icons)
         }
     }
 }
@@ -1223,6 +1227,181 @@ where
             established_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
         })
+    }
+}
+
+/// Read half of a full-duplex split `TransportSessionV2`, owning independent inbound AEAD state.
+pub struct TransportReaderV2<R> {
+    reader: R,
+    service_id: ServiceId,
+    peer_device_id: [u8; 16],
+    peer_device_id_hex: String,
+    rx_state: DirectionalCipherState,
+}
+
+/// Write half of a full-duplex split `TransportSessionV2`, owning independent outbound AEAD state.
+pub struct TransportWriterV2<W> {
+    writer: W,
+    service_id: ServiceId,
+    peer_device_id: [u8; 16],
+    peer_device_id_hex: String,
+    tx_state: DirectionalCipherState,
+    established_at: Instant,
+    rekey_frame_limit: u64,
+}
+
+impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
+    pub fn peer_device_id(&self) -> [u8; 16] {
+        self.peer_device_id
+    }
+
+    pub fn peer_device_id_hex(&self) -> &str {
+        &self.peer_device_id_hex
+    }
+
+    pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
+        let max_plaintext = self.service_id.max_plaintext_frame_bytes();
+        let max_ciphertext = max_plaintext + AEAD_TAG_LEN;
+
+        loop {
+            let mut hdr = [0u8; RECORD_HEADER_LEN];
+            self.reader
+                .read_exact(&mut hdr)
+                .await
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+
+            let mut magic = [0u8; 4];
+            magic.copy_from_slice(&hdr[0..4]);
+            if magic != TRANSPORT_WIRE_MAGIC {
+                return Err(TransportError::InvalidMagic(magic));
+            }
+            if hdr[4] != TRANSPORT_HEADER_VERSION_BYTE {
+                return Err(TransportError::UnsupportedVersion(hdr[4] as u16));
+            }
+
+            let ct_len = u32::from_be_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]) as usize;
+            if ct_len < AEAD_TAG_LEN || ct_len > max_ciphertext {
+                return Err(TransportError::OversizedFrame {
+                    len: ct_len,
+                    max: max_ciphertext,
+                });
+            }
+
+            let mut ciphertext = vec![0u8; ct_len];
+            self.reader
+                .read_exact(&mut ciphertext)
+                .await
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+
+            let (frame_type, plaintext) = self.rx_state.open_record(&hdr, &ciphertext)?;
+            match frame_type {
+                RecordFrameType::ApplicationData => return Ok(plaintext),
+                RecordFrameType::Rekey => {
+                    self.rx_state.ratchet_epoch()?;
+                }
+                RecordFrameType::KeepAlive => continue,
+                RecordFrameType::CloseNotify => return Err(TransportError::ConnectionClosed),
+            }
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
+    pub fn peer_device_id(&self) -> [u8; 16] {
+        self.peer_device_id
+    }
+
+    pub fn peer_device_id_hex(&self) -> &str {
+        &self.peer_device_id_hex
+    }
+
+    pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
+        let rekey_frame = self.tx_state.seal_record(
+            RecordFrameType::Rekey,
+            b"REKEY-V2",
+            self.service_id.max_plaintext_frame_bytes(),
+        )?;
+        self.writer
+            .write_all(&rekey_frame)
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        self.tx_state.ratchet_epoch()?;
+        Ok(())
+    }
+
+    pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        if self.tx_state.current_seq() >= self.rekey_frame_limit
+            || (self.tx_state.current_epoch() == 0
+                && self.established_at.elapsed().as_secs() >= DEFAULT_REKEY_AGE_SECS)
+        {
+            self.initiate_rekey().await?;
+        }
+
+        let frame = self.tx_state.seal_record(
+            RecordFrameType::ApplicationData,
+            plaintext,
+            self.service_id.max_plaintext_frame_bytes(),
+        )?;
+        self.writer
+            .write_all(&frame)
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn close_notify(&mut self) -> Result<(), TransportError> {
+        let frame = self.tx_state.seal_record(
+            RecordFrameType::CloseNotify,
+            b"",
+            self.service_id.max_plaintext_frame_bytes(),
+        )?;
+        self.writer
+            .write_all(&frame)
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl TransportSessionV2<tokio::net::TcpStream> {
+    /// Splits a TCP `TransportSessionV2` into lock-free full-duplex reader and writer halves.
+    pub fn into_split_tcp(
+        self,
+    ) -> (
+        TransportReaderV2<tokio::net::tcp::OwnedReadHalf>,
+        TransportWriterV2<tokio::net::tcp::OwnedWriteHalf>,
+    ) {
+        let (read_half, write_half) = self.stream.into_split();
+        (
+            TransportReaderV2 {
+                reader: read_half,
+                service_id: self.service_id,
+                peer_device_id: self.peer_device_id,
+                peer_device_id_hex: self.peer_device_id_hex.clone(),
+                rx_state: self.rx_state,
+            },
+            TransportWriterV2 {
+                writer: write_half,
+                service_id: self.service_id,
+                peer_device_id: self.peer_device_id,
+                peer_device_id_hex: self.peer_device_id_hex,
+                tx_state: self.tx_state,
+                established_at: self.established_at,
+                rekey_frame_limit: self.rekey_frame_limit,
+            },
+        )
     }
 }
 
