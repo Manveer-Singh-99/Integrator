@@ -11,13 +11,7 @@ pub struct FileClipboardHelper {
 
 impl FileClipboardHelper {
     pub fn new() -> Result<Self> {
-        let home = if cfg!(target_os = "windows") {
-            std::env::var("USERPROFILE").map(PathBuf::from)?
-        } else {
-            std::env::var("HOME").map(PathBuf::from)?
-        };
-
-        let cache_dir = home.join(".usbc_clipboard_cache");
+        let cache_dir = crate::system_info::app_data_dir();
         if !cache_dir.exists() {
             std::fs::create_dir_all(&cache_dir)?;
         }
@@ -33,6 +27,21 @@ impl FileClipboardHelper {
         &self.cache_dir
     }
 
+    fn is_persistent_state_file(path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(
+                "app_config.json"
+                    | "device_id"
+                    | "trusted_peers.json"
+                    | "peer_history.json"
+                    | "active_mount.json"
+                    | "features.json"
+                    | "spatial_test_chime.wav"
+            )
+        )
+    }
+
     /// Prunes stale entries in the cache directory to prevent disk bloat.
     /// Keeps total cache size under max_bytes (default 10 GB) and removes entries older than max_age_days.
     pub fn prune_cache(&self, max_age_days: u64, max_bytes: u64) {
@@ -41,12 +50,15 @@ impl FileClipboardHelper {
         }
 
         let now = std::time::SystemTime::now();
-        let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+        let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86400));
 
         let mut entries = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.cache_dir) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
+                if Self::is_persistent_state_file(&path) {
+                    continue;
+                }
                 if let Ok(meta) = entry.metadata() {
                     let mtime = meta.modified().unwrap_or(now);
                     let size = if meta.is_dir() {
@@ -95,34 +107,7 @@ impl FileClipboardHelper {
     }
 
     fn find_helper(name: &str) -> Option<PathBuf> {
-        let candidates = [
-            PathBuf::from(name),
-            PathBuf::from(format!("app/{}", name)),
-            if cfg!(target_os = "windows") {
-                PathBuf::from(r"C:\Users\Manveer Singh\mac-windows-usbc-bridge\app").join(name)
-            } else {
-                PathBuf::from("/Users/manveersingh/mac-windows-usbc-bridge/app").join(name)
-            },
-        ];
-        for c in &candidates {
-            if c.exists() {
-                if let Ok(abs) = c.canonicalize() {
-                    return Some(abs);
-                }
-                return Some(c.clone());
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let c1 = parent.join(name);
-                if c1.exists() { return Some(c1); }
-                let c2 = parent.join("../../").join(name);
-                if c2.exists() { return Some(c2); }
-                let c3 = parent.join("../../app").join(name);
-                if c3.exists() { return Some(c3); }
-            }
-        }
-        None
+        crate::system_info::find_app_helper(name)
     }
 
     /// Reads currently copied file paths from the OS clipboard.

@@ -1,45 +1,51 @@
-//! Cross-Platform Launch at Login Manager.
-//!
-//! Controls automatic login startup on macOS and Windows:
-//! - macOS: Native Apple System Events Login Item (System Settings -> General -> Login Items)
-//! - Windows: Standard HKCU\Software\Microsoft\Windows\CurrentVersion\Run registry key
-
+use crate::system_info;
+use anyhow::Result;
+use std::path::PathBuf;
 use std::process::Command;
-use anyhow::{Result, Context};
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+#[cfg(target_os = "macos")]
+const LAUNCH_AGENT_LABEL: &str = "com.manveersingh.integrator";
 
 pub struct AutostartManager;
 
 impl AutostartManager {
-    /// Checks whether Launch at Login is currently configured for the application.
     pub fn is_enabled() -> bool {
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
+            let plist_exists = mac_launch_agent_plist().is_file();
+            if plist_exists {
+                return true;
+            }
             let script = r#"tell application "System Events" to (exists login item "Integrator") or (exists login item "MacWindowsBridge")"#;
-            if let Ok(output) = Command::new("osascript").args(&["-e", script]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                return stdout.trim() == "true";
+            if let Ok(out) = Command::new("osascript").args(["-e", script]).output() {
+                return String::from_utf8_lossy(&out.stdout).trim() == "true";
             }
             false
-        } else if cfg!(target_os = "windows") {
-            #[cfg(target_os = "windows")]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                let mut cmd = Command::new("reg.exe");
-                cmd.args(&["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "Integrator"]);
-                cmd.creation_flags(CREATE_NO_WINDOW);
-                if let Ok(out) = cmd.output() {
-                    return out.status.success();
-                }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = Command::new("reg");
+            cmd.creation_flags(0x08000000);
+            cmd.args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "Integrator",
+            ]);
+            if let Ok(out) = cmd.output() {
+                return out.status.success();
             }
             false
-        } else {
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
             false
         }
     }
 
-    /// Sets the Launch at Login preference.
     pub fn set_enabled(enable: bool) -> Result<bool> {
         if enable {
             Self::enable()
@@ -48,75 +54,101 @@ impl AutostartManager {
         }
     }
 
-    /// Registers the application to run automatically upon user login.
     pub fn enable() -> Result<bool> {
-        if cfg!(target_os = "macos") {
-            let app_path = "/Applications/Integrator.app";
-            let script = format!(
-                r#"tell application "System Events"
-                    if exists login item "MacWindowsBridge" then
-                        delete login item "MacWindowsBridge"
-                    end if
-                    if not (exists login item "Integrator") then
-                        make login item at end with properties {{path:"{}", hidden:false, name:"Integrator"}}
-                    end if
-                end tell"#,
-                app_path
-            );
-            let out = Command::new("osascript")
-                .args(&["-e", &script])
-                .output()
-                .context("Failed to execute osascript to add login item")?;
-
-            if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("macOS login item registration failed: {}", err.trim());
-            }
-            tracing::info!("🚀 Registered Integrator as macOS System Login Item");
-            Ok(true)
-        } else if cfg!(target_os = "windows") {
-            #[cfg(target_os = "windows")]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                let exe_path = std::env::current_exe()?
-                    .to_string_lossy()
-                    .to_string();
-                let cmd_val = format!("\"{}\" --hidden", exe_path);
-
-                let mut cmd = Command::new("reg.exe");
-                cmd.args(&[
-                    "add",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                    "/v",
-                    "Integrator",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    &cmd_val,
-                    "/f",
-                ]);
-                cmd.creation_flags(CREATE_NO_WINDOW);
-                let out = cmd.output().context("Failed to add Windows registry Run key")?;
-
-                if !out.status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    anyhow::bail!("Windows Run key registration failed: {}", err.trim());
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(app_bundle) = resolve_mac_app_bundle() {
+                let app_str = app_bundle.to_string_lossy().replace('"', "\\\"");
+                let script = format!(
+                    r#"tell application "System Events"
+                        if not (exists login item "Integrator") then
+                            make login item at end with properties {{path:"{}", hidden:false, name:"Integrator"}}
+                        end if
+                    end tell"#,
+                    app_str
+                );
+                let out = Command::new("osascript").args(["-e", &script]).output()?;
+                if out.status.success() {
+                    tracing::info!("🚀 Registered {} as macOS System Login Item", app_str);
+                    return Ok(true);
                 }
-                tracing::info!("🚀 Registered Integrator in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-                Ok(true)
             }
-            #[cfg(not(target_os = "windows"))]
-            {
-                Ok(true)
+
+            // Fallback: LaunchAgent pointing to current executable
+            let exe = std::env::current_exe()?;
+            let plist = mac_launch_agent_plist();
+            if let Some(parent) = plist.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
-        } else {
-            anyhow::bail!("Unsupported OS for login item");
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+                LAUNCH_AGENT_LABEL,
+                exe.to_string_lossy()
+            );
+            std::fs::write(&plist, xml)?;
+            tracing::info!("🚀 Registered LaunchAgent autostart: {}", plist.display());
+            Ok(true)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let exe_path = std::env::current_exe()?;
+            let exe_str = format!("\"{}\" --minimized", exe_path.to_string_lossy());
+            let mut cmd = Command::new("reg");
+            cmd.creation_flags(0x08000000);
+            cmd.args([
+                "add",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "Integrator",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &exe_str,
+                "/f",
+            ]);
+            let out = cmd.output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "Failed to register Windows Run key: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            tracing::info!("🚀 Registered Integrator in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+            Ok(true)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Ok(false)
         }
     }
 
-    /// Removes the application from automatic login.
     pub fn disable() -> Result<bool> {
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
+            let plist = mac_launch_agent_plist();
+            if plist.exists() {
+                let _ = Command::new("launchctl")
+                    .args(["unload", plist.to_string_lossy().as_ref()])
+                    .output();
+                let _ = std::fs::remove_file(&plist);
+            }
             let script = r#"tell application "System Events"
                 if exists login item "Integrator" then
                     delete login item "Integrator"
@@ -125,40 +157,87 @@ impl AutostartManager {
                     delete login item "MacWindowsBridge"
                 end if
             end tell"#;
-            let out = Command::new("osascript")
-                .args(&["-e", script])
-                .output()
-                .context("Failed to execute osascript to delete login item")?;
-
+            let out = Command::new("osascript").args(["-e", script]).output()?;
             if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("macOS login item deletion failed: {}", err.trim());
+                anyhow::bail!(
+                    "Failed to remove login item: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
             tracing::info!("🚀 Removed Integrator from macOS System Login Items");
             Ok(false)
-        } else if cfg!(target_os = "windows") {
-            #[cfg(target_os = "windows")]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                let mut cmd = Command::new("reg.exe");
-                cmd.args(&[
-                    "delete",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                    "/v",
-                    "Integrator",
-                    "/f",
-                ]);
-                cmd.creation_flags(CREATE_NO_WINDOW);
-                let _ = cmd.output();
-                tracing::info!("🚀 Removed Integrator from Windows Run registry key");
-                Ok(false)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                Ok(false)
-            }
-        } else {
-            anyhow::bail!("Unsupported OS for login item");
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = Command::new("reg");
+            cmd.creation_flags(0x08000000);
+            cmd.args([
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "Integrator",
+                "/f",
+            ]);
+            let _ = cmd.output()?;
+            tracing::info!("🚀 Removed Integrator from Windows Run registry key");
+            Ok(false)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Ok(false)
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launch_agent_plist() -> PathBuf {
+    system_info::user_home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", LAUNCH_AGENT_LABEL))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_mac_app_bundle() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            if ancestor
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("app"))
+                .unwrap_or(false)
+            {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+
+    let user_app = system_info::user_home_dir().join("Applications/Integrator.app");
+    for candidate in [
+        PathBuf::from("/Applications/Integrator.app"),
+        user_app,
+    ] {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(out) = Command::new("mdfind")
+        .arg("kMDItemCFBundleIdentifier == 'com.manveersingh.integrator'")
+        .output()
+    {
+        if out.status.success() {
+            if let Some(first) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                let p = PathBuf::from(first.trim());
+                if p.is_dir() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
 }

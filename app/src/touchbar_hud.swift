@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit
 
 // MARK: - RPC Data Models
 struct GpuTelemetryData: Codable {
@@ -76,12 +77,16 @@ class GoopyLiquidGlassPillView: NSView {
         label.isEditable = false
         label.isSelectable = false
         label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.stringValue = text
         addSubview(label)
 
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6)
         ])
 
         updateRestingStyle()
@@ -242,12 +247,39 @@ class GoopyLiquidGlassPillView: NSView {
 @objc public class TouchBarHudController: NSObject, NSTouchBarDelegate {
     public static let shared = TouchBarHudController()
 
-    public private(set) var isActive: Bool = false
+    private static let rpcPort: UInt16 = 58281
+    private let stateLock = NSLock()
+
+    private var _isActive: Bool = false
+    public var isActive: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isActive
+    }
+
+    private var _peerIp: String? = nil
+    var peerIp: String? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _peerIp
+        }
+        set {
+            stateLock.lock()
+            _peerIp = Self.normalizedIp(newValue)
+            stateLock.unlock()
+        }
+    }
+
+    private var isPollingInFlight: Bool = false
+    private var lastKnownGpuName: String? = nil
+    private var pendingPasteText: String? = nil
+
     var touchBar: NSTouchBar?
-    var peerIp: String = "10.99.99.1"
     var pollTimer: Timer?
 
     // Goopy Liquid Glass Pill Views
+    var viewGpu: GoopyLiquidGlassPillView?
     var viewTemp: GoopyLiquidGlassPillView?
     var viewPower: GoopyLiquidGlassPillView?
     var viewClock: GoopyLiquidGlassPillView?
@@ -255,15 +287,75 @@ class GoopyLiquidGlassPillView: NSView {
     var viewUtil: GoopyLiquidGlassPillView?
     var viewPaste: GoopyLiquidGlassPillView?
 
+    private static func normalizedIp(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        var addr4 = in_addr()
+        var addr6 = in6_addr()
+        if inet_pton(AF_INET, trimmed, &addr4) == 1 || inet_pton(AF_INET6, trimmed, &addr6) == 1 {
+            return trimmed
+        }
+        return nil
+    }
+
+    /// Detects whether this Mac has Touch Bar hardware / ControlStrip / DFR runtime
+    /// and NSTouchBar system-modal presentation support.
+    public static func isTouchBarSupported() -> Bool {
+        let presentSelPlacement = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
+        let presentSelLegacy = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
+        let hasModalApi =
+            (NSTouchBar.responds(to: presentSelPlacement) && class_getClassMethod(NSTouchBar.self, presentSelPlacement) != nil) ||
+            (NSTouchBar.responds(to: presentSelLegacy) && class_getClassMethod(NSTouchBar.self, presentSelLegacy) != nil)
+        guard hasModalApi else { return false }
+
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.controlstrip").isEmpty {
+            return true
+        }
+
+        if let dfrHandle = dlopen("/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation", RTLD_LAZY),
+           let dfrSym = dlsym(dfrHandle, "DFRGetScreenSize") {
+            typealias DfrSizeFn = @convention(c) () -> CGSize
+            let fn = unsafeBitCast(dfrSym, to: DfrSizeFn.self)
+            let size = fn()
+            if size.width > 0 && size.height > 0 {
+                return true
+            }
+        }
+
+        let mainPort: mach_port_t = 0
+        if let matchDispdfr = IOServiceNameMatching("dispdfr") {
+            let service = IOServiceGetMatchingService(mainPort, matchDispdfr)
+            if service != 0 {
+                IOObjectRelease(service)
+                return true
+            }
+        }
+
+        if let matchT2 = IOServiceMatching("AppleEmbeddedOSSupportHost") {
+            let service = IOServiceGetMatchingService(mainPort, matchT2)
+            if service != 0 {
+                IOObjectRelease(service)
+                return true
+            }
+        }
+
+        return false
+    }
+
     public func showRemotePasteButton(name: String, totalBytes: UInt64) {
+        guard Self.isTouchBarSupported() else { return }
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let mb = Double(totalBytes) / (1024.0 * 1024.0)
             let sizeStr = mb >= 1024.0 ? String(format: "%.1f GB", mb / 1024.0) : String(format: "%.0f MB", mb)
             let btnText = "📥 Paste \(name) (\(sizeStr))"
+            self.pendingPasteText = btnText
 
             if !self.isActive {
-                self.start(peerIp: self.peerIp)
+                self.activateOnMainThread()
             }
 
             if let existing = self.viewPaste {
@@ -284,6 +376,7 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     public func updatePasteProgress(percent: Float, mbPerSec: Float) {
+        guard Self.isTouchBarSupported() else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let view = self.viewPaste else { return }
             view.setText(String(format: "📥 %.0f%% • %.0f MB/s", percent, mbPerSec))
@@ -294,6 +387,7 @@ class GoopyLiquidGlassPillView: NSView {
     public func resetPasteButton() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.pendingPasteText = nil
             if let tb = self.touchBar {
                 let idPaste = NSTouchBarItem.Identifier("paste_remote")
                 tb.defaultItemIdentifiers.removeAll { $0 == idPaste }
@@ -306,103 +400,179 @@ class GoopyLiquidGlassPillView: NSView {
         super.init()
     }
 
-    public func start(peerIp: String = "10.99.99.1") {
-        self.peerIp = peerIp
-        DispatchQueue.main.async { [weak self] in
+    public func launch_touchbar_hud(peerIp: String? = nil) {
+        start(peerIp: peerIp)
+    }
+
+    public func start(peerIp: String? = nil) {
+        guard Self.isTouchBarSupported() else {
+            NSLog("ℹ️ [TouchBarHud] Touch Bar DF/NSTouchBar support not detected on this Mac; skipping HUD launch.")
+            return
+        }
+
+        if let normalized = Self.normalizedIp(peerIp) {
+            self.peerIp = normalized
+        } else if peerIp == nil || peerIp?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            self.peerIp = nil
+        }
+
+        let block = { [weak self] in
             guard let self = self else { return }
-            guard !self.isActive else { return }
-            self.isActive = true
-            self.setupTouchBar()
-            self.startPolling()
-            print("🚀 NVIDIA Goopy Liquid Glass HUD started directly within main app process.")
+            if self.isActive {
+                self.queryTelemetry()
+                return
+            }
+            self.activateOnMainThread()
+        }
+
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
         }
     }
 
+    private func activateOnMainThread() {
+        guard Self.isTouchBarSupported() else { return }
+        guard !self.isActive else { return }
+        guard self.setupTouchBar() else { return }
+
+        stateLock.lock()
+        _isActive = true
+        stateLock.unlock()
+
+        self.startPolling()
+        NSLog("🚀 Integrator Touch Bar GPU HUD active.")
+    }
+
     public func dismiss() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.isActive else { return }
-            self.isActive = false
+        let block = { [weak self] in
+            guard let self = self else { return }
+            guard self.isActive else { return }
+
+            self.stateLock.lock()
+            self._isActive = false
+            self.stateLock.unlock()
+
             self.pollTimer?.invalidate()
             self.pollTimer = nil
+
             if let tb = self.touchBar {
                 let sel = NSSelectorFromString("dismissSystemModalTouchBar:")
-                if NSTouchBar.responds(to: sel) {
+                if NSTouchBar.responds(to: sel),
+                   let method = class_getClassMethod(NSTouchBar.self, sel) {
                     typealias DismissFunc = @convention(c) (AnyClass, Selector, AnyObject) -> Void
-                    let method = class_getClassMethod(NSTouchBar.self, sel)!
                     let imp = method_getImplementation(method)
                     let fn = unsafeBitCast(imp, to: DismissFunc.self)
                     fn(NSTouchBar.self, sel, tb)
                 }
             }
+
             self.touchBar = nil
-            print("🚀 NVIDIA Goopy Liquid Glass HUD dismissed.")
+            self.viewGpu = nil
+            self.viewTemp = nil
+            self.viewPower = nil
+            self.viewClock = nil
+            self.viewVram = nil
+            self.viewUtil = nil
+            self.viewPaste = nil
+            NSLog("🚀 Integrator Touch Bar GPU HUD dismissed.")
+        }
+
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
         }
     }
 
-    func setupTouchBar() {
+    @discardableResult
+    func setupTouchBar() -> Bool {
+        guard Self.isTouchBarSupported() else { return false }
+
         let tb = NSTouchBar()
         tb.delegate = self
 
-        // Exclusively render the 5 performance metric pills
         tb.defaultItemIdentifiers = [
+            NSTouchBarItem.Identifier("gpu"),
             NSTouchBarItem.Identifier("temp"),
             NSTouchBarItem.Identifier("power"),
             NSTouchBarItem.Identifier("clock"),
             NSTouchBarItem.Identifier("vram"),
             NSTouchBarItem.Identifier("util")
         ]
-        self.touchBar = tb
 
-        // Placement: 0 (NSTouchBarPlacementDefault) keeps the native macOS Control Strip intact!
+        // Placement: 0 (NSTouchBarPlacementDefault) keeps the native macOS Control Strip intact.
         let sel = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
-        if NSTouchBar.responds(to: sel) {
+        if NSTouchBar.responds(to: sel),
+           let method = class_getClassMethod(NSTouchBar.self, sel) {
+            self.touchBar = tb
             typealias PresentFunc = @convention(c) (AnyClass, Selector, AnyObject, Int64, AnyObject?) -> Void
-            let method = class_getClassMethod(NSTouchBar.self, sel)!
             let imp = method_getImplementation(method)
             let fn = unsafeBitCast(imp, to: PresentFunc.self)
             fn(NSTouchBar.self, sel, tb, 0, nil)
-            print("🚀 NVIDIA Goopy Liquid Glass HUD presented (placement 0, Control Strip Preserved)")
-        } else {
-            let sel2 = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
+            NSLog("🚀 Integrator Touch Bar GPU HUD presented (placement 0, Control Strip preserved)")
+            return true
+        }
+
+        let sel2 = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
+        if NSTouchBar.responds(to: sel2),
+           let method2 = class_getClassMethod(NSTouchBar.self, sel2) {
+            self.touchBar = tb
             typealias PresentFunc2 = @convention(c) (AnyClass, Selector, AnyObject, AnyObject?) -> Void
-            let method2 = class_getClassMethod(NSTouchBar.self, sel2)!
             let imp2 = method_getImplementation(method2)
             let fn2 = unsafeBitCast(imp2, to: PresentFunc2.self)
             fn2(NSTouchBar.self, sel2, tb, nil)
+            NSLog("🚀 Integrator Touch Bar GPU HUD presented (legacy modal API)")
+            return true
         }
+
+        return false
     }
 
     public func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         let item = NSCustomTouchBarItem(identifier: identifier)
         switch identifier.rawValue {
+        case "gpu":
+            let v = GoopyLiquidGlassPillView(text: "Peer Offline", accent: .systemGray, width: 118)
+            self.viewGpu = v
+            item.view = v
+            item.visibilityPriority = .high
         case "temp":
-            let v = GoopyLiquidGlassPillView(text: "🌡️ --°C", accent: NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0), width: 85)
+            let v = GoopyLiquidGlassPillView(text: "🌡️ --°C", accent: .systemGray, width: 74)
             self.viewTemp = v
             item.view = v
+            item.visibilityPriority = .high
         case "power":
-            let v = GoopyLiquidGlassPillView(text: "⚡ --W", accent: NSColor(red: 0.95, green: 0.65, blue: 0.1, alpha: 1.0), width: 85)
+            let v = GoopyLiquidGlassPillView(text: "⚡ --W", accent: .systemGray, width: 72)
             self.viewPower = v
             item.view = v
+            item.visibilityPriority = .low
         case "clock":
-            let v = GoopyLiquidGlassPillView(text: "🚀 -- MHz", accent: NSColor(red: 0.05, green: 0.7, blue: 0.85, alpha: 1.0), width: 98)
+            let v = GoopyLiquidGlassPillView(text: "🚀 -- MHz", accent: .systemGray, width: 86)
             self.viewClock = v
             item.view = v
+            item.visibilityPriority = .low
         case "vram":
-            let v = GoopyLiquidGlassPillView(text: "💾 -- / 8.1 GB", accent: NSColor(red: 0.25, green: 0.5, blue: 0.95, alpha: 1.0), width: 110)
+            let v = GoopyLiquidGlassPillView(text: "💾 -- / -- GB", accent: .systemGray, width: 102)
             self.viewVram = v
             item.view = v
+            item.visibilityPriority = .normal
         case "util":
-            let v = GoopyLiquidGlassPillView(text: "📊 --% GPU", accent: NSColor(red: 0.65, green: 0.35, blue: 0.95, alpha: 1.0), width: 88)
+            let v = GoopyLiquidGlassPillView(text: "📊 --% GPU", accent: .systemGray, width: 82)
             self.viewUtil = v
             item.view = v
+            item.visibilityPriority = .high
         case "paste_remote":
-            let v = GoopyLiquidGlassPillView(text: "📥 Paste", accent: NSColor.systemCyan, width: 170)
+            let initialText = self.pendingPasteText ?? "📥 Paste"
+            let v = GoopyLiquidGlassPillView(text: initialText, accent: NSColor.systemCyan, width: 155)
             v.onTap = {
                 v.setText("⏳ Streaming...")
                 trigger_rust_remote_paste()
             }
             self.viewPaste = v
             item.view = v
+            item.visibilityPriority = .high
         default:
             return nil
         }
@@ -410,128 +580,308 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     func startPolling() {
+        self.pollTimer?.invalidate()
         queryTelemetry()
-        self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.queryTelemetry()
         }
+        RunLoop.main.add(timer, forMode: .common)
+        self.pollTimer = timer
     }
 
     func queryTelemetry() {
+        guard self.isActive else { return }
+
+        stateLock.lock()
+        if isPollingInFlight {
+            stateLock.unlock()
+            return
+        }
+        isPollingInFlight = true
+        stateLock.unlock()
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self, self.isActive else { return }
+            guard let self = self else { return }
+            defer {
+                self.stateLock.lock()
+                self.isPollingInFlight = false
+                self.stateLock.unlock()
+            }
+            guard self.isActive else { return }
 
-            let host = self.peerIp
-            let port: UInt16 = 58281
+            guard let host = self.peerIp else {
+                self.updateOfflineUi(statusText: "Peer Offline")
+                return
+            }
 
-            var clientSocket: Int32 = -1
-            clientSocket = socket(AF_INET, SOCK_STREAM, 0)
-            guard clientSocket >= 0 else { return }
+            guard let response = self.sendRpcRequest(host: host, port: Self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
+                self.updateOfflineUi(statusText: "Peer Offline")
+                return
+            }
 
-            var timeout = timeval(tv_sec: 1, tv_usec: 0)
-            setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-            setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            if response.success, let telemetry = response.gpu_telemetry {
+                self.updateUi(with: telemetry)
+            } else {
+                self.updateOfflineUi(statusText: "Telemetry N/A")
+            }
+        }
+    }
 
-            var serverAddr = sockaddr_in()
-            serverAddr.sin_family = sa_family_t(AF_INET)
-            serverAddr.sin_port = port.bigEndian
-            inet_pton(AF_INET, host, &serverAddr.sin_addr)
+    private func sendRpcRequest(host: String, port: UInt16, requestJson: String) -> DisplayRpcResponseData? {
+        guard let reqJson = requestJson.data(using: .utf8) else { return nil }
 
-            let connectRes = withUnsafePointer(to: &serverAddr) {
+        var addr4 = sockaddr_in()
+        var addr6 = sockaddr_in6()
+        let isIPv4 = inet_pton(AF_INET, host, &addr4.sin_addr) == 1
+        let isIPv6 = !isIPv4 && inet_pton(AF_INET6, host, &addr6.sin6_addr) == 1
+        guard isIPv4 || isIPv6 else { return nil }
+
+        let clientSocket = socket(isIPv4 ? AF_INET : AF_INET6, SOCK_STREAM, 0)
+        guard clientSocket >= 0 else { return nil }
+        defer { close(clientSocket) }
+
+        var noSigPipe: Int32 = 1
+        setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let connectRes: Int32
+        if isIPv4 {
+            addr4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr4.sin_family = sa_family_t(AF_INET)
+            addr4.sin_port = port.bigEndian
+            connectRes = withUnsafePointer(to: &addr4) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     connect(clientSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
-
-            guard connectRes == 0 else {
-                close(clientSocket)
-                return
-            }
-
-            let reqJson = "\"GetGpuTelemetry\"".data(using: .utf8)!
-            var lenBigEndian = UInt32(reqJson.count).bigEndian
-
-            send(clientSocket, &lenBigEndian, 4, 0)
-            reqJson.withUnsafeBytes { rawPtr in
-                _ = send(clientSocket, rawPtr.baseAddress, reqJson.count, 0)
-            }
-
-            var respLenBigEndian: UInt32 = 0
-            let rcvLen = recv(clientSocket, &respLenBigEndian, 4, 0)
-            guard rcvLen == 4 else {
-                close(clientSocket)
-                return
-            }
-
-            let respLen = Int(UInt32(bigEndian: respLenBigEndian))
-            guard respLen > 0 && respLen < 65536 else {
-                close(clientSocket)
-                return
-            }
-
-            var respData = Data(count: respLen)
-            var totalRead = 0
-            while totalRead < respLen {
-                let bytesLeft = respLen - totalRead
-                let n = respData.withUnsafeMutableBytes { ptr -> Int in
-                    guard let base = ptr.baseAddress else { return 0 }
-                    return recv(clientSocket, base.advanced(by: totalRead), bytesLeft, 0)
+        } else {
+            addr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr6.sin6_family = sa_family_t(AF_INET6)
+            addr6.sin6_port = port.bigEndian
+            connectRes = withUnsafePointer(to: &addr6) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(clientSocket, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
                 }
-                if n <= 0 { break }
-                totalRead += n
             }
-            close(clientSocket)
+        }
 
-            guard totalRead == respLen else { return }
+        guard connectRes == 0 else { return nil }
 
-            if let decoded = try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData),
-               let t = decoded.gpu_telemetry {
-                self.updateUi(with: t)
+        var lenBigEndian = UInt32(reqJson.count).bigEndian
+        let headerSent = withUnsafeBytes(of: &lenBigEndian) { ptr -> Bool in
+            guard let base = ptr.baseAddress else { return false }
+            return sendAll(socket: clientSocket, buffer: base, length: 4)
+        }
+        guard headerSent else { return nil }
+
+        let bodySent = reqJson.withUnsafeBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress else { return false }
+            return sendAll(socket: clientSocket, buffer: base, length: reqJson.count)
+        }
+        guard bodySent else { return nil }
+
+        var respLenBigEndian: UInt32 = 0
+        let headerRead = withUnsafeMutableBytes(of: &respLenBigEndian) { ptr -> Bool in
+            guard let base = ptr.baseAddress else { return false }
+            return recvExact(socket: clientSocket, buffer: base, length: 4)
+        }
+        guard headerRead else { return nil }
+
+        let respLen = Int(UInt32(bigEndian: respLenBigEndian))
+        guard respLen > 0 && respLen <= 65_536 else { return nil }
+
+        var respData = Data(count: respLen)
+        let bodyRead = respData.withUnsafeMutableBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress else { return false }
+            return recvExact(socket: clientSocket, buffer: base, length: respLen)
+        }
+        guard bodyRead else { return nil }
+
+        return try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData)
+    }
+
+    private func sendAll(socket fd: Int32, buffer: UnsafeRawPointer, length: Int) -> Bool {
+        var totalSent = 0
+        while totalSent < length {
+            let sent = send(fd, buffer.advanced(by: totalSent), length - totalSent, 0)
+            if sent <= 0 {
+                return false
             }
+            totalSent += sent
+        }
+        return true
+    }
+
+    private func recvExact(socket fd: Int32, buffer: UnsafeMutableRawPointer, length: Int) -> Bool {
+        var totalRead = 0
+        while totalRead < length {
+            let n = recv(fd, buffer.advanced(by: totalRead), length - totalRead, 0)
+            if n <= 0 {
+                return false
+            }
+            totalRead += n
+        }
+        return true
+    }
+
+    private func compactGpuName(_ raw: String) -> String {
+        var name = raw
+            .replacingOccurrences(of: "(R)", with: "")
+            .replacingOccurrences(of: "(TM)", with: "")
+            .replacingOccurrences(of: "®", with: "")
+            .replacingOccurrences(of: "™", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        while name.contains("  ") {
+            name = name.replacingOccurrences(of: "  ", with: " ")
+        }
+
+        if name.isEmpty {
+            return "GPU"
+        }
+
+        let removableSuffixes = [" Laptop GPU", " Graphics"]
+        for suffix in removableSuffixes where name.count > 14 && name.hasSuffix(suffix) {
+            name = String(name.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+        }
+
+        let removablePrefixes = ["NVIDIA ", "GeForce ", "AMD ", "Radeon ", "Intel "]
+        for prefix in removablePrefixes where name.count > 14 && name.hasPrefix(prefix) {
+            name = String(name.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+        }
+
+        let maxChars = 14
+        if name.count > maxChars {
+            return String(name.prefix(maxChars - 1)) + "…"
+        }
+        return name
+    }
+
+    func updateOfflineUi(statusText: String = "Peer Offline") {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.viewGpu?.setText(statusText)
+            self.viewGpu?.setAccent(.systemGray)
+
+            self.viewTemp?.setText("🌡️ --°C")
+            self.viewTemp?.setAccent(.systemGray)
+
+            self.viewPower?.setText("⚡ --W")
+            self.viewPower?.setAccent(.systemGray)
+
+            self.viewClock?.setText("🚀 -- MHz")
+            self.viewClock?.setAccent(.systemGray)
+
+            self.viewVram?.setText("💾 -- / -- GB")
+            self.viewVram?.setAccent(.systemGray)
+
+            self.viewUtil?.setText("📊 --% GPU")
+            self.viewUtil?.setAccent(.systemGray)
         }
     }
 
     func updateUi(with t: GpuTelemetryData) {
+        self.stateLock.lock()
+        self.lastKnownGpuName = t.gpu_name
+        self.stateLock.unlock()
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            let hasLiveCounters =
+                t.temperature_c > 0 ||
+                t.power_usage_watts > 0.05 ||
+                t.core_clock_mhz > 0 ||
+                t.gpu_utilization_percent > 0
+
+            // 0. Dynamic GPU Name (compactly truncated for Touch Bar width)
+            if let v = self.viewGpu {
+                v.setText("🎮 \(self.compactGpuName(t.gpu_name))")
+                v.setAccent(NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0))
+            }
+
             // 1. Temperature with Dynamic Thermal Color
             if let v = self.viewTemp {
-                v.setText("🌡️ \(t.temperature_c)°C")
-                if t.temperature_c < 55 {
-                    v.setAccent(NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0)) // Emerald
-                } else if t.temperature_c < 75 {
-                    v.setAccent(NSColor(red: 0.95, green: 0.55, blue: 0.1, alpha: 1.0)) // Amber
+                if t.temperature_c > 0 {
+                    v.setText("🌡️ \(t.temperature_c)°C")
+                    if t.temperature_c < 55 {
+                        v.setAccent(NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0))
+                    } else if t.temperature_c < 75 {
+                        v.setAccent(NSColor(red: 0.95, green: 0.55, blue: 0.1, alpha: 1.0))
+                    } else {
+                        v.setAccent(NSColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1.0))
+                    }
                 } else {
-                    v.setAccent(NSColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1.0)) // Ruby
+                    v.setText("🌡️ --°C")
+                    v.setAccent(.systemGray)
                 }
             }
 
             // 2. Power Draw
             if let v = self.viewPower {
-                v.setText(String(format: "⚡ %.1fW", t.power_usage_watts))
+                if t.power_usage_watts > 0.05 {
+                    v.setText(String(format: "⚡ %.1fW", t.power_usage_watts))
+                    v.setAccent(NSColor(red: 0.95, green: 0.65, blue: 0.1, alpha: 1.0))
+                } else {
+                    v.setText("⚡ --W")
+                    v.setAccent(.systemGray)
+                }
             }
 
             // 3. Core Clock
             if let v = self.viewClock {
-                v.setText("🚀 \(t.core_clock_mhz) MHz")
+                if t.core_clock_mhz > 0 {
+                    v.setText("🚀 \(t.core_clock_mhz) MHz")
+                    v.setAccent(NSColor(red: 0.05, green: 0.7, blue: 0.85, alpha: 1.0))
+                } else {
+                    v.setText("🚀 -- MHz")
+                    v.setAccent(.systemGray)
+                }
             }
 
             // 4. VRAM Usage
             if let v = self.viewVram {
-                let usedGb = Float(t.memory_used_mb) / 1024.0
-                let totalGb = Float(t.memory_total_mb) / 1024.0
-                v.setText(String(format: "💾 %.1f/%.1f GB", usedGb, totalGb))
+                if t.memory_total_mb > 0 {
+                    let totalGb = Double(t.memory_total_mb) / 1024.0
+                    if t.memory_used_mb > 0 || hasLiveCounters {
+                        let usedGb = Double(t.memory_used_mb) / 1024.0
+                        v.setText(String(format: "💾 %.1f/%.1f GB", usedGb, totalGb))
+                    } else {
+                        v.setText(String(format: "💾 --/%.1f GB", totalGb))
+                    }
+                    v.setAccent(NSColor(red: 0.25, green: 0.5, blue: 0.95, alpha: 1.0))
+                } else if t.memory_used_mb > 0 {
+                    let usedGb = Double(t.memory_used_mb) / 1024.0
+                    v.setText(String(format: "💾 %.1f GB", usedGb))
+                    v.setAccent(NSColor(red: 0.25, green: 0.5, blue: 0.95, alpha: 1.0))
+                } else {
+                    v.setText("💾 -- GB")
+                    v.setAccent(.systemGray)
+                }
             }
 
             // 5. Utilization
             if let v = self.viewUtil {
-                v.setText("📊 \(t.gpu_utilization_percent)% GPU")
+                if hasLiveCounters {
+                    v.setText("📊 \(t.gpu_utilization_percent)% GPU")
+                    v.setAccent(NSColor(red: 0.65, green: 0.35, blue: 0.95, alpha: 1.0))
+                } else {
+                    v.setText("📊 --% GPU")
+                    v.setAccent(.systemGray)
+                }
             }
         }
     }
 
     public func updateUiExplicit(temp: UInt32, power: Float, clock: UInt32, vramUsed: UInt64, vramTotal: UInt64, util: UInt32) {
+        stateLock.lock()
+        let gpuName = lastKnownGpuName ?? "Remote GPU"
+        stateLock.unlock()
+
         let t = GpuTelemetryData(
-            gpu_name: "NVIDIA GeForce RTX 5070 Laptop GPU",
+            gpu_name: gpuName,
             temperature_c: temp,
             power_usage_watts: power,
             gpu_utilization_percent: util,
@@ -547,8 +897,8 @@ class GoopyLiquidGlassPillView: NSView {
 // MARK: - C FFI Interface for Main App Integration
 @_cdecl("init_touchbar_in_app")
 public func init_touchbar_in_app(peerIpPtr: UnsafePointer<CChar>?) {
-    let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : "10.99.99.1"
-    TouchBarHudController.shared.start(peerIp: peerIp)
+    let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil
+    TouchBarHudController.shared.launch_touchbar_hud(peerIp: peerIp)
 }
 
 @_cdecl("dismiss_touchbar_in_app")
@@ -582,8 +932,13 @@ public func update_touchbar_telemetry_in_app(
 
 @_cdecl("run_touchbar_cli_loop")
 public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
-    let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : "10.99.99.1"
-    TouchBarHudController.shared.start(peerIp: peerIp)
+    guard TouchBarHudController.isTouchBarSupported() else {
+        NSLog("ℹ️ [TouchBarHud] Touch Bar DF/NSTouchBar support not detected on this Mac; exiting CLI loop.")
+        return
+    }
+
+    let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil
+    TouchBarHudController.shared.launch_touchbar_hud(peerIp: peerIp)
 
     signal(SIGINT) { _ in
         TouchBarHudController.shared.dismiss()

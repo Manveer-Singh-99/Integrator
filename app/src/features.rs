@@ -1,4 +1,4 @@
-//! Feature flags and master switches for Mac-Windows Fusion Bridge.
+//! Feature flags and master switches for Integrator.
 //!
 //! Provides granular master switches for all workstation fusion capabilities,
 //! persisting user preferences to disk across application restarts on both macOS and Windows.
@@ -48,15 +48,15 @@ pub struct FeatureManager {
     config_path: PathBuf,
 }
 
+impl Default for FeatureManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeatureManager {
     pub fn new() -> Self {
-        let home = if cfg!(target_os = "windows") {
-            std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into())
-        } else {
-            std::env::var("HOME").unwrap_or_else(|_| ".".into())
-        };
-        let config_dir = PathBuf::from(home).join(".usbc_clipboard_cache");
-        let _ = fs::create_dir_all(&config_dir);
+        let config_dir = crate::system_info::app_data_dir();
         let config_path = config_dir.join("features.json");
 
         let flags = if let Ok(data) = fs::read_to_string(&config_path) {
@@ -72,11 +72,14 @@ impl FeatureManager {
     }
 
     pub fn get_flags(&self) -> FeatureFlags {
-        self.flags.read().unwrap().clone()
+        self.flags
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn is_enabled(&self, feature: &str) -> bool {
-        let f = self.flags.read().unwrap();
+        let f = self.flags.read().unwrap_or_else(|e| e.into_inner());
         match feature {
             "display" => f.display,
             "clipboard" => f.clipboard,
@@ -96,7 +99,7 @@ impl FeatureManager {
 
     pub fn set_flag(&self, feature: &str, enabled: bool) -> FeatureFlags {
         {
-            let mut f = self.flags.write().unwrap();
+            let mut f = self.flags.write().unwrap_or_else(|e| e.into_inner());
             match feature {
                 "display" => f.display = enabled,
                 "clipboard" => f.clipboard = enabled,

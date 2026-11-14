@@ -1,49 +1,44 @@
-//! Display control protocol for cross-platform second-screen extensions.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DisplayRpcRequest {
-    /// Remote command: Launch Moonlight client to stream from host
+    Ping,
+    GetHardwareProfile,
+    PairRequest {
+        device_id: String,
+        hostname: String,
+        pin: String,
+    },
     StartMoonlight {
         host_ip: String,
-        app_name: String,
+        #[serde(default)]
+        host_port: u16,
+        #[serde(default)]
+        host_name: String,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
         audio_on_host: bool,
-        fullscreen: bool,
     },
-    /// Remote command: Terminate Moonlight client
     StopMoonlight,
-    /// Local/Remote command: Toggle Mac-to-PC extended screen (Mac as host, PC as 165Hz second screen)
     ToggleMacToPc,
-    /// Local/Remote command: Toggle PC-to-Mac extended screen (PC as host, Mac as second screen)
     TogglePcToMac,
-    /// Stop all active second screen extensions
     StopAll,
-    /// Query current display extension status
     GetStatus,
-    /// Query live GPU telemetry (temps, watts, clocks, utilization)
     GetGpuTelemetry,
-    /// On-demand paste remote announced files directly into active folder
     PasteRemote,
-    /// Show and focus main application window (Single-Instance IPC)
     ShowWindow,
-    /// Sync ambient light sensor telemetry (Lux, CCT Kelvin, gamma comp)
     SyncTrueTone {
         lux: f32,
         cct: u32,
         gamma_comp: f32,
     },
-    /// Request peer to mount network shared storage
     MountStorage,
-    /// Request peer to unmount network shared storage
     UnmountStorage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DisplayRpcResponse {
     pub success: bool,
     pub message: String,
@@ -52,4 +47,6 @@ pub struct DisplayRpcResponse {
     pub gpu_telemetry: Option<crate::telemetry::GpuTelemetry>,
     pub ambient_light: Option<crate::truetone::AmbientLightData>,
     pub storage_status: Option<crate::storage::StorageStatus>,
+    #[serde(default)]
+    pub hardware_profile: Option<crate::system_info::LocalHardwareProfile>,
 }

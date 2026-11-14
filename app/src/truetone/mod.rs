@@ -1,6 +1,6 @@
 //! Cross-Screen True Tone & Chromatic Adaptation Sync.
 //!
-//! Matches Windows OMEN screen white point to MacBook Pro Retina display
+//! Matches remote peer display white point to the Mac ambient light environment
 //! in real-time using ambient light sensor telemetry and Bradford CAT.
 
 use anyhow::Result;
@@ -26,7 +26,7 @@ pub fn read_ambient_light() -> AmbientLightData {
         let mut lux: f32 = 0.0;
         let mut cct: u32 = 0;
         let ok = unsafe { read_mac_ambient_sensor(&mut lux, &mut cct) };
-        if ok {
+        if ok && lux.is_finite() && lux >= 0.0 {
             AmbientLightData {
                 lux,
                 cct_kelvin: cct,
@@ -38,8 +38,8 @@ pub fn read_ambient_light() -> AmbientLightData {
             }
         } else {
             AmbientLightData {
-                lux: 100.0,
-                cct_kelvin: 5500,
+                lux: 0.0,
+                cct_kelvin: 6500,
                 supported: false,
                 updated_at_secs: 0,
             }
