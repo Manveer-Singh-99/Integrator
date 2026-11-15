@@ -20,8 +20,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 /// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG (`getrandom`).
+pub fn try_csprng_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    getrandom::fill(buf)
+}
+
+/// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG (`getrandom`).
 pub fn csprng_fill(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("OS CSPRNG (getrandom) failed to produce entropy");
+    try_csprng_fill(buf).expect("OS CSPRNG (getrandom) failed to produce entropy");
 }
 
 /// Returns a fixed-size array of cryptographically secure random bytes.
@@ -29,6 +34,13 @@ pub fn csprng_array<const N: usize>() -> [u8; N] {
     let mut arr = [0u8; N];
     csprng_fill(&mut arr);
     arr
+}
+
+/// Returns a zeroizing fixed-size array of cryptographically secure random bytes.
+pub fn try_csprng_array<const N: usize>() -> Result<zeroize::Zeroizing<[u8; N]>, getrandom::Error> {
+    let mut arr = zeroize::Zeroizing::new([0u8; N]);
+    try_csprng_fill(&mut *arr)?;
+    Ok(arr)
 }
 
 /// Constant-time byte slice equality check using `subtle::ConstantTimeEq`.
@@ -106,14 +118,13 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Hexadecimal decoding into `Vec<u8>`.
+/// Hexadecimal decoding into `Vec<u8>`. Rejects non-hex whitespace and odd lengths.
 pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    let trimmed = hex.trim();
-    if trimmed.len() % 2 != 0 {
+    let bytes = hex.as_bytes();
+    if bytes.len() % 2 != 0 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut out = Vec::with_capacity(trimmed.len() / 2);
-    let bytes = trimmed.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
     for i in (0..bytes.len()).step_by(2) {
         let hi = (bytes[i] as char).to_digit(16)?;
         let lo = (bytes[i + 1] as char).to_digit(16)?;
@@ -689,8 +700,9 @@ mod tests {
 
         // Stage 1: Initial unpaired communication attempt MUST be rejected
         {
+            let dir_fake = unique_temp_dir("m6_fake");
             let mut fake_peer_ks =
-                KeystoreV2::open_with_provider(unique_temp_dir("m6_fake"), &kek_c).unwrap();
+                KeystoreV2::open_with_provider(dir_fake.clone(), &kek_c).unwrap();
             let srv_id = ks_server.lock().unwrap().local_device_id();
             let srv_pk = ks_server.lock().unwrap().local_ed25519_pubkey();
             fake_peer_ks
@@ -733,6 +745,7 @@ mod tests {
                 "Unpaired client must be rejected with UntrustedPeer before pairing"
             );
             assert!(cli_res.is_err());
+            let _ = std::fs::remove_dir_all(&dir_fake);
         }
 
         // Stages 2-7: Execute full 4-message IPR2 SPAKE2 + Ed25519 pairing over TCP
@@ -858,7 +871,7 @@ mod tests {
                 &sess_id,
             );
             let mut sender =
-                AudioSessionSender::new(sess_id, *k_audio, nonce_salt, now + wire.expires_in_secs);
+                AudioSessionSender::new(sess_id, k_audio, nonce_salt, now + wire.expires_in_secs);
             let dgram = sender
                 .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x7Fu8; 288], now)
                 .unwrap();
@@ -870,5 +883,107 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_client);
         let _ = std::fs::remove_dir_all(&dir_server);
+    }
+
+    #[test]
+    fn test_keystore_metadata_mac_tamper_detection() {
+        let dir = std::env::temp_dir().join(format!(
+            "integrator_mac_tamper_{}_{}",
+            std::process::id(),
+            unix_epoch_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kek = FixedKekProvider::new([0x31u8; 32]);
+
+        let mut ks_srv = KeystoreV2::open_with_provider(dir.join("srv"), &kek).unwrap();
+        let peer_sk = ed25519_dalek::SigningKey::from_bytes(&[0x44u8; 32]);
+        let peer_pk = peer_sk.verifying_key().to_bytes();
+        let peer_id = derive_device_id_from_pubkey(&peer_pk);
+        let root_key = Zeroizing::new([0x77u8; 32]);
+
+        ks_srv
+            .commit_paired_peer(
+                peer_id,
+                peer_pk,
+                root_key,
+                "Peer-Box".into(),
+                "Windows".into(),
+                "192.168.10.20".into(),
+                true,
+            )
+            .unwrap();
+
+        let peer2_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
+        let peer2_pk = peer2_sk.verifying_key().to_bytes();
+        let peer2_id = derive_device_id_from_pubkey(&peer2_pk);
+        ks_srv
+            .commit_paired_peer(
+                peer2_id,
+                peer2_pk,
+                Zeroizing::new([0x88u8; 32]),
+                "Blocked-Box".into(),
+                "Windows".into(),
+                "192.168.10.99".into(),
+                false,
+            )
+            .unwrap();
+        ks_srv
+            .untrust_or_block_peer(&hex_encode(&peer2_id), true, Some("192.168.10.99"))
+            .unwrap();
+
+        let store_path = dir.join("srv").join("trusted_peers_v2.json");
+        let original = std::fs::read_to_string(&store_path).unwrap();
+        assert!(
+            original.contains("state_mac_hex"),
+            "persisted keystore must include state_mac_hex"
+        );
+
+        let tamper_cases = [
+            original.replace("\"192.168.10.20\"", "\"10.0.0.99\""),
+            original.replace("\"Peer-Box\"", "\"Evil-Host\""),
+            original.replace(&hex_encode(&peer2_id), "00000000000000000000000000000000"),
+            original.replace("\"192.168.10.99\"", "\"10.0.0.1\""),
+        ];
+
+        for tampered in tamper_cases {
+            assert_ne!(tampered, original);
+            std::fs::write(&store_path, tampered).unwrap();
+            let err = match KeystoreV2::open_with_provider(dir.join("srv"), &kek) {
+                Ok(_) => panic!("tampered keystore metadata must be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, KeystoreError::AeadTamperDetected(_)),
+                "expected AeadTamperDetected, got {:?}",
+                err
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_hw_kek_corrupt_seed_refused_without_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "integrator_macos_corrupt_seed_{}_{}",
+            std::process::id(),
+            unix_epoch_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_path = dir.join(".master_kek_v2.seed");
+        std::fs::write(&seed_path, b"corrupt-short-seed").unwrap();
+
+        let res = KeystoreV2::open_with_provider(dir.clone(), &keystore::OsNativeKekProvider);
+        assert!(
+            matches!(res, Err(KeystoreError::CorruptKeystore(_))),
+            "corrupt seed must fail with CorruptKeystore"
+        );
+        assert!(
+            seed_path.exists(),
+            "corrupt .master_kek_v2.seed must NOT be deleted on load error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

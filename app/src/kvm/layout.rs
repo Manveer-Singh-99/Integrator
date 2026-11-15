@@ -3,11 +3,15 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 use super::protocol::{KvmLayoutConfig, ScreenEdge};
 
 pub const DEAD_CORNER_PX: f32 = 36.0;
+const MAX_CLOCK_SKEW_MS: u64 = 300_000;
+static LAYOUT_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenRect {
@@ -48,18 +52,13 @@ pub fn load_layout_config() -> KvmLayoutConfig {
 }
 
 pub fn save_layout_config(cfg: &KvmLayoutConfig) -> std::io::Result<()> {
+    let _guard = LAYOUT_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut sanitized = cfg.clone();
     sanitize_layout(&mut sanitized);
     let path = layout_config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(&sanitized)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    crate::system_info::atomic_write_private(&path, json.as_bytes())
 }
 
 pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
@@ -73,6 +72,14 @@ pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
         "cache" => "cache".to_string(),
         _ => "downloads".to_string(),
     };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let max_ts = now_ms.saturating_add(MAX_CLOCK_SKEW_MS);
+    if cfg.updated_at_ms > max_ts {
+        cfg.updated_at_ms = max_ts;
+    }
 }
 
 /// Computes the peer-side mirrored layout when the user sets local arrangement
@@ -131,7 +138,15 @@ pub fn compute_normalized_edge_pos(
             }
         }
     };
-    (raw - alignment_offset.clamp(-0.5, 0.5)).clamp(0.02, 0.98)
+    let offset = if alignment_offset.is_finite() {
+        alignment_offset.clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    if !raw.is_finite() {
+        return 0.5;
+    }
+    (raw - offset).clamp(0.02, 0.98)
 }
 
 /// Resolves an entry point `(px, py)` just inside `entry_edge` on the destination display.
@@ -141,8 +156,16 @@ pub fn resolve_entry_point(
     norm_pos: f32,
     inset_px: f32,
 ) -> (f32, f32) {
-    let n = norm_pos.clamp(0.02, 0.98);
-    let inset = inset_px.max(2.0);
+    let n = if norm_pos.is_finite() {
+        norm_pos.clamp(0.02, 0.98)
+    } else {
+        0.5
+    };
+    let inset = if inset_px.is_finite() {
+        inset_px.max(2.0)
+    } else {
+        6.0
+    };
     match entry_edge {
         ScreenEdge::Left => (
             target_rect.x + inset,

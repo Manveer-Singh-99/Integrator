@@ -58,6 +58,9 @@ pub const AUDIO_SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Maximum active UDP audio sessions tracked concurrently.
 pub const MAX_ACTIVE_AUDIO_SESSIONS: usize = 16;
 
+/// Maximum active UDP audio sessions per paired peer device.
+pub const MAX_PER_PEER_AUDIO_SESSIONS: usize = 2;
+
 /// Maximum packet sequence number (`2^48 - 1`) before requiring session rotation.
 pub const MAX_AUDIO_PACKET_SEQ: u64 = (1u64 << 48) - 1;
 
@@ -177,6 +180,11 @@ impl AudioDatagramHeader {
 
         let timestamp_us = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
         let frame_samples = u16::from_be_bytes([buf[28], buf[29]]);
+        if flags == AUDIO_FLAG_PCM_FRAME && frame_samples == 0 {
+            return Err(AudioUdpError::InvalidHandshakeParam(
+                "frame_samples must be non-zero for PCM frames",
+            ));
+        }
         let payload_len = u16::from_be_bytes([buf[30], buf[31]]);
         if !(MIN_AUDIO_PAYLOAD_LEN..=MAX_AUDIO_PAYLOAD_LEN).contains(&(payload_len as usize)) {
             return Err(AudioUdpError::PacketBounds(payload_len as usize));
@@ -304,17 +312,17 @@ fn build_audio_aead_nonce(nonce_salt: &[u8; 4], pkt_seq: u64) -> [u8; 12] {
 /// Sender-side state for encrypting outbound `IUA2` UDP audio datagrams.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AudioSessionSender {
-    pub session_id: [u8; 8],
-    k_audio: [u8; 32],
+    session_id: [u8; 8],
+    k_audio: Zeroizing<[u8; 32]>,
     nonce_salt: [u8; 4],
     next_seq: u64,
-    pub expires_at_secs: u64,
+    expires_at_secs: u64,
 }
 
 impl AudioSessionSender {
     pub fn new(
         session_id: [u8; 8],
-        k_audio: [u8; 32],
+        k_audio: Zeroizing<[u8; 32]>,
         nonce_salt: [u8; 4],
         expires_at_secs: u64,
     ) -> Self {
@@ -325,6 +333,14 @@ impl AudioSessionSender {
             next_seq: 1,
             expires_at_secs,
         }
+    }
+
+    pub fn session_id(&self) -> [u8; 8] {
+        self.session_id
+    }
+
+    pub fn expires_at_secs(&self) -> u64 {
+        self.expires_at_secs
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -342,6 +358,14 @@ impl AudioSessionSender {
     ) -> Result<Vec<u8>, AudioUdpError> {
         if now_secs >= self.expires_at_secs {
             return Err(AudioUdpError::SessionExpired);
+        }
+        if flags != AUDIO_FLAG_PCM_FRAME && flags != AUDIO_FLAG_KEEPALIVE {
+            return Err(AudioUdpError::InvalidFlags(flags));
+        }
+        if flags == AUDIO_FLAG_PCM_FRAME && frame_samples == 0 {
+            return Err(AudioUdpError::InvalidHandshakeParam(
+                "frame_samples must be non-zero for PCM frames",
+            ));
         }
         if !(MIN_AUDIO_PAYLOAD_LEN..=MAX_AUDIO_PAYLOAD_LEN).contains(&plaintext.len()) {
             return Err(AudioUdpError::PacketBounds(plaintext.len()));
@@ -365,7 +389,7 @@ impl AudioSessionSender {
         let header_bytes = header.to_bytes();
         let nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, pkt_seq);
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.k_audio));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.k_audio));
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes),
@@ -385,17 +409,17 @@ impl AudioSessionSender {
 
 /// Receiver-side state for a single authenticated `IUA2` UDP audio session.
 pub struct AudioSessionReceiver {
-    pub session_id: [u8; 8],
-    pub peer_device_id: [u8; 16],
+    session_id: [u8; 8],
+    peer_device_id: [u8; 16],
     k_audio: Zeroizing<[u8; 32]>,
     nonce_salt: [u8; 4],
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub bit_depth: u8,
-    pub created_at_secs: u64,
-    pub expires_at_secs: u64,
-    pub last_activity_secs: u64,
-    pub replay_window: ReplayWindow64,
+    sample_rate: u32,
+    channels: u8,
+    bit_depth: u8,
+    created_at_secs: u64,
+    expires_at_secs: u64,
+    last_activity_secs: u64,
+    replay_window: ReplayWindow64,
 }
 
 impl AudioSessionReceiver {
@@ -422,6 +446,34 @@ impl AudioSessionReceiver {
             last_activity_secs: now_secs,
             replay_window: ReplayWindow64::new(),
         }
+    }
+
+    pub fn session_id(&self) -> [u8; 8] {
+        self.session_id
+    }
+
+    pub fn peer_device_id(&self) -> [u8; 16] {
+        self.peer_device_id
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    pub fn bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+
+    pub fn created_at_secs(&self) -> u64 {
+        self.created_at_secs
+    }
+
+    pub fn expires_at_secs(&self) -> u64 {
+        self.expires_at_secs
     }
 
     pub fn is_expired(&self, now_secs: u64) -> bool {
@@ -459,7 +511,7 @@ impl AudioSessionReceiver {
         // Step 1: Pre-AEAD replay check (read-only)
         self.replay_window.check_before_aead(header.pkt_seq)?;
 
-        // Step 2: AEAD decryption & Poly1305 tag verification
+        // Step 2: AEAD decryption & Poly1305 tag verification (authenticates entire header AAD first)
         let nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, header.pkt_seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.k_audio));
         let plaintext = cipher
@@ -472,7 +524,20 @@ impl AudioSessionReceiver {
             )
             .map_err(|_| AudioUdpError::AeadFailed)?;
 
-        // Step 3: Commit sequence number to replay window ONLY after AEAD succeeds
+        if header.flags == AUDIO_FLAG_PCM_FRAME {
+            let bytes_per_sample_frame =
+                (self.channels as usize).saturating_mul((self.bit_depth as usize) / 8);
+            let expected_pcm_len =
+                (header.frame_samples as usize).saturating_mul(bytes_per_sample_frame);
+            if (header.payload_len as usize) != expected_pcm_len {
+                return Err(AudioUdpError::PayloadLengthMismatch {
+                    header_len: expected_pcm_len,
+                    actual_len: header.payload_len as usize,
+                });
+            }
+        }
+
+        // Step 3: Commit sequence number to replay window ONLY after AEAD and framing checks succeed
         self.replay_window.commit_after_aead(header.pkt_seq);
         self.last_activity_secs = now_secs;
 
@@ -516,6 +581,11 @@ impl AudioSessionRegistry {
         bit_depth: u8,
         now_secs: u64,
     ) -> Result<NegotiatedAudioSessionWire, AudioUdpError> {
+        if constant_time_eq(sender_nonce, &[0u8; 32]) {
+            return Err(AudioUdpError::InvalidHandshakeParam(
+                "sender_nonce must be non-zero",
+            ));
+        }
         if !(8_000..=192_000).contains(&sample_rate) {
             return Err(AudioUdpError::InvalidHandshakeParam(
                 "sample_rate must be 8000..=192000",
@@ -532,23 +602,47 @@ impl AudioSessionRegistry {
 
         self.prune_expired(now_secs);
 
-        // Remove any prior session for the same peer_device_id if we are near capacity
-        if self.sessions.len() >= MAX_ACTIVE_AUDIO_SESSIONS {
-            self.sessions
-                .retain(|_, s| s.peer_device_id != peer_device_id);
-            if self.sessions.len() >= MAX_ACTIVE_AUDIO_SESSIONS {
-                if let Some(oldest_id) = self
-                    .sessions
-                    .iter()
-                    .min_by_key(|(_, s)| s.last_activity_secs)
-                    .map(|(k, _)| *k)
-                {
-                    self.sessions.remove(&oldest_id);
-                }
+        // Enforce per-peer concurrent session cap by evicting this peer's oldest session first.
+        while self
+            .sessions
+            .values()
+            .filter(|s| s.peer_device_id == peer_device_id)
+            .count()
+            >= MAX_PER_PEER_AUDIO_SESSIONS
+        {
+            if let Some(oldest_peer_id) = self
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.peer_device_id == peer_device_id)
+                .min_by_key(|(_, s)| s.last_activity_secs)
+                .map(|(k, _)| *k)
+            {
+                self.sessions.remove(&oldest_peer_id);
+            } else {
+                break;
             }
         }
 
-        let session_id = csprng_array::<8>();
+        // Enforce global session table bound.
+        while self.sessions.len() >= MAX_ACTIVE_AUDIO_SESSIONS {
+            if let Some(oldest_id) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.last_activity_secs)
+                .map(|(k, _)| *k)
+            {
+                self.sessions.remove(&oldest_id);
+            } else {
+                break;
+            }
+        }
+
+        let session_id = loop {
+            let candidate = csprng_array::<8>();
+            if !self.sessions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let receiver_nonce = csprng_array::<32>();
         let (k_audio, nonce_salt) =
             derive_audio_session_keys(k_root, sender_nonce, &receiver_nonce, &session_id);
@@ -595,9 +689,15 @@ impl AudioSessionRegistry {
         Ok((peer_id, hdr, plain))
     }
 
+    pub fn active_session_count_at(&self, now_secs: u64) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| !s.is_expired(now_secs))
+            .count()
+    }
+
     pub fn active_session_count(&self) -> usize {
-        let now = unix_epoch_secs();
-        self.sessions.values().filter(|s| !s.is_expired(now)).count()
+        self.active_session_count_at(unix_epoch_secs())
     }
 }
 
@@ -624,7 +724,7 @@ mod tests {
 
         let sender = AudioSessionSender::new(
             session_id,
-            *k_audio,
+            k_audio,
             nonce_salt,
             now + wire.expires_in_secs,
         );
@@ -672,7 +772,7 @@ mod tests {
     #[test]
     fn test_audio_udp_replay_out_of_order_and_anti_window_poisoning() {
         let (mut sender, mut registry, now) = setup_sender_and_registry();
-        let pcm = vec![0x33u8; 128];
+        let pcm = vec![0x33u8; 48 * 6]; // 48 frames * 2ch * 3B (24-bit)
 
         // Generate 80 sequential packets (seq 1..=80)
         let mut packets = Vec::new();
@@ -732,7 +832,7 @@ mod tests {
     #[test]
     fn test_audio_udp_session_expiry_and_unknown_session_rejected() {
         let (mut sender, mut registry, now) = setup_sender_and_registry();
-        let pcm = vec![0xAAu8; 64];
+        let pcm = vec![0xAAu8; 16 * 6]; // 16 frames * 2ch * 3B (24-bit)
 
         let dgram1 = sender
             .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 16, &pcm, now)
@@ -751,5 +851,42 @@ mod tests {
             registry.open_incoming_datagram(&dgram1, now + AUDIO_SESSION_IDLE_TIMEOUT_SECS + 1),
             Err(AudioUdpError::SessionExpired)
         );
+    }
+
+    #[test]
+    fn test_audio_udp_rejects_zero_nonce_zero_samples_pcm_mismatch_and_caps_per_peer() {
+        let now = 1_750_000_000u64;
+        let peer_id = [0x42u8; 16];
+        let k_root = [0x77u8; 32];
+        let mut reg = AudioSessionRegistry::new();
+
+        // Zero sender_nonce rejected
+        assert_eq!(
+            reg.negotiate_receiver_session(peer_id, &k_root, &[0u8; 32], 48_000, 2, 24, now)
+                .unwrap_err(),
+            AudioUdpError::InvalidHandshakeParam("sender_nonce must be non-zero")
+        );
+
+        // Per-peer session limit enforced cleanly
+        let sender_nonce = [0x11u8; 32];
+        for i in 0..4 {
+            reg.negotiate_receiver_session(peer_id, &k_root, &sender_nonce, 48_000, 2, 24, now + i)
+                .unwrap();
+        }
+        assert_eq!(reg.active_session_count_at(now + 3), MAX_PER_PEER_AUDIO_SESSIONS);
+
+        // Zero frame_samples on PCM frame rejected; mismatched PCM payload length rejected on open
+        let (mut sender, mut reg2, now2) = setup_sender_and_registry();
+        assert!(matches!(
+            sender.seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 0, &[0x11u8; 6], now2),
+            Err(AudioUdpError::InvalidHandshakeParam(_))
+        ));
+        let bad_pcm = sender
+            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 10, &[0x11u8; 12], now2)
+            .unwrap();
+        assert!(matches!(
+            reg2.open_incoming_datagram(&bad_pcm, now2),
+            Err(AudioUdpError::PayloadLengthMismatch { .. })
+        ));
     }
 }

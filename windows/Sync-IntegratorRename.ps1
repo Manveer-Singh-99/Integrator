@@ -59,16 +59,26 @@ if ($CurrentDirName -ne "Integrator") {
     }
 }
 
-# Step 4: Build Windows Release Binary
+# Step 4: Build Windows Release Binaries
 $AppDir = Join-Path -Path (Get-Location) -ChildPath "app"
 if (Test-Path $AppDir) {
     Set-Location $AppDir
     if (Get-Command cargo -ErrorAction SilentlyContinue) {
-        Write-Host "[*] Building release binary with updated embedded icon and autostart..." -ForegroundColor Yellow
+        Write-Host "[*] Building release core & CLI binaries (cargo build --release)..." -ForegroundColor Yellow
         cargo build --release
-        Write-Host "[✓] Release build completed successfully: target\release\Integrator.exe" -ForegroundColor Green
+        if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
+        Write-Host "[✓] Rust core build completed: target\release\integrator.exe & integrator_core.dll" -ForegroundColor Green
     } else {
-        Write-Host "[!] Cargo not found in PATH. Skipping compilation." -ForegroundColor Gray
+        Write-Host "[!] Cargo not found in PATH. Skipping Rust compilation." -ForegroundColor Gray
+    }
+
+    $UiProj = Join-Path -Path $AppDir -ChildPath "ui-windows\IntegratorUI.csproj"
+    if ((Test-Path $UiProj) -and (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        $ArchPlat = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "ARM64" } else { "x64" }
+        Write-Host "[*] Building native WinUI 3 GUI (IntegratorUI.csproj, Platform=$ArchPlat)..." -ForegroundColor Yellow
+        dotnet build $UiProj -c Release -p:Platform=$ArchPlat
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build IntegratorUI.csproj failed" }
+        Write-Host "[✓] WinUI 3 build completed." -ForegroundColor Green
     }
 }
 

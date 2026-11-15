@@ -1,40 +1,173 @@
-//! Native OS file clipboard readers and writers.
+//! Cross-platform helper for native OS file clipboard operations (`CF_HDROP` / `NSPasteboard`).
 //!
-//! Uses in-process native OS APIs on both platforms:
 //! - macOS: `NSPasteboard` file URLs via linked Swift FFI (`read_pasteboard_files_in_app` /
-//!   `write_pasteboard_files_in_app`), with `macos_clip_files` CLI as fallback.
-//! - Windows: Win32 `CF_HDROP` (`OpenClipboard`, `DragQueryFileW`, `SetClipboardData`)
-//!   using UTF-16 `fWide = TRUE` and retry backoff on clipboard contention, with
-//!   `win_clip_files.exe` as fallback.
+//!   `write_pasteboard_files_in_app`) using `\0`-delimited paths, with `macos_clip_files --nul` as fallback.
+//! - Windows: Native Win32 `CF_HDROP` (`DROPFILES`) APIs using a message-only `HWND_MESSAGE` owner window
+//!   so `EmptyClipboard()` + `SetClipboardData(CF_HDROP, ...)` preserves ownership, with `win_clip_files.exe --nul`
+//!   as fallback.
 
+use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use anyhow::{Context, Result};
-use tracing::{info, warn};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 #[cfg(target_os = "macos")]
 extern "C" {
     fn read_pasteboard_files_in_app(out_buf: *mut u8, cap: usize) -> isize;
-    fn write_pasteboard_files_in_app(paths_ptr: *const std::os::raw::c_char) -> bool;
-    #[allow(dead_code)]
-    fn clear_pasteboard_in_app();
+    fn write_pasteboard_files_in_app(paths_ptr: *const u8, len: usize) -> bool;
 }
+
+const PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+const MAX_CACHE_WALK_DEPTH: usize = 64;
+const MACOS_INITIAL_READ_CAP: usize = 64 * 1024;
+const MACOS_RETRY_READ_CAP: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct FileClipboardHelper {
     cache_dir: PathBuf,
+    last_prune: Mutex<Instant>,
+}
+
+/// Ensures `cache_dir` exists as a private real directory (never following a symlink).
+fn ensure_private_cache_dir(base_dir: &Path) -> Result<PathBuf> {
+    if let Ok(meta) = std::fs::symlink_metadata(base_dir) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Refusing symlinked clipboard base directory: {}",
+                base_dir.display()
+            );
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut db = std::fs::DirBuilder::new();
+            db.recursive(true).mode(0o700);
+            db.create(base_dir)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(base_dir)?;
+        }
+    }
+
+    let cache_dir = base_dir.join("clipboard_cache");
+    match std::fs::symlink_metadata(&cache_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                bail!(
+                    "Refusing non-directory or symlinked clipboard cache path: {}",
+                    cache_dir.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &cache_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let create_res = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut db = std::fs::DirBuilder::new();
+                    db.mode(0o700);
+                    db.create(&cache_dir)
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::create_dir(&cache_dir)
+                }
+            };
+            match create_res {
+                Ok(()) => {}
+                Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = std::fs::symlink_metadata(&cache_dir)?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        bail!(
+                            "Refusing non-directory or symlinked clipboard cache path: {}",
+                            cache_dir.display()
+                        );
+                    }
+                }
+                Err(ce) => return Err(ce.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(cache_dir)
+}
+
+/// Splits a `\0`-delimited UTF-8 byte stream into ordered unique `PathBuf`s without `.trim()` mangling.
+pub(crate) fn parse_nul_paths(bytes: &[u8]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for segment in bytes.split(|&b| b == 0) {
+        if segment.is_empty() {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(segment) {
+            if !s.is_empty() {
+                let pb = PathBuf::from(s);
+                if seen.insert(pb.clone()) {
+                    out.push(pb);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Serializes paths as `\0`-delimited UTF-8 bytes while rejecting empty or interior-NUL paths.
+pub(crate) fn serialize_nul_paths(files: &[PathBuf]) -> Result<Vec<u8>> {
+    if files.is_empty() {
+        bail!("No file paths provided for clipboard write");
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in files {
+        let s = path
+            .to_str()
+            .context("Clipboard file path contains non-UTF-8 sequences")?;
+        if s.is_empty() || s.as_bytes().contains(&0) {
+            bail!("Invalid clipboard file path (empty or interior NUL)");
+        }
+        if seen.insert(s.to_owned()) {
+            if !out.is_empty() {
+                out.push(0);
+            }
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+    if out.is_empty() {
+        bail!("No valid file paths provided for clipboard write");
+    }
+    Ok(out)
 }
 
 impl FileClipboardHelper {
     pub fn new() -> Result<Self> {
-        let cache_dir = crate::system_info::app_data_dir();
-        if !cache_dir.exists() {
-            std::fs::create_dir_all(&cache_dir)?;
-        }
+        let base_dir = crate::system_info::app_data_dir();
+        let cache_dir = ensure_private_cache_dir(&base_dir)?;
+        Self::new_in_dir(cache_dir)
+    }
 
-        let helper = Self { cache_dir };
-        // Prune cache entries older than 3 days or if total cache exceeds 10 GB
+    pub(crate) fn new_in_dir(cache_dir: PathBuf) -> Result<Self> {
+        let helper = Self {
+            cache_dir,
+            last_prune: Mutex::new(Instant::now()),
+        };
         helper.prune_cache(3, 10 * 1024 * 1024 * 1024);
-
         Ok(helper)
     }
 
@@ -42,89 +175,141 @@ impl FileClipboardHelper {
         &self.cache_dir
     }
 
-    fn is_persistent_state_file(path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    pub(crate) fn maybe_prune_cache(&self) {
+        let should_prune = {
+            if let Ok(mut guard) = self.last_prune.lock() {
+                if guard.elapsed() >= PRUNE_INTERVAL {
+                    *guard = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_prune {
+            self.prune_cache(3, 10 * 1024 * 1024 * 1024);
+        }
+    }
+
+    /// Persistent security, configuration, identity, and state files stored alongside app data
+    /// that must never be evicted by cache pruning.
+    pub(crate) fn is_persistent_state_file(path: &Path) -> bool {
+        let Some(name_os) = path.file_name() else {
             return false;
         };
-        matches!(
-            name,
-            "app_config.json"
-                | "device_id"
-                | "trusted_peers.json"
-                | "trusted_peers_v2.json"
-                | "peer_history.json"
-                | "active_mount.json"
-                | "features.json"
-                | "kvm_layout.json"
-                | "drag_staging"
-                | "spatial_test_chime.wav"
-        ) || name.starts_with("trusted_peers.json.")
-            || name.starts_with("features.json.")
+        let name = name_os.to_string_lossy().to_ascii_lowercase();
+        const EXACT_PROTECTED: &[&str] = &[
+            "security",
+            "clipboard_cache",
+            "trusted_peers.json",
+            "trusted_peers_v2.json",
+            "trust_config.json",
+            "peer_history.json",
+            "features.json",
+            "app_config.json",
+            "kvm_layout.json",
+            "active_mount.json",
+            ".master_kek_v2.seed",
+        ];
+        if EXACT_PROTECTED.contains(&name.as_str()) {
+            return true;
+        }
+        const PREFIX_PROTECTED: &[&str] = &[
+            "trusted_peers",
+            "trust_config",
+            "peer_history",
+            "features.json.",
+            "app_config.json.",
+            "kvm_layout.json.",
+            "active_mount.json.",
+            ".master_kek",
+            "sunshine_adapter_override",
+        ];
+        PREFIX_PROTECTED.iter().any(|p| name.starts_with(p))
     }
 
-    /// Prunes stale entries in the cache directory to prevent disk bloat.
+    /// Removes expired staging directories/files and enforces the `max_bytes` cache budget.
     pub fn prune_cache(&self, max_age_days: u64, max_bytes: u64) {
-        if !self.cache_dir.exists() {
+        let Ok(entries) = std::fs::read_dir(&self.cache_dir) else {
             return;
-        }
+        };
 
-        let now = std::time::SystemTime::now();
-        let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86400));
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+        let mut items: Vec<(PathBuf, bool, bool, SystemTime, u64)> = Vec::new();
+        let mut total_size: u64 = 0;
 
-        let mut entries = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(&self.cache_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if Self::is_persistent_state_file(&path) {
-                    continue;
-                }
-                if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                    if meta.file_type().is_symlink() {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if Self::is_persistent_state_file(&p) {
+                continue;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                let is_symlink = meta.file_type().is_symlink();
+                let is_dir = !is_symlink && meta.is_dir();
+                // Missing/unreadable mtime falls back to UNIX_EPOCH so orphaned corrupt items are evicted first.
+                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+                let size = if is_symlink {
+                    meta.len()
+                } else if is_dir {
+                    Self::calculate_dir_size_depth(&p, 0)
+                } else {
+                    meta.len()
+                };
+
+                let age = now.duration_since(mtime).unwrap_or_default();
+                if age > max_age {
+                    let removed = if is_dir {
+                        std::fs::remove_dir_all(&p).is_ok()
+                    } else {
+                        std::fs::remove_file(&p).is_ok()
+                    };
+                    if removed {
                         continue;
                     }
-                    let mtime = meta.modified().unwrap_or(now);
-                    let size = if meta.is_dir() {
-                        Self::calculate_dir_size(&path)
-                    } else {
-                        meta.len()
-                    };
-                    entries.push((path, mtime, size));
                 }
+
+                total_size = total_size.saturating_add(size);
+                items.push((p, is_dir, is_symlink, mtime, size));
             }
         }
 
-        entries.sort_by_key(|e| e.1);
-        let mut total_size: u64 = entries.iter().map(|e| e.2).sum();
-
-        for (path, mtime, size) in entries {
-            let is_stale = now
-                .duration_since(mtime)
-                .map(|d| d > max_age)
-                .unwrap_or(false);
-            if is_stale || total_size > max_bytes {
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else {
-                    let _ = std::fs::remove_file(&path);
+        if total_size > max_bytes {
+            items.sort_by_key(|item| item.3);
+            for (p, is_dir, _is_symlink, _, size) in items {
+                if total_size <= max_bytes {
+                    break;
                 }
-                total_size = total_size.saturating_sub(size);
+                let removed = if is_dir {
+                    std::fs::remove_dir_all(&p).is_ok()
+                } else {
+                    std::fs::remove_file(&p).is_ok()
+                };
+                if removed {
+                    total_size = total_size.saturating_sub(size);
+                }
             }
         }
     }
 
-    fn calculate_dir_size(path: &Path) -> u64 {
-        let mut total = 0;
-        if let Ok(read_dir) = std::fs::read_dir(path) {
-            for entry in read_dir.flatten() {
+    fn calculate_dir_size_depth(path: &Path, depth: usize) -> u64 {
+        if depth >= MAX_CACHE_WALK_DEPTH {
+            return 0;
+        }
+        let mut total: u64 = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
                 let p = entry.path();
                 if let Ok(meta) = std::fs::symlink_metadata(&p) {
                     if meta.file_type().is_symlink() {
                         continue;
                     }
                     if meta.is_dir() {
-                        total += Self::calculate_dir_size(&p);
+                        total = total.saturating_add(Self::calculate_dir_size_depth(&p, depth + 1));
                     } else {
-                        total += meta.len();
+                        total = total.saturating_add(meta.len());
                     }
                 }
             }
@@ -138,179 +323,189 @@ impl FileClipboardHelper {
 
     /// Reads currently copied file paths from the OS clipboard.
     pub fn read_copied_files(&self) -> Vec<PathBuf> {
-        let mut results = Vec::new();
-
         #[cfg(target_os = "macos")]
         {
-            let mut buf = vec![0u8; 256 * 1024];
+            let mut buf = vec![0u8; MACOS_INITIAL_READ_CAP];
             let n = unsafe { read_pasteboard_files_in_app(buf.as_mut_ptr(), buf.len()) };
-            if n > 0 && (n as usize) < buf.len() {
-                let text = String::from_utf8_lossy(&buf[..n as usize]);
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        let p = PathBuf::from(trimmed);
-                        if p.exists() {
-                            results.push(p);
-                        }
-                    }
+            if n == 0 {
+                return Vec::new();
+            }
+            if n > 0 && (n as usize) <= buf.len() {
+                return parse_nul_paths(&buf[..n as usize]);
+            }
+            if n < 0 {
+                let mut big_buf = vec![0u8; MACOS_RETRY_READ_CAP];
+                let n2 = unsafe {
+                    read_pasteboard_files_in_app(big_buf.as_mut_ptr(), big_buf.len())
+                };
+                if n2 == 0 {
+                    return Vec::new();
                 }
-                return results;
+                if n2 > 0 && (n2 as usize) <= big_buf.len() {
+                    return parse_nul_paths(&big_buf[..n2 as usize]);
+                }
             }
 
             if let Some(helper) = Self::find_helper("macos_clip_files") {
-                if let Ok(output) = Command::new(&helper).arg("read").output() {
-                    if output.status.success() {
-                        let text = String::from_utf8_lossy(&output.stdout);
-                        for line in text.lines() {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let p = PathBuf::from(trimmed);
-                                if p.exists() {
-                                    results.push(p);
-                                }
-                            }
-                        }
+                match Command::new(&helper).args(["read", "--nul"]).output() {
+                    Ok(output) if output.status.success() => {
+                        return parse_nul_paths(&output.stdout);
+                    }
+                    Ok(output) => {
+                        warn!(
+                            "macos_clip_files read failed ({:?}): {}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to spawn macos_clip_files fallback: {}", e);
                     }
                 }
             }
+            Vec::new()
         }
 
         #[cfg(target_os = "windows")]
         {
-            if let Some(files) = win32_clip_files::read_cf_hdrop_files() {
-                for p in files {
-                    if p.exists() {
-                        results.push(p);
-                    }
+            use std::os::windows::process::CommandExt;
+
+            match win32::read_cf_hdrop_files() {
+                Ok(Some(paths)) => return paths,
+                Ok(None) => return Vec::new(),
+                Err(e) => {
+                    warn!(
+                        "Native Win32 CF_HDROP read failed ({}); trying win_clip_files.exe fallback",
+                        e
+                    );
                 }
-                return results;
             }
 
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
             if let Some(helper) = Self::find_helper("win_clip_files.exe") {
                 let mut cmd = Command::new(&helper);
-                cmd.arg("read").creation_flags(CREATE_NO_WINDOW);
-                if let Ok(output) = cmd.output() {
-                    if output.status.success() {
-                        let text = String::from_utf8_lossy(&output.stdout);
-                        for line in text.lines() {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let p = PathBuf::from(trimmed);
-                                if p.exists() {
-                                    results.push(p);
-                                }
-                            }
-                        }
+                cmd.args(["read", "--nul"]).creation_flags(CREATE_NO_WINDOW);
+                match cmd.output() {
+                    Ok(output) if output.status.success() => {
+                        return parse_nul_paths(&output.stdout);
+                    }
+                    Ok(output) => {
+                        warn!(
+                            "win_clip_files.exe read failed ({:?}): {}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to spawn win_clip_files.exe fallback: {}", e);
                     }
                 }
             }
+            Vec::new()
         }
 
-        results
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Vec::new()
+        }
     }
 
-    /// Sets the OS clipboard so that the user can immediately paste the file(s) into Finder or Explorer.
+    /// Writes local staged file paths onto the OS clipboard so native Cmd+V / Ctrl+V works.
     pub fn write_copied_files(&self, files: &[PathBuf]) -> Result<()> {
-        if files.is_empty() {
-            return Ok(());
-        }
+        let nul_bytes = serialize_nul_paths(files)?;
 
         #[cfg(target_os = "macos")]
         {
-            let joined: String = files
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Ok(c_str) = std::ffi::CString::new(joined) {
-                let ok = unsafe { write_pasteboard_files_in_app(c_str.as_ptr()) };
-                if ok {
-                    info!(
-                        "Registered {} file(s) onto macOS NSPasteboard in-process",
-                        files.len()
-                    );
-                    return Ok(());
-                }
-            }
-
-            let helper = Self::find_helper("macos_clip_files")
-                .context("macos_clip_files helper not found and in-process NSPasteboard write failed")?;
-            let mut cmd = Command::new(helper);
-            cmd.arg("write");
-            for f in files {
-                cmd.arg(f);
-            }
-            let status = cmd.status().context("Failed to execute macos_clip_files")?;
-            if !status.success() {
-                warn!("macos_clip_files write returned non-zero status");
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            if win32_clip_files::write_cf_hdrop_files(files).is_ok() {
-                info!(
-                    "Registered {} file(s) onto Windows CF_HDROP clipboard in-process",
-                    files.len()
-                );
+            if unsafe { write_pasteboard_files_in_app(nul_bytes.as_ptr(), nul_bytes.len()) } {
                 return Ok(());
             }
 
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            let helper = Self::find_helper("win_clip_files.exe")
-                .context("Win32 CF_HDROP clipboard write failed and win_clip_files.exe fallback not found")?;
-            let mut cmd = Command::new(helper);
-            cmd.arg("write").creation_flags(CREATE_NO_WINDOW);
-            for f in files {
-                cmd.arg(f);
+            let helper = Self::find_helper("macos_clip_files").context(
+                "macos_clip_files helper not found and in-process NSPasteboard write failed",
+            )?;
+            let mut child = Command::new(helper)
+                .args(["write", "--nul"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("Failed to execute macos_clip_files")?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(&nul_bytes)
+                    .context("Failed to write paths to macos_clip_files stdin")?;
             }
-            let status = cmd.status().context("Failed to execute win_clip_files.exe")?;
-            if !status.success() {
-                warn!("win_clip_files.exe write returned non-zero status");
+            let output = child
+                .wait_with_output()
+                .context("Failed waiting for macos_clip_files")?;
+            if !output.status.success() {
+                bail!(
+                    "macos_clip_files write failed ({:?}): {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
             }
-        }
-
-        info!(
-            "Registered {} file(s) onto native OS clipboard for pasting",
-            files.len()
-        );
-        Ok(())
-    }
-
-    /// Clears the native OS clipboard.
-    #[allow(dead_code)]
-    pub fn clear_clipboard(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            unsafe {
-                clear_pasteboard_in_app();
-            }
+            return Ok(());
         }
 
         #[cfg(target_os = "windows")]
         {
-            let _ = win32_clip_files::clear_win32_clipboard();
+            use std::os::windows::process::CommandExt;
+
+            if let Err(err) = win32::write_cf_hdrop_files(files) {
+                warn!("Native Win32 CF_HDROP write error: {}, trying fallback...", err);
+                let helper = Self::find_helper("win_clip_files.exe").context(
+                    "Win32 CF_HDROP clipboard write failed and win_clip_files.exe fallback not found",
+                )?;
+                let mut child = Command::new(helper)
+                    .args(["write", "--nul"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("Failed to execute win_clip_files.exe")?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(&nul_bytes)
+                        .context("Failed to write paths to win_clip_files.exe stdin")?;
+                }
+                let output = child
+                    .wait_with_output()
+                    .context("Failed waiting for win_clip_files.exe")?;
+                if !output.status.success() {
+                    bail!(
+                        "win_clip_files.exe write failed ({:?}): {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+            }
+            return Ok(());
         }
 
-        Ok(())
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = nul_bytes;
+            Ok(())
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
-mod win32_clip_files {
-    use anyhow::Result;
-    use std::ffi::OsString;
+mod win32 {
+    use anyhow::{bail, Context, Result};
+    use std::ffi::c_void;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
-    use std::time::Duration;
+
+    use crate::clipboard::protocol::MAX_TRANSFER_FILES;
 
     const CF_HDROP: u32 = 15;
     const GMEM_MOVEABLE: u32 = 0x0002;
     const GMEM_ZEROINIT: u32 = 0x0040;
+    const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
+    const MAX_DROP_ITEMS_INSPECT: usize = MAX_TRANSFER_FILES * 4;
+    const MAX_EXTENDED_PATH_CHARS: u32 = 32_768;
 
     #[repr(C)]
     struct DropFiles {
@@ -323,18 +518,33 @@ mod win32_clip_files {
 
     #[link(name = "user32")]
     extern "system" {
-        fn OpenClipboard(h_wnd_new_owner: *mut std::ffi::c_void) -> i32;
+        fn OpenClipboard(h_wnd_new_owner: *mut c_void) -> i32;
         fn CloseClipboard() -> i32;
         fn EmptyClipboard() -> i32;
         fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn GetClipboardData(u_format: u32) -> *mut std::ffi::c_void;
-        fn SetClipboardData(u_format: u32, h_mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GetClipboardData(u_format: u32) -> *mut c_void;
+        fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            h_wnd_parent: *mut c_void,
+            h_menu: *mut c_void,
+            h_instance: *mut c_void,
+            lp_param: *mut c_void,
+        ) -> *mut c_void;
+        fn DestroyWindow(h_wnd: *mut c_void) -> i32;
     }
 
     #[link(name = "shell32")]
     extern "system" {
         fn DragQueryFileW(
-            h_drop: *mut std::ffi::c_void,
+            h_drop: *mut c_void,
             i_file: u32,
             lpsz_file: *mut u16,
             cch: u32,
@@ -343,110 +553,293 @@ mod win32_clip_files {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut std::ffi::c_void;
-        fn GlobalLock(h_mem: *mut std::ffi::c_void) -> *mut u8;
-        fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
-        fn GlobalFree(h_mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
+        fn GlobalLock(h_mem: *mut c_void) -> *mut u8;
+        fn GlobalUnlock(h_mem: *mut c_void) -> i32;
+        fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
-    fn open_clipboard_with_retry() -> bool {
-        for _ in 0..6 {
-            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
-                return true;
+    struct OwnerWindow(*mut c_void);
+
+    impl OwnerWindow {
+        fn create_message_only() -> Result<Self> {
+            // System predefined "Static" class needs no RegisterClassW.
+            let static_class: [u16; 7] = [b'S' as u16, b't' as u16, b'a' as u16, b't' as u16, b'i' as u16, b'c' as u16, 0];
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    static_class.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if hwnd.is_null() {
+                return Err(std::io::Error::last_os_error())
+                    .context("Failed to create hidden HWND_MESSAGE clipboard owner window");
             }
-            std::thread::sleep(Duration::from_millis(15));
+            Ok(Self(hwnd))
         }
-        false
+
+        fn as_ptr(&self) -> *mut c_void {
+            self.0
+        }
     }
 
-    pub fn read_cf_hdrop_files() -> Option<Vec<PathBuf>> {
-        if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
-            return Some(Vec::new());
-        }
-        if !open_clipboard_with_retry() {
-            return None;
-        }
-        let mut out = Vec::new();
-        unsafe {
-            let h_drop = GetClipboardData(CF_HDROP);
-            if !h_drop.is_null() {
-                let count = DragQueryFileW(h_drop, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
-                for idx in 0..count {
-                    let chars = DragQueryFileW(h_drop, idx, std::ptr::null_mut(), 0);
-                    if chars > 0 && chars < 32_768 {
-                        let mut buf = vec![0u16; (chars + 1) as usize];
-                        let copied = DragQueryFileW(h_drop, idx, buf.as_mut_ptr(), chars + 1);
-                        if copied > 0 {
-                            let os_str = OsString::from_wide(&buf[..copied as usize]);
-                            out.push(PathBuf::from(os_str));
-                        }
-                    }
+    impl Drop for OwnerWindow {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    DestroyWindow(self.0);
                 }
             }
-            let _ = CloseClipboard();
         }
-        Some(out)
+    }
+
+    struct ClipboardGuard;
+
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    fn open_clipboard_with_retry(hwnd: *mut c_void) -> Result<ClipboardGuard> {
+        for _ in 0..8 {
+            if unsafe { OpenClipboard(hwnd) } != 0 {
+                return Ok(ClipboardGuard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(std::io::Error::last_os_error()).context("OpenClipboard failed after retries")
+    }
+
+    pub fn read_cf_hdrop_files() -> Result<Option<Vec<PathBuf>>> {
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+                return Ok(None);
+            }
+            let _guard = open_clipboard_with_retry(std::ptr::null_mut())?;
+            if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+                return Ok(None);
+            }
+            let h_drop = GetClipboardData(CF_HDROP);
+            if h_drop.is_null() {
+                return Ok(None);
+            }
+            let raw_count = DragQueryFileW(h_drop, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+            if raw_count == 0 {
+                return Ok(None);
+            }
+            let count = (raw_count as usize).min(MAX_DROP_ITEMS_INSPECT);
+            let mut paths = Vec::with_capacity(count.min(MAX_TRANSFER_FILES));
+            for i in 0..count {
+                let len = DragQueryFileW(h_drop, i as u32, std::ptr::null_mut(), 0);
+                if len == 0 || len > MAX_EXTENDED_PATH_CHARS {
+                    continue;
+                }
+                let mut buf = vec![0u16; (len + 1) as usize];
+                let copied = DragQueryFileW(h_drop, i as u32, buf.as_mut_ptr(), len + 1);
+                if copied > 0 {
+                    buf.truncate(copied as usize);
+                    let os_str = std::ffi::OsString::from_wide(&buf);
+                    paths.push(PathBuf::from(os_str));
+                }
+            }
+            Ok(Some(paths))
+        }
     }
 
     pub fn write_cf_hdrop_files(files: &[PathBuf]) -> Result<()> {
-        let mut wide_list: Vec<u16> = Vec::new();
+        if files.is_empty() {
+            bail!("No files provided");
+        }
+        if files.len() > MAX_TRANSFER_FILES {
+            bail!(
+                "Refusing to write {} files to CF_HDROP (max {})",
+                files.len(),
+                MAX_TRANSFER_FILES
+            );
+        }
+
+        let mut wide_chars: Vec<u16> = Vec::new();
         for f in files {
-            wide_list.extend(f.as_os_str().encode_wide());
-            wide_list.push(0);
+            let start_len = wide_chars.len();
+            for code in f.as_os_str().encode_wide() {
+                if code == 0 {
+                    bail!("Interior NUL in clipboard file path: {}", f.display());
+                }
+                wide_chars.push(code);
+            }
+            if wide_chars.len() == start_len {
+                bail!("Empty clipboard file path rejected");
+            }
+            wide_chars.push(0);
         }
-        wide_list.push(0); // Double-NUL terminator required by DROPFILES
+        wide_chars.push(0); // Double null terminator
 
-        let header_bytes = std::mem::size_of::<DropFiles>();
-        let total_bytes = header_bytes + wide_list.len() * std::mem::size_of::<u16>();
+        let struct_size = std::mem::size_of::<DropFiles>();
+        let wide_bytes = wide_chars
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .context("CF_HDROP byte size overflow")?;
+        let byte_len = struct_size
+            .checked_add(wide_bytes)
+            .context("CF_HDROP allocation size overflow")?;
 
-        if !open_clipboard_with_retry() {
-            anyhow::bail!("Could not open Windows clipboard after retries");
-        }
+        let owner = OwnerWindow::create_message_only()?;
 
         unsafe {
-            let _ = EmptyClipboard();
-            let h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes);
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, byte_len);
             if h_mem.is_null() {
-                let _ = CloseClipboard();
-                anyhow::bail!("GlobalAlloc failed for CF_HDROP");
-            }
-            let ptr = GlobalLock(h_mem);
-            if ptr.is_null() {
-                let _ = GlobalFree(h_mem);
-                let _ = CloseClipboard();
-                anyhow::bail!("GlobalLock failed for CF_HDROP");
+                return Err(std::io::Error::last_os_error()).context("GlobalAlloc failed");
             }
 
-            let df = DropFiles {
-                p_files: header_bytes as u32,
+            let ptr = GlobalLock(h_mem);
+            if ptr.is_null() {
+                let err = std::io::Error::last_os_error();
+                GlobalFree(h_mem);
+                return Err(err).context("GlobalLock failed");
+            }
+
+            let drop_files = DropFiles {
+                p_files: struct_size as u32,
                 pt_x: 0,
                 pt_y: 0,
                 f_nc: 0,
                 f_wide: 1,
             };
-            std::ptr::write_unaligned(ptr as *mut DropFiles, df);
-            let dest_wide = ptr.add(header_bytes) as *mut u16;
-            std::ptr::copy_nonoverlapping(wide_list.as_ptr(), dest_wide, wide_list.len());
-            let _ = GlobalUnlock(h_mem);
+            std::ptr::copy_nonoverlapping(
+                &drop_files as *const DropFiles as *const u8,
+                ptr,
+                struct_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                wide_chars.as_ptr() as *const u8,
+                ptr.add(struct_size),
+                wide_bytes,
+            );
+            GlobalUnlock(h_mem);
 
-            if SetClipboardData(CF_HDROP, h_mem).is_null() {
-                let _ = GlobalFree(h_mem);
-                let _ = CloseClipboard();
-                anyhow::bail!("SetClipboardData(CF_HDROP) failed");
+            let _guard = match open_clipboard_with_retry(owner.as_ptr()) {
+                Ok(g) => g,
+                Err(e) => {
+                    GlobalFree(h_mem);
+                    return Err(e);
+                }
+            };
+            if EmptyClipboard() == 0 {
+                let err = std::io::Error::last_os_error();
+                GlobalFree(h_mem);
+                return Err(err).context("EmptyClipboard failed");
             }
-            let _ = CloseClipboard();
+            let set_res = SetClipboardData(CF_HDROP, h_mem);
+            if set_res.is_null() {
+                let err = std::io::Error::last_os_error();
+                GlobalFree(h_mem);
+                return Err(err).context("SetClipboardData(CF_HDROP) failed");
+            }
+            // Clipboard owns h_mem after SetClipboardData succeeds.
         }
         Ok(())
     }
+}
 
-    pub fn clear_win32_clipboard() -> Result<()> {
-        if !open_clipboard_with_retry() {
-            anyhow::bail!("Could not open Windows clipboard to clear");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "integrator_fh_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn nul_path_round_trip_preserves_spaces_newlines_and_dedups() {
+        let paths = vec![
+            PathBuf::from("/tmp/ leading space.txt"),
+            PathBuf::from("/tmp/with\nnewline.txt"),
+            PathBuf::from("/tmp/ leading space.txt"),
+            PathBuf::from("/tmp/trailing "),
+        ];
+        let encoded = serialize_nul_paths(&paths).expect("serialize paths");
+        let decoded = parse_nul_paths(&encoded);
+        assert_eq!(
+            decoded,
+            vec![
+                PathBuf::from("/tmp/ leading space.txt"),
+                PathBuf::from("/tmp/with\nnewline.txt"),
+                PathBuf::from("/tmp/trailing "),
+            ]
+        );
+        assert!(serialize_nul_paths(&[PathBuf::from("/tmp/bad\0path")]).is_err());
+    }
+
+    #[test]
+    fn persistent_state_files_are_protected_by_prune_cache() {
+        let dir = temp_test_dir("persistent");
+        for name in [
+            "trusted_peers_v2.json",
+            "trusted_peers_v2.json.tmp",
+            ".master_kek_v2.seed",
+            "features.json",
+            "active_mount.json",
+            "kvm_layout.json",
+            "transient.bin",
+        ] {
+            std::fs::write(dir.join(name), vec![b'x'; 32]).unwrap();
         }
-        unsafe {
-            let _ = EmptyClipboard();
-            let _ = CloseClipboard();
+        let helper = FileClipboardHelper::new_in_dir(dir.clone()).unwrap();
+        // Force size budget below everything to verify persistent files remain untouched.
+        helper.prune_cache(3, 1);
+        assert!(dir.join("trusted_peers_v2.json").exists());
+        assert!(dir.join("trusted_peers_v2.json.tmp").exists());
+        assert!(dir.join(".master_kek_v2.seed").exists());
+        assert!(dir.join("features.json").exists());
+        assert!(dir.join("active_mount.json").exists());
+        assert!(dir.join("kvm_layout.json").exists());
+        assert!(!dir.join("transient.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_private_cache_dir_rejects_symlink_and_isolates_subfolder() {
+        let base = temp_test_dir("isolated");
+        let cache = ensure_private_cache_dir(&base).unwrap();
+        assert_eq!(cache, base.join("clipboard_cache"));
+        assert!(cache.is_dir());
+
+        #[cfg(unix)]
+        {
+            let target = temp_test_dir("symlink_target");
+            let sym_base = temp_test_dir("sym_parent");
+            let sym = sym_base.join("clipboard_cache");
+            std::os::unix::fs::symlink(&target, &sym).unwrap();
+            assert!(ensure_private_cache_dir(&sym_base).is_err());
+            let _ = std::fs::remove_dir_all(&target);
+            let _ = std::fs::remove_dir_all(&sym_base);
         }
-        Ok(())
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

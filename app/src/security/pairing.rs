@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 pub const PAIRING_WIRE_MAGIC: [u8; 4] = *b"IPR2";
 pub const PAIRING_PROTOCOL_VERSION: u16 = 2;
@@ -40,9 +42,11 @@ pub const PIN_TTL_SECS: u64 = 600; // 10 minutes
 pub const INFLIGHT_SESSION_TTL_SECS: u64 = 15; // 15 seconds per handshake
 pub const MAX_CONCURRENT_PAIRING_SESSIONS: usize = 4;
 pub const MAX_FAILED_ATTEMPTS_PER_IP: u32 = 3;
+pub const MAX_PAIR_INIT_PER_IP_PER_WINDOW: u32 = 12;
 pub const IP_ATTEMPT_WINDOW_SECS: u64 = 60;
 pub const BASE_IP_LOCKOUT_SECS: u64 = 60;
 pub const MAX_IP_RATE_LIMIT_ENTRIES: usize = 1024;
+pub const PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_PLATFORM_LEN: usize = 16;
 
@@ -224,7 +228,9 @@ impl PairingError {
 #[derive(Debug, Clone)]
 struct IpRateLimitRecord {
     failures: u32,
+    init_attempts: u32,
     window_started_at: u64,
+    init_window_started_at: u64,
     locked_until: u64,
     consecutive_lockouts: u32,
     last_touched: u64,
@@ -244,7 +250,7 @@ struct InFlightServerSession {
 
 /// Manages the host's active pairing PIN, per-IP rate limiting, and in-flight SPAKE2 sessions.
 pub struct PairingCoordinatorV2 {
-    active_pin: Option<String>,
+    active_pin: Option<Zeroizing<String>>,
     pin_created_at_secs: u64,
     pairing_window_open: bool,
     local_device_name: String,
@@ -270,7 +276,7 @@ impl PairingCoordinatorV2 {
     /// the pairing window for `PIN_TTL_SECS` (10 minutes).
     pub fn open_pairing_window(&mut self, now_secs: u64) -> String {
         let pin = generate_unbiased_6digit_pin();
-        self.active_pin = Some(pin.clone());
+        self.active_pin = Some(Zeroizing::new(pin.clone()));
         self.pin_created_at_secs = now_secs;
         self.pairing_window_open = true;
         self.inflight_sessions.clear();
@@ -286,7 +292,7 @@ impl PairingCoordinatorV2 {
         if !is_valid_6digit_pin(pin) {
             return Err(PairingError::InvalidPinFormat);
         }
-        self.active_pin = Some(pin.to_string());
+        self.active_pin = Some(Zeroizing::new(pin.to_string()));
         self.pin_created_at_secs = now_secs;
         self.pairing_window_open = true;
         self.inflight_sessions.clear();
@@ -299,6 +305,14 @@ impl PairingCoordinatorV2 {
         self.inflight_sessions.clear();
     }
 
+    pub fn pin_created_at_secs(&self) -> u64 {
+        self.pin_created_at_secs
+    }
+
+    pub fn cancel_inflight_for_ip(&mut self, ip: IpAddr) {
+        self.inflight_sessions.retain(|_, s| s.source_ip != ip);
+    }
+
     pub fn active_pin(&self, now_secs: u64) -> Option<&str> {
         if !self.pairing_window_open {
             return None;
@@ -306,7 +320,50 @@ impl PairingCoordinatorV2 {
         if now_secs.saturating_sub(self.pin_created_at_secs) > PIN_TTL_SECS {
             return None;
         }
-        self.active_pin.as_deref()
+        self.active_pin.as_deref().map(|z| z.as_str())
+    }
+
+    fn evict_one_rate_limit_entry(&mut self, now_secs: u64) {
+        // Prefer evicting unlocked entries (oldest last_touched first) so flooding IPs cannot
+        // push an actively locked-out attacker out of the table.
+        if let Some(&evict_ip) = self
+            .ip_rate_limits
+            .iter()
+            .filter(|(_, r)| r.locked_until <= now_secs)
+            .min_by_key(|(_, r)| r.last_touched)
+            .map(|(k, _)| k)
+            .or_else(|| {
+                self.ip_rate_limits
+                    .iter()
+                    .min_by_key(|(_, r)| r.locked_until)
+                    .map(|(k, _)| k)
+            })
+        {
+            self.ip_rate_limits.remove(&evict_ip);
+        }
+    }
+
+    fn ensure_rate_limit_entry_mut(
+        &mut self,
+        ip: IpAddr,
+        now_secs: u64,
+    ) -> &mut IpRateLimitRecord {
+        if self.ip_rate_limits.len() >= MAX_IP_RATE_LIMIT_ENTRIES
+            && !self.ip_rate_limits.contains_key(&ip)
+        {
+            self.evict_one_rate_limit_entry(now_secs);
+        }
+        self.ip_rate_limits
+            .entry(ip)
+            .or_insert_with(|| IpRateLimitRecord {
+                failures: 0,
+                init_attempts: 0,
+                window_started_at: now_secs,
+                init_window_started_at: now_secs,
+                locked_until: 0,
+                consecutive_lockouts: 0,
+                last_touched: now_secs,
+            })
     }
 
     fn check_ip_rate_limit(&mut self, ip: IpAddr, now_secs: u64) -> Result<(), PairingError> {
@@ -321,36 +378,38 @@ impl PairingCoordinatorV2 {
                 rec.failures = 0;
                 rec.window_started_at = now_secs;
             }
+            if now_secs.saturating_sub(rec.init_window_started_at) > IP_ATTEMPT_WINDOW_SECS {
+                rec.init_attempts = 0;
+                rec.init_window_started_at = now_secs;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_and_record_pair_init(&mut self, ip: IpAddr, now_secs: u64) -> Result<(), PairingError> {
+        let entry = self.ensure_rate_limit_entry_mut(ip, now_secs);
+        entry.last_touched = now_secs;
+        if now_secs.saturating_sub(entry.init_window_started_at) > IP_ATTEMPT_WINDOW_SECS {
+            entry.init_attempts = 0;
+            entry.init_window_started_at = now_secs;
+        }
+        entry.init_attempts = entry.init_attempts.saturating_add(1);
+        if entry.init_attempts > MAX_PAIR_INIT_PER_IP_PER_WINDOW {
+            let exp = entry.consecutive_lockouts.min(4);
+            let lockout_secs = BASE_IP_LOCKOUT_SECS.saturating_mul(1u64 << exp);
+            entry.locked_until = now_secs.saturating_add(lockout_secs);
+            entry.consecutive_lockouts = entry.consecutive_lockouts.saturating_add(1);
+            entry.init_attempts = 0;
+            return Err(PairingError::IpRateLimited {
+                retry_after_secs: lockout_secs,
+            });
         }
         Ok(())
     }
 
     /// Records a failed authentication attempt for `ip` WITHOUT rotating or invalidating the host's active PIN.
     fn record_ip_failure(&mut self, ip: IpAddr, now_secs: u64) {
-        if self.ip_rate_limits.len() >= MAX_IP_RATE_LIMIT_ENTRIES
-            && !self.ip_rate_limits.contains_key(&ip)
-        {
-            // Evict the oldest entry to bound memory usage.
-            if let Some((&oldest_ip, _)) = self
-                .ip_rate_limits
-                .iter()
-                .min_by_key(|(_, r)| r.last_touched)
-            {
-                self.ip_rate_limits.remove(&oldest_ip);
-            }
-        }
-
-        let entry = self
-            .ip_rate_limits
-            .entry(ip)
-            .or_insert_with(|| IpRateLimitRecord {
-                failures: 0,
-                window_started_at: now_secs,
-                locked_until: 0,
-                consecutive_lockouts: 0,
-                last_touched: now_secs,
-            });
-
+        let entry = self.ensure_rate_limit_entry_mut(ip, now_secs);
         entry.last_touched = now_secs;
         if now_secs.saturating_sub(entry.window_started_at) > IP_ATTEMPT_WINDOW_SECS {
             entry.failures = 0;
@@ -398,15 +457,16 @@ impl PairingCoordinatorV2 {
 
         let pin = match &self.active_pin {
             Some(p) if now_secs.saturating_sub(self.pin_created_at_secs) <= PIN_TTL_SECS => {
-                p.clone()
+                Zeroizing::new(p.as_str().to_string())
             }
             Some(_) => {
-                self.pairing_window_open = false;
-                self.active_pin = None;
+                self.close_pairing_window();
                 return Err(PairingError::PinExpired);
             }
             None => return Err(PairingError::PairingWindowClosed),
         };
+
+        self.check_and_record_pair_init(source_ip, now_secs)?;
 
         let client_device_id: [u8; 16] = hex_decode_array(&init_msg.client_device_id_hex)
             .ok_or_else(|| PairingError::MalformedMessage("invalid client_device_id_hex".into()))?;
@@ -501,23 +561,34 @@ impl PairingCoordinatorV2 {
         self.check_ip_rate_limit(source_ip, now_secs)?;
         self.prune_expired_sessions(now_secs);
 
+        if !self.pairing_window_open || self.active_pin.is_none() {
+            return Err(PairingError::PairingWindowClosed);
+        }
+        if now_secs.saturating_sub(self.pin_created_at_secs) > PIN_TTL_SECS {
+            self.close_pairing_window();
+            return Err(PairingError::PinExpired);
+        }
+
         let session_id: [u8; 16] = hex_decode_array(&confirm_msg.pairing_session_id_hex)
             .ok_or_else(|| {
                 PairingError::MalformedMessage("invalid pairing_session_id_hex".into())
             })?;
 
-        let session = match self.inflight_sessions.remove(&session_id) {
-            Some(s) => s,
+        match self.inflight_sessions.get(&session_id) {
             None => {
                 self.record_ip_failure(source_ip, now_secs);
                 return Err(PairingError::SessionNotFoundOrExpired);
             }
-        };
-
-        if session.source_ip != source_ip {
-            self.record_ip_failure(source_ip, now_secs);
-            return Err(PairingError::SessionIpMismatch);
+            Some(s) if s.source_ip != source_ip => {
+                self.record_ip_failure(source_ip, now_secs);
+                return Err(PairingError::SessionIpMismatch);
+            }
+            Some(_) => {}
         }
+        let session = self
+            .inflight_sessions
+            .remove(&session_id)
+            .ok_or(PairingError::SessionNotFoundOrExpired)?;
 
         let spake2_share_a: [u8; 32] = match hex_decode_array(&confirm_msg.spake2_share_a_hex) {
             Some(arr) => arr,
@@ -617,7 +688,7 @@ impl PairingCoordinatorV2 {
 
 /// Client-side (`Initiator A`) state machine for a single pairing handshake.
 pub struct ClientPairingHandshakeV2 {
-    pin: String,
+    pin: Zeroizing<String>,
     init_msg: PairInitMsg,
     client_device_id: [u8; 16],
     client_ed25519_pk: [u8; 32],
@@ -662,7 +733,7 @@ impl ClientPairingHandshakeV2 {
 
         Ok((
             Self {
-                pin: trimmed_pin.to_string(),
+                pin: Zeroizing::new(trimmed_pin.to_string()),
                 init_msg: init_msg.clone(),
                 client_device_id,
                 client_ed25519_pk,
@@ -862,13 +933,13 @@ where
     frame.extend_from_slice(&(json.len() as u16).to_be_bytes());
     frame.extend_from_slice(&json);
 
-    writer
-        .write_all(&frame)
+    tokio::time::timeout(PAIRING_IO_TIMEOUT, writer.write_all(&frame))
         .await
+        .map_err(|_| PairingError::IoFailure("pairing write timed out".into()))?
         .map_err(|e| PairingError::IoFailure(e.to_string()))?;
-    writer
-        .flush()
+    tokio::time::timeout(PAIRING_IO_TIMEOUT, writer.flush())
         .await
+        .map_err(|_| PairingError::IoFailure("pairing flush timed out".into()))?
         .map_err(|e| PairingError::IoFailure(e.to_string()))?;
     Ok(())
 }
@@ -895,9 +966,9 @@ where
         Some(m) => m,
         None => {
             let mut m = [0u8; 4];
-            reader
-                .read_exact(&mut m)
+            tokio::time::timeout(PAIRING_IO_TIMEOUT, reader.read_exact(&mut m))
                 .await
+                .map_err(|_| PairingError::IoFailure("pairing magic read timed out".into()))?
                 .map_err(|e| PairingError::IoFailure(e.to_string()))?;
             m
         }
@@ -907,9 +978,9 @@ where
     }
 
     let mut rest_hdr = [0u8; 4];
-    reader
-        .read_exact(&mut rest_hdr)
+    tokio::time::timeout(PAIRING_IO_TIMEOUT, reader.read_exact(&mut rest_hdr))
         .await
+        .map_err(|_| PairingError::IoFailure("pairing header read timed out".into()))?
         .map_err(|e| PairingError::IoFailure(e.to_string()))?;
 
     if rest_hdr[0] != PAIRING_HEADER_VERSION_BYTE {
@@ -924,9 +995,9 @@ where
     }
 
     let mut payload = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload)
+    tokio::time::timeout(PAIRING_IO_TIMEOUT, reader.read_exact(&mut payload))
         .await
+        .map_err(|_| PairingError::IoFailure("pairing payload read timed out".into()))?
         .map_err(|e| PairingError::IoFailure(e.to_string()))?;
 
     Ok((msg_type, payload))
@@ -1091,10 +1162,18 @@ where
         }
     };
 
-    send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await?;
+    if let Err(e) = send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await {
+        let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        coord.cancel_inflight_for_ip(source_ip);
+        return Err(e);
+    }
 
     let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
     if msg_type_2 != PairingMsgType::PairClientConfirm {
+        {
+            let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            coord.cancel_inflight_for_ip(source_ip);
+        }
         let err = PairingError::InvalidMessageType(msg_type_2 as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
         return Err(err);
@@ -1103,6 +1182,10 @@ where
     let confirm_msg: PairClientConfirmMsg = match serde_json::from_slice(&payload_2) {
         Ok(m) => m,
         Err(e) => {
+            {
+                let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                coord.cancel_inflight_for_ip(source_ip);
+            }
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
                 send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1111,20 +1194,35 @@ where
     };
 
     let now_secs_2 = unix_epoch_secs();
-    let confirm_res = {
+    let (was_already_paired, confirm_res) = {
         let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_ids: std::collections::HashSet<String> =
+            ks.list_peers().into_iter().map(|p| p.device_id_hex).collect();
         let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        coord.handle_pair_client_confirm(
+        let res = coord.handle_pair_client_confirm(
             &mut ks,
             source_ip,
             &confirm_msg,
             via_direct_cable,
             now_secs_2,
-        )
+        );
+        let existed = res
+            .as_ref()
+            .map(|(_, creds, _)| prior_ids.contains(&creds.device_id_hex))
+            .unwrap_or(false);
+        (existed, res)
     };
     match confirm_res {
         Ok((complete_msg, creds, sas)) => {
-            send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await?;
+            if let Err(e) =
+                send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await
+            {
+                if !was_already_paired {
+                    let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = ks.unpair_peer(&creds.device_id_hex);
+                }
+                return Err(e);
+            }
             Ok((creds, sas))
         }
         Err(err) => {
@@ -1197,10 +1295,14 @@ where
         }
     };
 
-    send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await?;
+    if let Err(e) = send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await {
+        coordinator.cancel_inflight_for_ip(source_ip);
+        return Err(e);
+    }
 
     let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
     if msg_type_2 != PairingMsgType::PairClientConfirm {
+        coordinator.cancel_inflight_for_ip(source_ip);
         let err = PairingError::InvalidMessageType(msg_type_2 as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
         return Err(err);
@@ -1209,6 +1311,7 @@ where
     let confirm_msg: PairClientConfirmMsg = match serde_json::from_slice(&payload_2) {
         Ok(m) => m,
         Err(e) => {
+            coordinator.cancel_inflight_for_ip(source_ip);
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
                 send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1217,6 +1320,11 @@ where
     };
 
     let now_secs_2 = unix_epoch_secs();
+    let prior_ids: std::collections::HashSet<String> = keystore
+        .list_peers()
+        .into_iter()
+        .map(|p| p.device_id_hex)
+        .collect();
     match coordinator.handle_pair_client_confirm(
         keystore,
         source_ip,
@@ -1225,7 +1333,15 @@ where
         now_secs_2,
     ) {
         Ok((complete_msg, creds, sas)) => {
-            send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await?;
+            let was_already_paired = prior_ids.contains(&creds.device_id_hex);
+            if let Err(e) =
+                send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await
+            {
+                if !was_already_paired {
+                    let _ = keystore.unpair_peer(&creds.device_id_hex);
+                }
+                return Err(e);
+            }
             Ok((creds, sas))
         }
         Err(err) => {
@@ -1327,10 +1443,22 @@ pub fn is_valid_6digit_pin(pin: &str) -> bool {
     pin.len() == 6 && pin.chars().all(|c| c.is_ascii_digit())
 }
 
+fn is_bidi_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 fn sanitize_label(input: &str, max_len: usize) -> String {
     let filtered: String = input
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_bidi_format_char(*c))
         .take(max_len)
         .collect();
     let trimmed = filtered.trim();
@@ -1706,6 +1834,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_c1);
         let _ = std::fs::remove_dir_all(&dir_c2);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn test_pairing_spoofed_ip_confirm_does_not_evict_legit_inflight_session() {
+        let (dir_c, mut ks_c) = temp_keystore("spoof_c", 0xA1);
+        let (dir_s, mut ks_s) = temp_keystore("spoof_s", 0xA2);
+        let mut coordinator =
+            PairingCoordinatorV2::new("HP-Omen".to_string(), "Windows".to_string());
+        let now = 7_000_000;
+        coordinator.open_pairing_window_with_pin("654321", now).unwrap();
+
+        let legit_ip = IpAddr::V4(Ipv4Addr::new(10, 99, 99, 2));
+        let attacker_ip = IpAddr::V4(Ipv4Addr::new(10, 99, 99, 200));
+
+        let (hs, init_msg) =
+            ClientPairingHandshakeV2::initiate(&ks_c, "654321", "Mac", "macOS").unwrap();
+        let share_msg = coordinator
+            .handle_pair_init(&ks_s, legit_ip, &init_msg, now)
+            .unwrap();
+        let (awaiting, confirm_msg) = hs.process_server_share(&ks_c, &share_msg).unwrap();
+
+        // Off-path attacker tries to submit confirm from another IP -> must fail with SessionIpMismatch
+        // AND must NOT remove the legitimate in-flight session.
+        let spoof_res = coordinator.handle_pair_client_confirm(
+            &mut ks_s,
+            attacker_ip,
+            &confirm_msg,
+            false,
+            now,
+        );
+        assert_eq!(spoof_res.unwrap_err(), PairingError::SessionIpMismatch);
+
+        // Legitimate client can still complete the same session.
+        let (complete_msg, srv_creds, _) = coordinator
+            .handle_pair_client_confirm(&mut ks_s, legit_ip, &confirm_msg, true, now)
+            .expect("legit session must remain intact after spoofed IP attempt");
+        let (cli_creds, _) = awaiting
+            .finalize_and_commit(&mut ks_c, &complete_msg, "10.99.99.1", true)
+            .unwrap();
+        assert_eq!(*srv_creds.root_key, *cli_creds.root_key);
+
+        let _ = std::fs::remove_dir_all(&dir_c);
         let _ = std::fs::remove_dir_all(&dir_s);
     }
 }

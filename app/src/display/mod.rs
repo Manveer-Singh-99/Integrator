@@ -7,6 +7,7 @@ pub mod server;
 pub use controller::DisplayController;
 pub use server::DisplayServer;
 pub use protocol::DisplayRpcRequest;
+#[allow(unused_imports)]
 pub use win_display::WinDisplayManager;
 #[allow(unused_imports)]
 pub use mac_display::MacDisplayManager;

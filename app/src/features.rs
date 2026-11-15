@@ -7,11 +7,15 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, warn};
 
+static FEATURES_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FeatureFlags {
     pub display: bool,
     pub clipboard: bool,
@@ -127,6 +131,16 @@ impl FeatureManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn from_flags_for_test(flags: FeatureFlags) -> Self {
+        let seq = FEATURES_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            flags: Arc::new(RwLock::new(flags)),
+            config_path: std::env::temp_dir()
+                .join(format!("integrator_test_features_{}_{}.json", std::process::id(), seq)),
+        }
+    }
+
     pub fn get_flags(&self) -> FeatureFlags {
         self.flags
             .read()
@@ -161,64 +175,82 @@ impl FeatureManager {
     /// Updates a known feature flag and persists it atomically to disk, returning an error
     /// if the feature identifier is unknown, dependency is unmet, or disk persistence fails.
     pub fn set_flag_checked(&self, feature: &str, enabled: bool) -> Result<FeatureFlags, String> {
-        let updated = {
-            let mut f = self.flags.write().unwrap_or_else(|e| e.into_inner());
-            match feature.trim() {
-                "display" => f.display = enabled,
-                "clipboard" => {
-                    if enabled && !f.input_kvm {
-                        return Err(
-                            "Universal Input & KVM must be enabled before turning on Universal Clipboard."
-                                .to_string(),
-                        );
-                    }
-                    f.clipboard = enabled;
+        // Hold the write lock across atomic disk persistence so concurrent callers
+        // cannot reorder disk snapshots and failed writes never mutate in-memory state.
+        let mut f = self.flags.write().unwrap_or_else(|e| e.into_inner());
+        let mut candidate = f.clone();
+        match feature.trim() {
+            "display" => candidate.display = enabled,
+            "clipboard" => {
+                if enabled && !candidate.input_kvm {
+                    return Err(
+                        "Universal Input & KVM must be enabled before turning on Universal Clipboard."
+                            .to_string(),
+                    );
                 }
-                "input_kvm" | "input" => {
-                    f.input_kvm = enabled;
-                    if !enabled {
-                        // Auto-disable coupled continuity features when KVM is turned off.
-                        f.clipboard = false;
-                        f.dragdrop = false;
-                    }
-                }
-                "dragdrop" => {
-                    if enabled && !f.input_kvm {
-                        return Err(
-                            "Universal Input & KVM must be enabled before turning on Cross-Screen Drag & Drop."
-                                .to_string(),
-                        );
-                    }
-                    f.dragdrop = enabled;
-                }
-                "storage" => f.storage = enabled,
-                "touchid" => f.touchid = enabled,
-                "truetone" => f.truetone = enabled,
-                "camera" => f.camera = enabled,
-                "audio" => f.audio = enabled,
-                "touchbar" => f.touchbar = enabled,
-                "multiwan" => f.multiwan = enabled,
-                "benchmark" => f.benchmark = enabled,
-                other => {
-                    return Err(format!("Unknown feature identifier: '{}'", other));
+                candidate.clipboard = enabled;
+            }
+            "input_kvm" | "input" => {
+                candidate.input_kvm = enabled;
+                if !enabled {
+                    // Auto-disable coupled continuity features when KVM is turned off.
+                    candidate.clipboard = false;
+                    candidate.dragdrop = false;
                 }
             }
-            f.clone()
-        };
+            "dragdrop" => {
+                if enabled && !candidate.input_kvm {
+                    return Err(
+                        "Universal Input & KVM must be enabled before turning on Cross-Screen Drag & Drop."
+                            .to_string(),
+                    );
+                }
+                candidate.dragdrop = enabled;
+            }
+            "storage" => candidate.storage = enabled,
+            "touchid" => candidate.touchid = enabled,
+            "truetone" => candidate.truetone = enabled,
+            "camera" => candidate.camera = enabled,
+            "audio" => candidate.audio = enabled,
+            "touchbar" => candidate.touchbar = enabled,
+            "multiwan" => candidate.multiwan = enabled,
+            "benchmark" => candidate.benchmark = enabled,
+            other => {
+                return Err(format!("Unknown feature identifier: '{}'", other));
+            }
+        }
 
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {}", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
-        let json = serde_json::to_string_pretty(&updated)
+        let json = serde_json::to_string_pretty(&candidate)
             .map_err(|e| format!("Failed to serialize feature flags: {}", e))?;
-        let tmp_path = self.config_path.with_extension("json.tmp");
-        fs::write(&tmp_path, json)
-            .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
-        fs::rename(&tmp_path, &self.config_path)
-            .map_err(|e| format!("Failed to save {}: {}", self.config_path.display(), e))?;
+        let seq = FEATURES_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self
+            .config_path
+            .with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
+        if let Err(e) = fs::write(&tmp_path, json.as_bytes()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write {}: {}", tmp_path.display(), e));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = fs::rename(&tmp_path, &self.config_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Failed to save {}: {}", self.config_path.display(), e));
+        }
 
-        Ok(updated)
+        *f = candidate.clone();
+        Ok(candidate)
     }
 
     pub fn set_flag(&self, feature: &str, enabled: bool) -> FeatureFlags {
@@ -286,5 +318,19 @@ mod tests {
         assert!(mgr.is_enabled("dragdrop"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn partial_json_backwards_compatibility_uses_defaults() {
+        let legacy_partial = r#"{"display":false,"input_kvm":true,"clipboard":false}"#;
+        let parsed: FeatureFlags =
+            serde_json::from_str(legacy_partial).expect("partial JSON should deserialize");
+        let defaults = FeatureFlags::default();
+        assert!(!parsed.display);
+        assert!(parsed.input_kvm);
+        assert!(!parsed.clipboard);
+        assert_eq!(parsed.dragdrop, defaults.dragdrop);
+        assert_eq!(parsed.storage, defaults.storage);
+        assert_eq!(parsed.benchmark, defaults.benchmark);
     }
 }

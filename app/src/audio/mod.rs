@@ -12,7 +12,7 @@
 //!   local 24-bit 48kHz stereo WAV chime synthesis is provided for speaker verification.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::net::IpAddr;
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -41,14 +41,21 @@ pub const AUDIO_PORT: u16 = config::AUDIO_PORT;
 
 const LOG_RATE_LIMIT: Duration = Duration::from_secs(30);
 const RECENT_PACKET_WINDOW_MS: u64 = 5_000;
+#[allow(dead_code)]
+const MAX_NEGOTIATED_AUDIO_TTL_SECS: u64 = 600;
 
 static SINK_LISTENING: AtomicBool = AtomicBool::new(false);
 static LAST_PACKET_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
 static PACKETS_DRAINED: AtomicU64 = AtomicU64::new(0);
 static AUDIO_SESSION_REGISTRY: OnceLock<Mutex<AudioSessionRegistry>> = OnceLock::new();
+static CHIME_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn global_audio_registry() -> &'static Mutex<AudioSessionRegistry> {
     AUDIO_SESSION_REGISTRY.get_or_init(|| Mutex::new(AudioSessionRegistry::new()))
+}
+
+fn chime_file_lock() -> &'static Mutex<()> {
+    CHIME_FILE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[allow(dead_code)]
@@ -159,28 +166,65 @@ impl AudioManager {
         channels: u8,
         bit_depth: u8,
     ) -> Result<NegotiatedAudioSessionWire, String> {
-        let Some(sender_nonce) = security::hex_decode_array::<32>(sender_nonce_hex) else {
-            return Err("Invalid 32-byte sender_nonce_hex".into());
-        };
-        let ip_str = caller_ip.to_string();
-        let Some(peer_creds) = trust::lookup_verified_peer_for_ip(&ip_str) else {
-            return Err(format!("No cryptographically paired peer found for {}", ip_str));
-        };
-
-        let now = security::unix_epoch_secs();
-        let mut reg = global_audio_registry()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        reg.negotiate_receiver_session(
-            peer_creds.device_id,
-            &peer_creds.root_key,
-            &sender_nonce,
+        Self::handle_negotiate_session_for_peer(
+            None,
+            caller_ip,
+            sender_nonce_hex,
             sample_rate,
             channels,
             bit_depth,
-            now,
         )
-        .map_err(|e| e.to_string())
+    }
+
+    /// Resolves peer credentials directly by cryptographically authenticated `TransportSessionV2`
+    /// `peer_device_id` when available, falling back to verified IP lookup only for local/test callers.
+    pub fn handle_negotiate_session_for_peer(
+        authenticated_peer_device_id: Option<&str>,
+        caller_ip: IpAddr,
+        sender_nonce_hex: &str,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+    ) -> Result<NegotiatedAudioSessionWire, String> {
+        let Some(sender_nonce) = security::hex_decode_array::<32>(sender_nonce_hex) else {
+            return Err("Invalid 32-byte sender_nonce_hex".into());
+        };
+        if sender_nonce.iter().all(|&b| b == 0) {
+            return Err("Rejected all-zero audio sender_nonce".into());
+        }
+
+        let peer_creds = match authenticated_peer_device_id {
+            Some(peer_id) => trust::lookup_verified_peer_by_id_at_ip(peer_id, caller_ip)
+                .ok_or_else(|| {
+                    format!(
+                        "No cryptographically paired non-blocked peer {} for {}",
+                        peer_id, caller_ip
+                    )
+                })?,
+            None => {
+                let ip_str = caller_ip.to_string();
+                trust::lookup_verified_peer_for_ip(&ip_str).ok_or_else(|| {
+                    format!("No cryptographically paired peer found for {}", ip_str)
+                })?
+            }
+        };
+
+        let now = security::unix_epoch_secs();
+        let res = {
+            let mut reg = global_audio_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            reg.negotiate_receiver_session(
+                peer_creds.device_id,
+                &peer_creds.root_key,
+                &sender_nonce,
+                sample_rate,
+                channels,
+                bit_depth,
+                now,
+            )
+        };
+        res.map_err(|e| e.to_string())
     }
 
     /// Negotiates an outbound `AudioSessionSender` with `peer_ip` over `TransportSessionV2` (`DisplayRpc`).
@@ -207,10 +251,19 @@ impl AudioManager {
         let wire = resp
             .audio_session
             .ok_or_else(|| anyhow::anyhow!("Peer response missing audio_session parameters"))?;
+        if wire.expires_in_secs == 0 {
+            anyhow::bail!("Peer returned zero audio session TTL");
+        }
+        if sample_rate == 0 || channels == 0 || bit_depth == 0 {
+            anyhow::bail!("Invalid local audio stream parameters");
+        }
         let session_id = security::hex_decode_array::<8>(&wire.session_id_hex)
             .ok_or_else(|| anyhow::anyhow!("Invalid session_id_hex from peer"))?;
         let receiver_nonce = security::hex_decode_array::<32>(&wire.receiver_nonce_hex)
             .ok_or_else(|| anyhow::anyhow!("Invalid receiver_nonce_hex from peer"))?;
+        if receiver_nonce.iter().all(|&b| b == 0) {
+            anyhow::bail!("Peer returned all-zero receiver_nonce");
+        }
 
         let (k_audio, nonce_salt) = derive_audio_session_keys(
             &peer_creds.root_key,
@@ -219,29 +272,51 @@ impl AudioManager {
             &session_id,
         );
         let now = security::unix_epoch_secs();
+        let bounded_ttl = wire.expires_in_secs.min(MAX_NEGOTIATED_AUDIO_TTL_SECS);
         Ok(AudioSessionSender::new(
             session_id,
-            *k_audio,
+            k_audio,
             nonce_salt,
-            now.saturating_add(wire.expires_in_secs),
+            now.saturating_add(bounded_ttl),
         ))
+    }
+
+    /// Generates and plays a 24-bit 48kHz stereo test chime asynchronously off the Tokio pool.
+    #[allow(dead_code)]
+    pub async fn play_spatial_test_chime_async() -> Result<String> {
+        tokio::task::spawn_blocking(Self::play_spatial_test_chime)
+            .await
+            .map_err(|e| anyhow::anyhow!("Audio chime task panicked: {}", e))?
     }
 
     /// Generates and plays a 24-bit 48kHz stereo test chime through the local
     /// host's default audio output.
     pub fn play_spatial_test_chime() -> Result<String> {
-        let wav_path = system_info::app_data_dir().join("spatial_test_chime.wav");
+        let _guard = chime_file_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let data_dir = system_info::app_data_dir();
+        std::fs::create_dir_all(&data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let wav_path = data_dir.join("spatial_test_chime.wav");
 
         // Synthesize 24-bit 48kHz stereo WAV
         Self::synthesize_chime_wav(&wav_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&wav_path, std::fs::Permissions::from_mode(0o600));
+        }
 
-        // Play sound via native OS audio engine
+        // Play sound via native OS audio engine using qualified system binaries
         #[cfg(target_os = "macos")]
         {
-            let child = Command::new("afplay")
+            let child = Command::new("/usr/bin/afplay")
                 .arg(&wav_path)
                 .spawn()
-                .context("Failed to spawn afplay")?;
+                .context("Failed to spawn /usr/bin/afplay")?;
 
             reap_child(child);
             Ok("Played 24-bit 48kHz stereo chime via macOS audio output".to_string())
@@ -254,7 +329,7 @@ impl AudioManager {
                 "(New-Object Media.SoundPlayer '{}').PlaySync()",
                 path_str.replace('\'', "''")
             );
-            let mut cmd = Command::new("powershell.exe");
+            let mut cmd = Command::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
             cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
             cmd.creation_flags(CREATE_NO_WINDOW);
             let child = cmd
@@ -280,7 +355,8 @@ impl AudioManager {
         let num_channels = 2usize;
         let bytes_per_sample = 3usize; // 24-bit
 
-        let mut file = File::create(path)?;
+        let raw_file = File::create(path)?;
+        let mut file = BufWriter::with_capacity(64 * 1024, raw_file);
 
         // RIFF WAVE Header for 24-bit stereo 48000Hz PCM
         let block_align = (num_channels * bytes_per_sample) as u16;
@@ -354,19 +430,22 @@ impl AudioManager {
     /// anti-replay protection, and session expiry while rate-limiting warnings so LAN floods
     /// cannot spam logs.
     pub async fn start_sink_server() -> Result<()> {
-        if SINK_LISTENING.load(Ordering::Acquire) {
+        if SINK_LISTENING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(());
         }
+        let guard = SinkListeningGuard;
 
         let socket = tokio::net::UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).await?;
-        SINK_LISTENING.store(true, Ordering::Release);
         tracing::info!(
             "🔊 Experimental Authenticated UDP Audio Sink (IUA2 Preview) listening on port {} (AEAD + 64-pkt replay window; OS playback not active)",
             AUDIO_PORT
         );
 
         tokio::spawn(async move {
-            let _guard = SinkListeningGuard;
+            let _guard = guard;
             // Allocate 1 byte beyond MAX_AUDIO_DATAGRAM_LEN so oversized datagrams
             // on Unix are detected via `size > MAX_AUDIO_DATAGRAM_LEN`.
             let mut buf = vec![0u8; MAX_AUDIO_DATAGRAM_LEN + 1];
@@ -461,6 +540,43 @@ mod tests {
     }
 
     #[test]
+    fn reject_all_zero_sender_nonce_and_authenticate_by_device_id() {
+        let zeros = "00".repeat(32);
+        assert!(AudioManager::handle_negotiate_session_for_peer(
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &zeros,
+            48_000,
+            2,
+            24
+        )
+        .is_err());
+
+        let nonce = security::hex_encode(&security::csprng_array::<32>());
+        let local_id = trust::local_device_id_hex();
+        let wire = AudioManager::handle_negotiate_session_for_peer(
+            Some(&local_id),
+            "127.0.0.1".parse().unwrap(),
+            &nonce,
+            48_000,
+            2,
+            24,
+        );
+        assert!(wire.is_ok());
+
+        // Unknown device_id must fail even on loopback
+        assert!(AudioManager::handle_negotiate_session_for_peer(
+            Some(&"ff".repeat(16)),
+            "127.0.0.1".parse().unwrap(),
+            &nonce,
+            48_000,
+            2,
+            24,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn negotiate_and_verify_loopback_iua2_session() {
         let sender_nonce = security::csprng_array::<32>();
         let sender_nonce_hex = security::hex_encode(&sender_nonce);
@@ -485,18 +601,18 @@ mod tests {
         let now = security::unix_epoch_secs();
         let mut sender = AudioSessionSender::new(
             session_id,
-            *k_audio,
+            k_audio,
             nonce_salt,
             now + wire.expires_in_secs,
         );
 
         let dgram = sender
-            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x11u8; 144], now)
+            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x11u8; 288], now)
             .unwrap();
         let mut reg = global_audio_registry().lock().unwrap();
         let (peer_id, hdr, plain) = reg.open_incoming_datagram(&dgram, now).unwrap();
         assert_eq!(peer_id, creds.device_id);
         assert_eq!(hdr.pkt_seq, 1);
-        assert_eq!(plain.len(), 144);
+        assert_eq!(plain.len(), 288);
     }
 }

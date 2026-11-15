@@ -14,28 +14,36 @@ namespace IntegratorUI
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void UiEventCallback(IntPtr eventNameUtf8, IntPtr payloadJsonUtf8);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.I1)]
         internal static extern bool integrator_core_try_focus_existing();
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int integrator_core_run_cli(int argc, IntPtr[] argv);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void integrator_core_set_ui_callback(UiEventCallback? cb);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int integrator_core_init(UiEventCallback? cb);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr integrator_core_invoke(IntPtr methodUtf8, IntPtr paramsJsonUtf8);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void integrator_core_free_string(IntPtr ptr);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void integrator_core_tray_action(IntPtr actionUtf8);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.ApplicationDirectory | DllImportSearchPath.System32)]
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void integrator_core_shutdown();
     }
@@ -48,13 +56,20 @@ namespace IntegratorUI
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
+        private static readonly JsonSerializerOptions JsonOptionsIncludeNulls = new()
+        {
+            PropertyNameCaseInsensitive = true
+        };
+
         // Hold delegate strongly so GC never collects the native callback trampoline.
         private static CoreNative.UiEventCallback? _nativeCallback;
+        private static int _shutdownDone;
         public static event Action<string, string>? UiEventReceived;
 
         private static IntPtr AllocUtf8(string value)
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(value + "\0");
+            string sanitized = (value ?? string.Empty).Replace("\0", string.Empty);
+            byte[] bytes = Encoding.UTF8.GetBytes(sanitized + "\0");
             IntPtr ptr = Marshal.AllocHGlobal(bytes.Length);
             Marshal.Copy(bytes, 0, ptr, bytes.Length);
             return ptr;
@@ -63,12 +78,7 @@ namespace IntegratorUI
         private static string ReadUtf8(IntPtr ptr)
         {
             if (ptr == IntPtr.Zero) return string.Empty;
-            int len = 0;
-            while (Marshal.ReadByte(ptr, len) != 0) len++;
-            if (len == 0) return string.Empty;
-            byte[] buf = new byte[len];
-            Marshal.Copy(ptr, buf, 0, len);
-            return Encoding.UTF8.GetString(buf);
+            return Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
         }
 
         public static int RunCliIfRequested(string[] args)
@@ -103,31 +113,41 @@ namespace IntegratorUI
 
         public static bool Initialize()
         {
+            System.Threading.Interlocked.Exchange(ref _shutdownDone, 0);
             _nativeCallback = OnNativeUiEvent;
             return CoreNative.integrator_core_init(_nativeCallback) == 0;
         }
 
         private static void OnNativeUiEvent(IntPtr eventPtr, IntPtr payloadPtr)
         {
-            string evt = ReadUtf8(eventPtr);
-            string payload = ReadUtf8(payloadPtr);
-            UiEventReceived?.Invoke(evt, payload);
+            try
+            {
+                string evt = ReadUtf8(eventPtr);
+                string payload = ReadUtf8(payloadPtr);
+                UiEventReceived?.Invoke(evt, payload);
+            }
+            catch
+            {
+                // Never allow managed exceptions to unwind across native C ABI callbacks.
+            }
         }
 
-        public static RpcResult<T> Invoke<T>(string method, object? parameters = null)
+        public static RpcResult<T> Invoke<T>(string method, object? parameters = null, bool preserveNulls = false)
         {
             string paramsJson = parameters switch
             {
                 null => "{}",
                 string s => s,
-                _ => JsonSerializer.Serialize(parameters, JsonOptions)
+                _ => JsonSerializer.Serialize(parameters, preserveNulls ? JsonOptionsIncludeNulls : JsonOptions)
             };
 
-            IntPtr mPtr = AllocUtf8(method);
-            IntPtr pPtr = AllocUtf8(paramsJson);
+            IntPtr mPtr = IntPtr.Zero;
+            IntPtr pPtr = IntPtr.Zero;
             IntPtr resPtr = IntPtr.Zero;
             try
             {
+                mPtr = AllocUtf8(method);
+                pPtr = AllocUtf8(paramsJson);
                 resPtr = CoreNative.integrator_core_invoke(mPtr, pPtr);
                 if (resPtr == IntPtr.Zero)
                 {
@@ -148,28 +168,34 @@ namespace IntegratorUI
             finally
             {
                 if (resPtr != IntPtr.Zero) CoreNative.integrator_core_free_string(resPtr);
-                Marshal.FreeHGlobal(mPtr);
-                Marshal.FreeHGlobal(pPtr);
+                if (mPtr != IntPtr.Zero) Marshal.FreeHGlobal(mPtr);
+                if (pPtr != IntPtr.Zero) Marshal.FreeHGlobal(pPtr);
             }
         }
 
         public static void TrayAction(string action)
         {
-            IntPtr aPtr = AllocUtf8(action);
+            IntPtr aPtr = IntPtr.Zero;
             try
             {
+                aPtr = AllocUtf8(action);
                 CoreNative.integrator_core_tray_action(aPtr);
             }
             finally
             {
-                Marshal.FreeHGlobal(aPtr);
+                if (aPtr != IntPtr.Zero) Marshal.FreeHGlobal(aPtr);
             }
         }
 
         public static void Shutdown()
         {
-            CoreNative.integrator_core_set_ui_callback(null);
-            CoreNative.integrator_core_shutdown();
+            if (System.Threading.Interlocked.Exchange(ref _shutdownDone, 1) != 0)
+            {
+                return;
+            }
+            try { CoreNative.integrator_core_set_ui_callback(null); } catch { }
+            _nativeCallback = null;
+            try { CoreNative.integrator_core_shutdown(); } catch { }
         }
     }
 
@@ -304,13 +330,14 @@ namespace IntegratorUI
         [JsonPropertyName("touchbar")] public bool Touchbar { get; set; } = true;
         [JsonPropertyName("storage")] public bool Storage { get; set; } = true;
         [JsonPropertyName("audio")] public bool Audio { get; set; } = true;
+        [JsonPropertyName("benchmark")] public bool Benchmark { get; set; } = true;
     }
 
     internal sealed class KvmLayoutConfigModel
     {
-        [JsonPropertyName("peer_edge")] public string PeerEdge { get; set; } = "right";
+        [JsonPropertyName("peer_edge")] public string PeerEdge { get; set; } = "left";
         [JsonPropertyName("alignment_offset")] public float AlignmentOffset { get; set; }
-        [JsonPropertyName("hop_delay_ms")] public uint HopDelayMs { get; set; } = 35;
+        [JsonPropertyName("hop_delay_ms")] public uint HopDelayMs { get; set; } = 40;
         [JsonPropertyName("dead_corners")] public bool DeadCorners { get; set; } = true;
         [JsonPropertyName("modifier_translation")] public bool ModifierTranslation { get; set; } = true;
         [JsonPropertyName("precision_touchpad")] public bool PrecisionTouchpad { get; set; } = true;

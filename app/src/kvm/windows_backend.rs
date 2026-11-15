@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton, ScreenEdge};
@@ -10,6 +10,7 @@ use crate::kvm::service::{HookDecision, KvmService};
 
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static START_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 type KvmWinEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
 type KvmWinDragEndedCallback = extern "C" fn(bool, *const c_char);
@@ -19,6 +20,8 @@ extern "C" {
         cb: Option<KvmWinEventCallback>,
         drag_ended_cb: Option<KvmWinDragEndedCallback>,
     ) -> bool;
+    fn integrator_kvm_win_stop_hooks();
+    fn integrator_kvm_win_is_hook_active() -> bool;
     fn integrator_kvm_win_screen_rect(
         out_x: *mut f64,
         out_y: *mut f64,
@@ -34,7 +37,6 @@ extern "C" {
         restore_y: i32,
     );
     fn integrator_kvm_win_set_controlled(controlled: bool, entry_x: i32, entry_y: i32);
-    fn integrator_kvm_win_warp_cursor(x: i32, y: i32);
     fn integrator_kvm_win_take_drag_paths() -> *mut c_char;
     fn integrator_kvm_win_free_str(ptr: *mut c_char);
     fn integrator_kvm_win_cancel_local_drag();
@@ -61,17 +63,45 @@ extern "C" {
 
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
+    let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ok = unsafe { integrator_kvm_win_start_hooks(Some(on_win_event), Some(on_drag_ended)) };
     HOOK_ACTIVE.store(ok, Ordering::Release);
     if ok {
         tracing::info!("🖱️ Windows LL mouse/keyboard hooks & OLE IDropTarget/DoDragDrop active");
     } else {
-        tracing::warn!("⚠️ Failed to install Windows low-level KVM input hooks");
+        tracing::warn!("⚠️ Failed to install Windows low-level KVM input hooks; will retry");
+        std::thread::Builder::new()
+            .name("kvm-win-hook-retry".into())
+            .spawn(|| {
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _g = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    let activated = unsafe {
+                        integrator_kvm_win_start_hooks(Some(on_win_event), Some(on_drag_ended))
+                    };
+                    if activated {
+                        HOOK_ACTIVE.store(true, Ordering::Release);
+                        tracing::info!("🖱️ Windows low-level KVM input hooks activated on retry");
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+pub fn stop() {
+    let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    HOOK_ACTIVE.store(false, Ordering::Release);
+    unsafe {
+        integrator_kvm_win_stop_hooks();
     }
 }
 
 pub fn is_hook_active() -> bool {
-    HOOK_ACTIVE.load(Ordering::Acquire)
+    let active = unsafe { integrator_kvm_win_is_hook_active() };
+    HOOK_ACTIVE.store(active, Ordering::Release);
+    active
 }
 
 pub fn sync_edge_probe(enabled: bool, peer_edge: ScreenEdge) {
@@ -130,12 +160,6 @@ pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
     }
 }
 
-pub fn warp_cursor(x: f32, y: f32) {
-    unsafe {
-        integrator_kvm_win_warp_cursor(x.round() as i32, y.round() as i32);
-    }
-}
-
 pub fn probe_active_drag_paths() -> Vec<PathBuf> {
     let ptr = unsafe { integrator_kvm_win_take_drag_paths() };
     if ptr.is_null() {
@@ -184,8 +208,10 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, _x: f32, _y
 }
 
 pub fn inject_scroll(dx: f32, dy: f32) {
+    let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
+    let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
     unsafe {
-        integrator_kvm_win_inject_scroll(dx as f64, dy as f64);
+        integrator_kvm_win_inject_scroll(safe_dx as f64, safe_dy as f64);
     }
 }
 
@@ -276,6 +302,8 @@ extern "C" fn on_win_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64
             let vk = a as u16;
             if let Some(key) = win_vk_to_logical(vk) {
                 svc.on_local_key_event(key, b > 0.5, win_flags_to_modifiers(extra))
+            } else if svc.is_controlling_peer_fast() {
+                HookDecision::Swallow
             } else {
                 HookDecision::PassThrough
             }
@@ -454,7 +482,7 @@ pub fn logical_to_win_vk(key: LogicalKey) -> Option<(u16, bool)> {
         PageDown => (0x22, true),
         CapsLock => (0x14, false),
         ShiftLeft => (0xA0, false),
-        ShiftRight => (0xA1, true),
+        ShiftRight => (0xA1, false),
         ControlLeft => (0xA2, false),
         ControlRight => (0xA3, true),
         AltLeft => (0xA4, false),
@@ -474,4 +502,25 @@ pub fn logical_to_win_vk(key: LogicalKey) -> Option<(u16, bool)> {
         F11 => (0x7A, false),
         F12 => (0x7B, false),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn right_shift_is_not_extended_while_right_ctrl_and_alt_are() {
+        assert_eq!(logical_to_win_vk(LogicalKey::ShiftLeft), Some((0xA0, false)));
+        assert_eq!(logical_to_win_vk(LogicalKey::ShiftRight), Some((0xA1, false)));
+        assert_eq!(logical_to_win_vk(LogicalKey::ControlRight), Some((0xA3, true)));
+        assert_eq!(logical_to_win_vk(LogicalKey::AltRight), Some((0xA5, true)));
+        assert_eq!(logical_to_win_vk(LogicalKey::MetaLeft), Some((0x5B, true)));
+    }
+
+    #[test]
+    fn win_flags_to_modifiers_decodes_all_bits() {
+        let mask = win_flags_to_modifiers(0b1111);
+        assert!(mask.shift && mask.control && mask.alt && mask.meta);
+        assert_eq!(win_flags_to_modifiers(0), ModifierMask::default());
+    }
 }

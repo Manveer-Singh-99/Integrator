@@ -1,50 +1,39 @@
-#[cfg(target_os = "macos")]
-use crate::system_info;
-use anyhow::Result;
-#[cfg(target_os = "macos")]
+use anyhow::{Context, Result};
+use std::path::Path;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
-const LAUNCH_AGENT_LABEL: &str = "com.manveersingh.integrator";
+const MAC_LAUNCH_LABEL: &str = "com.manveersingh.integrator";
+
+#[cfg(target_os = "windows")]
+const WIN_TASK_NAME: &str = "IntegratorAutostart";
+#[cfg(target_os = "windows")]
+const WIN_LEGACY_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct AutostartManager;
-
-#[cfg(target_os = "macos")]
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
 
 impl AutostartManager {
     pub fn is_enabled() -> bool {
         #[cfg(target_os = "macos")]
         {
-            // Check LaunchAgent plist directly on disk without invoking `osascript`
-            // ("System Events") on every status poll, avoiding macOS TCC Automation prompts.
-            mac_launch_agent_plist().is_file()
+            return mac_plist_path().map(|p| p.is_file()).unwrap_or(false);
         }
 
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            let mut cmd = Command::new("reg");
-            cmd.creation_flags(0x08000000);
-            cmd.args([
-                "query",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "Integrator",
-            ]);
-            if let Ok(out) = cmd.output() {
-                return out.status.success();
-            }
-            false
+            let schtasks = crate::system_info::system32_exe("schtasks.exe");
+            return Command::new(&schtasks)
+                .args(["/Query", "/TN", WIN_TASK_NAME])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -53,144 +42,441 @@ impl AutostartManager {
         }
     }
 
-    pub fn set_enabled(enable: bool) -> Result<bool> {
-        if enable {
-            Self::enable()
-        } else {
-            Self::disable()
-        }
-    }
-
-    pub fn enable() -> Result<bool> {
+    pub fn set_enabled(enabled: bool) -> Result<bool> {
         #[cfg(target_os = "macos")]
         {
-            let exe = if let Some(bundle_exe) = resolve_mac_app_executable() {
-                bundle_exe
-            } else {
-                std::env::current_exe()?
-            };
-            let plist = mac_launch_agent_plist();
-            if let Some(parent) = plist.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let escaped_exe = xml_escape(&exe.to_string_lossy());
-            let xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+            set_enabled_macos(enabled)?;
+            return Ok(Self::is_enabled());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            set_enabled_windows(enabled)?;
+            return Ok(Self::is_enabled());
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = enabled;
+            anyhow::bail!("Autostart is only supported on macOS and Windows")
+        }
+    }
+}
+
+pub(crate) fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn validate_path_for_xml(path: &Path) -> Result<String> {
+    let s = path
+        .to_str()
+        .context("Executable path contains invalid UTF-8")?;
+    if s.is_empty() {
+        anyhow::bail!("Executable path is empty");
+    }
+    if s.chars().any(|c| c.is_control()) {
+        anyhow::bail!("Executable path contains disallowed control characters");
+    }
+    Ok(s.to_string())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
+    let exe_str = validate_path_for_xml(exe_path)?;
+    let escaped = xml_escape(&exe_str);
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{}</string>
+    <string>com.manveersingh.integrator</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
+        <string>{escaped}</string>
         <string>--hidden</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
-"#,
-                LAUNCH_AGENT_LABEL, escaped_exe
-            );
-            std::fs::write(&plist, xml)?;
-            tracing::info!("🚀 Registered LaunchAgent autostart: {}", plist.display());
-            Ok(true)
-        }
+"#
+    ))
+}
 
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            let exe_path = std::env::current_exe()?;
-            let exe_str = format!("\"{}\" --minimized", exe_path.to_string_lossy());
-            let mut cmd = Command::new("reg");
-            cmd.creation_flags(0x08000000);
-            cmd.args([
-                "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "Integrator",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &exe_str,
-                "/f",
-            ]);
-            let out = cmd.output()?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "Failed to register Windows Run key: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> Result<String> {
+    let exe_str = validate_path_for_xml(exe_path)?;
+    let escaped_exe = xml_escape(&exe_str);
+    let user_xml = match user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(uid) => {
+            if uid.chars().any(|c| c.is_control()) {
+                anyhow::bail!("User ID contains disallowed control characters");
             }
-            tracing::info!("🚀 Registered Integrator in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-            Ok(true)
+            format!("<UserId>{}</UserId>", xml_escape(uid))
         }
+        None => String::new(),
+    };
 
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Ok(false)
-        }
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Integrator auto-start elevated service</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      {user_xml}
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      {user_xml}
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escaped_exe}</Command>
+      <Arguments>--minimized</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    ))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn encode_utf16_le_with_bom(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+    bytes.push(0xFF);
+    bytes.push(0xFE);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
     }
-
-    pub fn disable() -> Result<bool> {
-        #[cfg(target_os = "macos")]
-        {
-            let plist = mac_launch_agent_plist();
-            if plist.exists() {
-                let _ = std::fs::remove_file(&plist);
-            }
-            tracing::info!("🚀 Removed Integrator LaunchAgent autostart");
-            Ok(false)
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            let mut cmd = Command::new("reg");
-            cmd.creation_flags(0x08000000);
-            cmd.args([
-                "delete",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "Integrator",
-                "/f",
-            ]);
-            let _ = cmd.output()?;
-            tracing::info!("🚀 Removed Integrator from Windows Run registry key");
-            Ok(false)
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Ok(false)
-        }
-    }
+    bytes
 }
 
 #[cfg(target_os = "macos")]
-fn mac_launch_agent_plist() -> PathBuf {
-    system_info::user_home_dir()
-        .join("Library/LaunchAgents")
-        .join(format!("{}.plist", LAUNCH_AGENT_LABEL))
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_mac_app_executable() -> Option<PathBuf> {
+fn mac_plist_path() -> Result<PathBuf> {
+    let home = home_dir().context("Could not resolve HOME directory")?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{MAC_LAUNCH_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_mac_app_executable() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
-        let s = exe.to_string_lossy();
-        if s.contains(".app/Contents/MacOS/") {
-            return Some(exe);
+        let canonical = exe.canonicalize().unwrap_or(exe);
+        let s = canonical.to_string_lossy();
+        if s.contains(".app/Contents/MacOS/") && canonical.is_file() {
+            return Ok(canonical);
         }
     }
-    let candidates = [
+
+    let mut candidates = vec![
+        PathBuf::from("/Applications/Integrator.app/Contents/MacOS/Integrator"),
         PathBuf::from("/Applications/Integrator.app/Contents/MacOS/integrator"),
-        system_info::user_home_dir().join("Applications/Integrator.app/Contents/MacOS/integrator"),
     ];
-    for c in candidates {
-        if c.is_file() {
-            return Some(c);
+    if let Some(home) = home_dir() {
+        candidates.push(home.join("Applications/Integrator.app/Contents/MacOS/Integrator"));
+        candidates.push(home.join("Applications/Integrator.app/Contents/MacOS/integrator"));
+    }
+    for cand in candidates {
+        if cand.is_file() {
+            return Ok(cand);
         }
     }
-    None
+
+    let exe = std::env::current_exe().context("Could not resolve current executable path")?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    anyhow::bail!("Could not locate Integrator executable for LaunchAgent")
+}
+
+#[cfg(target_os = "macos")]
+fn current_uid() -> Result<String> {
+    let out = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .context("Failed to execute /usr/bin/id")?;
+    if !out.status.success() {
+        anyhow::bail!("/usr/bin/id -u exited with status {}", out.status);
+    }
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("Unexpected UID from /usr/bin/id: {:?}", uid);
+    }
+    Ok(uid)
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout(uid: &str) {
+    let service_target = format!("gui/{uid}/{MAC_LAUNCH_LABEL}");
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &service_target])
+        .output();
+}
+
+#[cfg(target_os = "macos")]
+fn set_enabled_macos(enabled: bool) -> Result<()> {
+    let plist_path = mac_plist_path()?;
+    let uid = current_uid()?;
+
+    if enabled {
+        let dir = plist_path
+            .parent()
+            .context("LaunchAgent plist has no parent directory")?;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create LaunchAgents directory {}", dir.display()))?;
+
+        let exe_path = resolve_mac_app_executable()?;
+        let plist_xml = build_macos_plist_xml(&exe_path)?;
+
+        launchctl_bootout(&uid);
+        crate::system_info::atomic_write_private(&plist_path, plist_xml.as_bytes())
+            .with_context(|| format!("Failed to write LaunchAgent plist {}", plist_path.display()))?;
+
+        let domain = format!("gui/{uid}");
+        let plist_str = plist_path
+            .to_str()
+            .context("LaunchAgent plist path is not valid UTF-8")?;
+        let out = Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain, plist_str])
+            .output()
+            .context("Failed to invoke /bin/launchctl bootstrap")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            tracing::warn!(
+                status = %out.status,
+                stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
+                "launchctl bootstrap returned non-zero (plist saved for next login)"
+            );
+        }
+    } else {
+        launchctl_bootout(&uid);
+        if plist_path.symlink_metadata().is_ok() {
+            std::fs::remove_file(&plist_path)
+                .with_context(|| format!("Failed to remove {}", plist_path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn parse_whoami_sid_csv(csv: &str) -> Option<String> {
+    let line = csv.lines().next()?.trim();
+    // Format: "DOMAIN\user","S-1-5-21-..."
+    let mut parts = line.split("\",\"");
+    let _user = parts.next()?;
+    let sid_raw = parts.next()?.trim_matches('"').trim();
+    if sid_raw.starts_with("S-1-") && sid_raw.len() > 4 {
+        Some(sid_raw.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_id() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let whoami = crate::system_info::system32_exe("whoami.exe");
+    if let Ok(out) = Command::new(&whoami)
+        .args(["/USER", "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        if out.status.success() {
+            if let Some(sid) = parse_whoami_sid_csv(&String::from_utf8_lossy(&out.stdout)) {
+                return Some(sid);
+            }
+        }
+    }
+
+    let user = std::env::var("USERNAME").ok()?;
+    let user = user.trim();
+    if user.is_empty() {
+        return None;
+    }
+    match std::env::var("USERDOMAIN") {
+        Ok(dom) if !dom.trim().is_empty() => Some(format!("{}\\{user}", dom.trim())),
+        _ => Some(user.to_string()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_legacy_run_key() {
+    use std::os::windows::process::CommandExt;
+    let reg = crate::system_info::system32_exe("reg.exe");
+    let _ = Command::new(&reg)
+        .args(["delete", WIN_LEGACY_RUN_KEY, "/v", "Integrator", "/f"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(target_os = "windows")]
+fn set_enabled_windows(enabled: bool) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    cleanup_legacy_run_key();
+
+    let schtasks = crate::system_info::system32_exe("schtasks.exe");
+    if enabled {
+        let exe = std::env::current_exe().context("Could not resolve current executable path")?;
+        let user_id = current_windows_user_id();
+        let xml = build_windows_task_xml(&exe, user_id.as_deref())?;
+        let xml_bytes = encode_utf16_le_with_bom(&xml);
+
+        let data_dir = crate::system_info::app_data_dir();
+        std::fs::create_dir_all(&data_dir).with_context(|| {
+            format!("Failed to create app data directory {}", data_dir.display())
+        })?;
+        let xml_path = data_dir.join(format!("autostart_{}.xml.tmp", std::process::id()));
+        crate::system_info::atomic_write_private(&xml_path, &xml_bytes)
+            .with_context(|| format!("Failed to write task XML {}", xml_path.display()))?;
+
+        let xml_path_str = xml_path
+            .to_str()
+            .context("Task XML path contains invalid UTF-8")?;
+        let out = Command::new(&schtasks)
+            .args(["/Create", "/TN", WIN_TASK_NAME, "/XML", xml_path_str, "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = std::fs::remove_file(&xml_path);
+
+        let out = out.context("Failed to execute schtasks.exe /Create")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            anyhow::bail!(
+                "schtasks /Create failed ({}): {} {}",
+                out.status,
+                stderr.trim(),
+                stdout.trim()
+            );
+        }
+    } else {
+        let out = Command::new(&schtasks)
+            .args(["/Delete", "/TN", WIN_TASK_NAME, "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .context("Failed to execute schtasks.exe /Delete")?;
+        if !out.status.success() && AutostartManager::is_enabled() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            anyhow::bail!(
+                "schtasks /Delete failed ({}): {} {}",
+                out.status,
+                stderr.trim(),
+                stdout.trim()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_escape_escapes_all_reserved_characters() {
+        let raw = r#"C:\A&B\<Test> "One" 'Two'"#;
+        let escaped = xml_escape(raw);
+        assert_eq!(
+            escaped,
+            "C:\\A&amp;B\\&lt;Test&gt; &quot;One&quot; &apos;Two&apos;"
+        );
+    }
+
+    #[test]
+    fn build_macos_plist_xml_escapes_special_chars_and_sets_keys() {
+        let path = Path::new("/Applications/A&B <App>/Integrator.app/Contents/MacOS/integrator");
+        let xml = build_macos_plist_xml(path).unwrap();
+        assert!(xml.contains("<string>com.manveersingh.integrator</string>"));
+        assert!(xml.contains(
+            "<string>/Applications/A&amp;B &lt;App&gt;/Integrator.app/Contents/MacOS/integrator</string>"
+        ));
+        assert!(xml.contains("<string>--hidden</string>"));
+        assert!(xml.contains("<key>RunAtLoad</key>"));
+    }
+
+    #[test]
+    fn build_windows_task_xml_configures_highest_available_and_battery_options() {
+        let path = Path::new(r"C:\Program Files\Integrator & Co\IntegratorUI.exe");
+        let xml = build_windows_task_xml(path, Some("S-1-5-21-123456-7890")).unwrap();
+        assert!(xml.contains("encoding=\"UTF-16\""));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<UserId>S-1-5-21-123456-7890</UserId>"));
+        assert!(xml.contains(
+            "<Command>C:\\Program Files\\Integrator &amp; Co\\IntegratorUI.exe</Command>"
+        ));
+        assert!(xml.contains("<Arguments>--minimized</Arguments>"));
+    }
+
+    #[test]
+    fn reject_control_characters_in_paths_and_users() {
+        assert!(build_macos_plist_xml(Path::new("/tmp/bad\npath")).is_err());
+        assert!(build_windows_task_xml(Path::new("C:\\bad\0path.exe"), None).is_err());
+        assert!(build_windows_task_xml(Path::new("C:\\ok.exe"), Some("bad\ruser")).is_err());
+    }
+
+    #[test]
+    fn utf16_le_bom_encoding_matches_expected_bytes() {
+        let bytes = encode_utf16_le_with_bom("AB");
+        assert_eq!(bytes, vec![0xFF, 0xFE, b'A', 0x00, b'B', 0x00]);
+    }
 }

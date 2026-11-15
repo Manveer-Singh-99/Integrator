@@ -1,34 +1,43 @@
 //! High-level display extension controller and RPC orchestrator.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::CONTROL_PORT;
 use crate::discovery::{DiscoveryManager, PeerCandidate};
+use crate::features::FeatureManager;
 use crate::system_info;
 use crate::trust;
 use super::mac_display::MacDisplayManager;
-use super::protocol::{DisplayRpcRequest, DisplayRpcResponse};
+use super::protocol::{required_feature_for_rpc, DisplayRpcRequest, DisplayRpcResponse};
 use super::win_display::WinDisplayManager;
 
 #[derive(Clone)]
 pub struct DisplayController {
     discovery: DiscoveryManager,
-    is_active: Arc<RwLock<bool>>,
+    features: Arc<FeatureManager>,
+    transition_lock: Arc<Mutex<()>>,
+    host_active: Arc<RwLock<bool>>,
+    client_active: Arc<RwLock<bool>>,
     active_mode: Arc<RwLock<Option<String>>>,
+    active_peer_ip: Arc<RwLock<Option<String>>>,
 }
 
 impl DisplayController {
-    pub fn new(discovery: DiscoveryManager) -> Self {
+    pub fn new(discovery: DiscoveryManager, features: Arc<FeatureManager>) -> Self {
         Self {
             discovery,
-            is_active: Arc::new(RwLock::new(false)),
+            features,
+            transition_lock: Arc::new(Mutex::new(())),
+            host_active: Arc::new(RwLock::new(false)),
+            client_active: Arc::new(RwLock::new(false)),
             active_mode: Arc::new(RwLock::new(None)),
+            active_peer_ip: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -36,14 +45,22 @@ impl DisplayController {
         DisplayRpcResponse {
             success,
             message: message.into(),
-            is_active: *self.is_active.read().await,
+            is_active: self.is_active().await,
             active_mode: self.active_mode.read().await.clone(),
             ..Default::default()
         }
     }
 
+    fn format_socket_target(ip: &str, port: u16) -> String {
+        if let Ok(parsed) = ip.trim().parse::<IpAddr>() {
+            SocketAddr::new(parsed, port).to_string()
+        } else {
+            format!("{}:{}", ip.trim(), port)
+        }
+    }
+
     async fn is_tcp_port_open(ip: &str, port: u16) -> bool {
-        let addr = format!("{}:{}", ip, port);
+        let addr = Self::format_socket_target(ip, port);
         matches!(
             tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(&addr)).await,
             Ok(Ok(_))
@@ -123,9 +140,16 @@ impl DisplayController {
             }
         }
 
-        let local_disp = system_info::get_primary_display_info();
-        let final_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680);
-        let final_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320);
+        let local_disp = tokio::task::spawn_blocking(system_info::get_primary_display_info)
+            .await
+            .unwrap_or(system_info::PrimaryDisplayInfo {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                scale_factor: 1.0,
+            });
+        let final_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680) & !1;
+        let final_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320) & !1;
         let raw_fps = if fps > 0 { fps } else { local_disp.fps };
         let final_fps = (if raw_fps > 0 { raw_fps } else { 60 }).clamp(30, 240);
         let final_hostname = if hostname.is_empty() { peer_ip } else { hostname };
@@ -174,12 +198,14 @@ impl DisplayController {
 
         #[cfg(target_os = "macos")]
         {
-            let is_running = MacDisplayManager::is_virtual_display_active();
+            let _tx = self.transition_lock.lock().await;
+            let is_running =
+                *self.host_active.read().await || MacDisplayManager::is_virtual_display_active();
             if is_running {
-                self.stop_mac_to_pc().await?;
+                self.stop_mac_to_pc_locked().await?;
                 Ok("Stopped Mac-to-PC extended display".into())
             } else {
-                self.start_mac_to_pc().await?;
+                self.start_mac_to_pc_locked().await?;
                 let mode = self
                     .active_mode
                     .read()
@@ -193,13 +219,42 @@ impl DisplayController {
 
     /// Starts Mac-as-Host extended desktop to the discovered peer.
     pub async fn start_mac_to_pc(&self) -> Result<()> {
+        let _tx = self.transition_lock.lock().await;
+        self.start_mac_to_pc_locked().await
+    }
+
+    async fn clear_host_state(&self) {
+        *self.host_active.write().await = false;
+        let client_on = *self.client_active.read().await;
+        if !client_on {
+            *self.active_peer_ip.write().await = None;
+            *self.active_mode.write().await = None;
+        } else {
+            *self.active_mode.write().await = Some("Client".into());
+        }
+    }
+
+    async fn clear_client_state(&self) {
+        *self.client_active.write().await = false;
+        let host_on = *self.host_active.read().await;
+        if !host_on {
+            *self.active_peer_ip.write().await = None;
+            *self.active_mode.write().await = None;
+        }
+    }
+
+    async fn start_mac_to_pc_locked(&self) -> Result<()> {
         let peer = self
             .discovery
             .get_best_peer()
             .await
             .context("No active peer discovered. Connect a direct cable or add a peer IP in Settings.")?;
         let peer_ip = peer.addr.ip().to_string();
-        let my_ip = system_info::local_ip_for_peer(&peer_ip)
+        let peer_ip_route = peer_ip.clone();
+        let my_ip = tokio::task::spawn_blocking(move || system_info::local_ip_for_peer(&peer_ip_route))
+            .await
+            .ok()
+            .flatten()
             .with_context(|| format!("Could not determine local route IP to reach peer {}", peer_ip))?;
 
         let (w, h, fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
@@ -209,34 +264,48 @@ impl DisplayController {
         );
 
         // 1. Spawn virtual display matching peer display dimensions and configure Sunshine output ID
-        let disp_id = MacDisplayManager::start_virtual_display(w, h, fps)?;
+        let disp_id = tokio::task::spawn_blocking(move || MacDisplayManager::start_virtual_display(w, h, fps))
+            .await
+            .context("Virtual display task panicked")??;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        if let Err(e) = MacDisplayManager::configure_sunshine_output(disp_id) {
+        if let Err(e) = tokio::task::spawn_blocking(move || MacDisplayManager::configure_sunshine_output(disp_id))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)))
+        {
             warn!("Failed to configure Sunshine output_name = {}: {}", disp_id, e);
         }
 
         // 2. Start local Sunshine and wait for its configured port
-        if let Err(e) = MacDisplayManager::start_sunshine() {
-            let _ = MacDisplayManager::stop_virtual_display();
+        if let Err(e) = tokio::task::spawn_blocking(MacDisplayManager::start_sunshine)
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)))
+        {
+            let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
+            self.clear_host_state().await;
             return Err(e);
         }
 
-        let (my_sunshine_name, my_sunshine_port, _) = system_info::read_sunshine_config_info();
+        let (my_sunshine_name, my_sunshine_port, _) =
+            tokio::task::spawn_blocking(system_info::read_sunshine_config_info)
+                .await
+                .unwrap_or((None, 47989, None));
         info!("Waiting for Sunshine server on port {}...", my_sunshine_port);
         if !MacDisplayManager::wait_for_sunshine_ready(Duration::from_secs(10)).await {
-            let _ = MacDisplayManager::stop_virtual_display();
-            let _ = MacDisplayManager::stop_sunshine();
-            *self.is_active.write().await = false;
-            *self.active_mode.write().await = None;
+            let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
+            let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_sunshine).await;
+            self.clear_host_state().await;
             anyhow::bail!(
                 "Mac Sunshine server failed to listen on port {} within 10s (check Screen Recording permission for Sunshine.app and ~/Library/Logs/sunshine.log)",
                 my_sunshine_port
             );
         }
 
+        let fallback_host = tokio::task::spawn_blocking(system_info::get_hostname)
+            .await
+            .unwrap_or_else(|_| "Mac".to_string());
         let host_name = my_sunshine_name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(system_info::get_hostname);
+            .unwrap_or(fallback_host);
         let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
         // 3. Send RPC to peer to launch Moonlight in fullscreen at peer native resolution/refresh
@@ -254,24 +323,28 @@ impl DisplayController {
         let resp = match Self::send_remote_rpc(&peer_ip, &rpc).await {
             Ok(r) => r,
             Err(e) => {
-                let _ = MacDisplayManager::stop_virtual_display();
-                let _ = MacDisplayManager::stop_sunshine();
+                let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
+                let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_sunshine).await;
+                self.clear_host_state().await;
                 return Err(e);
             }
         };
         if !resp.success {
-            let _ = MacDisplayManager::stop_virtual_display();
-            let _ = MacDisplayManager::stop_sunshine();
+            let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
+            let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_sunshine).await;
+            self.clear_host_state().await;
             anyhow::bail!("Peer {} failed to start Moonlight: {}", peer_hostname, resp.message);
         }
 
         let mode_summary = format!("{}x{} @ {}Hz", w, h, fps);
-        MacDisplayManager::show_notification(
-            "Second Screen Enabled",
-            &format!("{} active on {}", mode_summary, peer_hostname),
-        );
+        let notify_msg = format!("{} active on {}", mode_summary, peer_hostname);
+        let _ = tokio::task::spawn_blocking(move || {
+            MacDisplayManager::show_notification("Second Screen Enabled", &notify_msg);
+        })
+        .await;
 
-        *self.is_active.write().await = true;
+        *self.host_active.write().await = true;
+        *self.active_peer_ip.write().await = Some(peer_ip);
         *self.active_mode.write().await = Some(format!("Mac -> {} ({})", peer_hostname, mode_summary));
 
         Ok(())
@@ -279,21 +352,32 @@ impl DisplayController {
 
     /// Stops Mac-as-Host extended desktop cleanly even if no peer is reachable.
     pub async fn stop_mac_to_pc(&self) -> Result<()> {
+        let _tx = self.transition_lock.lock().await;
+        self.stop_mac_to_pc_locked().await
+    }
+
+    async fn stop_mac_to_pc_locked(&self) -> Result<()> {
         info!("Stopping Mac-to-PC extended display...");
 
-        let _ = MacDisplayManager::stop_virtual_display();
-        let _ = MacDisplayManager::stop_sunshine();
+        let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
+        let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_sunshine).await;
 
-        if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+        let target_ip = match self.active_peer_ip.read().await.clone() {
+            Some(ip) => Some(ip),
+            None => self.discovery.get_peer_ip().await,
+        };
+        if let Some(peer_ip) = target_ip {
             let _ = Self::send_remote_rpc(&peer_ip, &DisplayRpcRequest::StopMoonlight).await;
         } else {
             warn!("No active peer reachable during stop_mac_to_pc; cleaned up local display state");
         }
 
-        MacDisplayManager::show_notification("Second Screen Disabled", "Virtual display stopped.");
+        let _ = tokio::task::spawn_blocking(|| {
+            MacDisplayManager::show_notification("Second Screen Disabled", "Virtual display stopped.");
+        })
+        .await;
 
-        *self.is_active.write().await = false;
-        *self.active_mode.write().await = None;
+        self.clear_host_state().await;
 
         Ok(())
     }
@@ -318,12 +402,14 @@ impl DisplayController {
 
         #[cfg(target_os = "windows")]
         {
-            let is_running = *self.is_active.read().await || WinDisplayManager::is_vdd_active();
+            let _tx = self.transition_lock.lock().await;
+            let is_running =
+                *self.host_active.read().await || WinDisplayManager::is_vdd_active();
             if is_running {
-                self.stop_pc_to_mac().await?;
+                self.stop_pc_to_mac_locked().await?;
                 Ok("Stopped PC-to-Mac extended display".into())
             } else {
-                self.start_pc_to_mac().await?;
+                self.start_pc_to_mac_locked().await?;
                 let mode = self
                     .active_mode
                     .read()
@@ -337,13 +423,22 @@ impl DisplayController {
 
     /// Starts PC-as-Host extended desktop to the discovered Mac peer.
     pub async fn start_pc_to_mac(&self) -> Result<()> {
+        let _tx = self.transition_lock.lock().await;
+        self.start_pc_to_mac_locked().await
+    }
+
+    async fn start_pc_to_mac_locked(&self) -> Result<()> {
         let peer = self
             .discovery
             .get_best_peer()
             .await
             .context("No active peer discovered. Connect a direct cable or add a peer IP in Settings.")?;
         let peer_ip = peer.addr.ip().to_string();
-        let my_ip = system_info::local_ip_for_peer(&peer_ip)
+        let peer_ip_route = peer_ip.clone();
+        let my_ip = tokio::task::spawn_blocking(move || system_info::local_ip_for_peer(&peer_ip_route))
+            .await
+            .ok()
+            .flatten()
             .with_context(|| format!("Could not determine local route IP to reach peer {}", peer_ip))?;
 
         let (w, h, fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
@@ -353,10 +448,15 @@ impl DisplayController {
         );
 
         // 1. Enable Windows virtual display / secondary Sunshine if present
-        WinDisplayManager::enable_vdd_device()?;
+        tokio::task::spawn_blocking(WinDisplayManager::enable_vdd_device)
+            .await
+            .context("VDD enable task panicked")??;
 
         // 2. Wait for local Sunshine on configured port (or port 48989 if a secondary instance is open)
-        let (my_sunshine_name, configured_port, _) = system_info::read_sunshine_config_info();
+        let (my_sunshine_name, configured_port, _) =
+            tokio::task::spawn_blocking(system_info::read_sunshine_config_info)
+                .await
+                .unwrap_or((None, 47989, None));
         let mut active_port = configured_port;
         let mut ready = false;
         for attempt in 0..40 {
@@ -375,7 +475,8 @@ impl DisplayController {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         if !ready {
-            let _ = WinDisplayManager::disable_vdd_device();
+            let _ = tokio::task::spawn_blocking(WinDisplayManager::disable_vdd_device).await;
+            self.clear_host_state().await;
             anyhow::bail!(
                 "Windows Sunshine server failed to listen on port {} (or secondary 48989) within 8s",
                 configured_port
@@ -383,14 +484,20 @@ impl DisplayController {
         }
 
         let secondary_name = if active_port == 48989 {
-            Self::read_secondary_sunshine_name()
+            tokio::task::spawn_blocking(Self::read_secondary_sunshine_name)
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };
+        let fallback_host = tokio::task::spawn_blocking(system_info::get_hostname)
+            .await
+            .unwrap_or_else(|_| "Windows".to_string());
         let host_name = secondary_name
             .or(my_sunshine_name)
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(system_info::get_hostname);
+            .unwrap_or(fallback_host);
         let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
         // 3. Send RPC to peer to launch Moonlight client
@@ -408,17 +515,20 @@ impl DisplayController {
         let resp = match Self::send_remote_rpc(&peer_ip, &rpc).await {
             Ok(r) => r,
             Err(e) => {
-                let _ = WinDisplayManager::disable_vdd_device();
+                let _ = tokio::task::spawn_blocking(WinDisplayManager::disable_vdd_device).await;
+                self.clear_host_state().await;
                 return Err(e);
             }
         };
         if !resp.success {
-            let _ = WinDisplayManager::disable_vdd_device();
+            let _ = tokio::task::spawn_blocking(WinDisplayManager::disable_vdd_device).await;
+            self.clear_host_state().await;
             anyhow::bail!("Peer {} failed to start Moonlight: {}", peer_hostname, resp.message);
         }
 
         let mode_summary = format!("{}x{} @ {}Hz", w, h, fps);
-        *self.is_active.write().await = true;
+        *self.host_active.write().await = true;
+        *self.active_peer_ip.write().await = Some(peer_ip);
         *self.active_mode.write().await = Some(format!("PC -> {} ({})", peer_hostname, mode_summary));
 
         Ok(())
@@ -426,18 +536,26 @@ impl DisplayController {
 
     /// Stops PC-as-Host extended desktop cleanly even if no peer is reachable.
     pub async fn stop_pc_to_mac(&self) -> Result<()> {
+        let _tx = self.transition_lock.lock().await;
+        self.stop_pc_to_mac_locked().await
+    }
+
+    async fn stop_pc_to_mac_locked(&self) -> Result<()> {
         info!("Stopping PC-to-Mac extended display...");
 
-        let _ = WinDisplayManager::disable_vdd_device();
+        let _ = tokio::task::spawn_blocking(WinDisplayManager::disable_vdd_device).await;
 
-        if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+        let target_ip = match self.active_peer_ip.read().await.clone() {
+            Some(ip) => Some(ip),
+            None => self.discovery.get_peer_ip().await,
+        };
+        if let Some(peer_ip) = target_ip {
             let _ = Self::send_remote_rpc(&peer_ip, &DisplayRpcRequest::StopMoonlight).await;
         } else {
             warn!("No active peer reachable during stop_pc_to_mac; cleaned up local VDD state");
         }
 
-        *self.is_active.write().await = false;
-        *self.active_mode.write().await = None;
+        self.clear_host_state().await;
 
         Ok(())
     }
@@ -447,6 +565,7 @@ impl DisplayController {
         &self,
         req: DisplayRpcRequest,
         peer_ip: Option<IpAddr>,
+        peer_device_id: Option<&str>,
     ) -> DisplayRpcResponse {
         let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
         let is_authorized_remote_toggle = match req {
@@ -474,10 +593,32 @@ impl DisplayController {
                 .await;
         }
 
+        if let Some(feature) = required_feature_for_rpc(&req) {
+            if !self.features.is_enabled(feature)
+                && !(is_loopback_caller && matches!(req, DisplayRpcRequest::StopAll | DisplayRpcRequest::StopMoonlight))
+            {
+                warn!(
+                    "🚫 Rejected DisplayRpcRequest {:?} from {:?}: feature '{}' is disabled",
+                    req, peer_ip, feature
+                );
+                return self
+                    .base_response(
+                        false,
+                        format!("Rejected: feature '{}' is disabled on this device", feature),
+                    )
+                    .await;
+            }
+        }
+
         match req {
             DisplayRpcRequest::Ping => self.base_response(true, "pong").await,
             DisplayRpcRequest::GetHardwareProfile => {
-                let profile = system_info::collect_local_profile();
+                let Ok(profile) = tokio::task::spawn_blocking(system_info::collect_local_profile).await
+                else {
+                    return self
+                        .base_response(false, "Failed to collect hardware profile")
+                        .await;
+                };
                 let mut resp = self
                     .base_response(true, format!("Hardware profile for {}", profile.hostname))
                     .await;
@@ -577,9 +718,17 @@ impl DisplayController {
                         .unwrap_or_else(|| effective_host_ip.clone())
                 };
 
-                let local_disp = system_info::get_primary_display_info();
-                let eff_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680);
-                let eff_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320);
+                let _tx = self.transition_lock.lock().await;
+                let local_disp = tokio::task::spawn_blocking(system_info::get_primary_display_info)
+                    .await
+                    .unwrap_or(system_info::PrimaryDisplayInfo {
+                        width: 1920,
+                        height: 1080,
+                        fps: 60,
+                        scale_factor: 1.0,
+                    });
+                let eff_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680) & !1;
+                let eff_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320) & !1;
                 let raw_fps = if fps > 0 { fps } else { local_disp.fps };
                 let eff_fps = (if raw_fps > 0 { raw_fps } else { 60 }).clamp(30, 240);
                 let eff_bitrate = if bitrate_kbps > 0 {
@@ -588,33 +737,40 @@ impl DisplayController {
                     100_000
                 };
 
-                let launch_res = if cfg!(target_os = "windows") {
-                    WinDisplayManager::start_moonlight_client(
-                        &effective_host_ip,
-                        port,
-                        &effective_host_name,
-                        eff_w,
-                        eff_h,
-                        eff_fps,
-                        eff_bitrate,
-                        audio_on_host,
-                    )
-                } else {
-                    MacDisplayManager::start_moonlight_client(
-                        &effective_host_ip,
-                        port,
-                        &effective_host_name,
-                        eff_w,
-                        eff_h,
-                        eff_fps,
-                        eff_bitrate,
-                        audio_on_host,
-                    )
-                };
+                let host_ip_arg = effective_host_ip.clone();
+                let host_name_arg = effective_host_name.clone();
+                let launch_res = tokio::task::spawn_blocking(move || {
+                    if cfg!(target_os = "windows") {
+                        WinDisplayManager::start_moonlight_client(
+                            &host_ip_arg,
+                            port,
+                            &host_name_arg,
+                            eff_w,
+                            eff_h,
+                            eff_fps,
+                            eff_bitrate,
+                            audio_on_host,
+                        )
+                    } else {
+                        MacDisplayManager::start_moonlight_client(
+                            &host_ip_arg,
+                            port,
+                            &host_name_arg,
+                            eff_w,
+                            eff_h,
+                            eff_fps,
+                            eff_bitrate,
+                            audio_on_host,
+                        )
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Moonlight launcher panicked: {}", e)));
 
                 match launch_res {
                     Ok(_) => {
-                        *self.is_active.write().await = true;
+                        *self.client_active.write().await = true;
+                        *self.active_peer_ip.write().await = Some(effective_host_ip.clone());
                         *self.active_mode.write().await = Some("Client".into());
                         self.base_response(
                             true,
@@ -626,8 +782,7 @@ impl DisplayController {
                         .await
                     }
                     Err(e) => {
-                        *self.is_active.write().await = false;
-                        *self.active_mode.write().await = None;
+                        self.clear_client_state().await;
                         self.base_response(false, format!("Failed to start Moonlight client: {}", e))
                             .await
                     }
@@ -635,13 +790,16 @@ impl DisplayController {
             }
             DisplayRpcRequest::StopMoonlight => {
                 info!("Handling StopMoonlight RPC");
-                if cfg!(target_os = "windows") {
-                    let _ = WinDisplayManager::stop_moonlight_client();
-                } else {
-                    let _ = MacDisplayManager::stop_moonlight_client();
-                }
-                *self.is_active.write().await = false;
-                *self.active_mode.write().await = None;
+                let _tx = self.transition_lock.lock().await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    if cfg!(target_os = "windows") {
+                        let _ = WinDisplayManager::stop_moonlight_client();
+                    } else {
+                        let _ = MacDisplayManager::stop_moonlight_client();
+                    }
+                })
+                .await;
+                self.clear_client_state().await;
                 self.base_response(true, "Stopped Moonlight client").await
             }
             DisplayRpcRequest::ToggleMacToPc => match self.toggle_mac_to_pc().await {
@@ -657,19 +815,30 @@ impl DisplayController {
                     .await,
             },
             DisplayRpcRequest::StopAll => {
+                let _tx = self.transition_lock.lock().await;
                 if cfg!(target_os = "macos") {
-                    let _ = self.stop_mac_to_pc().await;
-                    let _ = MacDisplayManager::stop_moonlight_client();
+                    let _ = self.stop_mac_to_pc_locked().await;
+                    let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_moonlight_client)
+                        .await;
                 } else if cfg!(target_os = "windows") {
-                    let _ = self.stop_pc_to_mac().await;
-                    let _ = WinDisplayManager::stop_moonlight_client();
+                    let _ = self.stop_pc_to_mac_locked().await;
+                    let _ = tokio::task::spawn_blocking(WinDisplayManager::stop_moonlight_client)
+                        .await;
                 }
                 if is_loopback_caller {
                     if let Some(remote_ip) = self.discovery.get_peer_ip().await {
-                        let _ = Self::send_remote_rpc(&remote_ip, &DisplayRpcRequest::StopAll).await;
+                        if let Ok(ip) = remote_ip.parse::<IpAddr>() {
+                            if !ip.is_loopback() {
+                                let _ =
+                                    Self::send_remote_rpc(&remote_ip, &DisplayRpcRequest::StopAll)
+                                        .await;
+                            }
+                        }
                     }
                 }
-                *self.is_active.write().await = false;
+                *self.host_active.write().await = false;
+                *self.client_active.write().await = false;
+                *self.active_peer_ip.write().await = None;
                 *self.active_mode.write().await = None;
                 self.base_response(true, "All display extensions stopped")
                     .await
@@ -686,7 +855,9 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::GetGpuTelemetry => {
-                let telemetry = crate::telemetry::query_gpu_telemetry();
+                let telemetry = tokio::task::spawn_blocking(crate::telemetry::query_gpu_telemetry)
+                    .await
+                    .unwrap_or(None);
                 let success = telemetry.is_some();
                 let msg = if success {
                     "GPU telemetry retrieved"
@@ -719,7 +890,21 @@ impl DisplayController {
                 cct,
                 gamma_comp,
             } => {
-                let res = crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp);
+                if !lux.is_finite()
+                    || !(0.0..=200_000.0).contains(&lux)
+                    || !(1000..=15_000).contains(&cct)
+                    || !gamma_comp.is_finite()
+                    || !(0.2..=3.0).contains(&gamma_comp)
+                {
+                    return self
+                        .base_response(false, "Rejected SyncTrueTone: out-of-range calibration values")
+                        .await;
+                }
+                let res = tokio::task::spawn_blocking(move || {
+                    crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("TrueTone task panicked: {}", e)));
                 let success = res.is_ok();
                 let message = match res {
                     Ok(_) => format!(
@@ -763,10 +948,16 @@ impl DisplayController {
                         .await;
                 };
 
-                match crate::storage::StorageManager::mount_with_share(
-                    &target_ip,
-                    share_hint.as_deref(),
-                ) {
+                let mount_res = tokio::task::spawn_blocking(move || {
+                    crate::storage::StorageManager::mount_with_share(
+                        &target_ip,
+                        share_hint.as_deref(),
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Mount task panicked: {}", e)));
+
+                match mount_res {
                     Ok(status) => {
                         let mut resp = self
                             .base_response(status.is_mounted, status.message.clone())
@@ -779,16 +970,21 @@ impl DisplayController {
                         .await,
                 }
             }
-            DisplayRpcRequest::UnmountStorage => match crate::storage::StorageManager::unmount() {
-                Ok(status) => {
-                    let mut resp = self.base_response(true, status.message.clone()).await;
-                    resp.storage_status = Some(status);
-                    resp
+            DisplayRpcRequest::UnmountStorage => {
+                let unmount_res = tokio::task::spawn_blocking(crate::storage::StorageManager::unmount)
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Unmount task panicked: {}", e)));
+                match unmount_res {
+                    Ok(status) => {
+                        let mut resp = self.base_response(true, status.message.clone()).await;
+                        resp.storage_status = Some(status);
+                        resp
+                    }
+                    Err(e) => self
+                        .base_response(false, format!("Unmount request failed: {}", e))
+                        .await,
                 }
-                Err(e) => self
-                    .base_response(false, format!("Unmount request failed: {}", e))
-                    .await,
-            },
+            }
             DisplayRpcRequest::NegotiateAudioSession {
                 sender_nonce_hex,
                 sample_rate,
@@ -800,13 +996,22 @@ impl DisplayController {
                         .base_response(false, "Missing peer IP for audio session negotiation")
                         .await;
                 };
-                match crate::audio::AudioManager::handle_negotiate_session(
-                    caller_ip,
-                    &sender_nonce_hex,
-                    sample_rate,
-                    channels,
-                    bit_depth,
-                ) {
+                let auth_id = peer_device_id.map(|s| s.to_string());
+                let nonce_arg = sender_nonce_hex;
+                let neg_res = tokio::task::spawn_blocking(move || {
+                    crate::audio::AudioManager::handle_negotiate_session_for_peer(
+                        auth_id.as_deref(),
+                        caller_ip,
+                        &nonce_arg,
+                        sample_rate,
+                        channels,
+                        bit_depth,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Audio negotiation panicked: {}", e)));
+
+                match neg_res {
                     Ok(wire) => {
                         let mut resp = self
                             .base_response(
@@ -827,22 +1032,34 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::GetPairingPin => {
-                let (cfg, _) = trust::get_trust_snapshot();
+                let (pin, _ttl_secs) = trust::open_or_get_pairing_pin();
                 let mut resp = self
-                    .base_response(true, format!("Active Pairing PIN: {}", cfg.pairing_pin))
+                    .base_response(true, format!("Active Pairing PIN: {}", pin))
                     .await;
-                resp.pairing_token = Some(cfg.pairing_pin);
+                resp.pairing_token = Some(pin);
                 resp
             }
             DisplayRpcRequest::PairWithPeer { ip, pin } => {
-                match trust::pair_with_remote_peer_v2(ip.trim(), CONTROL_PORT, pin.trim()).await {
+                let trimmed_ip = ip.trim();
+                let trimmed_pin = pin.trim();
+                if trimmed_ip.parse::<IpAddr>().is_err() {
+                    return self
+                        .base_response(false, "Invalid peer IP address for pairing")
+                        .await;
+                }
+                if trimmed_pin.len() != 6 || !trimmed_pin.bytes().all(|b| b.is_ascii_digit()) {
+                    return self
+                        .base_response(false, "Pairing PIN must be a 6-digit number")
+                        .await;
+                }
+                match trust::pair_with_remote_peer_v2(trimmed_ip, CONTROL_PORT, trimmed_pin).await {
                     Ok((creds, sas_6)) => {
                         self.base_response(
                             true,
                             format!(
                                 "Paired and mutually authenticated with {} ({}) [SAS: {}]",
                                 creds.hostname,
-                                ip.trim(),
+                                trimmed_ip,
                                 sas_6
                             ),
                         )
@@ -856,11 +1073,14 @@ impl DisplayController {
 
     /// Returns whether display streaming is currently active.
     pub async fn is_active(&self) -> bool {
-        let lock_active = *self.is_active.read().await;
+        let host_active = *self.host_active.read().await;
+        let client_active = *self.client_active.read().await;
         if cfg!(target_os = "macos") {
-            lock_active || MacDisplayManager::is_virtual_display_active()
+            host_active || client_active || MacDisplayManager::is_virtual_display_active()
+        } else if cfg!(target_os = "windows") {
+            host_active || client_active || WinDisplayManager::is_vdd_active()
         } else {
-            lock_active
+            host_active || client_active
         }
     }
 
@@ -874,7 +1094,7 @@ impl DisplayController {
         peer_ip: &str,
         req: &DisplayRpcRequest,
     ) -> Result<DisplayRpcResponse> {
-        let addr = format!("{}:{}", peer_ip, CONTROL_PORT);
+        let addr = Self::format_socket_target(peer_ip, CONTROL_PORT);
         let mut session = trust::connect_transport_to_ip(
             peer_ip,
             CONTROL_PORT,
@@ -916,46 +1136,74 @@ pub extern "C" fn fetch_rust_gpu_telemetry_json(
     out_buf: *mut u8,
     cap: usize,
 ) -> usize {
-    if peer_ip_ptr.is_null() || out_buf.is_null() || cap < 2 {
-        return 0;
-    }
-    let peer_ip = unsafe { std::ffi::CStr::from_ptr(peer_ip_ptr) }
-        .to_string_lossy()
-        .trim()
-        .to_string();
-    if peer_ip.is_empty() {
-        return 0;
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if peer_ip_ptr.is_null() || out_buf.is_null() || cap < 2 {
+            return 0;
+        }
+        let peer_ip = unsafe { std::ffi::CStr::from_ptr(peer_ip_ptr) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if peer_ip.is_empty() || peer_ip.parse::<IpAddr>().is_err() {
+            return 0;
+        }
 
-    let fetch_future = async {
-        DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetGpuTelemetry).await
-    };
+        let fetch_future = async move {
+            DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetGpuTelemetry).await
+        };
 
-    let resp_res = if let Some(handle) = crate::clipboard::TOKIO_HANDLE.get() {
-        handle.block_on(fetch_future)
-    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        rt.block_on(fetch_future)
-    } else {
-        return 0;
-    };
+        let resp_res = if let Some(handle) = crate::clipboard::TOKIO_HANDLE.get() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let h = handle.clone();
+                let Ok(res) = std::thread::spawn(move || h.block_on(fetch_future)).join() else {
+                    return 0;
+                };
+                res
+            } else {
+                handle.block_on(fetch_future)
+            }
+        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(fetch_future)
+        } else {
+            return 0;
+        };
 
-    let Ok(resp) = resp_res else {
-        return 0;
-    };
-    let Ok(json_bytes) = serde_json::to_vec(&resp) else {
-        return 0;
-    };
-    if json_bytes.is_empty() || json_bytes.len() >= cap {
-        return 0;
+        let Ok(resp) = resp_res else {
+            return 0;
+        };
+        let Ok(json_bytes) = serde_json::to_vec(&resp) else {
+            return 0;
+        };
+        if json_bytes.is_empty() || json_bytes.len() >= cap {
+            return 0;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(json_bytes.as_ptr(), out_buf, json_bytes.len());
+            *out_buf.add(json_bytes.len()) = 0;
+        }
+        json_bytes.len()
+    }))
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_socket_target_supports_ipv4_and_ipv6() {
+        assert_eq!(
+            DisplayController::format_socket_target("10.0.0.2", 58281),
+            "10.0.0.2:58281"
+        );
+        assert_eq!(
+            DisplayController::format_socket_target("fe80::1", 58281),
+            "[fe80::1]:58281"
+        );
     }
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(json_bytes.as_ptr(), out_buf, json_bytes.len());
-        *out_buf.add(json_bytes.len()) = 0;
-    }
-    json_bytes.len()
 }
 

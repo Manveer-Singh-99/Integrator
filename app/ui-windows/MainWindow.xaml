@@ -149,21 +149,21 @@
                                 </StackPanel>
                             </Border>
 
-                            <Button Click="RefreshBtn_Click" Padding="10,5">
+                            <Button Click="RefreshBtn_Click" Padding="10,5" AutomationProperties.Name="Refresh status">
                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                     <FontIcon Glyph="&#xE72C;" FontSize="12" />
                                     <TextBlock Text="Refresh" FontSize="12" />
                                 </StackPanel>
                             </Button>
 
-                            <Button Click="OpenCacheBtn_Click" Padding="10,5">
+                            <Button Click="OpenCacheBtn_Click" Padding="10,5" AutomationProperties.Name="Open clipboard cache folder">
                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                     <FontIcon Glyph="&#xE8B7;" FontSize="12" />
                                     <TextBlock Text="Open Cache" FontSize="12" />
                                 </StackPanel>
                             </Button>
 
-                            <Button Click="HideWindowBtn_Click" Padding="10,5">
+                            <Button Click="HideWindowBtn_Click" Padding="10,5" AutomationProperties.Name="Hide window to system tray">
                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                     <FontIcon Glyph="&#xE747;" FontSize="12" />
                                     <TextBlock Text="Hide" FontSize="12" />
@@ -199,7 +199,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchDisplay" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="display" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="display"
+                                                  AutomationProperties.Name="Enable Extended Screen and GPU Acceleration" />
                                 </Grid>
 
                                 <Grid ColumnSpacing="10">
@@ -209,11 +210,15 @@
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0" Spacing="4">
                                         <TextBlock Text="Encode GPU" Style="{StaticResource SubCaptionStyle}" />
-                                        <ComboBox x:Name="EncodeGpuCombo" HorizontalAlignment="Stretch" />
+                                        <ComboBox x:Name="EncodeGpuCombo" HorizontalAlignment="Stretch"
+                                                  SelectionChanged="GpuCombo_SelectionChanged"
+                                                  AutomationProperties.Name="Encode GPU preference" />
                                     </StackPanel>
                                     <StackPanel Grid.Column="1" Spacing="4">
                                         <TextBlock Text="Decode GPU" Style="{StaticResource SubCaptionStyle}" />
-                                        <ComboBox x:Name="DecodeGpuCombo" HorizontalAlignment="Stretch" />
+                                        <ComboBox x:Name="DecodeGpuCombo" HorizontalAlignment="Stretch"
+                                                  SelectionChanged="GpuCombo_SelectionChanged"
+                                                  AutomationProperties.Name="Decode GPU preference" />
                                     </StackPanel>
                                 </Grid>
 
@@ -263,7 +268,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchKvm" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="input_kvm" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="input_kvm"
+                                                  AutomationProperties.Name="Enable Universal Input KVM" />
                                 </Grid>
 
                                 <!-- Interactive 2D Desk Placement Schematic -->
@@ -306,7 +312,8 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Text="Alignment Offset" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
                                     <Slider x:Name="AlignmentSlider" Grid.Column="1" Minimum="-0.5" Maximum="0.5" StepFrequency="0.02"
-                                            ValueChanged="KvmSlider_ValueChanged" />
+                                            ValueChanged="KvmSlider_ValueChanged"
+                                            AutomationProperties.Name="Alignment Offset" />
                                     <TextBlock x:Name="AlignmentValueText" Grid.Column="2" Text="0%" FontSize="12"
                                                HorizontalAlignment="Right" VerticalAlignment="Center" />
                                 </Grid>
@@ -318,9 +325,10 @@
                                         <ColumnDefinition Width="52" />
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Text="Edge Hop Delay" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
-                                    <Slider x:Name="HopDelaySlider" Grid.Column="1" Minimum="0" Maximum="300" StepFrequency="5"
-                                            ValueChanged="KvmSlider_ValueChanged" />
-                                    <TextBlock x:Name="HopDelayValueText" Grid.Column="2" Text="35 ms" FontSize="12"
+                                    <Slider x:Name="HopDelaySlider" Grid.Column="1" Minimum="0" Maximum="250" StepFrequency="5"
+                                            ValueChanged="KvmSlider_ValueChanged"
+                                            AutomationProperties.Name="Edge Hop Delay" />
+                                    <TextBlock x:Name="HopDelayValueText" Grid.Column="2" Text="40 ms" FontSize="12"
                                                HorizontalAlignment="Right" VerticalAlignment="Center" />
                                 </Grid>
 
@@ -372,7 +380,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchDragDrop" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="dragdrop" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="dragdrop"
+                                                  AutomationProperties.Name="Enable Cross-Screen Drag and Drop" />
                                 </Grid>
 
                                 <StackPanel x:Name="DragDropKvmWarn" Visibility="Collapsed" Orientation="Horizontal" Spacing="6">
@@ -395,7 +404,8 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Text="Fallback Drop Folder" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
                                     <ComboBox x:Name="DropFolderCombo" Grid.Column="1" HorizontalAlignment="Stretch"
-                                              SelectionChanged="DropFolderCombo_SelectionChanged">
+                                              SelectionChanged="DropFolderCombo_SelectionChanged"
+                                              AutomationProperties.Name="Fallback Drop Folder">
                                         <ComboBoxItem Content="Downloads" Tag="downloads" />
                                         <ComboBoxItem Content="Desktop" Tag="desktop" />
                                         <ComboBoxItem Content="Clipboard Cache" Tag="cache" />
@@ -435,7 +445,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchClipboard" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="clipboard" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="clipboard"
+                                                  AutomationProperties.Name="Enable Universal Clipboard" />
                                 </Grid>
 
                                 <StackPanel x:Name="ClipboardKvmWarn" Visibility="Collapsed" Orientation="Horizontal" Spacing="6">
@@ -494,9 +505,13 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBox x:Name="ManualIpInput" Grid.Column="0" PlaceholderText="Manual peer IP (e.g. 10.99.99.2)" />
+                                    <TextBox x:Name="ManualIpInput" Grid.Column="0" MaxLength="64"
+                                             PlaceholderText="Manual peer IP (e.g. 10.99.99.2)"
+                                             AutomationProperties.Name="Manual peer IP address" />
                                     <Button Grid.Column="1" Content="Add IP" Click="AddManualIp_Click" />
                                 </Grid>
+
+                                <StackPanel x:Name="ManualIpsPanel" Spacing="4" />
 
                                 <StackPanel x:Name="PeersListPanel" Spacing="6" />
 
@@ -583,7 +598,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchStorage" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="storage" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="storage"
+                                                  AutomationProperties.Name="Enable Auto-Mounted Shared Storage" />
                                 </Grid>
 
                                 <TextBlock x:Name="StorageSummaryText" Text="SMB volume ready on trusted peer"
@@ -594,7 +610,10 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBox x:Name="PreferredShareInput" Grid.Column="0" PlaceholderText="Preferred Share Name" />
+                                    <TextBox x:Name="PreferredShareInput" Grid.Column="0" MaxLength="128"
+                                             PlaceholderText="Preferred Share Name"
+                                             TextChanged="PreferredShareInput_TextChanged"
+                                             AutomationProperties.Name="Preferred Share Name" />
                                     <Button Grid.Column="1" Content="Set Share" Click="SetShare_Click" />
                                 </Grid>
 
@@ -627,7 +646,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchTrueTone" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="truetone" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="truetone"
+                                                  AutomationProperties.Name="Enable True Tone and Chromatic Sync" />
                                 </Grid>
 
                                 <Grid ColumnSpacing="10">
@@ -638,7 +658,8 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Text="CCT" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
                                     <Slider x:Name="CctSlider" Grid.Column="1" Minimum="3500" Maximum="8000" StepFrequency="100" Value="6500"
-                                            ValueChanged="TrueToneSlider_ValueChanged" />
+                                            ValueChanged="TrueToneSlider_ValueChanged"
+                                            AutomationProperties.Name="Color Temperature Kelvin" />
                                     <TextBlock x:Name="CctValueText" Grid.Column="2" Text="6500K" FontSize="12"
                                                HorizontalAlignment="Right" VerticalAlignment="Center" />
                                 </Grid>
@@ -651,7 +672,8 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBlock Text="Gamma" Style="{StaticResource SubCaptionStyle}" VerticalAlignment="Center" />
                                     <Slider x:Name="GammaSlider" Grid.Column="1" Minimum="0.70" Maximum="1.30" StepFrequency="0.05" Value="1.0"
-                                            ValueChanged="TrueToneSlider_ValueChanged" />
+                                            ValueChanged="TrueToneSlider_ValueChanged"
+                                            AutomationProperties.Name="Gamma compensation" />
                                     <TextBlock x:Name="GammaValueText" Grid.Column="2" Text="1.00x" FontSize="12"
                                                HorizontalAlignment="Right" VerticalAlignment="Center" />
                                 </Grid>
@@ -685,7 +707,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchTouchBar" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="touchbar" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="touchbar"
+                                                  AutomationProperties.Name="Enable Touch Bar Hardware HUD" />
                                 </Grid>
 
                                 <TextBlock x:Name="TouchBarDescText" Text="No Apple Touch Bar hardware detected on this workstation."
@@ -720,7 +743,8 @@
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchAudio" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
-                                                  Toggled="FeatureSwitch_Toggled" Tag="audio" />
+                                                  Toggled="FeatureSwitch_Toggled" Tag="audio"
+                                                  AutomationProperties.Name="Enable Dynamic Audio Routing" />
                                 </Grid>
 
                                 <TextBlock x:Name="AudioTopologyText"
@@ -757,7 +781,8 @@
                                 </Grid>
 
                                 <ToggleSwitch x:Name="SwitchAutostart" Header="Launch Integrator Automatically at Login"
-                                              Toggled="AutostartSwitch_Toggled" />
+                                              Toggled="AutostartSwitch_Toggled"
+                                              AutomationProperties.Name="Launch Integrator Automatically at Login" />
 
                                 <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Continuity Camera • Multi-WAN Bonding"
                                            Style="{StaticResource SubCaptionStyle}" />
@@ -787,8 +812,9 @@
                                 </Grid>
 
                                 <Border Height="175" CornerRadius="8" Padding="10"
-                                        Background="#22000000" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
-                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                                    <ScrollViewer x:Name="LogsScrollViewer" VerticalScrollBarVisibility="Auto">
                                         <StackPanel x:Name="LogsListPanel" Spacing="3" />
                                     </ScrollViewer>
                                 </Border>
@@ -808,7 +834,7 @@
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
             <StackPanel Orientation="Horizontal" Spacing="8">
                 <Ellipse x:Name="ToastDot" Width="8" Height="8" Fill="#18B4D4" />
-                <TextBlock x:Name="ToastMessage" FontSize="12" FontWeight="Medium" />
+                <TextBlock x:Name="ToastMessage" FontSize="12" FontWeight="Medium" TextWrapping="Wrap" MaxWidth="360" />
             </StackPanel>
         </Border>
     </Grid>

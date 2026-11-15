@@ -68,8 +68,9 @@ impl LinkMonitor {
         Some((ms * 100.0).round() / 100.0)
     }
 
-    /// Background loop monitoring link health and logging dynamic route transitions.
-    pub async fn run_watchdog(&self) {
+    /// Background loop monitoring link health and logging dynamic route transitions
+    /// until cancelled cleanly via `shutdown`.
+    pub async fn run_watchdog_until(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let peer_ip = self.peer_addr.ip().to_string();
         let (transport, link_desc) = describe_route_async(peer_ip.clone()).await;
         info!(
@@ -81,33 +82,58 @@ impl LinkMonitor {
         let mut is_connected = false;
 
         loop {
-            match self.measure_rtt(Duration::from_millis(800)).await {
-                Some(rtt) => {
-                    if !is_connected {
-                        let (transport, _) = describe_route_async(peer_ip.clone()).await;
-                        info!(
-                            "🟢 {} link ESTABLISHED to {} (RTT: {:.2}ms)",
-                            transport.label(),
-                            self.peer_addr,
-                            rtt.as_secs_f64() * 1000.0
-                        );
-                        is_connected = true;
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
                     }
                 }
-                None => {
-                    if is_connected {
-                        let (transport, _) = describe_route_async(peer_ip.clone()).await;
-                        warn!(
-                            "🔴 {} link LOST to {} (Peer unreachable)",
-                            transport.label(),
-                            self.peer_addr
-                        );
-                        is_connected = false;
+                rtt_res = self.measure_rtt(Duration::from_millis(800)) => {
+                    match rtt_res {
+                        Some(rtt) => {
+                            if !is_connected {
+                                let (transport, _) = describe_route_async(peer_ip.clone()).await;
+                                info!(
+                                    "🟢 {} link ESTABLISHED to {} (RTT: {:.2}ms)",
+                                    transport.label(),
+                                    self.peer_addr,
+                                    rtt.as_secs_f64() * 1000.0
+                                );
+                                is_connected = true;
+                            }
+                        }
+                        None => {
+                            if is_connected {
+                                let (transport, _) = describe_route_async(peer_ip.clone()).await;
+                                warn!(
+                                    "🔴 {} link LOST to {} (Peer unreachable)",
+                                    transport.label(),
+                                    self.peer_addr
+                                );
+                                is_connected = false;
+                            }
+                        }
                     }
                 }
             }
-            sleep(self.check_interval).await;
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = sleep(self.check_interval) => {}
+            }
         }
+    }
+
+    /// Background loop monitoring link health and logging dynamic route transitions.
+    pub async fn run_watchdog(&self) {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.run_watchdog_until(rx).await;
     }
 }
 
@@ -152,5 +178,19 @@ mod tests {
             .await;
         assert!(rtt.is_some());
         let _ = accept_task.await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_exits_cleanly_on_shutdown() {
+        let monitor = LinkMonitor::new("127.0.0.1", 58281).unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            monitor.run_watchdog_until(rx).await;
+        });
+        let _ = tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog should exit cleanly on shutdown")
+            .unwrap();
     }
 }

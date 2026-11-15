@@ -1,58 +1,56 @@
 import Foundation
 import IOKit
 
-// MARK: - Dynamic IOKit HID Function Bindings
-typealias IOHIDEventSystemClientRef = CFTypeRef
-typealias IOHIDEventRef = CFTypeRef
-
+// MARK: - Dynamic IOKit HID Function Bindings (Strict C Pointer ABI)
 private let ioKitHandle: UnsafeMutableRawPointer? = dlopen(
     "/System/Library/Frameworks/IOKit.framework/IOKit",
-    RTLD_NOW
+    RTLD_NOW | RTLD_LOCAL
 )
 
-private let iohidClientCreateWithType: (@convention(c) (CFAllocator?, UInt32, CFDictionary?) -> Unmanaged<CFTypeRef>?)? = {
+private typealias FnIOHIDClientCreateWithType = @convention(c) (
+    UnsafeRawPointer?, UInt32, UnsafeRawPointer?
+) -> UnsafeMutableRawPointer?
+private typealias FnIOHIDClientSetMatching = @convention(c) (
+    UnsafeRawPointer, UnsafeRawPointer
+) -> Void
+private typealias FnIOHIDClientCopyServices = @convention(c) (
+    UnsafeRawPointer
+) -> UnsafeMutableRawPointer?
+private typealias FnIOHIDServiceCopyEvent = @convention(c) (
+    UnsafeRawPointer, Int64, UnsafeRawPointer?, UInt32
+) -> UnsafeMutableRawPointer?
+private typealias FnIOHIDEventGetFloatValue = @convention(c) (
+    UnsafeRawPointer, Int32
+) -> Double
+
+private let iohidClientCreateWithType: FnIOHIDClientCreateWithType? = {
     guard let handle = ioKitHandle,
           let sym = dlsym(handle, "IOHIDEventSystemClientCreateWithType") else { return nil }
-    return unsafeBitCast(
-        sym,
-        to: (@convention(c) (CFAllocator?, UInt32, CFDictionary?) -> Unmanaged<CFTypeRef>?).self
-    )
+    return unsafeBitCast(sym, to: FnIOHIDClientCreateWithType.self)
 }()
 
-private let iohidClientSetMatching: (@convention(c) (IOHIDEventSystemClientRef, CFDictionary) -> Void)? = {
+private let iohidClientSetMatching: FnIOHIDClientSetMatching? = {
     guard let handle = ioKitHandle,
           let sym = dlsym(handle, "IOHIDEventSystemClientSetMatching") else { return nil }
-    return unsafeBitCast(
-        sym,
-        to: (@convention(c) (IOHIDEventSystemClientRef, CFDictionary) -> Void).self
-    )
+    return unsafeBitCast(sym, to: FnIOHIDClientSetMatching.self)
 }()
 
-private let iohidClientCopyServices: (@convention(c) (IOHIDEventSystemClientRef) -> Unmanaged<CFArray>?)? = {
+private let iohidClientCopyServices: FnIOHIDClientCopyServices? = {
     guard let handle = ioKitHandle,
           let sym = dlsym(handle, "IOHIDEventSystemClientCopyServices") else { return nil }
-    return unsafeBitCast(
-        sym,
-        to: (@convention(c) (IOHIDEventSystemClientRef) -> Unmanaged<CFArray>?).self
-    )
+    return unsafeBitCast(sym, to: FnIOHIDClientCopyServices.self)
 }()
 
-private let iohidServiceCopyEvent: (@convention(c) (CFTypeRef, Int64, Int32, Int64) -> Unmanaged<CFTypeRef>?)? = {
+private let iohidServiceCopyEvent: FnIOHIDServiceCopyEvent? = {
     guard let handle = ioKitHandle,
           let sym = dlsym(handle, "IOHIDServiceClientCopyEvent") else { return nil }
-    return unsafeBitCast(
-        sym,
-        to: (@convention(c) (CFTypeRef, Int64, Int32, Int64) -> Unmanaged<CFTypeRef>?).self
-    )
+    return unsafeBitCast(sym, to: FnIOHIDServiceCopyEvent.self)
 }()
 
-private let iohidEventGetFloatValue: (@convention(c) (IOHIDEventRef, Int32) -> Double)? = {
+private let iohidEventGetFloatValue: FnIOHIDEventGetFloatValue? = {
     guard let handle = ioKitHandle,
           let sym = dlsym(handle, "IOHIDEventGetFloatValue") else { return nil }
-    return unsafeBitCast(
-        sym,
-        to: (@convention(c) (IOHIDEventRef, Int32) -> Double).self
-    )
+    return unsafeBitCast(sym, to: FnIOHIDEventGetFloatValue.self)
 }()
 
 // MARK: - Ambient Light Sensor Reader FFI
@@ -85,22 +83,29 @@ public func read_mac_ambient_sensor(
         return setUnsupported()
     }
 
-    guard let client = createClient(kCFAllocatorDefault, 1, nil)?.takeRetainedValue() else {
+    guard let clientPtr = createClient(nil, 1, nil) else {
         return setUnsupported()
     }
+    let clientObj = Unmanaged<CFTypeRef>.fromOpaque(clientPtr).takeRetainedValue()
+    let clientRaw = UnsafeRawPointer(clientPtr)
 
     // Apple HID Ambient Light Sensor usage page/usage (covers Apple Silicon SPU & Intel LMU HID)
-    let matching: [String: Any] = [
+    let matching = [
         "PrimaryUsagePage": 0xff00,
         "PrimaryUsage": 4
-    ]
-    setMatching(client, matching as CFDictionary)
+    ] as NSDictionary
+    setMatching(clientRaw, Unmanaged.passUnretained(matching).toOpaque())
 
-    guard let servicesRef = copyServices(client)?.takeRetainedValue() else {
+    guard let servicesRaw = copyServices(clientRaw) else {
         return setUnsupported()
     }
-    let services = servicesRef as [CFTypeRef]
-    guard !services.isEmpty else {
+    let servicesObj = Unmanaged<CFTypeRef>.fromOpaque(servicesRaw).takeRetainedValue()
+    guard CFGetTypeID(servicesObj) == CFArrayGetTypeID() else {
+        return setUnsupported()
+    }
+    let services = servicesObj as! CFArray
+    let count = CFArrayGetCount(services)
+    guard count > 0 else {
         return setUnsupported()
     }
 
@@ -110,26 +115,42 @@ public func read_mac_ambient_sensor(
     let ch0Field: Int32 = Int32((alsEventType << 16) | 1)
     let ch2Field: Int32 = Int32((alsEventType << 16) | 3)
 
-    for service in services {
-        guard let event = copyEvent(service, alsEventType, 0, 0)?.takeRetainedValue() else {
+    _ = clientObj // keep retained until loop finishes
+    for idx in 0..<count {
+        guard let serviceRaw = CFArrayGetValueAtIndex(services, idx) else {
             continue
         }
-
-        let luxRaw = getFloatValue(event, luxField)
+        guard let eventRaw = copyEvent(serviceRaw, alsEventType, nil, 0) else {
+            continue
+        }
+        let eventObj = Unmanaged<CFTypeRef>.fromOpaque(eventRaw).takeRetainedValue()
+        let luxRaw = getFloatValue(UnsafeRawPointer(eventRaw), luxField)
         guard luxRaw.isFinite, luxRaw >= 0.0 else {
+            _ = eventObj
             continue
         }
 
         let lux = Float(luxRaw)
-        let ch0 = getFloatValue(event, ch0Field) // Red / Warm channel
-        let ch2 = getFloatValue(event, ch2Field) // Blue / Cool channel
+        guard lux.isFinite, lux >= 0.0 else {
+            _ = eventObj
+            continue
+        }
+
+        let ch0 = getFloatValue(UnsafeRawPointer(eventRaw), ch0Field) // Red / Warm channel
+        let ch2 = getFloatValue(UnsafeRawPointer(eventRaw), ch2Field) // Blue / Cool channel
+        _ = eventObj
 
         // Calculate Correlated Color Temperature (Kelvin) relative to D65 (6500K).
         var cctKelvin: Double = 6500.0
         if ch0.isFinite, ch2.isFinite, ch0 > 0.0, ch2 > 0.0 {
             let ratio = ch2 / ch0
-            cctKelvin = 3000.0 + (ratio * 3500.0)
-            cctKelvin = min(max(cctKelvin, 2500.0), 9000.0)
+            if ratio.isFinite {
+                cctKelvin = 3000.0 + (ratio * 3500.0)
+                cctKelvin = min(max(cctKelvin, 2500.0), 9000.0)
+            }
+        }
+        guard cctKelvin.isFinite else {
+            continue
         }
 
         outLux?.pointee = lux

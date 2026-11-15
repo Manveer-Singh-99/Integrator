@@ -29,10 +29,13 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use subtle::ConstantTimeEq;
@@ -43,6 +46,10 @@ pub const KEYSTORE_SCHEMA_VERSION: u32 = 2;
 
 const AAD_LOCAL_IDENTITY_PREFIX: &[u8] = b"integrator-keystore-v2-local-id";
 const AAD_PEER_ROOT_PREFIX: &[u8] = b"integrator-keystore-v2-peer-root";
+const KEYSTORE_META_MAC_SALT: &[u8] = b"integrator-keystore-v2-meta-salt";
+const KEYSTORE_META_MAC_INFO: &[u8] = b"integrator-keystore-v2-meta-mac";
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeystoreError {
@@ -179,6 +186,8 @@ struct KeystoreFileV2 {
     pub blocked_ips: Vec<String>,
     #[serde(default)]
     pub legacy_v1_quarantined: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_mac_hex: Option<String>,
 }
 
 /// Verified in-memory representation of a pinned peer with its unwrapped `K_root`.
@@ -225,7 +234,7 @@ pub struct KeystoreV2 {
 impl KeystoreV2 {
     /// Opens or initializes the production v2 keystore in the default directory (`~/.integrator/security`).
     pub fn open_default() -> Result<Self, KeystoreError> {
-        let dir = default_keystore_dir();
+        let dir = try_default_keystore_dir()?;
         Self::open_with_provider(dir, &OsNativeKekProvider)
     }
 
@@ -256,7 +265,8 @@ impl KeystoreV2 {
         legacy_v1_quarantined: bool,
     ) -> Result<Self, KeystoreError> {
         let mut sk_seed = Zeroizing::new([0u8; 32]);
-        super::csprng_fill(&mut *sk_seed);
+        super::try_csprng_fill(&mut *sk_seed)
+            .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
         let signing_key = SigningKey::from_bytes(&sk_seed);
         let verifying_key = signing_key.verifying_key();
         let pubkey_bytes = verifying_key.to_bytes();
@@ -286,8 +296,14 @@ impl KeystoreV2 {
         kek: Zeroizing<[u8; 32]>,
         newly_quarantined: bool,
     ) -> Result<Self, KeystoreError> {
-        let raw = fs::read_to_string(&keystore_path)
-            .map_err(|e| KeystoreError::IoFailure(format!("read {}: {}", keystore_path.display(), e)))?;
+        let raw_bytes = read_secure_bytes(&keystore_path)?;
+        let raw = String::from_utf8(raw_bytes).map_err(|e| {
+            KeystoreError::CorruptKeystore(format!(
+                "non-UTF8 bytes in {}: {}",
+                keystore_path.display(),
+                e
+            ))
+        })?;
 
         let parsed: KeystoreFileV2 = serde_json::from_str(&raw).map_err(|e| {
             KeystoreError::CorruptKeystore(format!("invalid JSON in {}: {}", keystore_path.display(), e))
@@ -299,6 +315,23 @@ impl KeystoreV2 {
                 parsed.schema_version, KEYSTORE_SCHEMA_VERSION
             )));
         }
+
+        // Verify metadata integrity MAC when present (upgrade older v2 stores on save below).
+        let needs_mac_upgrade = match &parsed.state_mac_hex {
+            Some(mac_hex) => {
+                let presented_mac: [u8; 32] = super::hex_decode_array(mac_hex).ok_or_else(|| {
+                    KeystoreError::AeadTamperDetected("invalid state_mac_hex encoding".into())
+                })?;
+                let expected_mac = compute_keystore_file_mac(&kek, &parsed)?;
+                if !bool::from(presented_mac.ct_eq(&expected_mac)) {
+                    return Err(KeystoreError::AeadTamperDetected(
+                        "keystore metadata integrity MAC verification failed".into(),
+                    ));
+                }
+                false
+            }
+            None => true,
+        };
 
         let local_pk_bytes: [u8; 32] = super::hex_decode_array(&parsed.local_ed25519_pubkey_hex)
             .ok_or_else(|| KeystoreError::CorruptKeystore("invalid local_ed25519_pubkey_hex".into()))?;
@@ -324,7 +357,23 @@ impl KeystoreV2 {
             ));
         }
 
+        let mut blocked_device_ids = Vec::new();
+        for b in &parsed.blocked_device_ids {
+            let norm = b.trim().to_ascii_lowercase();
+            if !norm.is_empty() && !blocked_device_ids.contains(&norm) {
+                blocked_device_ids.push(norm);
+            }
+        }
+        let mut blocked_ips = Vec::new();
+        for ip in &parsed.blocked_ips {
+            let norm = ip.trim().to_string();
+            if !norm.is_empty() && !blocked_ips.contains(&norm) {
+                blocked_ips.push(norm);
+            }
+        }
+
         let mut peers = HashMap::new();
+        let mut seen_hostnames: Vec<String> = Vec::new();
         for rec in &parsed.peers {
             if rec.schema_version != KEYSTORE_SCHEMA_VERSION {
                 return Err(KeystoreError::CorruptKeystore(format!(
@@ -377,6 +426,22 @@ impl KeystoreV2 {
             }
 
             let canonical_id_hex = super::hex_encode(&peer_id);
+            if blocked_device_ids.iter().any(|b| b == &canonical_id_hex) {
+                warn!("Skipping blocked peer '{}' during keystore load", canonical_id_hex);
+                continue;
+            }
+            let clean_host = rec.hostname.trim().to_string();
+            let host_lower = clean_host.to_ascii_lowercase();
+            if !host_lower.is_empty() && host_lower != "unknown" {
+                if seen_hostnames.contains(&host_lower) {
+                    return Err(KeystoreError::CorruptKeystore(format!(
+                        "duplicate pinned hostname '{}' in keystore",
+                        clean_host
+                    )));
+                }
+                seen_hostnames.push(host_lower);
+            }
+
             peers.insert(
                 canonical_id_hex.clone(),
                 VerifiedPeerCredentials {
@@ -385,9 +450,9 @@ impl KeystoreV2 {
                     ed25519_pubkey: peer_pk,
                     key_id,
                     root_key,
-                    hostname: rec.hostname.clone(),
-                    os: rec.os.clone(),
-                    last_ip: rec.last_ip.clone(),
+                    hostname: clean_host,
+                    os: rec.os.trim().to_string(),
+                    last_ip: rec.last_ip.trim().to_string(),
                     paired_at_epoch: rec.paired_at_epoch,
                     via_direct_cable: rec.via_direct_cable,
                 },
@@ -403,13 +468,13 @@ impl KeystoreV2 {
             local_device_id: local_id_bytes,
             local_device_id_hex: super::hex_encode(&local_id_bytes),
             peers,
-            blocked_device_ids: parsed.blocked_device_ids,
-            blocked_ips: parsed.blocked_ips,
+            blocked_device_ids,
+            blocked_ips,
             legacy_v1_quarantined: parsed.legacy_v1_quarantined || newly_quarantined,
         };
 
-        if newly_quarantined && !parsed.legacy_v1_quarantined {
-            let _ = store.persist_to_disk();
+        if (newly_quarantined && !parsed.legacy_v1_quarantined) || needs_mac_upgrade {
+            store.persist_to_disk()?;
         }
 
         Ok(store)
@@ -471,6 +536,11 @@ impl KeystoreV2 {
                 derived_hex: super::hex_encode(&derived_id),
             });
         }
+        if bool::from(peer_device_id.ct_eq(&self.local_device_id)) {
+            return Err(KeystoreError::CorruptKeystore(
+                "Cannot pair device with its own local identity".into(),
+            ));
+        }
 
         let id_hex = super::hex_encode(peer_device_id);
         if self.blocked_device_ids.iter().any(|b| b == &id_hex) {
@@ -490,7 +560,7 @@ impl KeystoreV2 {
         let trimmed_host = hostname.trim();
         if !trimmed_host.is_empty() && !trimmed_host.eq_ignore_ascii_case("unknown") {
             for existing in self.peers.values() {
-                if existing.hostname.eq_ignore_ascii_case(trimmed_host)
+                if existing.hostname.trim().eq_ignore_ascii_case(trimmed_host)
                     && !bool::from(existing.ed25519_pubkey.ct_eq(peer_ed25519_pk))
                 {
                     return Err(KeystoreError::PinnedIdentityKeyMismatch {
@@ -516,7 +586,8 @@ impl KeystoreV2 {
         last_ip: String,
         via_direct_cable: bool,
     ) -> Result<VerifiedPeerCredentials, KeystoreError> {
-        self.check_peer_identity_pinning(&peer_device_id, &peer_ed25519_pk, &hostname)?;
+        let clean_hostname = hostname.trim().to_string();
+        self.check_peer_identity_pinning(&peer_device_id, &peer_ed25519_pk, &clean_hostname)?;
 
         let key_id = super::derive_key_id(&root_key);
         let device_id_hex = super::hex_encode(&peer_device_id);
@@ -528,24 +599,28 @@ impl KeystoreV2 {
             ed25519_pubkey: peer_ed25519_pk,
             key_id,
             root_key,
-            hostname,
-            os,
-            last_ip,
+            hostname: clean_hostname,
+            os: os.trim().to_string(),
+            last_ip: last_ip.trim().to_string(),
             paired_at_epoch: now_secs,
             via_direct_cable,
         };
 
-        self.peers.insert(device_id_hex, creds.clone());
-        self.persist_to_disk()?;
+        let mut next_peers = self.peers.clone();
+        next_peers.insert(device_id_hex, creds.clone());
+        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
+        self.peers = next_peers;
         Ok(creds)
     }
 
     /// Explicitly unpairs/revokes a pinned peer so a new key or fresh pairing can be established.
     pub fn unpair_peer(&mut self, device_id_hex: &str) -> Result<bool, KeystoreError> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
-        let removed = self.peers.remove(&canonical).is_some();
+        let mut next_peers = self.peers.clone();
+        let removed = next_peers.remove(&canonical).is_some();
         if removed {
-            self.persist_to_disk()?;
+            self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
+            self.peers = next_peers;
         }
         Ok(removed)
     }
@@ -558,31 +633,51 @@ impl KeystoreV2 {
         known_ip: Option<&str>,
     ) -> Result<(), KeystoreError> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
-        let removed_peer = self.peers.remove(&canonical);
+        let mut next_peers = self.peers.clone();
+        let mut next_blocked_ids = self.blocked_device_ids.clone();
+        let mut next_blocked_ips = self.blocked_ips.clone();
+
+        let removed_peer = next_peers.remove(&canonical);
         if block {
-            if !self.blocked_device_ids.iter().any(|b| b == &canonical) {
-                self.blocked_device_ids.push(canonical.clone());
+            if !canonical.is_empty() && !next_blocked_ids.iter().any(|b| b == &canonical) {
+                next_blocked_ids.push(canonical.clone());
             }
             if let Some(peer) = removed_peer {
                 if !peer.last_ip.is_empty()
-                    && !self.blocked_ips.iter().any(|ip| ip == &peer.last_ip)
+                    && !next_blocked_ips.iter().any(|ip| ip == &peer.last_ip)
                 {
-                    self.blocked_ips.push(peer.last_ip);
+                    next_blocked_ips.push(peer.last_ip);
                 }
             }
             if let Some(ip) = known_ip.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                if !self.blocked_ips.iter().any(|bip| bip == ip) {
-                    self.blocked_ips.push(ip.to_string());
+                if !next_blocked_ips.iter().any(|bip| bip == ip) {
+                    next_blocked_ips.push(ip.to_string());
                 }
             }
         } else {
-            self.blocked_device_ids.retain(|b| b != &canonical);
+            next_blocked_ids.retain(|b| b != &canonical);
+            if let Some(peer) = removed_peer {
+                if !peer.last_ip.is_empty() {
+                    next_blocked_ips.retain(|bip| bip != &peer.last_ip);
+                }
+            }
+            if let Some(ip) = known_ip.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                next_blocked_ips.retain(|bip| bip != ip);
+            }
         }
-        self.persist_to_disk()
+        self.persist_state(&next_peers, &next_blocked_ids, &next_blocked_ips)?;
+        self.peers = next_peers;
+        self.blocked_device_ids = next_blocked_ids;
+        self.blocked_ips = next_blocked_ips;
+        Ok(())
     }
 
     pub fn blocked_device_ids(&self) -> &[String] {
         &self.blocked_device_ids
+    }
+
+    pub fn blocked_ips(&self) -> &[String] {
+        &self.blocked_ips
     }
 
     pub fn is_device_or_ip_blocked(&self, device_id_hex: &str, ip: &str) -> bool {
@@ -627,25 +722,44 @@ impl KeystoreV2 {
         new_ip: &str,
     ) -> Result<(), KeystoreError> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
-        if let Some(peer) = self.peers.get_mut(&canonical) {
-            if peer.last_ip != new_ip {
-                peer.last_ip = new_ip.to_string();
-                self.persist_to_disk()?;
-            }
-            Ok(())
-        } else {
-            Err(KeystoreError::PeerNotFound(canonical))
+        let clean_new_ip = new_ip.trim();
+        if !self.peers.contains_key(&canonical) {
+            return Err(KeystoreError::PeerNotFound(canonical));
         }
+        let unchanged = self
+            .peers
+            .get(&canonical)
+            .map(|p| p.last_ip == clean_new_ip)
+            .unwrap_or(false);
+        if unchanged {
+            return Ok(());
+        }
+        let mut next_peers = self.peers.clone();
+        if let Some(peer) = next_peers.get_mut(&canonical) {
+            peer.last_ip = clean_new_ip.to_string();
+        }
+        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
+        self.peers = next_peers;
+        Ok(())
     }
 
     pub fn persist_to_disk(&self) -> Result<(), KeystoreError> {
+        self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips)
+    }
+
+    fn persist_state(
+        &self,
+        peers_map: &HashMap<String, VerifiedPeerCredentials>,
+        blocked_device_ids: &[String],
+        blocked_ips: &[String],
+    ) -> Result<(), KeystoreError> {
         let local_pk_bytes = self.local_verifying_key.to_bytes();
         let local_sk_bytes = Zeroizing::new(self.local_signing_key.to_bytes());
         let local_aad = build_local_identity_aad(&self.local_device_id, &local_pk_bytes);
         let wrapped_local_sk = wrap_secret_32(&self.kek, &local_sk_bytes, &local_aad)?;
 
-        let mut serialized_peers = Vec::with_capacity(self.peers.len());
-        for peer in self.peers.values() {
+        let mut serialized_peers = Vec::with_capacity(peers_map.len());
+        for peer in peers_map.values() {
             let peer_aad = build_peer_root_aad(&peer.device_id, &peer.ed25519_pubkey, &peer.key_id);
             let wrapped_root = wrap_secret_32(&self.kek, &peer.root_key, &peer_aad)?;
             serialized_peers.push(TrustedPeerRecordV2 {
@@ -663,22 +777,84 @@ impl KeystoreV2 {
         }
         serialized_peers.sort_by(|a, b| a.device_id_hex.cmp(&b.device_id_hex));
 
-        let file_obj = KeystoreFileV2 {
+        let mut sorted_blocked_ids = blocked_device_ids.to_vec();
+        sorted_blocked_ids.sort();
+        sorted_blocked_ids.dedup();
+        let mut sorted_blocked_ips = blocked_ips.to_vec();
+        sorted_blocked_ips.sort();
+        sorted_blocked_ips.dedup();
+
+        let mut file_obj = KeystoreFileV2 {
             schema_version: KEYSTORE_SCHEMA_VERSION,
             local_device_id_hex: self.local_device_id_hex.clone(),
             local_ed25519_pubkey_hex: super::hex_encode(&local_pk_bytes),
             wrapped_local_ed25519_sk: wrapped_local_sk,
             peers: serialized_peers,
-            blocked_device_ids: self.blocked_device_ids.clone(),
-            blocked_ips: self.blocked_ips.clone(),
+            blocked_device_ids: sorted_blocked_ids,
+            blocked_ips: sorted_blocked_ips,
             legacy_v1_quarantined: self.legacy_v1_quarantined,
+            state_mac_hex: None,
         };
+        let mac = compute_keystore_file_mac(&self.kek, &file_obj)?;
+        file_obj.state_mac_hex = Some(super::hex_encode(&mac));
 
         let json_bytes = serde_json::to_vec_pretty(&file_obj)
             .map_err(|e| KeystoreError::SerializationFailure(e.to_string()))?;
 
         atomic_write_secure_file(&self.storage_dir, &self.keystore_path, &json_bytes)
     }
+}
+
+fn compute_keystore_file_mac(
+    kek: &[u8; 32],
+    file_obj: &KeystoreFileV2,
+) -> Result<[u8; 32], KeystoreError> {
+    let hk = Hkdf::<Sha256>::new(Some(KEYSTORE_META_MAC_SALT), kek);
+    let mut mac_key = Zeroizing::new([0u8; 32]);
+    hk.expand(KEYSTORE_META_MAC_INFO, &mut *mac_key)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("HKDF meta MAC key failed: {}", e)))?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&*mac_key)
+        .map_err(|_| KeystoreError::OsKeystoreFailure("HMAC meta MAC init failed".into()))?;
+
+    fn update_lp(mac: &mut HmacSha256, bytes: &[u8]) {
+        mac.update(&(bytes.len() as u32).to_be_bytes());
+        mac.update(bytes);
+    }
+
+    mac.update(&file_obj.schema_version.to_be_bytes());
+    update_lp(&mut mac, file_obj.local_device_id_hex.as_bytes());
+    update_lp(&mut mac, file_obj.local_ed25519_pubkey_hex.as_bytes());
+    mac.update(&[u8::from(file_obj.legacy_v1_quarantined)]);
+
+    let mut peers = file_obj.peers.clone();
+    peers.sort_by(|a, b| a.device_id_hex.cmp(&b.device_id_hex));
+    mac.update(&(peers.len() as u32).to_be_bytes());
+    for p in &peers {
+        mac.update(&p.schema_version.to_be_bytes());
+        update_lp(&mut mac, p.device_id_hex.as_bytes());
+        update_lp(&mut mac, p.ed25519_pubkey_hex.as_bytes());
+        update_lp(&mut mac, p.key_id_hex.as_bytes());
+        update_lp(&mut mac, p.hostname.as_bytes());
+        update_lp(&mut mac, p.os.as_bytes());
+        update_lp(&mut mac, p.last_ip.as_bytes());
+        mac.update(&p.paired_at_epoch.to_be_bytes());
+        mac.update(&[u8::from(p.via_direct_cable)]);
+    }
+
+    mac.update(&(file_obj.blocked_device_ids.len() as u32).to_be_bytes());
+    for bid in &file_obj.blocked_device_ids {
+        update_lp(&mut mac, bid.as_bytes());
+    }
+    mac.update(&(file_obj.blocked_ips.len() as u32).to_be_bytes());
+    for bip in &file_obj.blocked_ips {
+        update_lp(&mut mac, bip.as_bytes());
+    }
+
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Ok(out)
 }
 
 fn build_local_identity_aad(device_id: &[u8; 16], pubkey: &[u8; 32]) -> Vec<u8> {
@@ -705,7 +881,8 @@ fn wrap_secret_32(
 ) -> Result<AeadWrappedSecret, KeystoreError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(kek));
     let mut nonce_bytes = [0u8; 12];
-    super::csprng_fill(&mut nonce_bytes);
+    super::try_csprng_fill(&mut nonce_bytes)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -763,32 +940,166 @@ fn unwrap_secret_32(
     Ok(out)
 }
 
-pub fn default_keystore_dir() -> PathBuf {
+const MAX_KEYSTORE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+pub fn try_default_keystore_dir() -> Result<PathBuf, KeystoreError> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data).join("Integrator").join("security");
+            let trimmed = local_app_data.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed).join("Integrator").join("security"));
+            }
         }
         if let Ok(user_profile) = std::env::var("USERPROFILE") {
-            return PathBuf::from(user_profile).join(".integrator").join("security");
+            let trimmed = user_profile.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed).join(".integrator").join("security"));
+            }
         }
+        Err(KeystoreError::IoFailure(
+            "Neither LOCALAPPDATA nor USERPROFILE is set; refusing insecure temporary keystore fallback".into(),
+        ))
     }
     #[cfg(not(target_os = "windows"))]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".integrator").join("security");
+            let trimmed = home.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed).join(".integrator").join("security"));
+            }
+        }
+        Err(KeystoreError::IoFailure(
+            "HOME is unset or empty; refusing insecure temporary keystore fallback".into(),
+        ))
+    }
+}
+
+pub fn default_keystore_dir() -> Option<PathBuf> {
+    try_default_keystore_dir().ok()
+}
+
+fn verify_non_symlink_regular_file(path: &Path) -> Result<fs::Metadata, KeystoreError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| KeystoreError::IoFailure(format!("stat {}: {}", path.display(), e)))?;
+    if meta.file_type().is_symlink() {
+        return Err(KeystoreError::IoFailure(format!(
+            "refusing to follow symlink at {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(KeystoreError::IoFailure(format!(
+                "refusing to follow reparse point at {}",
+                path.display()
+            )));
         }
     }
-    std::env::temp_dir().join("integrator_security")
+    if !meta.is_file() {
+        return Err(KeystoreError::IoFailure(format!(
+            "expected regular file at {}",
+            path.display()
+        )));
+    }
+    Ok(meta)
+}
+
+fn read_secure_bytes(path: &Path) -> Result<Vec<u8>, KeystoreError> {
+    let meta = verify_non_symlink_regular_file(path)?;
+    if meta.len() > MAX_KEYSTORE_FILE_BYTES {
+        return Err(KeystoreError::CorruptKeystore(format!(
+            "file {} exceeds maximum size ({} bytes)",
+            path.display(),
+            meta.len()
+        )));
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let file = opts
+        .open(path)
+        .map_err(|e| KeystoreError::IoFailure(format!("open {}: {}", path.display(), e)))?;
+    let mut buf = Vec::with_capacity(meta.len().min(65536) as usize);
+    let mut limited = file.take(MAX_KEYSTORE_FILE_BYTES + 1);
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| KeystoreError::IoFailure(format!("read {}: {}", path.display(), e)))?;
+    if (buf.len() as u64) > MAX_KEYSTORE_FILE_BYTES {
+        return Err(KeystoreError::CorruptKeystore(format!(
+            "file {} exceeded {} bytes while reading",
+            path.display(),
+            MAX_KEYSTORE_FILE_BYTES
+        )));
+    }
+    Ok(buf)
 }
 
 fn ensure_secure_directory(dir: &Path) -> Result<(), KeystoreError> {
-    fs::create_dir_all(dir)
-        .map_err(|e| KeystoreError::IoFailure(format!("create_dir_all {}: {}", dir.display(), e)))?;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(KeystoreError::IoFailure(format!(
+                    "refusing symlink keystore directory {}",
+                    dir.display()
+                )));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(KeystoreError::IoFailure(format!(
+                        "refusing reparse-point keystore directory {}",
+                        dir.display()
+                    )));
+                }
+            }
+            if !meta.is_dir() {
+                return Err(KeystoreError::IoFailure(format!(
+                    "keystore path {} exists and is not a directory",
+                    dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(|e| {
+                KeystoreError::IoFailure(format!("create_dir_all {}: {}", dir.display(), e))
+            })?;
+            let meta = fs::symlink_metadata(dir).map_err(|e| {
+                KeystoreError::IoFailure(format!("stat {}: {}", dir.display(), e))
+            })?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(KeystoreError::IoFailure(format!(
+                    "keystore directory {} failed post-create validation",
+                    dir.display()
+                )));
+            }
+        }
+        Err(e) => {
+            return Err(KeystoreError::IoFailure(format!(
+                "stat {}: {}",
+                dir.display(),
+                e
+            )));
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            KeystoreError::IoFailure(format!("chmod 0700 {}: {}", dir.display(), e))
+        })?;
     }
     Ok(())
 }
@@ -796,7 +1107,8 @@ fn ensure_secure_directory(dir: &Path) -> Result<(), KeystoreError> {
 fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result<(), KeystoreError> {
     ensure_secure_directory(dir)?;
     let mut rnd = [0u8; 6];
-    super::csprng_fill(&mut rnd);
+    super::try_csprng_fill(&mut rnd)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
     let tmp_name = format!(
         ".{}.tmp.{}.{}",
         target
@@ -821,6 +1133,19 @@ fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result
         .open(&tmp_path)
         .map_err(|e| KeystoreError::IoFailure(format!("open temp {}: {}", tmp_path.display(), e)))?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(KeystoreError::IoFailure(format!(
+                "chmod 0600 temp {}: {}",
+                tmp_path.display(),
+                e
+            )));
+        }
+    }
+
     if let Err(e) = file.write_all(content).and_then(|_| file.sync_all()) {
         let _ = fs::remove_file(&tmp_path);
         return Err(KeystoreError::IoFailure(format!(
@@ -844,7 +1169,9 @@ fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            KeystoreError::IoFailure(format!("chmod 0600 {}: {}", target.display(), e))
+        })?;
     }
 
     Ok(())
@@ -860,43 +1187,58 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
     }
 
     // Only inspect global home directory paths when operating on the default keystore directory.
-    if storage_dir == default_keystore_dir() {
+    if default_keystore_dir().as_deref() == Some(storage_dir) {
         #[cfg(target_os = "windows")]
         if let Ok(profile) = std::env::var("USERPROFILE") {
-            let p = PathBuf::from(profile);
-            candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
-            candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
+                candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+            }
         }
         #[cfg(not(target_os = "windows"))]
         if let Ok(home) = std::env::var("HOME") {
-            let p = PathBuf::from(home);
-            candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
-            candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+            let trimmed = home.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
+                candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+            }
         }
     }
 
     let mut quarantined_any = false;
     for legacy_path in candidate_paths {
-        if legacy_path.exists() {
-            let bak_path = legacy_path.with_extension("json.v1.deprecated.bak");
-            match fs::rename(&legacy_path, &bak_path) {
-                Ok(()) => {
-                    info!(
-                        "Quarantined legacy v1 trust file {} -> {}",
-                        legacy_path.display(),
-                        bak_path.display()
-                    );
-                    quarantined_any = true;
+        let Ok(meta) = fs::symlink_metadata(&legacy_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        let bak_path = legacy_path.with_extension("json.v1.deprecated.bak");
+        match fs::rename(&legacy_path, &bak_path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&bak_path, fs::Permissions::from_mode(0o600));
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to rename legacy v1 trust file {}: {}; removing legacy file",
-                        legacy_path.display(),
-                        e
-                    );
-                    if fs::remove_file(&legacy_path).is_ok() {
-                        quarantined_any = true;
-                    }
+                info!(
+                    "Quarantined legacy v1 trust file {} -> {}",
+                    legacy_path.display(),
+                    bak_path.display()
+                );
+                quarantined_any = true;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to rename legacy v1 trust file {}: {}; removing legacy file",
+                    legacy_path.display(),
+                    e
+                );
+                if fs::remove_file(&legacy_path).is_ok() {
+                    quarantined_any = true;
                 }
             }
         }
@@ -1015,16 +1357,26 @@ fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
         return Ok(binding);
     }
 
-    if let Ok(out) = std::process::Command::new("ioreg")
+    if let Ok(out) = std::process::Command::new("/usr/sbin/ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
     {
         if out.status.success() {
             let txt = String::from_utf8_lossy(&out.stdout);
-            for line in txt.lines() {
-                if line.contains("IOPlatformUUID") || line.contains("IOPlatformSerialNumber") {
-                    binding.extend_from_slice(line.trim().as_bytes());
-                    binding.push(b'|');
+            for key_name in ["IOPlatformUUID", "IOPlatformSerialNumber"] {
+                for line in txt.lines() {
+                    if let Some((_, rhs)) = line.split_once(key_name) {
+                        if let Some((_, val_part)) = rhs.split_once('=') {
+                            let val = val_part.trim().trim_matches('"').trim();
+                            if !val.is_empty() {
+                                binding.extend_from_slice(key_name.as_bytes());
+                                binding.push(b'=');
+                                binding.extend_from_slice(val.as_bytes());
+                                binding.push(b'|');
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1050,25 +1402,30 @@ fn macos_hw_bound_load_or_create_kek(
         fn getuid() -> u32;
     }
 
-    fs::create_dir_all(storage_dir)
-        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("create keystore dir: {}", e)))?;
-    let _ = fs::set_permissions(storage_dir, fs::Permissions::from_mode(0o700));
+    ensure_secure_directory(storage_dir)?;
 
     let seed_path = storage_dir.join(".master_kek_v2.seed");
     let mut seed = Zeroizing::new(Vec::new());
 
-    match fs::read(&seed_path) {
-        Ok(existing) => {
-            if existing.len() == 32 {
-                *seed = existing;
-            } else {
-                let _ = fs::remove_file(&seed_path);
+    match fs::symlink_metadata(&seed_path) {
+        Ok(_) => {
+            let existing = Zeroizing::new(read_secure_bytes(&seed_path)?);
+            if existing.len() != 32 {
+                return Err(KeystoreError::CorruptKeystore(format!(
+                    "invalid macOS sealed KEK seed length {} in {} (expected 32); refusing to overwrite existing trust state",
+                    existing.len(),
+                    seed_path.display()
+                )));
             }
+            fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+                KeystoreError::IoFailure(format!("chmod 0600 {}: {}", seed_path.display(), e))
+            })?;
+            *seed = existing.to_vec();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(KeystoreError::OsKeystoreFailure(format!(
-                "read macOS sealed KEK seed {}: {}",
+                "stat macOS sealed KEK seed {}: {}",
                 seed_path.display(),
                 e
             )));
@@ -1077,39 +1434,44 @@ fn macos_hw_bound_load_or_create_kek(
 
     if seed.len() != 32 {
         let mut fresh = Zeroizing::new([0u8; 32]);
-        super::csprng_fill(&mut *fresh);
-        match fs::OpenOptions::new()
+        super::try_csprng_fill(&mut *fresh)
+            .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&seed_path)
         {
             Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(&*fresh).map_err(|e| {
-                    KeystoreError::OsKeystoreFailure(format!(
-                        "write macOS sealed KEK seed {}: {}",
+                if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    drop(f);
+                    let _ = fs::remove_file(&seed_path);
+                    return Err(KeystoreError::IoFailure(format!(
+                        "chmod 0600 macOS sealed KEK seed {}: {}",
                         seed_path.display(),
                         e
-                    ))
-                })?;
-                let _ = fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600));
+                    )));
+                }
+                if let Err(e) = f.write_all(&*fresh).and_then(|_| f.sync_all()) {
+                    drop(f);
+                    let _ = fs::remove_file(&seed_path);
+                    return Err(KeystoreError::OsKeystoreFailure(format!(
+                        "write/sync macOS sealed KEK seed {}: {}",
+                        seed_path.display(),
+                        e
+                    )));
+                }
                 *seed = fresh.to_vec();
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = fs::read(&seed_path).map_err(|e2| {
-                    KeystoreError::OsKeystoreFailure(format!(
-                        "read existing macOS sealed KEK seed {}: {}",
-                        seed_path.display(),
-                        e2
-                    ))
-                })?;
+                let existing = Zeroizing::new(read_secure_bytes(&seed_path)?);
                 if existing.len() != 32 {
-                    return Err(KeystoreError::OsKeystoreFailure(
+                    return Err(KeystoreError::CorruptKeystore(
                         "Invalid macOS sealed KEK seed length".into(),
                     ));
                 }
-                *seed = existing;
+                *seed = existing.to_vec();
             }
             Err(e) => {
                 return Err(KeystoreError::OsKeystoreFailure(format!(
@@ -1119,8 +1481,6 @@ fn macos_hw_bound_load_or_create_kek(
                 )));
             }
         }
-    } else {
-        let _ = fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600));
     }
 
     let hw_id = macos_read_platform_hardware_identity()?;
@@ -1312,21 +1672,35 @@ fn windows_dpapi_load_or_create_kek(
     let dpapi_path = storage_dir.join("master_kek_v2.dpapi");
 
     let mut entropy_vec = DPAPI_ENTROPY.to_vec();
+    let entropy_len = u32::try_from(entropy_vec.len())
+        .map_err(|_| KeystoreError::OsKeystoreFailure("DPAPI entropy too large".into()))?;
     let entropy_blob = DataBlob {
-        cb_data: entropy_vec.len() as u32,
+        cb_data: entropy_len,
         pb_data: entropy_vec.as_mut_ptr(),
     };
 
-    if dpapi_path.exists() {
-        let mut encrypted_bytes = fs::read(&dpapi_path).map_err(|e| {
-            KeystoreError::IoFailure(format!("read DPAPI file {}: {}", dpapi_path.display(), e))
-        })?;
+    let dpapi_exists = match fs::symlink_metadata(&dpapi_path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(KeystoreError::IoFailure(format!(
+                "stat DPAPI file {}: {}",
+                dpapi_path.display(),
+                e
+            )));
+        }
+    };
+
+    if dpapi_exists {
+        let mut encrypted_bytes = Zeroizing::new(read_secure_bytes(&dpapi_path)?);
         if encrypted_bytes.is_empty() {
             return Err(KeystoreError::CorruptKeystore("empty DPAPI file".into()));
         }
+        let in_len = u32::try_from(encrypted_bytes.len())
+            .map_err(|_| KeystoreError::CorruptKeystore("DPAPI file exceeds u32 size".into()))?;
 
         let in_blob = DataBlob {
-            cb_data: encrypted_bytes.len() as u32,
+            cb_data: in_len,
             pb_data: encrypted_bytes.as_mut_ptr(),
         };
         let mut out_blob = DataBlob {
@@ -1352,30 +1726,37 @@ fn windows_dpapi_load_or_create_kek(
             ));
         }
 
-        let slice =
-            unsafe { std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize) };
-        if slice.len() != 32 {
+        let out_len = out_blob.cb_data as usize;
+        if out_len != 32 {
             unsafe {
-                std::ptr::write_bytes(out_blob.pb_data, 0, out_blob.cb_data as usize);
+                for i in 0..out_len {
+                    std::ptr::write_volatile(out_blob.pb_data.add(i), 0);
+                }
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
                 LocalFree(out_blob.pb_data as *mut c_void);
             }
             return Err(KeystoreError::CorruptKeystore(format!(
                 "DPAPI unwrapped KEK has invalid length {}",
-                slice.len()
+                out_len
             )));
         }
 
+        let slice = unsafe { std::slice::from_raw_parts(out_blob.pb_data, out_len) };
         let mut kek = Zeroizing::new([0u8; 32]);
         kek.copy_from_slice(slice);
         unsafe {
-            std::ptr::write_bytes(out_blob.pb_data, 0, out_blob.cb_data as usize);
+            for i in 0..out_len {
+                std::ptr::write_volatile(out_blob.pb_data.add(i), 0);
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
             LocalFree(out_blob.pb_data as *mut c_void);
         }
         return Ok(kek);
     }
 
     let mut new_kek = Zeroizing::new([0u8; 32]);
-    super::csprng_fill(&mut *new_kek);
+    super::try_csprng_fill(&mut *new_kek)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
 
     let in_blob = DataBlob {
         cb_data: 32,
@@ -1424,25 +1805,34 @@ fn unix_fallback_load_or_create_kek(
     ensure_secure_directory(storage_dir)?;
     let key_file = storage_dir.join(".master_kek_v2.seed");
 
-    let raw_seed: Zeroizing<[u8; 32]> = if key_file.exists() {
-        let bytes = fs::read(&key_file).map_err(|e| {
-            KeystoreError::IoFailure(format!("read {}: {}", key_file.display(), e))
-        })?;
-        if bytes.len() != 32 {
-            return Err(KeystoreError::CorruptKeystore(format!(
-                "invalid seed file length {} in {}",
-                bytes.len(),
-                key_file.display()
+    let raw_seed: Zeroizing<[u8; 32]> = match fs::symlink_metadata(&key_file) {
+        Ok(_) => {
+            let bytes = Zeroizing::new(read_secure_bytes(&key_file)?);
+            if bytes.len() != 32 {
+                return Err(KeystoreError::CorruptKeystore(format!(
+                    "invalid seed file length {} in {}",
+                    bytes.len(),
+                    key_file.display()
+                )));
+            }
+            let mut arr = Zeroizing::new([0u8; 32]);
+            arr.copy_from_slice(&bytes);
+            arr
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut arr = Zeroizing::new([0u8; 32]);
+            super::try_csprng_fill(&mut *arr)
+                .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
+            atomic_write_secure_file(storage_dir, &key_file, &*arr)?;
+            arr
+        }
+        Err(e) => {
+            return Err(KeystoreError::IoFailure(format!(
+                "stat {}: {}",
+                key_file.display(),
+                e
             )));
         }
-        let mut arr = Zeroizing::new([0u8; 32]);
-        arr.copy_from_slice(&bytes);
-        arr
-    } else {
-        let mut arr = Zeroizing::new([0u8; 32]);
-        super::csprng_fill(&mut *arr);
-        atomic_write_secure_file(storage_dir, &key_file, &*arr)?;
-        arr
     };
 
     // Combine the 0600 random seed with local machine/user identity via HKDF-SHA256.
@@ -1459,29 +1849,38 @@ fn unix_fallback_load_or_create_kek(
     let hk = Hkdf::<Sha256>::new(Some(&salt_data), &*raw_seed);
     let mut derived = Zeroizing::new([0u8; 32]);
     hk.expand(b"integrator-v2-master-kek", &mut *derived)
-        .expect("32-byte HKDF expand cannot fail");
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("HKDF expand failed: {}", e)))?;
     Ok(derived)
 }
 
 /// Global singleton accessor for the production v2 keystore.
-static GLOBAL_KEYSTORE_V2: OnceLock<Mutex<KeystoreV2>> = OnceLock::new();
+static GLOBAL_KEYSTORE_V2: OnceLock<Result<Mutex<KeystoreV2>, KeystoreError>> = OnceLock::new();
 
-pub fn global_keystore() -> &'static Mutex<KeystoreV2> {
-    GLOBAL_KEYSTORE_V2.get_or_init(|| {
+pub fn try_global_keystore() -> Result<&'static Mutex<KeystoreV2>, KeystoreError> {
+    let init = GLOBAL_KEYSTORE_V2.get_or_init(|| {
         #[cfg(test)]
-        let ks = {
+        {
             let test_dir = std::env::temp_dir().join(format!(
                 "integrator_global_ks_test_{}",
                 std::process::id()
             ));
             let _ = std::fs::create_dir_all(&test_dir);
             KeystoreV2::open_with_provider(test_dir, &FixedKekProvider::new([0xA5u8; 32]))
-                .expect("Failed to initialize test KeystoreV2")
-        };
+                .map(Mutex::new)
+        }
         #[cfg(not(test))]
-        let ks = KeystoreV2::open_default().unwrap_or_else(|e| {
-            panic!("Failed to initialize Integrator v2 security keystore: {}", e)
-        });
-        Mutex::new(ks)
+        {
+            KeystoreV2::open_default().map(Mutex::new)
+        }
+    });
+    match init {
+        Ok(m) => Ok(m),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+pub fn global_keystore() -> &'static Mutex<KeystoreV2> {
+    try_global_keystore().unwrap_or_else(|e| {
+        panic!("Failed to initialize Integrator v2 security keystore: {}", e)
     })
 }

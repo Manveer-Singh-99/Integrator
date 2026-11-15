@@ -25,22 +25,22 @@ use super::file_helper::FileClipboardHelper;
 use super::os_seq;
 use super::protocol::{
     ClipboardMessage, ClipboardPayload, LazyAnnouncement, StreamRequest,
-    FRAME_DIR, FRAME_END, FRAME_FILE, FRAME_FILE_DATA, FRAME_FILE_HASH,
-    MAX_AUTO_STAGE_BYTES, MAX_CLIPBOARD_HEADER_BYTES, MAX_DIRECTORY_DEPTH,
-    MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_SINGLE_FILE_BYTES, MAX_TEXT_CHARS,
-    MAX_TOTAL_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+    FRAME_DIR, FRAME_END, FRAME_FILE, FRAME_FILE_DATA, FRAME_FILE_HASH, FRAME_IMAGE_DATA,
+    MAX_AUTO_STAGE_BYTES, MAX_CLIPBOARD_HEADER_BYTES, MAX_DIRECTORY_DEPTH, MAX_ROOTS,
+    MAX_SINGLE_FILE_BYTES, MAX_TEXT_CHARS, MAX_TOTAL_TRANSFER_BYTES, MAX_TRANSFER_FILES,
 };
 
+const MAX_PRE_AUTH_CLIP_CONNS: usize = 16;
+const MAX_POST_AUTH_CLIP_CONNS: usize = 8;
+const CLIP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB high-throughput AEAD chunk
-const MAX_CONCURRENT_CLIPBOARD_CONNS: usize = 8;
 const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(target_os = "macos")]
 extern "C" {
     pub fn init_shortcut_interceptor();
     pub fn set_has_pending_remote_file(pending: bool);
-    #[allow(dead_code)]
-    pub fn clear_pasteboard_in_app();
     fn notify_touchbar_remote_file(name: *const std::os::raw::c_char, total_bytes: u64);
     fn update_touchbar_paste_progress(percent: f32, mb_per_sec: f32);
     fn reset_touchbar_paste_progress();
@@ -83,16 +83,197 @@ fn compute_image_hash(width: usize, height: usize, rgba: &[u8]) -> String {
 }
 
 fn validate_image_bounds(width: usize, height: usize, rgba_len: usize) -> bool {
-    if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
-        return false;
+    super::protocol::validate_image_bounds(width, height, rgba_len).is_some()
+}
+
+fn is_valid_hex_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn format_socket_target(ip: &str, port: u16) -> String {
+    let trimmed = ip.trim();
+    if let Ok(parsed) = trimmed.parse::<IpAddr>() {
+        return std::net::SocketAddr::new(parsed, port).to_string();
     }
-    if rgba_len == 0 || rgba_len > MAX_IMAGE_BYTES {
-        return false;
+    if trimmed.contains(':') && !trimmed.starts_with('[') {
+        format!("[{}]:{}", trimmed, port)
+    } else {
+        format!("{}:{}", trimmed, port)
     }
-    match width.checked_mul(height).and_then(|px| px.checked_mul(4)) {
-        Some(expected) => expected == rgba_len,
-        None => false,
+}
+
+fn create_private_dir_no_symlink(dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                anyhow::bail!(
+                    "Security violation: '{}' is a symlink or non-directory",
+                    dir.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut db = std::fs::DirBuilder::new();
+                db.mode(0o700);
+                db.create(dir)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir(dir)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
+}
+
+/// Ensures every directory component from `base` down to `target_dir` exists as a real
+/// non-symlink directory, creating missing levels with private permissions.
+fn ensure_dir_no_symlinks(base: &Path, target_dir: &Path) -> Result<()> {
+    create_private_dir_no_symlink(base)?;
+    let canon_base = std::fs::canonicalize(base)
+        .with_context(|| format!("Failed to canonicalize base directory '{}'", base.display()))?;
+    if target_dir == base || target_dir == canon_base {
+        return Ok(());
+    }
+    let rel = target_dir
+        .strip_prefix(&canon_base)
+        .or_else(|_| target_dir.strip_prefix(base))
+        .with_context(|| {
+            format!(
+                "Target directory '{}' is outside base '{}'",
+                target_dir.display(),
+                base.display()
+            )
+        })?;
+    let mut cur = canon_base;
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                cur.push(seg);
+                create_private_dir_no_symlink(&cur)?;
+            }
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!(
+                "Unsafe path component in directory path '{}'",
+                target_dir.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn open_source_file_no_follow(path: &Path) -> Result<File> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to stat source path {:?}", path))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        anyhow::bail!(
+            "Security violation: source {:?} is a symlink or non-file",
+            path
+        );
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+        .with_context(|| format!("Failed to open source file {:?}", path))
+}
+
+fn move_staged_entry(src: &Path, dst: &Path) -> Result<()> {
+    let src_meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("Staged entry missing: {:?}", src))?;
+    if src_meta.file_type().is_symlink() {
+        anyhow::bail!("Security violation: staged entry {:?} is a symlink", src);
+    }
+    if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+        if dst_meta.file_type().is_symlink() {
+            anyhow::bail!("Security violation: destination {:?} is a symlink", dst);
+        }
+        anyhow::bail!("Destination {:?} already exists before commit", dst);
+    }
+    if std::fs::rename(src, dst).is_err() {
+        ClipboardService::copy_entry_all(src, dst)?;
+        if src_meta.is_dir() {
+            let _ = std::fs::remove_dir_all(src);
+        } else {
+            let _ = std::fs::remove_file(src);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_unique_root_name(
+    used: &mut std::collections::HashSet<String>,
+    base_name: &str,
+) -> String {
+    if used.insert(base_name.to_string()) {
+        return base_name.to_string();
+    }
+    let path_obj = Path::new(base_name);
+    let stem = path_obj
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(base_name);
+    let ext = path_obj.extension().and_then(|e| e.to_str());
+    for idx in 2..=10_000 {
+        let candidate = match ext {
+            Some(e) if !e.is_empty() => format!("{} ({}).{}", stem, idx, e),
+            _ => format!("{} ({})", stem, idx),
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    let fallback = format!("{}_{}", base_name, trust::generate_random_token_hex(4));
+    used.insert(fallback.clone());
+    fallback
+}
+
+fn sweep_staging_dir_entries(parent: &Path, prefixes: &[&str], max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !prefixes.iter().any(|pref| name.starts_with(pref)) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if now.duration_since(mtime).unwrap_or_default() > max_age {
+                if meta.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_orphaned_staging_dirs(cache_dir: &Path) {
+    let stale_age = Duration::from_secs(3600);
+    sweep_staging_dir_entries(cache_dir, &[".staging_", ".integrator_staging_"], stale_age);
+    let drag_root = crate::system_info::app_data_dir().join("drag_staging");
+    sweep_staging_dir_entries(&drag_root, &["drag_"], stale_age);
 }
 
 /// Checks whether a path component is a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
@@ -299,6 +480,14 @@ pub struct LocalPendingCopy {
     pub top_entries: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedCacheEntry {
+    session_id: String,
+    manifest_hash: [u8; 32],
+    session_dir: PathBuf,
+    roots: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct ClipboardService {
     discovery: DiscoveryManager,
@@ -309,6 +498,7 @@ pub struct ClipboardService {
     pending_remote: Arc<RwLock<Option<LazyAnnouncement>>>,
     pending_drag_sessions: Arc<RwLock<HashMap<String, LocalPendingCopy>>>,
     pending_drag_order: Arc<RwLock<VecDeque<String>>>,
+    verified_cache: Arc<RwLock<VecDeque<VerifiedCacheEntry>>>,
     last_remote_ip: Arc<RwLock<Option<IpAddr>>>,
     is_pasting: Arc<std::sync::atomic::AtomicBool>,
     features: Arc<OnceLock<Arc<crate::features::FeatureManager>>>,
@@ -317,6 +507,7 @@ pub struct ClipboardService {
 impl ClipboardService {
     pub fn new(discovery: DiscoveryManager) -> Result<Self> {
         let file_helper = Arc::new(FileClipboardHelper::new()?);
+        cleanup_orphaned_staging_dirs(file_helper.get_cache_dir());
         let initial_seq = os_seq::get_clipboard_sequence();
         let service = Self {
             discovery,
@@ -327,6 +518,7 @@ impl ClipboardService {
             pending_remote: Arc::new(RwLock::new(None)),
             pending_drag_sessions: Arc::new(RwLock::new(HashMap::new())),
             pending_drag_order: Arc::new(RwLock::new(VecDeque::new())),
+            verified_cache: Arc::new(RwLock::new(VecDeque::new())),
             last_remote_ip: Arc::new(RwLock::new(None)),
             is_pasting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             features: Arc::new(OnceLock::new()),
@@ -410,26 +602,30 @@ impl ClipboardService {
             CLIPBOARD_PORT
         );
 
-        // 1. Spawn TCP Receiver with bounded concurrency
+        // 1. Spawn TCP Receiver with separate pre-auth and post-auth semaphores + handshake timeout
         let s_clone = self.clone();
-        let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIPBOARD_CONNS));
+        let pre_auth_limiter = Arc::new(Semaphore::new(MAX_PRE_AUTH_CLIP_CONNS));
+        let post_auth_limiter = Arc::new(Semaphore::new(MAX_POST_AUTH_CLIP_CONNS));
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
-                        let Ok(permit) = Arc::clone(&conn_limiter).try_acquire_owned() else {
+                        let Ok(pre_permit) = Arc::clone(&pre_auth_limiter).try_acquire_owned() else {
                             warn!(
-                                "🚫 Dropped clipboard connection from {}: concurrency limit ({}) reached",
-                                addr, MAX_CONCURRENT_CLIPBOARD_CONNS
+                                "🚫 Dropped clipboard connection from {}: pre-auth limit ({}) reached",
+                                addr, MAX_PRE_AUTH_CLIP_CONNS
                             );
                             drop(socket);
                             continue;
                         };
                         let handler = s_clone.clone();
+                        let post_lim = Arc::clone(&post_auth_limiter);
                         tokio::spawn(async move {
-                            let _permit = permit;
                             debug!("Incoming clipboard connection from {}", addr);
-                            if let Err(e) = handler.handle_incoming(socket, addr).await {
+                            if let Err(e) = handler
+                                .handle_incoming_guarded(socket, addr, pre_permit, post_lim)
+                                .await
+                            {
                                 warn!("Error handling clipboard transfer from {}: {}", addr, e);
                             }
                         });
@@ -456,18 +652,94 @@ impl ClipboardService {
         Ok(())
     }
 
-    /// Handles incoming mutually authenticated `TransportSessionV2` (`ServiceId::ClipboardTransfer`)
-    /// clipboard payloads and stream requests from a paired peer.
-    async fn handle_incoming(&self, socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
+    async fn apply_remote_image(
+        &self,
+        peer_addr: SocketAddr,
+        expected_hash: &str,
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    ) -> Result<()> {
+        if !validate_image_bounds(width, height, rgba.len()) {
+            warn!(
+                "🚫 Rejected remote image from {}: invalid dimensions ({}x{}) or RGBA length ({})",
+                peer_addr,
+                width,
+                height,
+                rgba.len()
+            );
+            return Ok(());
+        }
+        let computed_hash = compute_image_hash(width, height, &rgba);
+        if expected_hash.is_empty()
+            || !trust::constant_time_eq(computed_hash.as_bytes(), expected_hash.as_bytes())
+        {
+            warn!(
+                "🚫 Rejected remote image from {}: SHA-256 integrity hash mismatch",
+                peer_addr
+            );
+            return Ok(());
+        }
+
+        {
+            let mut lock = self.last_hash.write().await;
+            *lock = computed_hash;
+        }
+
+        info!("🖼️ Verified & received remote image ({}x{} px)", width, height);
+        #[cfg(target_os = "macos")]
+        unsafe {
+            set_has_pending_remote_file(false);
+        }
+
+        let new_seq = tokio::task::spawn_blocking(move || -> Option<i64> {
+            let mut cb = Clipboard::new().ok()?;
+            let img_data = ImageData {
+                width,
+                height,
+                bytes: rgba.into(),
+            };
+            cb.set_image(img_data).ok()?;
+            let seq = os_seq::get_clipboard_sequence();
+            (seq >= 0).then_some(seq)
+        })
+        .await
+        .unwrap_or(None);
+
+        if let Some(seq) = new_seq {
+            let mut seq_lock = self.last_seq.write().await;
+            *seq_lock = seq;
+        }
+        Ok(())
+    }
+
+    /// Authenticates incoming `TransportSessionV2` under `pre_permit` + `CLIP_HANDSHAKE_TIMEOUT`,
+    /// then swaps into the post-auth concurrency pool before dispatching payloads.
+    async fn handle_incoming_guarded(
+        &self,
+        socket: TcpStream,
+        peer_addr: SocketAddr,
+        pre_permit: tokio::sync::OwnedSemaphorePermit,
+        post_limiter: Arc<Semaphore>,
+    ) -> Result<()> {
         let _ = socket.set_nodelay(true);
-        let mut session = trust::accept_transport_from_stream(
-            socket,
-            peer_addr.ip(),
-            None,
-            ServiceId::ClipboardTransfer,
+        let mut session = tokio::time::timeout(
+            CLIP_HANDSHAKE_TIMEOUT,
+            trust::accept_transport_from_stream(
+                socket,
+                peer_addr.ip(),
+                None,
+                ServiceId::ClipboardTransfer,
+            ),
         )
         .await
+        .context("Timed out during Clipboard TransportV2 handshake")?
         .map_err(|e| anyhow::anyhow!("Clipboard TransportV2 handshake rejected: {}", e))?;
+
+        drop(pre_permit);
+        let _post_permit = post_limiter
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("Post-auth clipboard concurrency limit reached"))?;
 
         let plaintext = tokio::time::timeout(
             FRAME_IO_TIMEOUT,
@@ -513,12 +785,20 @@ impl ClipboardService {
                 unsafe {
                     set_has_pending_remote_file(false);
                 }
-                if let Ok(mut cb) = Clipboard::new() {
-                    let _ = cb.set_text(text);
+
+                let new_seq = tokio::task::spawn_blocking(move || -> Option<i64> {
+                    let mut cb = Clipboard::new().ok()?;
+                    cb.set_text(text).ok()?;
+                    let seq = os_seq::get_clipboard_sequence();
+                    (seq >= 0).then_some(seq)
+                })
+                .await
+                .unwrap_or(None);
+
+                if let Some(seq) = new_seq {
+                    let mut seq_lock = self.last_seq.write().await;
+                    *seq_lock = seq;
                 }
-                let new_seq = os_seq::get_clipboard_sequence();
-                let mut seq_lock = self.last_seq.write().await;
-                *seq_lock = new_seq;
             }
             ClipboardPayload::Image {
                 width,
@@ -529,62 +809,63 @@ impl ClipboardService {
                     debug!("Ignoring remote clipboard image while Universal Clipboard/KVM is disabled");
                     return Ok(());
                 }
-                if !validate_image_bounds(width, height, rgba.len()) {
-                    warn!(
-                        "🚫 Rejected remote image from {}: invalid dimensions ({}x{}) or RGBA length ({})",
-                        peer_addr,
-                        width,
-                        height,
-                        rgba.len()
-                    );
+                self.apply_remote_image(peer_addr, &msg.hash, width, height, rgba)
+                    .await?;
+            }
+            ClipboardPayload::ImageStream {
+                width,
+                height,
+                byte_len,
+            } => {
+                if !allow_clipboard {
+                    debug!("Ignoring remote clipboard image stream while Universal Clipboard/KVM is disabled");
                     return Ok(());
                 }
-                let computed_hash = compute_image_hash(width, height, &rgba);
-                if msg.hash.is_empty()
-                    || !trust::constant_time_eq(computed_hash.as_bytes(), msg.hash.as_bytes())
-                {
+                let Some(expected_len) =
+                    super::protocol::validate_image_bounds(width, height, byte_len)
+                else {
                     warn!(
-                        "🚫 Rejected remote image from {}: SHA-256 integrity hash mismatch",
-                        peer_addr
+                        "🚫 Rejected remote ImageStream from {}: invalid dimensions ({}x{}, {} bytes)",
+                        peer_addr, width, height, byte_len
                     );
                     return Ok(());
+                };
+
+                let mut rgba = Vec::with_capacity(expected_len);
+                while rgba.len() < expected_len {
+                    let rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
+                        .await
+                        .context("Timed out reading image data chunk")?
+                        .map_err(|e| anyhow::anyhow!("Image stream aborted prematurely: {}", e))?;
+                    if rec.len() < 2 || rec[0] != FRAME_IMAGE_DATA {
+                        anyhow::bail!(
+                            "Expected FRAME_IMAGE_DATA (0x05) record, got len={}",
+                            rec.len()
+                        );
+                    }
+                    let chunk = &rec[1..];
+                    if rgba.len() + chunk.len() > expected_len {
+                        anyhow::bail!("Image stream overflowed declared byte_len");
+                    }
+                    rgba.extend_from_slice(chunk);
                 }
 
-                {
-                    let mut lock = self.last_hash.write().await;
-                    *lock = computed_hash;
-                }
-
-                info!("🖼️ Verified & received remote image ({}x{} px)", width, height);
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    set_has_pending_remote_file(false);
-                }
-                if let Ok(mut cb) = Clipboard::new() {
-                    let img_data = ImageData {
-                        width,
-                        height,
-                        bytes: rgba.into(),
-                    };
-                    let _ = cb.set_image(img_data);
-                }
-                let new_seq = os_seq::get_clipboard_sequence();
-                let mut seq_lock = self.last_seq.write().await;
-                *seq_lock = new_seq;
+                self.apply_remote_image(peer_addr, &msg.hash, width, height, rgba)
+                    .await?;
             }
             ClipboardPayload::LazyAnnouncement(ann) => {
                 if !allow_clipboard {
                     debug!("Ignoring remote file announcement while Universal Clipboard/KVM is disabled");
                     return Ok(());
                 }
-                if ann.session_id.trim().is_empty()
-                    || ann.session_id.len() > 128
+                if !is_valid_hex_session_id(&ann.session_id)
                     || ann.total_files == 0
                     || ann.total_files > MAX_TRANSFER_FILES
                     || ann.total_bytes > MAX_TOTAL_TRANSFER_BYTES
+                    || Self::effective_roots(&ann).is_err()
                 {
                     warn!(
-                        "🚫 Rejected out-of-bounds file announcement from {} (files={}, bytes={})",
+                        "🚫 Rejected invalid or out-of-bounds file announcement from {} (files={}, bytes={})",
                         peer_addr, ann.total_files, ann.total_bytes
                     );
                     return Ok(());
@@ -594,6 +875,12 @@ impl ClipboardService {
                     let mut lock = self.last_hash.write().await;
                     *lock = msg.hash.clone();
                 }
+
+                let helper_prune = Arc::clone(&self.file_helper);
+                tokio::task::spawn_blocking(move || {
+                    helper_prune.maybe_prune_cache();
+                    cleanup_orphaned_staging_dirs(helper_prune.get_cache_dir());
+                });
 
                 info!(
                     "📥 Peer announced file/folder '{}' ({} files, {:.1} MB). Ready for paste.",
@@ -649,18 +936,20 @@ impl ClipboardService {
                     warn!("Rejected remote clipboard stream request while Universal Clipboard/KVM is disabled");
                     return Ok(());
                 }
+                if !is_valid_hex_session_id(&req.session_id) {
+                    warn!("Rejected malformed stream request session_id");
+                    return Ok(());
+                }
                 let local_copy = {
                     let lock = self.pending_local.read().await;
                     lock.clone()
                 };
 
                 if let Some(copy) = local_copy {
-                    if !req.session_id.is_empty()
-                        && trust::constant_time_eq(
-                            copy.session_id.as_bytes(),
-                            req.session_id.as_bytes(),
-                        )
-                    {
+                    if trust::constant_time_eq(
+                        copy.session_id.as_bytes(),
+                        req.session_id.as_bytes(),
+                    ) {
                         info!(
                             "🚀 Peer requested on-demand stream for '{}' ({} files, {:.1} MB). Streaming over TransportV2...",
                             copy.root_name,
@@ -681,12 +970,15 @@ impl ClipboardService {
                     warn!("Rejected cross-screen drag stream request while Drag & Drop/KVM is disabled");
                     return Ok(());
                 }
+                if !is_valid_hex_session_id(&req.session_id) {
+                    warn!("Rejected malformed drag stream session_id");
+                    return Ok(());
+                }
                 let matched_copy = {
                     let lock = self.pending_drag_sessions.read().await;
                     lock.iter()
                         .find(|(k, _)| {
-                            !req.session_id.is_empty()
-                                && trust::constant_time_eq(k.as_bytes(), req.session_id.as_bytes())
+                            trust::constant_time_eq(k.as_bytes(), req.session_id.as_bytes())
                         })
                         .map(|(_, v)| v.clone())
                 };
@@ -746,40 +1038,68 @@ impl ClipboardService {
                 }
                 let rel = format!("{}/{}", rel_prefix, name);
 
-                if meta.is_dir() {
-                    if depth + 1 < MAX_DIRECTORY_DEPTH {
-                        directories.push(rel.clone());
-                        Self::collect_dir_entries(
-                            _root,
-                            &path,
-                            &rel,
-                            depth + 1,
-                            directories,
-                            files,
-                            total_bytes,
-                            total_files,
-                        );
-                    }
-                } else if meta.is_file() {
-                    let len = meta.len();
-                    if len <= MAX_SINGLE_FILE_BYTES
-                        && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
-                    {
-                        *total_bytes += len;
-                        *total_files += 1;
-                        files.push((rel, path));
-                    }
-                }
+        if meta.is_dir() {
+            if rel.len() > 4096 || directories.len() >= MAX_TRANSFER_FILES {
+                continue;
+            }
+            if depth + 1 < MAX_DIRECTORY_DEPTH {
+                directories.push(rel.clone());
+                Self::collect_dir_entries(
+                    _root,
+                    &path,
+                    &rel,
+                    depth + 1,
+                    directories,
+                    files,
+                    total_bytes,
+                    total_files,
+                );
+            }
+        } else if meta.is_file() {
+            let len = meta.len();
+            if rel.len() <= 4096
+                && len <= MAX_SINGLE_FILE_BYTES
+                && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
+                && *total_files < MAX_TRANSFER_FILES
+            {
+                *total_bytes += len;
+                *total_files += 1;
+                files.push((rel, path));
+            }
+        }
             }
         }
     }
 
     /// Continuous lightweight loop checking for clipboard sequence changes.
     async fn monitor_loop(&self) {
+        enum LocalClipboardSnapshot {
+            Unchanged,
+            Files {
+                hash_hex: String,
+                copy: LocalPendingCopy,
+            },
+            Image {
+                hash_hex: String,
+                width: usize,
+                height: usize,
+                rgba: Vec<u8>,
+            },
+            Text {
+                hash_hex: String,
+                text: String,
+            },
+        }
+
         loop {
             sleep(Duration::from_millis(120)).await;
 
-            let current_seq = os_seq::get_clipboard_sequence();
+            let current_seq = tokio::task::spawn_blocking(os_seq::get_clipboard_sequence)
+                .await
+                .unwrap_or(-1);
+            if current_seq < 0 {
+                continue;
+            }
             {
                 let read_lock = self.last_seq.read().await;
                 if *read_lock == current_seq {
@@ -798,149 +1118,109 @@ impl ClipboardService {
 
             debug!("Clipboard sequence updated: {}", current_seq);
 
-            // 1. Check for Copied Files and Folders (run on blocking pool so OS helpers never stall async workers)
+            let prev_hash = self.last_hash.read().await.clone();
             let helper = Arc::clone(&self.file_helper);
-            let copied_paths = tokio::task::spawn_blocking(move || helper.read_copied_files())
-                .await
-                .unwrap_or_default();
-
-            if !copied_paths.is_empty() {
-                let cache_dir = self.file_helper.get_cache_dir();
-                let external_paths: Vec<PathBuf> = copied_paths
-                    .into_iter()
-                    .filter(|p| !p.starts_with(cache_dir))
-                    .collect();
-
-                if external_paths.is_empty() {
-                    continue;
-                }
-
-                // Compute unified hash based on root base name and metadata
-                let mut hasher = Sha256::new();
-                for root in &external_paths {
-                    if let Some(name) = root.file_name() {
-                        hasher.update(name.to_string_lossy().as_bytes());
-                    }
-                    if let Ok(meta) = std::fs::symlink_metadata(root) {
-                        if meta.file_type().is_symlink() {
-                            continue;
-                        }
-                        hasher.update(&meta.len().to_le_bytes());
-                        if let Ok(mtime) = meta.modified() {
-                            if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                                hasher.update(&dur.as_millis().to_le_bytes());
-                            }
-                        }
-                    }
-                }
-
-                let hash_hex = to_hex_string(&hasher.finalize());
-                let mut hash_lock = self.last_hash.write().await;
-                if *hash_lock != hash_hex {
-                    *hash_lock = hash_hex.clone();
-                    drop(hash_lock);
-
-                    // Clear pending remote announcement on local file copy
-                    {
-                        let mut remote_lock = self.pending_remote.write().await;
-                        *remote_lock = None;
-                    }
-                    {
-                        let mut ip_lock = self.last_remote_ip.write().await;
-                        *ip_lock = None;
-                    }
-                    #[cfg(target_os = "macos")]
-                    unsafe {
-                        reset_touchbar_paste_progress();
-                        set_has_pending_remote_file(false);
+            let snapshot = tokio::task::spawn_blocking(move || -> LocalClipboardSnapshot {
+                let copied_paths = helper.read_copied_files();
+                if !copied_paths.is_empty() {
+                    let cache_dir = helper.get_cache_dir();
+                    let external_paths: Vec<PathBuf> = copied_paths
+                        .into_iter()
+                        .filter(|p| !p.starts_with(cache_dir))
+                        .collect();
+                    if external_paths.is_empty() {
+                        return LocalClipboardSnapshot::Unchanged;
                     }
 
-                    // Collect directory structure and file paths (skipping symlinks)
-                    let mut root_name = String::new();
-                    let mut directories = Vec::new();
-                    let mut files = Vec::new();
-                    let mut total_bytes: u64 = 0;
-                    let mut total_files: usize = 0;
-
+                    let mut hasher = Sha256::new();
                     for root in &external_paths {
-                        let Ok(meta) = std::fs::symlink_metadata(root) else {
-                            continue;
-                        };
-                        if meta.file_type().is_symlink() {
-                            continue;
+                        if let Some(name) = root.file_name() {
+                            hasher.update(name.to_string_lossy().as_bytes());
                         }
-                        if let Some(file_name) = root.file_name() {
-                            let name_str = file_name.to_string_lossy().to_string();
-                            if validate_single_path_component(&name_str).is_err() {
+                        if let Ok(meta) = std::fs::symlink_metadata(root) {
+                            if meta.file_type().is_symlink() {
                                 continue;
                             }
-                            if root_name.is_empty() {
-                                root_name = name_str.clone();
-                            }
-                            if meta.is_dir() {
-                                directories.push(name_str.clone());
-                                Self::collect_dir_entries(
-                                    root,
-                                    root,
-                                    &name_str,
-                                    1,
-                                    &mut directories,
-                                    &mut files,
-                                    &mut total_bytes,
-                                    &mut total_files,
-                                );
-                            } else if meta.is_file() {
-                                let len = meta.len();
-                                if total_files < MAX_TRANSFER_FILES
-                                    && len <= MAX_SINGLE_FILE_BYTES
-                                    && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
-                                {
-                                    total_bytes += len;
-                                    total_files += 1;
-                                    files.push((name_str, root.clone()));
+                            hasher.update(&meta.len().to_le_bytes());
+                            if let Ok(mtime) = meta.modified() {
+                                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                                    hasher.update(&dur.as_millis().to_le_bytes());
                                 }
                             }
                         }
                     }
 
-                    if total_files == 0 {
-                        continue;
+                    let hash_hex = to_hex_string(&hasher.finalize());
+                    if hash_hex == prev_hash {
+                        return LocalClipboardSnapshot::Unchanged;
+                    }
+                    if let Ok(copy) = ClipboardService::collect_local_entries(&external_paths) {
+                        return LocalClipboardSnapshot::Files { hash_hex, copy };
+                    }
+                    return LocalClipboardSnapshot::Unchanged;
+                }
+
+                if let Ok(mut cb) = Clipboard::new() {
+                    if let Ok(img) = cb.get_image() {
+                        if validate_image_bounds(img.width, img.height, img.bytes.len()) {
+                            let hash_hex = compute_image_hash(img.width, img.height, &img.bytes);
+                            if hash_hex == prev_hash {
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+                            return LocalClipboardSnapshot::Image {
+                                hash_hex,
+                                width: img.width,
+                                height: img.height,
+                                rgba: img.bytes.into_owned(),
+                            };
+                        }
                     }
 
-                    if external_paths.len() > 1 {
-                        root_name = format!("{} (+{} items)", root_name, external_paths.len() - 1);
+                    if let Ok(text) = cb.get_text() {
+                        if !text.is_empty() && text.len() <= MAX_TEXT_CHARS {
+                            let hash_hex = compute_text_hash(&text);
+                            if hash_hex == prev_hash {
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+                            return LocalClipboardSnapshot::Text { hash_hex, text };
+                        }
                     }
+                }
 
-                    // Cryptographically random 256-bit session capability token
-                    let session_id = trust::generate_random_token_hex(32);
+                LocalClipboardSnapshot::Unchanged
+            })
+            .await
+            .unwrap_or(LocalClipboardSnapshot::Unchanged);
 
+            match snapshot {
+                LocalClipboardSnapshot::Unchanged => continue,
+                LocalClipboardSnapshot::Files { hash_hex, copy } => {
+                    {
+                        let mut hash_lock = self.last_hash.write().await;
+                        *hash_lock = hash_hex.clone();
+                    }
+                    self.clear_remote_pending_ui_state().await;
+
+                    let ann = LazyAnnouncement {
+                        session_id: copy.session_id.clone(),
+                        root_name: copy.root_name.clone(),
+                        roots: copy.top_entries.clone(),
+                        total_files: copy.total_files,
+                        total_bytes: copy.total_bytes,
+                    };
                     {
                         let mut local_lock = self.pending_local.write().await;
-                        *local_lock = Some(LocalPendingCopy {
-                            session_id: session_id.clone(),
-                            root_name: root_name.clone(),
-                            total_files,
-                            total_bytes,
-                            directories,
-                            files,
-                            top_entries: Vec::new(),
-                        });
+                        *local_lock = Some(copy);
                     }
 
                     if let Some(peer_ip) = self.get_authorized_peer_ip().await {
                         info!(
                             "📢 Local copy detected: '{}' ({} files, {:.1} MB). Sending announcement to {}...",
-                            root_name,
-                            total_files,
-                            total_bytes as f64 / (1024.0 * 1024.0),
+                            ann.root_name,
+                            ann.total_files,
+                            ann.total_bytes as f64 / (1024.0 * 1024.0),
                             peer_ip
                         );
-                        let ann = LazyAnnouncement {
-                            session_id,
-                            root_name,
-                            total_files,
-                            total_bytes,
-                        };
                         tokio::spawn(async move {
                             if let Err(e) = Self::send_payload(
                                 &peer_ip,
@@ -957,127 +1237,93 @@ impl ClipboardService {
                     } else {
                         debug!(
                             "Local copy detected: '{}' ({} files), but no trusted peer is connected; skipping announcement",
-                            root_name, total_files
+                            ann.root_name, ann.total_files
                         );
                     }
                 }
-                continue;
-            }
-
-            // 2. Check for Image / Text via arboard
-            if let Ok(mut cb) = Clipboard::new() {
-                if let Ok(img) = cb.get_image() {
-                    let img_bytes_len = img.bytes.len();
-                    if validate_image_bounds(img.width, img.height, img_bytes_len) {
-                        let hash_hex = compute_image_hash(img.width, img.height, &img.bytes);
-
+                LocalClipboardSnapshot::Image {
+                    hash_hex,
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    {
                         let mut hash_lock = self.last_hash.write().await;
-                        if *hash_lock != hash_hex {
-                            *hash_lock = hash_hex.clone();
-                            drop(hash_lock);
+                        *hash_lock = hash_hex.clone();
+                    }
+                    self.clear_remote_pending_ui_state().await;
 
-                            {
-                                let mut remote_lock = self.pending_remote.write().await;
-                                *remote_lock = None;
-                            }
-                            {
-                                let mut ip_lock = self.last_remote_ip.write().await;
-                                *ip_lock = None;
-                            }
-                            #[cfg(target_os = "macos")]
-                            unsafe {
-                                reset_touchbar_paste_progress();
-                                set_has_pending_remote_file(false);
-                            }
-
-                            if let Some(peer_ip) = self.get_authorized_peer_ip().await {
-                                info!(
-                                    "📤 Detected local copied image ({}x{} px). Sending to {}...",
-                                    img.width, img.height, peer_ip
-                                );
-                                if let Err(e) = Self::send_payload(
-                                    &peer_ip,
-                                    ClipboardMessage {
-                                        hash: hash_hex,
-                                        payload: ClipboardPayload::Image {
-                                            width: img.width,
-                                            height: img.height,
-                                            rgba: img.bytes.into_owned(),
-                                        },
-                                    },
-                                )
-                                .await
-                                {
-                                    warn!("Failed to send image to {}: {}", peer_ip, e);
-                                }
-                            } else {
-                                debug!(
-                                    "Local image copied ({}x{} px), but no trusted peer is connected; skipping sync",
-                                    img.width, img.height
-                                );
-                            }
+                    if let Some(peer_ip) = self.get_authorized_peer_ip().await {
+                        info!(
+                            "📤 Detected local copied image ({}x{} px). Streaming to {}...",
+                            width, height, peer_ip
+                        );
+                        if let Err(e) =
+                            Self::send_image_stream(&peer_ip, hash_hex, width, height, rgba).await
+                        {
+                            warn!("Failed to stream image to {}: {}", peer_ip, e);
                         }
-                        continue;
+                    } else {
+                        debug!(
+                            "Local image copied ({}x{} px), but no trusted peer is connected; skipping sync",
+                            width, height
+                        );
                     }
                 }
-
-                if let Ok(text) = cb.get_text() {
-                    if !text.is_empty() && text.len() <= MAX_TEXT_CHARS {
-                        let hash_hex = compute_text_hash(&text);
-
+                LocalClipboardSnapshot::Text { hash_hex, text } => {
+                    {
                         let mut hash_lock = self.last_hash.write().await;
-                        if *hash_lock != hash_hex {
-                            *hash_lock = hash_hex.clone();
-                            drop(hash_lock);
+                        *hash_lock = hash_hex.clone();
+                    }
+                    self.clear_remote_pending_ui_state().await;
 
-                            {
-                                let mut remote_lock = self.pending_remote.write().await;
-                                *remote_lock = None;
-                            }
-                            {
-                                let mut ip_lock = self.last_remote_ip.write().await;
-                                *ip_lock = None;
-                            }
-                            #[cfg(target_os = "macos")]
-                            unsafe {
-                                reset_touchbar_paste_progress();
-                                set_has_pending_remote_file(false);
-                            }
-
-                            if let Some(peer_ip) = self.get_authorized_peer_ip().await {
-                                info!(
-                                    "📤 Detected local copied text ({} chars). Sending to {}...",
-                                    text.len(),
-                                    peer_ip
-                                );
-                                if let Err(e) = Self::send_payload(
-                                    &peer_ip,
-                                    ClipboardMessage {
-                                        hash: hash_hex,
-                                        payload: ClipboardPayload::Text(text),
-                                    },
-                                )
-                                .await
-                                {
-                                    warn!("Failed to send text to {}: {}", peer_ip, e);
-                                }
-                            } else {
-                                debug!(
-                                    "Local text copied ({} chars), but no trusted peer is connected; skipping sync",
-                                    text.len()
-                                );
-                            }
+                    if let Some(peer_ip) = self.get_authorized_peer_ip().await {
+                        info!(
+                            "📤 Detected local copied text ({} chars). Sending to {}...",
+                            text.len(),
+                            peer_ip
+                        );
+                        if let Err(e) = Self::send_payload(
+                            &peer_ip,
+                            ClipboardMessage {
+                                hash: hash_hex,
+                                payload: ClipboardPayload::Text(text),
+                            },
+                        )
+                        .await
+                        {
+                            warn!("Failed to send text to {}: {}", peer_ip, e);
                         }
-                        continue;
+                    } else {
+                        debug!(
+                            "Local text copied ({} chars), but no trusted peer is connected; skipping sync",
+                            text.len()
+                        );
                     }
                 }
             }
         }
     }
 
+    async fn clear_remote_pending_ui_state(&self) {
+        {
+            let mut remote_lock = self.pending_remote.write().await;
+            *remote_lock = None;
+        }
+        {
+            let mut ip_lock = self.last_remote_ip.write().await;
+            *ip_lock = None;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            reset_touchbar_paste_progress();
+            set_has_pending_remote_file(false);
+        }
+    }
+
     /// Sends an encrypted, mutually authenticated `ClipboardMessage` over `TransportSessionV2`.
     async fn send_payload(peer_ip: &str, msg: ClipboardMessage) -> Result<()> {
-        let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
+        let addr = format_socket_target(peer_ip, CLIPBOARD_PORT);
         let mut session = trust::connect_transport_to_ip(
             peer_ip,
             CLIPBOARD_PORT,
@@ -1088,6 +1334,12 @@ impl ClipboardService {
         .map_err(|e| anyhow::anyhow!("Failed to establish Clipboard TransportV2 to {}: {}", addr, e))?;
 
         let serialized = serde_json::to_vec(&msg)?;
+        if serialized.len() > MAX_CLIPBOARD_HEADER_BYTES {
+            anyhow::bail!(
+                "Serialized clipboard payload ({} bytes) exceeds MAX_CLIPBOARD_HEADER_BYTES",
+                serialized.len()
+            );
+        }
         tokio::time::timeout(
             FRAME_IO_TIMEOUT,
             session.send_chunked_payload(&serialized, MAX_CLIPBOARD_HEADER_BYTES),
@@ -1097,6 +1349,59 @@ impl ClipboardService {
         .map_err(|e| anyhow::anyhow!("Clipboard TransportV2 send error to {}: {}", addr, e))?;
 
         info!("✅ Sent TransportV2 encrypted clipboard message to {}", addr);
+        Ok(())
+    }
+
+    /// Streams raw RGBA pixels cleanly over `TransportSessionV2` without JSON expansion bloat.
+    async fn send_image_stream(
+        peer_ip: &str,
+        hash_hex: String,
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    ) -> Result<()> {
+        let byte_len = rgba.len();
+        if !validate_image_bounds(width, height, byte_len) {
+            anyhow::bail!("Refusing to stream invalid RGBA image dimensions/size");
+        }
+        let addr = format_socket_target(peer_ip, CLIPBOARD_PORT);
+        let mut session = trust::connect_transport_to_ip(
+            peer_ip,
+            CLIPBOARD_PORT,
+            ServiceId::ClipboardTransfer,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect ImageStream TransportV2 to {}: {}", addr, e))?;
+
+        let header = ClipboardMessage {
+            hash: hash_hex,
+            payload: ClipboardPayload::ImageStream {
+                width,
+                height,
+                byte_len,
+            },
+        };
+        let serialized = serde_json::to_vec(&header)?;
+        tokio::time::timeout(
+            FRAME_IO_TIMEOUT,
+            session.send_chunked_payload(&serialized, MAX_CLIPBOARD_HEADER_BYTES),
+        )
+        .await
+        .with_context(|| format!("Timed out sending image stream header to {}", addr))?
+        .map_err(|e| anyhow::anyhow!("ImageStream header error to {}: {}", addr, e))?;
+
+        let mut chunk_buf = Vec::with_capacity(STREAM_CHUNK_SIZE + 1);
+        for chunk in rgba.chunks(STREAM_CHUNK_SIZE) {
+            chunk_buf.clear();
+            chunk_buf.push(FRAME_IMAGE_DATA);
+            chunk_buf.extend_from_slice(chunk);
+            tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&chunk_buf))
+                .await
+                .with_context(|| format!("Timed out streaming image bytes to {}", addr))?
+                .map_err(|e| anyhow::anyhow!("ImageStream data error to {}: {}", addr, e))?;
+        }
+        info!("✅ Streamed {} bytes of RGBA image to {}", byte_len, addr);
         Ok(())
     }
 
@@ -1118,7 +1423,7 @@ impl ClipboardService {
         for dir_rel in &directories {
             let rel_bytes = dir_rel.as_bytes();
             if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
-                continue;
+                anyhow::bail!("Invalid directory path length {} in local copy", rel_bytes.len());
             }
             let mut rec = Vec::with_capacity(3 + rel_bytes.len());
             rec.push(FRAME_DIR);
@@ -1138,17 +1443,14 @@ impl ClipboardService {
         for (rel_path, abs_path) in files {
             let rel_bytes = rel_path.as_bytes();
             if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
-                continue;
+                anyhow::bail!("Invalid file path length {} in local copy", rel_bytes.len());
             }
 
-            let meta = std::fs::symlink_metadata(&abs_path)
-                .with_context(|| format!("Source file {:?} unavailable for streaming", abs_path))?;
-            if meta.file_type().is_symlink() {
-                anyhow::bail!("Refusing to stream symlink {:?}", abs_path);
-            }
-            let actual_len = meta.len();
-            let mut file = File::open(&abs_path)
-                .with_context(|| format!("Could not open {:?} for streaming", abs_path))?;
+            let mut file = open_source_file_no_follow(&abs_path)?;
+            let actual_len = file
+                .metadata()
+                .with_context(|| format!("Failed to inspect open source file {:?}", abs_path))?
+                .len();
 
             // Header record: [FRAME_FILE(1B) || path_len_be(2B) || rel_bytes || actual_len_be(8B)]
             let mut hdr_rec = Vec::with_capacity(11 + rel_bytes.len());
@@ -1238,7 +1540,7 @@ impl ClipboardService {
                 end try
             end tell
             "#;
-            if let Ok(output) = std::process::Command::new("osascript")
+            if let Ok(output) = std::process::Command::new("/usr/bin/osascript")
                 .arg("-e")
                 .arg(script)
                 .output()
@@ -1262,28 +1564,56 @@ impl ClipboardService {
         }
     }
 
-    /// Reveals the pasted file or folder in Finder or File Explorer.
+    /// Reveals the pasted file or folder in Finder or File Explorer without script or shell injection.
     pub fn reveal_in_file_manager(path: &Path) {
+        let path_owned = path.to_path_buf();
+
         #[cfg(target_os = "macos")]
         {
-            let escaped = path
-                .to_string_lossy()
-                .replace('\\', "\\\\")
-                .replace('\"', "\\\"");
-            let script = format!(
-                "tell application \"Finder\" to reveal POSIX file \"{}\"",
-                escaped
-            );
-            let _ = std::process::Command::new("osascript")
+            let script = r#"on run argv
+    if (count of argv) < 1 then return
+    tell application "Finder" to reveal POSIX file (item 1 of argv)
+end run"#;
+            if let Ok(mut child) = std::process::Command::new("/usr/bin/osascript")
                 .arg("-e")
-                .arg(&script)
-                .spawn();
+                .arg(script)
+                .arg("--")
+                .arg(&path_owned)
+                .spawn()
+            {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
         }
 
         #[cfg(target_os = "windows")]
         {
-            let arg = format!("/select,{}", path.to_string_lossy());
-            let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+            use std::os::windows::process::CommandExt;
+
+            let path_str = path_owned.to_string_lossy().to_string();
+            if path_str.is_empty()
+                || path_str.contains('"')
+                || path_str.chars().any(|c| c.is_control())
+            {
+                return;
+            }
+            let sys_root = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let explorer = sys_root.join("explorer.exe");
+            let mut cmd = std::process::Command::new(explorer);
+            cmd.raw_arg(format!("/select,\"{}\"", path_str));
+            if let Ok(mut child) = cmd.spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = path_owned;
         }
     }
 
@@ -1293,7 +1623,8 @@ impl ClipboardService {
             return Ok(());
         }
         if meta.is_dir() {
-            std::fs::create_dir_all(dst)?;
+            create_private_dir_no_symlink(dst)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             for entry in std::fs::read_dir(src)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -1302,9 +1633,14 @@ impl ClipboardService {
             }
         } else if meta.is_file() {
             if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                create_private_dir_no_symlink(parent)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
-            std::fs::copy(src, dst)?;
+            let mut reader = open_source_file_no_follow(src)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let mut writer = open_staged_file_create_new(dst)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            std::io::copy(&mut reader, &mut writer)?;
         }
         Ok(())
     }
@@ -1333,7 +1669,10 @@ impl ClipboardService {
         session_id: &str,
         is_drag: bool,
     ) -> Result<TransportSessionV2<TcpStream>> {
-        let addr = format!("{}:{}", peer_ip, CLIPBOARD_PORT);
+        if !is_valid_hex_session_id(session_id) {
+            anyhow::bail!("Rejected invalid clipboard/drag session_id");
+        }
+        let addr = format_socket_target(peer_ip, CLIPBOARD_PORT);
         let mut session = trust::connect_transport_to_ip(
             peer_ip,
             CLIPBOARD_PORT,
@@ -1356,6 +1695,9 @@ impl ClipboardService {
         };
 
         let serialized = serde_json::to_vec(&req_msg)?;
+        if serialized.len() > MAX_CLIPBOARD_HEADER_BYTES {
+            anyhow::bail!("Serialized stream request exceeds header cap");
+        }
         tokio::time::timeout(
             FRAME_IO_TIMEOUT,
             session.send_chunked_payload(&serialized, MAX_CLIPBOARD_HEADER_BYTES),
@@ -1367,17 +1709,21 @@ impl ClipboardService {
         Ok(session)
     }
 
-    /// Indexes local dragged files/folders using the exact security and quota protections used by
-    /// clipboard file streaming (`MAX_TRANSFER_FILES`, `MAX_DIRECTORY_DEPTH`, symlink & reserved-name guards).
-    pub fn collect_drag_items(paths: &[PathBuf]) -> Result<LocalPendingCopy> {
-        let mut root_name = String::new();
+    /// Indexes local files/folders (for both clipboard copy and cross-screen drag) using shared
+    /// quota, depth, length, symlink, reserved-name, and basename-collision protections.
+    pub(crate) fn collect_local_entries(paths: &[PathBuf]) -> Result<LocalPendingCopy> {
+        let mut first_root = String::new();
         let mut directories = Vec::new();
         let mut files = Vec::new();
         let mut top_entries = Vec::new();
+        let mut used_roots = std::collections::HashSet::new();
         let mut total_bytes: u64 = 0;
         let mut total_files: usize = 0;
 
         for root in paths {
+            if top_entries.len() >= MAX_ROOTS || total_files >= MAX_TRANSFER_FILES {
+                break;
+            }
             let Ok(meta) = std::fs::symlink_metadata(root) else {
                 continue;
             };
@@ -1387,20 +1733,30 @@ impl ClipboardService {
             let Some(file_name) = root.file_name() else {
                 continue;
             };
-            let name_str = file_name.to_string_lossy().to_string();
-            if validate_single_path_component(&name_str).is_err() {
+            let base_name = file_name.to_string_lossy().to_string();
+            if validate_single_path_component(&base_name).is_err() {
                 continue;
             }
-            if root_name.is_empty() {
-                root_name = name_str.clone();
+            let unique_root = resolve_unique_root_name(&mut used_roots, &base_name);
+            if validate_single_path_component(&unique_root).is_err()
+                || unique_root.len() > 4096
+            {
+                continue;
             }
+
             if meta.is_dir() {
-                directories.push(name_str.clone());
-                top_entries.push(name_str.clone());
+                if directories.len() >= MAX_TRANSFER_FILES {
+                    continue;
+                }
+                if first_root.is_empty() {
+                    first_root = unique_root.clone();
+                }
+                directories.push(unique_root.clone());
+                top_entries.push(unique_root.clone());
                 Self::collect_dir_entries(
                     root,
                     root,
-                    &name_str,
+                    &unique_root,
                     1,
                     &mut directories,
                     &mut files,
@@ -1413,20 +1769,25 @@ impl ClipboardService {
                     && len <= MAX_SINGLE_FILE_BYTES
                     && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
                 {
+                    if first_root.is_empty() {
+                        first_root = unique_root.clone();
+                    }
                     total_bytes += len;
                     total_files += 1;
-                    top_entries.push(name_str.clone());
-                    files.push((name_str, root.clone()));
+                    top_entries.push(unique_root.clone());
+                    files.push((unique_root, root.clone()));
                 }
             }
         }
 
         if total_files == 0 || top_entries.is_empty() {
-            anyhow::bail!("No valid non-symlink files found for cross-screen drag");
+            anyhow::bail!("No valid non-symlink files found");
         }
-        if top_entries.len() > 1 {
-            root_name = format!("{} (+{} items)", root_name, top_entries.len() - 1);
-        }
+        let root_name = if top_entries.len() > 1 {
+            format!("{} (+{} items)", first_root, top_entries.len() - 1)
+        } else {
+            first_root
+        };
 
         Ok(LocalPendingCopy {
             session_id: trust::generate_random_token_hex(32),
@@ -1437,6 +1798,12 @@ impl ClipboardService {
             files,
             top_entries,
         })
+    }
+
+    /// Indexes local dragged files/folders using the shared clipboard security and quota protections.
+    pub fn collect_drag_items(paths: &[PathBuf]) -> Result<LocalPendingCopy> {
+        Self::collect_local_entries(paths)
+            .map_err(|_| anyhow::anyhow!("No valid non-symlink files found for cross-screen drag"))
     }
 
     pub async fn register_drag_session(&self, copy: LocalPendingCopy) {
@@ -1471,23 +1838,27 @@ impl ClipboardService {
         if !self.is_dragdrop_enabled() {
             anyhow::bail!("Cross-Screen Drag & Drop is disabled");
         }
-        if session_id.trim().is_empty()
-            || session_id.len() > 128
-            || !session_id.chars().all(|c| c.is_ascii_hexdigit())
-        {
+        if !is_valid_hex_session_id(session_id) {
             anyhow::bail!("Rejected invalid drag session_id");
         }
-        if top_entries.is_empty() {
-            anyhow::bail!("Rejected drag offer with empty item list");
+        if top_entries.is_empty() || top_entries.len() > MAX_ROOTS {
+            anyhow::bail!("Rejected drag offer with invalid top-level entry count");
         }
         for entry in top_entries {
             validate_single_path_component(entry)?;
         }
 
-        let staging_root = crate::system_info::app_data_dir().join("drag_staging");
+        let base_dir = crate::system_info::app_data_dir();
+        let staging_root = base_dir.join("drag_staging");
+        ensure_dir_no_symlinks(&base_dir, &staging_root)?;
         let session_dir = staging_root.join(format!("drag_{}", session_id));
-        let _ = std::fs::remove_dir_all(&session_dir);
-        std::fs::create_dir_all(&session_dir)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&session_dir) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("Refusing symlinked drag staging directory");
+            }
+            let _ = std::fs::remove_dir_all(&session_dir);
+        }
+        ensure_dir_no_symlinks(&staging_root, &session_dir)?;
 
         let mut session = Self::connect_and_request_stream_kind(peer_ip, session_id, true)
             .await
@@ -1525,13 +1896,14 @@ impl ClipboardService {
 
     /// Receives and verifies directory frames, file frames, per-file SHA-256 digests, and the
     /// overall manifest SHA-256 digest into an isolated staging directory (`dest_base`).
+    /// Returns `(transferred_bytes, start_time, manifest_sha256)`.
     pub(crate) async fn receive_stream_frames_from_session<S>(
         session: &mut TransportSessionV2<S>,
         dest_base: &Path,
         expected_total_bytes: u64,
         expected_total_files: usize,
         root_remap: Option<(&str, &str)>,
-    ) -> Result<(u64, std::time::Instant)>
+    ) -> Result<(u64, std::time::Instant, [u8; 32])>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -1552,11 +1924,13 @@ impl ClipboardService {
 
         let mut transferred_bytes: u64 = 0;
         let mut received_files: usize = 0;
+        let mut received_dirs: usize = 0;
         let start_time = std::time::Instant::now();
         let mut last_progress_report = std::time::Instant::now();
         let mut manifest_hasher = Sha256::new();
         manifest_hasher.update(b"INTEGRATOR-FILE-MANIFEST-V2");
 
+        let manifest_sha256: [u8; 32];
         loop {
             let rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
                 .await
@@ -1582,9 +1956,18 @@ impl ClipboardService {
                         "Security violation: file transfer manifest SHA-256 mismatch; aborting commit"
                     );
                 }
+                manifest_sha256 = computed_manifest_sha256;
                 debug!("Verified FRAME_END and manifest SHA-256 from peer");
                 break;
             } else if tag == FRAME_DIR {
+                received_dirs += 1;
+                if received_dirs > MAX_TRANSFER_FILES {
+                    anyhow::bail!(
+                        "Peer sent too many directory frames ({} > max {})",
+                        received_dirs,
+                        MAX_TRANSFER_FILES
+                    );
+                }
                 if rec.len() < 3 {
                     anyhow::bail!("Malformed FRAME_DIR record (len {})", rec.len());
                 }
@@ -1596,7 +1979,7 @@ impl ClipboardService {
                     .context("Directory relative path is not valid UTF-8")?;
                 let rel_path = Self::remap_rel_root(raw_rel, root_remap);
                 let dest_path = ensure_safe_contained_path(dest_base, &rel_path)?;
-                std::fs::create_dir_all(&dest_path)?;
+                ensure_dir_no_symlinks(dest_base, &dest_path)?;
             } else if tag == FRAME_FILE {
                 received_files += 1;
                 if received_files > expected_total_files.min(MAX_TRANSFER_FILES) {
@@ -1641,7 +2024,7 @@ impl ClipboardService {
 
                 let dest_path = ensure_safe_contained_path(dest_base, &rel_path)?;
                 if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    ensure_dir_no_symlinks(dest_base, parent)?;
                 }
 
                 let mut file = open_staged_file_create_new(&dest_path)?;
@@ -1750,10 +2133,10 @@ impl ClipboardService {
             );
         }
 
-        Ok((transferred_bytes, start_time))
+        Ok((transferred_bytes, start_time, manifest_sha256))
     }
 
-    fn remap_rel_root(rel_path: &str, root_remap: Option<(&str, &str)>) -> String {
+    pub(crate) fn remap_rel_root(rel_path: &str, root_remap: Option<(&str, &str)>) -> String {
         let Some((orig_root, new_root)) = root_remap else {
             return rel_path.to_string();
         };
@@ -1762,25 +2145,78 @@ impl ClipboardService {
         }
         let mut comps = rel_path.split(['/', '\\']).filter(|s| !s.is_empty());
         let Some(first) = comps.next() else {
-            return new_root.to_string();
+            return rel_path.to_string();
         };
+        if first != orig_root {
+            return rel_path.to_string();
+        }
         let rest: Vec<&str> = comps.collect();
-        if first == orig_root {
-            if rest.is_empty() {
-                new_root.to_string()
-            } else {
-                format!("{}/{}", new_root, rest.join("/"))
-            }
-        } else if rest.is_empty() {
+        if rest.is_empty() {
             new_root.to_string()
         } else {
-            rel_path.to_string()
+            format!("{}/{}", new_root, rest.join("/"))
         }
     }
 
+    fn effective_roots(ann: &LazyAnnouncement) -> Result<Vec<String>> {
+        if ann.roots.is_empty() {
+            let single = safe_root_entry_name(&ann.root_name);
+            validate_single_path_component(&single)?;
+            return Ok(vec![single]);
+        }
+        if ann.roots.len() > MAX_ROOTS {
+            anyhow::bail!(
+                "Announcement roots count {} exceeds cap {}",
+                ann.roots.len(),
+                MAX_ROOTS
+            );
+        }
+        let mut seen = std::collections::HashSet::with_capacity(ann.roots.len());
+        let mut out = Vec::with_capacity(ann.roots.len());
+        for raw in &ann.roots {
+            validate_single_path_component(raw)?;
+            if !seen.insert(raw.clone()) {
+                anyhow::bail!("Duplicate top-level entry '{}' in announcement roots", raw);
+            }
+            out.push(raw.clone());
+        }
+        Ok(out)
+    }
+
+    async fn record_verified_cache(&self, entry: VerifiedCacheEntry) {
+        let mut cache = self.verified_cache.write().await;
+        if let Some(pos) = cache
+            .iter()
+            .position(|e| e.session_id == entry.session_id && e.manifest_hash == entry.manifest_hash)
+        {
+            cache.remove(pos);
+        }
+        while cache.len() >= 8 {
+            if let Some(evicted) = cache.pop_front() {
+                if evicted.session_dir != entry.session_dir {
+                    let dir = evicted.session_dir;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = std::fs::remove_dir_all(dir);
+                    })
+                    .await;
+                }
+            }
+        }
+        cache.push_back(entry);
+    }
+
+    async fn lookup_verified_cache(&self, session_id: &str) -> Option<VerifiedCacheEntry> {
+        let cache = self.verified_cache.read().await;
+        cache
+            .iter()
+            .rev()
+            .find(|e| e.session_id == session_id)
+            .cloned()
+    }
+
     /// Streams the peer's announced files into an isolated staging directory inside the local cache,
-    /// verifies per-file and manifest SHA-256 hashes, atomically commits the verified root entry,
-    /// and updates the native OS clipboard only after full verification succeeds.
+    /// verifies per-file and manifest SHA-256 hashes, commits all verified root items under a
+    /// `(session_id, manifest_hash)` directory, and updates the native OS clipboard.
     pub async fn stream_to_cache(&self, ann: LazyAnnouncement) -> Result<()> {
         self.stream_to_cache_from(ann, None).await
     }
@@ -1790,23 +2226,30 @@ impl ClipboardService {
         ann: LazyAnnouncement,
         source_ip: Option<IpAddr>,
     ) -> Result<()> {
+        if !is_valid_hex_session_id(&ann.session_id) {
+            anyhow::bail!("Rejected invalid session_id in lazy announcement");
+        }
+        let roots = Self::effective_roots(&ann)?;
         let peer_ip = self.resolve_stream_peer_ip(source_ip).await?;
         let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
-        let safe_name = safe_root_entry_name(&ann.root_name);
-        let dest_root = cache_dir.join(&safe_name);
 
-        // Stage into a unique isolated staging directory first so failed transfers never clobber cache
         let stage_dir = cache_dir.join(format!(
             ".staging_{}_{}",
-            safe_root_entry_name(&ann.session_id),
+            &ann.session_id[..ann.session_id.len().min(16)],
             trust::generate_random_token_hex(6)
         ));
-        let _ = std::fs::remove_dir_all(&stage_dir);
-        std::fs::create_dir_all(&stage_dir)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&stage_dir) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("Refusing symlinked staging directory");
+            }
+            let _ = std::fs::remove_dir_all(&stage_dir);
+        }
+        ensure_dir_no_symlinks(&cache_dir, &stage_dir)?;
 
         info!(
-            "📥 Streaming announced item '{}' ({:.1} MB) from {} into isolated staging cache...",
+            "📥 Streaming announced item '{}' ({} root(s), {:.1} MB) from {} into isolated staging cache...",
             ann.root_name,
+            roots.len(),
             ann.total_bytes as f64 / (1024.0 * 1024.0),
             peer_ip
         );
@@ -1828,7 +2271,7 @@ impl ClipboardService {
         )
         .await;
 
-        let (transferred_bytes, start_time) = match stream_res {
+        let (transferred_bytes, start_time, manifest_sha256) = match stream_res {
             Ok(v) => v,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&stage_dir);
@@ -1840,36 +2283,68 @@ impl ClipboardService {
             }
         };
 
-        let staged_item = stage_dir.join(&safe_name);
-        if staged_item.exists() {
-            if dest_root.exists() {
-                if dest_root.is_dir() {
-                    let _ = std::fs::remove_dir_all(&dest_root);
-                } else {
-                    let _ = std::fs::remove_file(&dest_root);
-                }
+        let manifest_hex = to_hex_string(&manifest_sha256);
+        let session_cache_dir = cache_dir.join(format!(
+            "s_{}_{}",
+            &ann.session_id[..ann.session_id.len().min(16)],
+            &manifest_hex[..16]
+        ));
+        if let Ok(meta) = std::fs::symlink_metadata(&session_cache_dir) {
+            if meta.file_type().is_symlink() {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                anyhow::bail!("Refusing symlinked verified cache directory");
             }
-            if std::fs::rename(&staged_item, &dest_root).is_err() {
-                Self::copy_entry_all(&staged_item, &dest_root)?;
+            let _ = std::fs::remove_dir_all(&session_cache_dir);
+        }
+        ensure_dir_no_symlinks(&cache_dir, &session_cache_dir)?;
+
+        let mut cached_roots = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let staged_item = ensure_safe_contained_path(&stage_dir, root)?;
+            let meta = std::fs::symlink_metadata(&staged_item).with_context(|| {
+                format!("Staged root entry '{}' missing after verified stream", root)
+            })?;
+            if meta.file_type().is_symlink() {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                let _ = std::fs::remove_dir_all(&session_cache_dir);
+                anyhow::bail!("Security violation: staged item '{}' is a symlink", root);
             }
+            let dest_item = ensure_safe_contained_path(&session_cache_dir, root)?;
+            if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                let _ = std::fs::remove_dir_all(&session_cache_dir);
+                return Err(e);
+            }
+            cached_roots.push(dest_item);
         }
         let _ = std::fs::remove_dir_all(&stage_dir);
 
-        // Only replace the native OS clipboard AFTER the staged file exists and passed SHA-256 verification
-        if dest_root.exists() {
-            let helper = Arc::clone(&self.file_helper);
-            let root_for_cb = dest_root.clone();
-            tokio::task::spawn_blocking(move || helper.write_copied_files(&[root_for_cb]))
-                .await
-                .context("Clipboard writer task panicked")??;
-            let new_seq = os_seq::get_clipboard_sequence();
+        if cached_roots.is_empty() {
+            let _ = std::fs::remove_dir_all(&session_cache_dir);
+            anyhow::bail!("Verified clipboard cache commit produced zero root items");
+        }
+
+        // Only replace the native OS clipboard AFTER all staged items pass SHA-256 verification.
+        let helper = Arc::clone(&self.file_helper);
+        let roots_for_cb = cached_roots.clone();
+        let new_seq = tokio::task::spawn_blocking(move || -> Result<i64> {
+            helper.write_copied_files(&roots_for_cb)?;
+            Ok(os_seq::get_clipboard_sequence())
+        })
+        .await
+        .context("Clipboard writer task panicked")??;
+        if new_seq >= 0 {
             let mut seq_lock = self.last_seq.write().await;
             *seq_lock = new_seq;
-            info!(
-                "📋 Registered verified '{}' on native clipboard. Ready for Cmd+V / Ctrl+V!",
-                ann.root_name
-            );
         }
+
+        self.record_verified_cache(VerifiedCacheEntry {
+            session_id: ann.session_id.clone(),
+            manifest_hash: manifest_sha256,
+            session_dir: session_cache_dir,
+            roots,
+        })
+        .await;
 
         #[cfg(target_os = "macos")]
         unsafe {
@@ -1888,43 +2363,8 @@ impl ClipboardService {
     }
 
     /// Executes On-Demand Remote Paste with isolated staging, SHA-256 verification, atomic commit,
-    /// and non-destructive collision naming.
+    /// multi-item support, and non-destructive collision naming.
     pub async fn paste_remote(&self, custom_target: Option<PathBuf>) -> Result<String> {
-        let ann = {
-            let lock = self.pending_remote.read().await;
-            lock.clone()
-        }
-        .context("No remote file announcement pending to paste")?;
-
-        let target_dir = custom_target.unwrap_or_else(Self::resolve_active_destination_folder);
-        let safe_name = safe_root_entry_name(&ann.root_name);
-        let dest_root = resolve_non_colliding_dest(&target_dir, &safe_name);
-        let final_name = dest_root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&safe_name)
-            .to_string();
-
-        // If the item is already present and verified in the staging cache, copy to non-colliding destination
-        let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
-        let cached_item = cache_dir.join(&safe_name);
-        if cached_item.exists() && target_dir != cache_dir {
-            info!(
-                "📋 Item '{}' already present in verified cache. Copying to {:?}...",
-                ann.root_name, dest_root
-            );
-            Self::copy_entry_all(&cached_item, &dest_root)?;
-            Self::reveal_in_file_manager(&dest_root);
-            #[cfg(target_os = "macos")]
-            unsafe {
-                reset_touchbar_paste_progress();
-            }
-            return Ok(format!(
-                "✅ Pasted '{}' into {:?}",
-                final_name, target_dir
-            ));
-        }
-
         if self
             .is_pasting
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1935,6 +2375,7 @@ impl ClipboardService {
 
         struct PasteGuard<'a> {
             service: &'a ClipboardService,
+            clear_pending_on_exit: bool,
         }
         impl<'a> Drop for PasteGuard<'a> {
             fn drop(&mut self) {
@@ -1943,12 +2384,109 @@ impl ClipboardService {
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 #[cfg(target_os = "macos")]
                 unsafe {
-                    set_has_pending_remote_file(false);
+                    if self.clear_pending_on_exit {
+                        set_has_pending_remote_file(false);
+                    }
                     reset_touchbar_paste_progress();
                 }
             }
         }
-        let _guard = PasteGuard { service: self };
+        let mut guard = PasteGuard {
+            service: self,
+            clear_pending_on_exit: false,
+        };
+
+        let ann = {
+            let lock = self.pending_remote.read().await;
+            lock.clone()
+        }
+        .context("No remote file announcement pending to paste")?;
+
+        if !is_valid_hex_session_id(&ann.session_id) {
+            anyhow::bail!("Rejected invalid session_id on pending paste");
+        }
+        let roots = Self::effective_roots(&ann)?;
+
+        let target_dir = match custom_target {
+            Some(dir) => dir,
+            None => tokio::task::spawn_blocking(Self::resolve_active_destination_folder)
+                .await
+                .unwrap_or_else(|_| crate::system_info::user_desktop_or_downloads_dir()),
+        };
+        if let Ok(meta) = std::fs::symlink_metadata(&target_dir) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                anyhow::bail!(
+                    "Refusing to paste into non-directory or symlinked target: {}",
+                    target_dir.display()
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "Destination directory does not exist: {}",
+                target_dir.display()
+            );
+        }
+
+        let cache_dir = self.file_helper.get_cache_dir().to_path_buf();
+
+        // Cache hit only if exact (session_id, manifest_hash) entry is verified and intact.
+        if let Some(cached) = self.lookup_verified_cache(&ann.session_id).await {
+            let all_present = target_dir != cache_dir
+                && !cached.roots.is_empty()
+                && cached.roots.iter().all(|r| {
+                    let p = cached.session_dir.join(r);
+                    std::fs::symlink_metadata(&p)
+                        .map(|m| !m.file_type().is_symlink())
+                        .unwrap_or(false)
+                });
+            if all_present {
+                info!(
+                    "📋 Item '{}' already present in verified cache ({}). Copying {} item(s) to {:?}...",
+                    ann.root_name,
+                    to_hex_string(&cached.manifest_hash[..4]),
+                    cached.roots.len(),
+                    target_dir
+                );
+                let mut pasted_paths = Vec::with_capacity(cached.roots.len());
+                for root in &cached.roots {
+                    let src = ensure_safe_contained_path(&cached.session_dir, root)?;
+                    let dest = resolve_non_colliding_dest(&target_dir, root);
+                    let src_c = src.clone();
+                    let dest_c = dest.clone();
+                    tokio::task::spawn_blocking(move || Self::copy_entry_all(&src_c, &dest_c))
+                        .await
+                        .context("Cache copy task panicked")??;
+                    pasted_paths.push(dest);
+                }
+
+                {
+                    let mut lock = self.pending_remote.write().await;
+                    *lock = None;
+                }
+                {
+                    let mut ip_lock = self.last_remote_ip.write().await;
+                    *ip_lock = None;
+                }
+                guard.clear_pending_on_exit = true;
+
+                if let Some(first_dest) = pasted_paths.first() {
+                    Self::reveal_in_file_manager(first_dest);
+                }
+                let final_summary = if pasted_paths.len() == 1 {
+                    pasted_paths[0]
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&ann.root_name)
+                        .to_string()
+                } else {
+                    ann.root_name.clone()
+                };
+                return Ok(format!(
+                    "✅ Pasted '{}' into {:?}",
+                    final_summary, target_dir
+                ));
+            }
+        }
 
         let last_ip = *self.last_remote_ip.read().await;
         let peer_ip = self.resolve_stream_peer_ip(last_ip).await?;
@@ -1959,12 +2497,17 @@ impl ClipboardService {
             ".integrator_staging_{}",
             trust::generate_random_token_hex(8)
         ));
-        let _ = std::fs::remove_dir_all(&stage_dir);
-        std::fs::create_dir_all(&stage_dir)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&stage_dir) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("Refusing symlinked target staging folder");
+            }
+            let _ = std::fs::remove_dir_all(&stage_dir);
+        }
+        ensure_dir_no_symlinks(&target_dir, &stage_dir)?;
 
         info!(
-            "📥 Initiating on-demand stream of '{}' from {} via isolated staging into {:?}",
-            ann.root_name, peer_ip, dest_root
+            "📥 Initiating on-demand stream of '{}' ({} root(s)) from {} via isolated staging into {:?}",
+            ann.root_name, roots.len(), peer_ip, target_dir
         );
 
         let mut session = match Self::connect_and_request_stream(&peer_ip, &ann.session_id).await {
@@ -1980,11 +2523,11 @@ impl ClipboardService {
             &stage_dir,
             ann.total_bytes,
             ann.total_files,
-            Some((&safe_name, &final_name)),
+            None,
         )
         .await;
 
-        let (transferred_bytes, start_time) = match stream_res {
+        let (transferred_bytes, start_time, _manifest_sha256) = match stream_res {
             Ok(v) => v,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&stage_dir);
@@ -1992,12 +2535,22 @@ impl ClipboardService {
             }
         };
 
-        // Atomically commit the verified item from `stage_dir` into `dest_root`
-        let staged_item = stage_dir.join(&final_name);
-        if staged_item.exists() {
-            if std::fs::rename(&staged_item, &dest_root).is_err() {
-                Self::copy_entry_all(&staged_item, &dest_root)?;
+        let mut committed_paths = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let staged_item = ensure_safe_contained_path(&stage_dir, root)?;
+            if !staged_item.exists() {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                anyhow::bail!(
+                    "Expected root entry '{}' missing from verified staging folder",
+                    root
+                );
             }
+            let dest_item = resolve_non_colliding_dest(&target_dir, root);
+            if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                return Err(e);
+            }
+            committed_paths.push(dest_item);
         }
         let _ = std::fs::remove_dir_all(&stage_dir);
 
@@ -2009,19 +2562,26 @@ impl ClipboardService {
             let mut ip_lock = self.last_remote_ip.write().await;
             *ip_lock = None;
         }
+        guard.clear_pending_on_exit = true;
 
-        #[cfg(target_os = "macos")]
-        unsafe {
-            reset_touchbar_paste_progress();
+        if let Some(first_dest) = committed_paths.first() {
+            Self::reveal_in_file_manager(first_dest);
         }
-
-        Self::reveal_in_file_manager(&dest_root);
 
         let elapsed = start_time.elapsed().as_secs_f64();
         let avg_mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+        let display_label = if committed_paths.len() == 1 {
+            committed_paths[0]
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&ann.root_name)
+                .to_string()
+        } else {
+            ann.root_name.clone()
+        };
         let msg = format!(
             "✅ Successfully pasted '{}' ({:.1} MB at {:.0} MB/s) into {:?}",
-            final_name,
+            display_label,
             transferred_bytes as f64 / (1024.0 * 1024.0),
             avg_mb_s,
             target_dir
@@ -2034,6 +2594,7 @@ impl ClipboardService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::protocol::MAX_IMAGE_DIMENSION;
     use crate::security::keystore::{FixedKekProvider, KeystoreV2};
     use zeroize::Zeroizing;
 
@@ -2133,29 +2694,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    #[tokio::test]
-    async fn test_file_stream_over_transport_v2_sha256_verification_and_truncation_abort() {
-        let src_dir = std::env::temp_dir().join(format!(
-            "integrator_stream_src_{}",
+    #[test]
+    fn remap_rel_root_never_collapses_unrelated_top_level_files() {
+        assert_eq!(
+            ClipboardService::remap_rel_root("alpha/file.txt", Some(("alpha", "alpha (2)"))),
+            "alpha (2)/file.txt"
+        );
+        assert_eq!(
+            ClipboardService::remap_rel_root("alpha", Some(("alpha", "alpha (2)"))),
+            "alpha (2)"
+        );
+        assert_eq!(
+            ClipboardService::remap_rel_root("other.txt", Some(("alpha", "alpha (2)"))),
+            "other.txt"
+        );
+        assert_eq!(
+            ClipboardService::remap_rel_root("beta/nested.txt", Some(("alpha", "alpha (2)"))),
+            "beta/nested.txt"
+        );
+    }
+
+    #[test]
+    fn collect_local_entries_preserves_multi_item_roots_and_disambiguates_duplicates() {
+        let base = std::env::temp_dir().join(format!(
+            "integrator_multi_collect_{}",
             trust::generate_random_token_hex(6)
         ));
-        let dst_dir = std::env::temp_dir().join(format!(
-            "integrator_stream_dst_{}",
-            trust::generate_random_token_hex(6)
-        ));
-        std::fs::create_dir_all(src_dir.join("bundle/sub")).unwrap();
-        std::fs::create_dir_all(&dst_dir).unwrap();
+        let d1 = base.join("dir_one");
+        let d2 = base.join("dir_two");
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
 
-        let f1_path = src_dir.join("bundle/hello.txt");
-        let f2_path = src_dir.join("bundle/sub/data.bin");
-        let f1_bytes = b"Integrator v2.0 authenticated file stream test";
-        let f2_bytes = vec![0x3Cu8; 300_000]; // spans multiple TransportV2 records
-        std::fs::write(&f1_path, f1_bytes).unwrap();
-        std::fs::write(&f2_path, &f2_bytes).unwrap();
+        let f1 = d1.join("dup.txt");
+        let f2 = d2.join("dup.txt");
+        let f3 = folder.join("inside.bin");
+        std::fs::write(&f1, b"first").unwrap();
+        std::fs::write(&f2, b"second").unwrap();
+        std::fs::write(&f3, b"third").unwrap();
 
-        // Setup paired KeystoreV2 instances for TransportSessionV2
-        let ks_dir_c = src_dir.join("ks_c");
-        let ks_dir_s = src_dir.join("ks_s");
+        let copy = ClipboardService::collect_local_entries(&[f1, f2, folder]).unwrap();
+        assert_eq!(copy.total_files, 3);
+        assert_eq!(
+            copy.top_entries,
+            vec![
+                "dup.txt".to_string(),
+                "dup (2).txt".to_string(),
+                "folder".to_string()
+            ]
+        );
+        assert_eq!(copy.root_name, "dup.txt (+2 items)");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn setup_paired_clipboard_sessions(
+        base: &Path,
+        tag: &str,
+    ) -> (
+        TransportSessionV2<tokio::io::DuplexStream>,
+        TransportSessionV2<tokio::io::DuplexStream>,
+    ) {
+        let ks_dir_c = base.join(format!("ks_c_{}", tag));
+        let ks_dir_s = base.join(format!("ks_s_{}", tag));
         let mut ks_c =
             KeystoreV2::open_with_provider(ks_dir_c, &FixedKekProvider::new([0x21u8; 32])).unwrap();
         let mut ks_s =
@@ -2182,8 +2784,6 @@ mod tests {
         )
         .unwrap();
         let peer_s = ks_c.get_peer(&ks_s.local_device_id_hex()).unwrap().clone();
-
-        // 1. Valid multi-file stream with per-file and manifest SHA-256 verification
         let (c_io, s_io) = tokio::io::duplex(512 * 1024);
         let (c_res, s_res) = tokio::join!(
             TransportSessionV2::connect_client(
@@ -2199,9 +2799,32 @@ mod tests {
                 false
             )
         );
-        let mut client_sess = c_res.unwrap();
-        let mut server_sess = s_res.unwrap();
+        (c_res.unwrap(), s_res.unwrap())
+    }
 
+    #[tokio::test]
+    async fn test_file_stream_over_transport_v2_sha256_verification_and_truncation_abort() {
+        let src_dir = std::env::temp_dir().join(format!(
+            "integrator_stream_src_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        let dst_dir = std::env::temp_dir().join(format!(
+            "integrator_stream_dst_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        std::fs::create_dir_all(src_dir.join("bundle/sub")).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let f1_path = src_dir.join("bundle/hello.txt");
+        let f2_path = src_dir.join("bundle/sub/data.bin");
+        let f1_bytes = b"Integrator v2.0 authenticated file stream test";
+        let f2_bytes = vec![0x3Cu8; 300_000];
+        std::fs::write(&f1_path, f1_bytes).unwrap();
+        std::fs::write(&f2_path, &f2_bytes).unwrap();
+
+        // 1. Valid multi-file stream with per-file and manifest SHA-256 verification
+        let (mut client_sess, mut server_sess) =
+            setup_paired_clipboard_sessions(&src_dir, "valid").await;
         let dirs = vec!["bundle".to_string(), "bundle/sub".to_string()];
         let files = vec![
             ("bundle/hello.txt".to_string(), f1_path.clone()),
@@ -2220,7 +2843,8 @@ mod tests {
             )
         );
         send_res.expect("sender stream must succeed");
-        let (rx_bytes, _) = recv_res.expect("receiver stream and SHA-256 checks must succeed");
+        let (rx_bytes, _, _manifest) =
+            recv_res.expect("receiver stream and SHA-256 checks must succeed");
         assert_eq!(rx_bytes, total_bytes);
         assert_eq!(
             std::fs::read(dst_dir.join("bundle/hello.txt")).unwrap(),
@@ -2232,23 +2856,8 @@ mod tests {
         );
 
         // 2. Corrupted per-file SHA-256 frame must be rejected by receiver
-        let (c_io2, s_io2) = tokio::io::duplex(128 * 1024);
-        let (c_res2, s_res2) = tokio::join!(
-            TransportSessionV2::connect_client(
-                c_io2,
-                &ks_c,
-                &peer_s,
-                ServiceId::ClipboardTransfer
-            ),
-            TransportSessionV2::accept_server(
-                s_io2,
-                &ks_s,
-                ServiceId::ClipboardTransfer,
-                false
-            )
-        );
-        let mut client_sess2 = c_res2.unwrap();
-        let mut server_sess2 = s_res2.unwrap();
+        let (mut client_sess2, mut server_sess2) =
+            setup_paired_clipboard_sessions(&src_dir, "corrupt").await;
         let dst_corrupt = src_dir.join("dst_corrupt");
         std::fs::create_dir_all(&dst_corrupt).unwrap();
 
@@ -2265,7 +2874,6 @@ mod tests {
             data.extend_from_slice(b"hello");
             server_sess2.send_message(&data).await.unwrap();
 
-            // Send bogus SHA-256 digest
             let mut bad_hash = [0xAAu8; 33];
             bad_hash[0] = FRAME_FILE_HASH;
             server_sess2.send_message(&bad_hash).await.unwrap();
@@ -2283,6 +2891,71 @@ mod tests {
         assert!(
             corrupt_rx_res.is_err(),
             "corrupted file SHA-256 must be rejected"
+        );
+
+        // 3. Premature TCP/session EOF (truncation abort) mid-file must fail cleanly
+        let (mut client_sess3, mut server_sess3) =
+            setup_paired_clipboard_sessions(&src_dir, "trunc").await;
+        let dst_trunc = src_dir.join("dst_trunc");
+        std::fs::create_dir_all(&dst_trunc).unwrap();
+
+        let trunc_sender = async move {
+            let rel = b"partial.bin";
+            let mut hdr = Vec::new();
+            hdr.push(FRAME_FILE);
+            hdr.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(rel);
+            hdr.extend_from_slice(&(1024u64).to_be_bytes());
+            server_sess3.send_message(&hdr).await.unwrap();
+
+            let mut data = vec![FRAME_FILE_DATA];
+            data.extend_from_slice(&[0x42u8; 100]);
+            server_sess3.send_message(&data).await.unwrap();
+            drop(server_sess3);
+        };
+        let (_, trunc_rx_res) = tokio::join!(
+            trunc_sender,
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess3,
+                &dst_trunc,
+                1024,
+                1,
+                None
+            )
+        );
+        assert!(trunc_rx_res.is_err(), "truncated stream must abort cleanly");
+
+        // 4. Excessive FRAME_DIR count beyond MAX_TRANSFER_FILES must be rejected
+        let (mut client_sess4, mut server_sess4) =
+            setup_paired_clipboard_sessions(&src_dir, "dir_flood").await;
+        let dst_flood = src_dir.join("dst_flood");
+        std::fs::create_dir_all(&dst_flood).unwrap();
+
+        let flood_sender = async move {
+            for idx in 0..=(MAX_TRANSFER_FILES + 1) {
+                let rel = format!("d{}", idx);
+                let mut dir_rec = Vec::with_capacity(3 + rel.len());
+                dir_rec.push(FRAME_DIR);
+                dir_rec.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+                dir_rec.extend_from_slice(rel.as_bytes());
+                if server_sess4.send_message(&dir_rec).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let (_, flood_rx_res) = tokio::join!(
+            flood_sender,
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess4,
+                &dst_flood,
+                0,
+                1,
+                None
+            )
+        );
+        assert!(
+            flood_rx_res.is_err(),
+            "FRAME_DIR count exceeding MAX_TRANSFER_FILES must be rejected"
         );
 
         let _ = std::fs::remove_dir_all(&src_dir);

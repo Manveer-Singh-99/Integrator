@@ -1,8 +1,6 @@
-pub mod protocol;
-pub mod file_helper;
-pub mod os_seq;
-pub mod service;
+pub(crate) mod file_helper;
+pub(crate) mod os_seq;
+pub(crate) mod protocol;
+pub(crate) mod service;
 
-pub use service::ClipboardService;
-pub use service::CLIPBOARD_INSTANCE;
-pub use service::TOKIO_HANDLE;
+pub use service::{ClipboardService, CLIPBOARD_INSTANCE, TOKIO_HANDLE};

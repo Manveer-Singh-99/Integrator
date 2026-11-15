@@ -15,6 +15,7 @@ private let kIntegratorEventTag: Int64 = 0x494E5447 // "INTG"
 //   2 = MouseButton (button: 0=left,1=right,2=middle; pressed: 0/1)
 //   3 = MouseScroll (dx, dy)
 //   4 = KeyEvent (keyCode, pressed: 0/1, cgFlagsRaw)
+//   5 = FlagsChanged (keyCode, 0, cgFlagsRaw)
 // Returns: 0 = pass through natively, 1 = swallow event, 2 = swallow and warp cursor to center (park_x, park_y)
 public typealias KvmEventCallback = @convention(c) (
     Int32,      // kind
@@ -27,17 +28,37 @@ public typealias KvmEventCallback = @convention(c) (
 
 public typealias KvmDragEndedCallback = @convention(c) (Bool, UnsafePointer<CChar>?) -> Void
 
+private final class SafeBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+
+    func set(_ newValue: T?) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> T? {
+        lock.lock()
+        let v = value
+        lock.unlock()
+        return v
+    }
+}
+
+private let gStateLock = NSLock()
+private let gTapLifecycleLock = NSLock()
+private let gHidLock = NSLock()
+
 private var gKvmCallback: KvmEventCallback? = nil
 private var gDragEndedCallback: KvmDragEndedCallback? = nil
 
 private var gEventTap: CFMachPort? = nil
 private var gTapThread: Thread? = nil
+private var gTapRunLoop: CFRunLoop? = nil
 private var gControllingPeer: Bool = false
-private var gControlledByPeer: Bool = false
-private var gLeftButtonHeldRemote: Bool = false
 private var gCursorHidden: Bool = false
 private var gDragChangeCountAtDown: Int = -1
-private var gSyntheticInjectorActive: Bool = false
 
 private var gParkX: Double = 400.0
 private var gParkY: Double = 300.0
@@ -52,9 +73,10 @@ private var gRemoteAltRight: Bool = false
 private var gRemoteMetaLeft: Bool = false
 private var gRemoteMetaRight: Bool = false
 
-private let gStateLock = NSLock()
 private var gBgCursorConfigured: Bool = false
+private var gCoreGraphicsHandle: UnsafeMutableRawPointer? = nil
 private var gAtExitRegistered: Bool = false
+private var gHidConn: io_connect_t = 0
 
 private func enableBackgroundCursorHiding() {
     gStateLock.lock()
@@ -67,7 +89,13 @@ private func enableBackgroundCursorHiding() {
 
     typealias CGSDefaultConnFn = @convention(c) () -> UInt32
     typealias CGSSetConnPropFn = @convention(c) (UInt32, UInt32, CFString, CFTypeRef) -> Int32
-    guard let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+    if gCoreGraphicsHandle == nil {
+        gCoreGraphicsHandle = dlopen(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            RTLD_LAZY
+        )
+    }
+    guard let handle = gCoreGraphicsHandle,
           let connSym = dlsym(handle, "CGSMainConnectionID"),
           let propSym = dlsym(handle, "CGSSetConnectionProperty")
     else { return }
@@ -76,47 +104,66 @@ private func enableBackgroundCursorHiding() {
     _ = setProp(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 }
 
+private func withHidConnection<T>(_ body: (io_connect_t) -> T?) -> T? {
+    gHidLock.lock()
+    defer { gHidLock.unlock() }
+    if gHidConn == 0 {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching(kIOHIDSystemClass)
+        )
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var conn: io_connect_t = 0
+        guard IOServiceOpen(
+            service,
+            mach_task_self_,
+            UInt32(kIOHIDParamConnectType),
+            &conn
+        ) == KERN_SUCCESS else {
+            return nil
+        }
+        gHidConn = conn
+    }
+    return body(gHidConn)
+}
+
 private func toggleMacCapsLock() -> Bool? {
-    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
-    guard service != 0 else { return nil }
-    defer { IOObjectRelease(service) }
-
-    var conn: io_connect_t = 0
-    guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
+    return withHidConnection { conn in
+        var cur = false
+        guard IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS else {
+            IOServiceClose(conn)
+            gHidConn = 0
+            return nil
+        }
+        let next = !cur
+        if IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), next) == KERN_SUCCESS {
+            return next
+        }
         return nil
     }
-    defer { IOServiceClose(conn) }
-
-    var cur = false
-    guard IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS else {
-        return nil
-    }
-    let next = !cur
-    if IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), next) == KERN_SUCCESS {
-        return next
-    }
-    return nil
 }
 
 private func currentMacCapsLockOn() -> Bool {
-    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
-    guard service != 0 else { return false }
-    defer { IOObjectRelease(service) }
-
-    var conn: io_connect_t = 0
-    guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
+    return withHidConnection { conn in
+        var cur = false
+        if IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS {
+            return cur
+        }
         return false
-    }
-    defer { IOServiceClose(conn) }
-
-    var cur = false
-    if IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &cur) == KERN_SUCCESS {
-        return cur
-    }
-    return false
+    } ?? false
 }
 
-private func clearRemoteModStateLocked() {
+private func snapshotAndClearRemoteModKeysLocked() -> [UInt16] {
+    var downCodes: [UInt16] = []
+    if gRemoteShiftLeft { downCodes.append(56) }
+    if gRemoteShiftRight { downCodes.append(60) }
+    if gRemoteCtrlLeft { downCodes.append(59) }
+    if gRemoteCtrlRight { downCodes.append(62) }
+    if gRemoteAltLeft { downCodes.append(58) }
+    if gRemoteAltRight { downCodes.append(61) }
+    if gRemoteMetaLeft { downCodes.append(55) }
+    if gRemoteMetaRight { downCodes.append(54) }
     gRemoteShiftLeft = false
     gRemoteShiftRight = false
     gRemoteCtrlLeft = false
@@ -125,22 +172,23 @@ private func clearRemoteModStateLocked() {
     gRemoteAltRight = false
     gRemoteMetaLeft = false
     gRemoteMetaRight = false
+    return downCodes
 }
 
 // MARK: - Primary Screen Geometry
 
 @_cdecl("integrator_kvm_macos_screen_rect")
 public func integrator_kvm_macos_screen_rect(
-    outX: UnsafeMutablePointer<Double>,
-    outY: UnsafeMutablePointer<Double>,
-    outW: UnsafeMutablePointer<Double>,
-    outH: UnsafeMutablePointer<Double>
+    outX: UnsafeMutablePointer<Double>?,
+    outY: UnsafeMutablePointer<Double>?,
+    outW: UnsafeMutablePointer<Double>?,
+    outH: UnsafeMutablePointer<Double>?
 ) {
     let bounds = CGDisplayBounds(CGMainDisplayID())
-    outX.pointee = Double(bounds.origin.x)
-    outY.pointee = Double(bounds.origin.y)
-    outW.pointee = Double(bounds.size.width)
-    outH.pointee = Double(bounds.size.height)
+    outX?.pointee = Double(bounds.origin.x)
+    outY?.pointee = Double(bounds.origin.y)
+    outW?.pointee = Double(bounds.size.width)
+    outH?.pointee = Double(bounds.size.height)
 }
 
 // MARK: - Cursor Visibility & Warp
@@ -153,10 +201,15 @@ public func integrator_kvm_macos_set_controlling(
     restoreX: Double,
     restoreY: Double
 ) {
+    let px = parkX.isFinite ? parkX : 400.0
+    let py = parkY.isFinite ? parkY : 300.0
+    let rx = restoreX.isFinite ? restoreX : px
+    let ry = restoreY.isFinite ? restoreY : py
+
     gStateLock.lock()
     gControllingPeer = controlling
-    gParkX = parkX
-    gParkY = parkY
+    gParkX = px
+    gParkY = py
     if controlling {
         gControllingEnteredAt = CFAbsoluteTimeGetCurrent()
     }
@@ -165,7 +218,7 @@ public func integrator_kvm_macos_set_controlling(
     if controlling {
         enableBackgroundCursorHiding()
         CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
-        CGWarpMouseCursorPosition(CGPoint(x: parkX, y: parkY))
+        CGWarpMouseCursorPosition(CGPoint(x: px, y: py))
         DispatchQueue.main.async {
             gStateLock.lock()
             let stillControlling = gControllingPeer
@@ -179,7 +232,7 @@ public func integrator_kvm_macos_set_controlling(
             }
         }
     } else {
-        CGWarpMouseCursorPosition(CGPoint(x: restoreX, y: restoreY))
+        CGWarpMouseCursorPosition(CGPoint(x: rx, y: ry))
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         DispatchQueue.main.async {
             gStateLock.lock()
@@ -198,16 +251,27 @@ public func integrator_kvm_macos_set_controlling(
 
 @_cdecl("integrator_kvm_macos_set_controlled")
 public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double, entryY: Double) {
+    var modsToRelease: [UInt16] = []
     gStateLock.lock()
-    gControlledByPeer = controlled
     if !controlled {
-        gLeftButtonHeldRemote = false
-        clearRemoteModStateLocked()
+        modsToRelease = snapshotAndClearRemoteModKeysLocked()
     }
     gStateLock.unlock()
 
-    DispatchQueue.main.async {
-        if controlled {
+    if !modsToRelease.isEmpty {
+        let src = CGEventSource(stateID: .hidSystemState)
+        for kc in modsToRelease {
+            if let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false) {
+                ev.type = .flagsChanged
+                ev.flags = [.maskNonCoalesced]
+                ev.setIntegerValueField(.eventSourceUserData, value: kIntegratorEventTag)
+                ev.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    if controlled && entryX.isFinite && entryY.isFinite {
+        DispatchQueue.main.async {
             gStateLock.lock()
             let needShow = gCursorHidden
             if needShow {
@@ -222,16 +286,11 @@ public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double
     }
 }
 
-@_cdecl("integrator_kvm_macos_warp_cursor")
-public func integrator_kvm_macos_warp_cursor(x: Double, y: Double) {
-    CGWarpMouseCursorPosition(CGPoint(x: x, y: y))
-}
-
 // MARK: - Drag Source Probe (`NSPasteboard(name: .drag)`)
 
 @_cdecl("integrator_kvm_macos_probe_drag_paths")
 public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CChar>? {
-    var jsonStr: String? = nil
+    let resultBox = SafeBox<String>()
     let sem = DispatchSemaphore(value: 0)
     let work = {
         let pb = NSPasteboard(name: .drag)
@@ -248,7 +307,7 @@ public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CCha
                    let data = try? JSONSerialization.data(withJSONObject: paths),
                    let str = String(data: data, encoding: .utf8)
                 {
-                    jsonStr = str
+                    resultBox.set(str)
                 }
             }
         }
@@ -260,7 +319,7 @@ public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CCha
         DispatchQueue.main.async(execute: work)
         _ = sem.wait(timeout: .now() + .milliseconds(120))
     }
-    guard let s = jsonStr else { return nil }
+    guard let s = resultBox.get() else { return nil }
     return strdup(s)
 }
 
@@ -282,24 +341,23 @@ public func integrator_kvm_macos_cancel_local_drag() {
 public func integrator_kvm_macos_icon_png_b64(pathPtr: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
     guard let pathPtr = pathPtr else { return nil }
     let path = String(cString: pathPtr)
-    var b64: String? = nil
+    guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return nil }
+
+    let resultBox = SafeBox<String>()
     let sem = DispatchSemaphore(value: 0)
     let work = {
         let icon = NSWorkspace.shared.icon(forFile: path)
         let targetSize = NSSize(width: 48, height: 48)
-        let img = NSImage(size: targetSize)
-        img.lockFocus()
-        icon.draw(in: NSRect(origin: .zero, size: targetSize),
-                  from: .zero,
-                  operation: .copy,
-                  fraction: 1.0)
-        img.unlockFocus()
+        let img = NSImage(size: targetSize, flipped: false) { rect in
+            icon.draw(in: rect, from: .zero, operation: .copy, fraction: 1.0)
+            return true
+        }
         if let tiff = img.tiffRepresentation,
            let rep = NSBitmapImageRep(data: tiff),
            let png = rep.representation(using: .png, properties: [:])
         {
             if png.count <= 48_000 {
-                b64 = png.base64EncodedString()
+                resultBox.set(png.base64EncodedString())
             }
         }
         sem.signal()
@@ -310,7 +368,7 @@ public func integrator_kvm_macos_icon_png_b64(pathPtr: UnsafePointer<CChar>?) ->
         DispatchQueue.main.async(execute: work)
         _ = sem.wait(timeout: .now() + .milliseconds(80))
     }
-    guard let out = b64 else { return nil }
+    guard let out = resultBox.get() else { return nil }
     return strdup(out)
 }
 
@@ -325,6 +383,7 @@ public func integrator_kvm_macos_free_str(ptr: UnsafeMutablePointer<CChar>?) {
 
 @_cdecl("integrator_kvm_macos_inject_mouse_move")
 public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHeld: Bool) {
+    guard x.isFinite, y.isFinite else { return }
     let pt = CGPoint(x: x, y: y)
     let src = CGEventSource(stateID: .hidSystemState)
     let evType: CGEventType = leftHeld ? .leftMouseDragged : .mouseMoved
@@ -336,11 +395,7 @@ public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHel
 
 @_cdecl("integrator_kvm_macos_inject_mouse_button")
 public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Bool, x: Double, y: Double) {
-    if button == 0 {
-        gStateLock.lock()
-        gLeftButtonHeldRemote = pressed
-        gStateLock.unlock()
-    }
+    guard x.isFinite, y.isFinite else { return }
     let pt = CGPoint(x: x, y: y)
     let src = CGEventSource(stateID: .hidSystemState)
     let cgBtn: CGMouseButton
@@ -364,8 +419,10 @@ public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Boo
 
 @_cdecl("integrator_kvm_macos_inject_scroll")
 public func integrator_kvm_macos_inject_scroll(dx: Double, dy: Double) {
-    let pxY = Int32((dy * 12.0).rounded())
-    let pxX = Int32((dx * 12.0).rounded())
+    let safeDx = dx.isFinite ? Swift.max(-4000.0, Swift.min(4000.0, dx * 12.0)) : 0.0
+    let safeDy = dy.isFinite ? Swift.max(-4000.0, Swift.min(4000.0, dy * 12.0)) : 0.0
+    let pxY = Int32(safeDy.rounded())
+    let pxX = Int32(safeDx.rounded())
     if pxX == 0 && pxY == 0 { return }
     let src = CGEventSource(stateID: .hidSystemState)
     if let ev = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: pxY, wheel2: pxX, wheel3: 0) {
@@ -524,6 +581,7 @@ public func integrator_kvm_macos_show_drag_ghost(
     subtitlePtr: UnsafePointer<CChar>?,
     iconB64Ptr: UnsafePointer<CChar>?
 ) {
+    guard cgX.isFinite, cgY.isFinite else { return }
     let title = titlePtr.map { String(cString: $0) } ?? "Universal Drag"
     let subtitle = subtitlePtr.map { String(cString: $0) } ?? "Streaming securely..."
     let iconB64 = iconB64Ptr.map { String(cString: $0) }
@@ -532,7 +590,7 @@ public func integrator_kvm_macos_show_drag_ghost(
         let panel = ensureGhostPanel()
         gGhostTitleLabel?.stringValue = title
         gGhostSubtitleLabel?.stringValue = subtitle
-        if let b64 = iconB64, let raw = Data(base64Encoded: b64), let img = NSImage(data: raw) {
+        if let b64 = iconB64, b64.count <= 80_000, let raw = Data(base64Encoded: b64), let img = NSImage(data: raw) {
             gGhostIconView?.contentTintColor = nil
             gGhostIconView?.image = img
         } else {
@@ -546,6 +604,7 @@ public func integrator_kvm_macos_show_drag_ghost(
 
 @_cdecl("integrator_kvm_macos_move_drag_ghost")
 public func integrator_kvm_macos_move_drag_ghost(cgX: Double, cgY: Double) {
+    guard cgX.isFinite, cgY.isFinite else { return }
     DispatchQueue.main.async {
         guard let panel = gGhostPanel, panel.isVisible else { return }
         panel.setFrameOrigin(cgPointToAppKitScreenOrigin(cgX: cgX, cgY: cgY))
@@ -564,7 +623,9 @@ public func integrator_kvm_macos_hide_drag_ghost() {
 private final class IntegratorDragSourceView: NSView, NSDraggingSource {
     var fileURLs: [URL] = []
     var sessionId: String = ""
+    var sessionToken: UInt64 = 0
     var sessionStarted = false
+    var watchdogWorkItem: DispatchWorkItem? = nil
     weak var hostWindow: NSWindow?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -576,11 +637,13 @@ private final class IntegratorDragSourceView: NSView, NSDraggingSource {
     override func mouseDragged(with event: NSEvent) {
         if sessionStarted || fileURLs.isEmpty { return }
         sessionStarted = true
+        watchdogWorkItem?.cancel()
+        watchdogWorkItem = nil
 
         var items: [NSDraggingItem] = []
-        for (idx, url) in fileURLs.prefix(24).enumerated() {
+        for (idx, url) in fileURLs.prefix(64).enumerated() {
             let item = NSDraggingItem(pasteboardWriter: url as NSURL)
-            let offset = CGFloat(idx.min(4)) * 3.0
+            let offset = CGFloat(Swift.min(idx, 4)) * 3.0
             item.setDraggingFrame(
                 NSRect(x: 16 + offset, y: 16 - offset, width: 44, height: 44),
                 contents: NSWorkspace.shared.icon(forFile: url.path)
@@ -609,9 +672,11 @@ private final class IntegratorDragSourceView: NSView, NSDraggingSource {
         endedAt screenPoint: NSPoint,
         operation: NSDragOperation
     ) {
-        gSyntheticInjectorActive = false
         let accepted = !operation.isEmpty
-        if let cb = gDragEndedCallback {
+        gStateLock.lock()
+        let cb = gDragEndedCallback
+        gStateLock.unlock()
+        if let cb = cb {
             sessionId.withCString { sid in
                 cb(accepted, sid)
             }
@@ -619,12 +684,9 @@ private final class IntegratorDragSourceView: NSView, NSDraggingSource {
     }
 }
 
-private extension Int {
-    func `min`(_ other: Int) -> Int { Swift.min(self, other) }
-}
-
 private var gDragInjectorWindow: NSWindow? = nil
 private var gDragInjectorView: IntegratorDragSourceView? = nil
+private var gDragSessionSeq: UInt64 = 0
 
 @_cdecl("integrator_kvm_macos_begin_native_drag")
 public func integrator_kvm_macos_begin_native_drag(
@@ -633,14 +695,19 @@ public func integrator_kvm_macos_begin_native_drag(
     cgX: Double,
     cgY: Double
 ) {
-    guard let pathsJsonPtr = pathsJsonPtr,
+    guard cgX.isFinite, cgY.isFinite,
+          let pathsJsonPtr = pathsJsonPtr,
           let data = String(cString: pathsJsonPtr).data(using: .utf8),
           let paths = try? JSONSerialization.jsonObject(with: data) as? [String],
           !paths.isEmpty
     else { return }
 
     let sid = sessionIdPtr.map { String(cString: $0) } ?? ""
-    let urls = paths.map { URL(fileURLWithPath: $0) }
+    let urls = paths.compactMap { path -> URL? in
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+    guard !urls.isEmpty else { return }
 
     DispatchQueue.main.async {
         let win: NSWindow
@@ -667,16 +734,39 @@ public func integrator_kvm_macos_begin_native_drag(
             gDragInjectorView = view
         }
 
+        view.watchdogWorkItem?.cancel()
+        gDragSessionSeq &+= 1
+        let myToken = gDragSessionSeq
+
         let mainH = Double(CGDisplayBounds(CGMainDisplayID()).size.height)
         let appKitOrigin = NSPoint(x: cgX - 48.0, y: (mainH - cgY) - 48.0)
         view.fileURLs = urls
         view.sessionId = sid
+        view.sessionToken = myToken
         view.sessionStarted = false
         win.setFrameOrigin(appKitOrigin)
         win.ignoresMouseEvents = false
         win.orderFrontRegardless()
 
-        gSyntheticInjectorActive = true
+        // Watchdog guarantees the invisible capture window never stays click-blocking onscreen
+        // if synthetic events fail or drag is aborted before mouseDragged fires.
+        let watchdog = DispatchWorkItem {
+            guard view.sessionToken == myToken && !view.sessionStarted else { return }
+            win.ignoresMouseEvents = true
+            win.orderOut(nil)
+            gGhostPanel?.orderOut(nil)
+            gStateLock.lock()
+            let cb = gDragEndedCallback
+            gStateLock.unlock()
+            if let cb = cb {
+                sid.withCString { sptr in
+                    cb(false, sptr)
+                }
+            }
+        }
+        view.watchdogWorkItem = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(600), execute: watchdog)
+
         DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(16)) {
             let src = CGEventSource(stateID: .hidSystemState)
             let pDown = CGPoint(x: cgX, y: cgY)
@@ -701,10 +791,16 @@ private func handleTapEvent(
     type: CGEventType,
     event: CGEvent
 ) -> Unmanaged<CGEvent>? {
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let tap = gEventTap {
+    if type == .tapDisabledByTimeout {
+        gStateLock.lock()
+        let tap = gEventTap
+        gStateLock.unlock()
+        if let tap = tap {
             CGEvent.tapEnable(tap: tap, enable: true)
         }
+        return Unmanaged.passUnretained(event)
+    }
+    if type == .tapDisabledByUserInput {
         return Unmanaged.passUnretained(event)
     }
 
@@ -716,13 +812,17 @@ private func handleTapEvent(
     if type == .leftMouseDown {
         // Track NSPasteboard(name: .drag) changeCount at press start (non-blocking)
         DispatchQueue.main.async {
+            let cnt = NSPasteboard(name: .drag).changeCount
             gStateLock.lock()
-            gDragChangeCountAtDown = NSPasteboard(name: .drag).changeCount
+            gDragChangeCountAtDown = cnt
             gStateLock.unlock()
         }
     }
 
-    guard let cb = gKvmCallback else {
+    gStateLock.lock()
+    let cb = gKvmCallback
+    gStateLock.unlock()
+    guard let cb = cb else {
         return Unmanaged.passUnretained(event)
     }
 
@@ -796,7 +896,11 @@ private func handleTapEvent(
 
 @_cdecl("integrator_kvm_macos_is_tap_active")
 public func integrator_kvm_macos_is_tap_active() -> Bool {
-    return gEventTap != nil && AXIsProcessTrusted()
+    gStateLock.lock()
+    let tap = gEventTap
+    gStateLock.unlock()
+    guard let tap = tap else { return false }
+    return CGEvent.tapIsEnabled(tap: tap) && AXIsProcessTrusted()
 }
 
 @_cdecl("integrator_kvm_macos_request_accessibility")
@@ -811,7 +915,7 @@ public func integrator_kvm_macos_request_accessibility() -> Bool {
     if Thread.isMainThread {
         promptWork()
     } else {
-        DispatchQueue.main.sync(execute: promptWork)
+        DispatchQueue.main.async(execute: promptWork)
     }
     return AXIsProcessTrusted()
 }
@@ -821,28 +925,33 @@ public func integrator_kvm_macos_start_tap(
     cb: KvmEventCallback?,
     dragEndedCb: KvmDragEndedCallback?
 ) -> Bool {
+    gTapLifecycleLock.lock()
+    defer { gTapLifecycleLock.unlock() }
+
+    gStateLock.lock()
     gKvmCallback = cb
     gDragEndedCallback = dragEndedCb
-
-    enableBackgroundCursorHiding()
-    gStateLock.lock()
+    let alreadyTap = gEventTap
     let reg = gAtExitRegistered
     if !reg {
         gAtExitRegistered = true
     }
     gStateLock.unlock()
+
+    enableBackgroundCursorHiding()
     if !reg {
         atexit {
             CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         }
     }
 
-    if gEventTap != nil {
-        return AXIsProcessTrusted()
+    if let tap = alreadyTap {
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return CGEvent.tapIsEnabled(tap: tap) && AXIsProcessTrusted()
     }
 
     let sem = DispatchSemaphore(value: 0)
-    var ok = false
+    let startResult = SafeBox<Bool>()
 
     let thread = Thread {
         let maskList: [CGEventType] = [
@@ -869,26 +978,69 @@ public func integrator_kvm_macos_start_tap(
             callback: callback,
             userInfo: nil
         ) else {
+            startResult.set(false)
             sem.signal()
             return
         }
 
+        let rl = CFRunLoopGetCurrent()
+        gStateLock.lock()
         gEventTap = tap
-        ok = true
+        gTapRunLoop = rl
+        gStateLock.unlock()
+
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CFRunLoopAddSource(rl, src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        startResult.set(true)
         sem.signal()
         CFRunLoopRun()
+
+        gStateLock.lock()
+        if gTapRunLoop === rl {
+            gTapRunLoop = nil
+            gEventTap = nil
+        }
+        gStateLock.unlock()
     }
     thread.name = "Integrator.KvmEventTap"
     thread.qualityOfService = .userInteractive
+    gStateLock.lock()
+    gTapThread = thread
+    gStateLock.unlock()
     thread.start()
+
     _ = sem.wait(timeout: .now() + .seconds(2))
-    if ok {
-        gTapThread = thread
-    } else {
+    let started = startResult.get() ?? false
+    if !started {
+        gStateLock.lock()
         gTapThread = nil
+        gStateLock.unlock()
     }
-    return ok
+    return started
+}
+
+@_cdecl("integrator_kvm_macos_stop_tap")
+public func integrator_kvm_macos_stop_tap() {
+    gTapLifecycleLock.lock()
+    defer { gTapLifecycleLock.unlock() }
+
+    gStateLock.lock()
+    let tap = gEventTap
+    let rl = gTapRunLoop
+    gEventTap = nil
+    gTapRunLoop = nil
+    gTapThread = nil
+    gKvmCallback = nil
+    gDragEndedCallback = nil
+    gStateLock.unlock()
+
+    if let tap = tap {
+        CGEvent.tapEnable(tap: tap, enable: false)
+        CFMachPortInvalidate(tap)
+    }
+    if let rl = rl {
+        CFRunLoopStop(rl)
+    }
+    CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
 }

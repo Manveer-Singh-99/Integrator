@@ -8,8 +8,100 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+static APP_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SYSTEM_INFO_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn app_config_lock() -> &'static Mutex<()> {
+    APP_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn system32_exe(name: &str) -> PathBuf {
+    if let Ok(root) = std::env::var("SystemRoot") {
+        let p = PathBuf::from(root).join("System32").join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from(r"C:\Windows\System32").join(name)
+}
+
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Refusing to overwrite symlink",
+            ));
+        }
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing parent path")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let seq = SYSTEM_INFO_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{}.{}.{}.tmp", fname, std::process::id(), seq));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn find_nvidia_smi_path() -> Option<PathBuf> {
+    let sys = system32_exe("nvidia-smi.exe");
+    if sys.is_file() {
+        return Some(sys);
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let p = PathBuf::from(pf)
+            .join("NVIDIA Corporation")
+            .join("NVSMI")
+            .join("nvidia-smi.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PrimaryDisplayInfo {
@@ -146,46 +238,77 @@ extern "C" {
     fn freeifaddrs(ifa: *mut DarwinIfAddrs);
 }
 
-pub fn user_home_dir() -> PathBuf {
+pub fn try_user_home_dir() -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         if let Ok(h) = std::env::var("HOME") {
-            if !h.trim().is_empty() {
-                return PathBuf::from(h);
+            let trimmed = h.trim();
+            if !trimmed.is_empty() && !trimmed.contains('\0') {
+                let p = PathBuf::from(trimmed);
+                if p.is_absolute() {
+                    return Some(p);
+                }
             }
         }
-        std::env::temp_dir()
+        None
     }
     #[cfg(target_os = "windows")]
     {
         if let Ok(h) = std::env::var("USERPROFILE") {
-            if !h.trim().is_empty() {
-                return PathBuf::from(h);
+            let trimmed = h.trim();
+            if !trimmed.is_empty() && !trimmed.contains('\0') {
+                return Some(PathBuf::from(trimmed));
             }
         }
         if let (Ok(d), Ok(p)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
-            let combined = format!("{}{}", d, p);
-            if !combined.trim().is_empty() {
-                return PathBuf::from(combined);
+            let combined = format!("{}{}", d.trim(), p.trim());
+            if !combined.is_empty() && !combined.contains('\0') {
+                return Some(PathBuf::from(combined));
             }
         }
         if let Ok(app) = std::env::var("LOCALAPPDATA") {
-            if !app.trim().is_empty() {
-                return PathBuf::from(app);
+            let trimmed = app.trim();
+            if !trimmed.is_empty() && !trimmed.contains('\0') {
+                return Some(PathBuf::from(trimmed));
             }
         }
-        std::env::temp_dir()
+        None
     }
 }
 
-/// Persistent app state directory (`~/.usbc_clipboard_cache`), preserving existing settings.
+pub fn user_home_dir() -> PathBuf {
+    try_user_home_dir().unwrap_or_else(|| {
+        #[cfg(not(target_os = "windows"))]
+        {
+            PathBuf::from("/var/empty/integrator_no_home")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            PathBuf::from(r"C:\ProgramData\IntegratorInvalidHome")
+        }
+    })
+}
+
+/// Persistent app state directory (`~/.usbc_clipboard_cache`), never falling back to `/tmp`.
 pub fn app_data_dir() -> PathBuf {
     let dir = user_home_dir().join(".usbc_clipboard_cache");
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() {
+            tracing::error!("Refusing symlinked app_data_dir: {}", dir.display());
+            return dir;
+        }
+    }
     let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     dir
 }
 
 pub fn load_path_preferences() -> AppPathPreferences {
+    let _guard = app_config_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = app_data_dir().join("app_config.json");
     std::fs::read_to_string(path)
         .ok()
@@ -194,9 +317,23 @@ pub fn load_path_preferences() -> AppPathPreferences {
 }
 
 pub fn save_path_preferences(prefs: &AppPathPreferences) -> std::io::Result<()> {
-    let path = app_data_dir().join("app_config.json");
+    let _guard = app_config_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let dir = app_data_dir();
+    if try_user_home_dir().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Home directory environment variables are unset; refusing insecure temp fallback",
+        ));
+    }
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join("app_config.json");
     let json = serde_json::to_string_pretty(prefs).unwrap_or_else(|_| "{}".into());
-    std::fs::write(path, json)
+    atomic_write_private(&path, json.as_bytes())
 }
 
 /// Resolve the active user's Desktop (falling back to Downloads or home dir) dynamically.
@@ -242,7 +379,7 @@ pub fn user_desktop_or_downloads_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn win_cmd(program: &str) -> Command {
+fn win_cmd(program: &Path) -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut cmd = Command::new(program);
@@ -252,7 +389,7 @@ fn win_cmd(program: &str) -> Command {
 
 #[cfg(target_os = "windows")]
 fn query_windows_shell_folder(value_name: &str) -> Option<String> {
-    let out = win_cmd("reg")
+    let out = win_cmd(&system32_exe("reg.exe"))
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
@@ -320,7 +457,7 @@ pub fn get_hostname() -> String {
     #[cfg(target_os = "macos")]
     {
         for key in ["ComputerName", "LocalHostName"] {
-            if let Ok(out) = Command::new("scutil").args(["--get", key]).output() {
+            if let Ok(out) = Command::new("/usr/sbin/scutil").args(["--get", key]).output() {
                 if out.status.success() {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !s.is_empty() {
@@ -329,7 +466,7 @@ pub fn get_hostname() -> String {
                 }
             }
         }
-        if let Ok(out) = Command::new("hostname").arg("-s").output() {
+        if let Ok(out) = Command::new("/bin/hostname").arg("-s").output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
@@ -347,7 +484,7 @@ pub fn get_hostname() -> String {
                 return trimmed;
             }
         }
-        if let Ok(out) = win_cmd("hostname").output() {
+        if let Ok(out) = win_cmd(&system32_exe("hostname.exe")).output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
@@ -366,7 +503,7 @@ pub fn get_hostname() -> String {
 pub fn get_hardware_model_and_cpu() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
-        let model = Command::new("sysctl")
+        let model = Command::new("/usr/sbin/sysctl")
             .args(["-n", "hw.model"])
             .output()
             .ok()
@@ -378,7 +515,7 @@ pub fn get_hardware_model_and_cpu() -> (String, String) {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Mac".into());
 
-        let cpu = Command::new("sysctl")
+        let cpu = Command::new("/usr/sbin/sysctl")
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
@@ -422,7 +559,7 @@ pub fn get_hardware_model_and_cpu() -> (String, String) {
 
 #[cfg(target_os = "windows")]
 fn reg_query_sz(key: &str, value: &str) -> Option<String> {
-    let out = win_cmd("reg")
+    let out = win_cmd(&system32_exe("reg.exe"))
         .args(["query", key, "/v", value])
         .output()
         .ok()?;
@@ -454,13 +591,13 @@ pub fn has_touch_bar_hardware() -> bool {
         static HAS_TB: OnceLock<bool> = OnceLock::new();
         *HAS_TB.get_or_init(|| {
             for class_name in ["AppleDFR", "AppleTouchBar"] {
-                if let Ok(out) = Command::new("ioreg").args(["-rc", class_name]).output() {
+                if let Ok(out) = Command::new("/usr/sbin/ioreg").args(["-rc", class_name]).output() {
                     if out.status.success() && !out.stdout.is_empty() {
                         return true;
                     }
                 }
             }
-            if let Ok(out) = Command::new("ioreg").args(["-n", "dispdfr", "-r"]).output() {
+            if let Ok(out) = Command::new("/usr/sbin/ioreg").args(["-n", "dispdfr", "-r"]).output() {
                 if out.status.success() && !out.stdout.is_empty() {
                     return true;
                 }
@@ -621,7 +758,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(cmd) = Command::new("system_profiler")
+        if let Ok(cmd) = Command::new("/usr/sbin/system_profiler")
             .args(["SPDisplaysDataType", "-json"])
             .output()
         {
@@ -676,31 +813,33 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
     #[cfg(target_os = "windows")]
     {
         // First collect any NVIDIA GPUs via nvidia-smi for exact model + VRAM.
-        if let Ok(cmd) = win_cmd("nvidia-smi")
-            .args(["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"])
-            .output()
-        {
-            if cmd.status.success() {
-                let txt = String::from_utf8_lossy(&cmd.stdout);
-                for line in txt.lines() {
-                    let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                    if parts.len() >= 2 && !parts[1].is_empty() {
-                        let idx = parts[0].parse::<u32>().unwrap_or(out.len() as u32);
-                        let vram = parts.get(2).and_then(|s| s.parse::<u64>().ok());
-                        out.push(GpuDeviceInfo {
-                            index: idx,
-                            name: parts[1].to_string(),
-                            vendor: "NVIDIA".into(),
-                            is_discrete: true,
-                            vram_mb: vram,
-                        });
+        if let Some(nvidia_smi_path) = find_nvidia_smi_path() {
+            if let Ok(cmd) = win_cmd(&nvidia_smi_path)
+                .args(["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"])
+                .output()
+            {
+                if cmd.status.success() {
+                    let txt = String::from_utf8_lossy(&cmd.stdout);
+                    for line in txt.lines() {
+                        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                        if parts.len() >= 2 && !parts[1].is_empty() {
+                            let idx = parts[0].parse::<u32>().unwrap_or(out.len() as u32);
+                            let vram = parts.get(2).and_then(|s| s.parse::<u64>().ok());
+                            out.push(GpuDeviceInfo {
+                                index: idx,
+                                name: parts[1].to_string(),
+                                vendor: "NVIDIA".into(),
+                                is_discrete: true,
+                                vram_mb: vram,
+                            });
+                        }
                     }
                 }
             }
         }
 
         // Also inspect Windows Display class registry keys for all adapters (Intel, AMD, NVIDIA, etc.).
-        if let Ok(cmd) = win_cmd("reg")
+        if let Ok(cmd) = win_cmd(&system32_exe("reg.exe"))
             .args([
                 "query",
                 r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
@@ -943,7 +1082,7 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
             }
         }
         // Spotlight bundle ID fallback if installed anywhere else on disk.
-        if let Ok(out) = Command::new("mdfind")
+        if let Ok(out) = Command::new("/usr/bin/mdfind")
             .arg("kMDItemCFBundleIdentifier == 'com.moonlight-stream.Moonlight'")
             .output()
         {
@@ -1011,9 +1150,18 @@ pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
     (name, port, adapter)
 }
 
+fn validate_sunshine_adapter_name(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.chars().any(|c| c.is_control()) {
+        anyhow::bail!("Invalid Sunshine adapter_name value");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Update `adapter_name` inside `sunshine.conf` safely; returns `Ok(true)` if changed.
 #[allow(dead_code)]
 pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
+    let clean_name = validate_sunshine_adapter_name(adapter_name)?;
     let conf_path = find_sunshine_conf()
         .ok_or_else(|| anyhow::anyhow!("sunshine.conf not found on this machine"))?;
     let content = std::fs::read_to_string(&conf_path)?;
@@ -1026,22 +1174,23 @@ pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
         if let Some((k, v)) = trimmed.split_once('=') {
             if k.trim() == "adapter_name" {
                 found = true;
-                if v.trim() != adapter_name {
+                if v.trim() != clean_name {
                     changed = true;
                 }
-                lines.push(format!("adapter_name = {}", adapter_name));
+                lines.push(format!("adapter_name = {}", clean_name));
                 continue;
             }
         }
         lines.push(raw.to_string());
     }
     if !found {
-        lines.push(format!("adapter_name = {}", adapter_name));
+        lines.push(format!("adapter_name = {}", clean_name));
         changed = true;
     }
 
     if changed {
-        std::fs::write(&conf_path, lines.join("\n") + "\n")?;
+        let payload = lines.join("\n") + "\n";
+        atomic_write_private(&conf_path, payload.as_bytes())?;
     }
     Ok(changed)
 }
@@ -1058,7 +1207,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = Command::new("sharing").arg("-l").output() {
+        if let Ok(out) = Command::new("/usr/bin/sharing").arg("-l").output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let mut current_name: Option<String> = None;
@@ -1107,7 +1256,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(out) = win_cmd("net").arg("share").output() {
+        if let Ok(out) = win_cmd(&system32_exe("net.exe")).arg("share").output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let mut in_rows = false;
@@ -1263,6 +1412,18 @@ fn compute_broadcast(ip: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
 }
 
 #[cfg(target_os = "macos")]
+struct IfAddrsGuard(*mut DarwinIfAddrs);
+
+#[cfg(target_os = "macos")]
+impl Drop for IfAddrsGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { freeifaddrs(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     let port_map = cached_mac_hardware_ports();
     let mut ifap: *mut DarwinIfAddrs = std::ptr::null_mut();
@@ -1270,6 +1431,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     if rc != 0 || ifap.is_null() {
         return Vec::new();
     }
+    let _guard = IfAddrsGuard(ifap);
 
     const IFF_UP: u32 = 0x1;
     const IFF_LOOPBACK: u32 = 0x8;
@@ -1288,7 +1450,9 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             continue;
         }
         let sa = unsafe { &*entry.ifa_addr };
-        if sa.sa_family != AF_INET {
+        if sa.sa_family != AF_INET
+            || (sa.sa_len as usize) < std::mem::size_of::<DarwinSockAddrIn>()
+        {
             continue;
         }
         let sin = unsafe { &*(entry.ifa_addr as *const DarwinSockAddrIn) };
@@ -1299,9 +1463,18 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
 
         let mask = if !entry.ifa_netmask.is_null() {
             let nsa = unsafe { &*entry.ifa_netmask };
-            if nsa.sa_family == AF_INET {
-                let nsin = unsafe { &*(entry.ifa_netmask as *const DarwinSockAddrIn) };
-                Ipv4Addr::from(nsin.sin_addr.to_ne_bytes())
+            let nlen = nsa.sa_len as usize;
+            if nlen >= 5 && (nsa.sa_family == AF_INET || nsa.sa_family == 0) {
+                let copy_len = (nlen - 4).min(4);
+                let mut mask_bytes = [0u8; 4];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (entry.ifa_netmask as *const u8).add(4),
+                        mask_bytes.as_mut_ptr(),
+                        copy_len,
+                    );
+                }
+                Ipv4Addr::from(mask_bytes)
             } else {
                 Ipv4Addr::new(255, 255, 255, 0)
             }
@@ -1349,8 +1522,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         });
     }
 
-    unsafe { freeifaddrs(ifap) };
-
+    // IfAddrsGuard frees `ifap` on drop.
     // Sort best wired / direct links before Wi-Fi
     out.sort_by_key(|i| i.transport);
     out
@@ -1373,7 +1545,7 @@ fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
     }
 
     let mut map = std::collections::HashMap::new();
-    if let Ok(out) = Command::new("networksetup")
+    if let Ok(out) = Command::new("/usr/sbin/networksetup")
         .arg("-listallhardwareports")
         .output()
     {
@@ -1441,7 +1613,7 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
     }
 
     let mut speed_mbps = None;
-    if let Ok(out) = Command::new("ifconfig").arg(iface).output() {
+    if let Ok(out) = Command::new("/sbin/ifconfig").arg(iface).output() {
         if out.status.success() {
             let txt = String::from_utf8_lossy(&out.stdout);
             for line in txt.lines() {
@@ -1491,7 +1663,7 @@ fn mac_is_usb_ncm_interface(iface: &str) -> bool {
     }
 
     let mut fresh = HashSet::new();
-    if let Ok(out) = Command::new("ioreg")
+    if let Ok(out) = Command::new("/usr/sbin/ioreg")
         .args(["-r", "-c", "AppleUSBDeviceNCMData", "-l"])
         .output()
     {
@@ -1548,14 +1720,27 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         fn GetIpAddrTable(p_ip_addr_table: *mut u8, pdw_size: *mut u32, b_order: i32) -> u32;
     }
 
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     let mut size: u32 = 0;
     let _ = unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
     if size < 4 {
         return Vec::new();
     }
     let mut buf = vec![0u8; size as usize];
-    let rc = unsafe { GetIpAddrTable(buf.as_mut_ptr(), &mut size, 1) };
-    if rc != 0 {
+    let mut succeeded = false;
+    for _ in 0..3 {
+        let rc = unsafe { GetIpAddrTable(buf.as_mut_ptr(), &mut size, 1) };
+        if rc == 0 {
+            succeeded = true;
+            break;
+        }
+        if rc == ERROR_INSUFFICIENT_BUFFER && (size as usize) > buf.len() && (size as usize) <= 4 * 1024 * 1024 {
+            buf.resize(size as usize, 0);
+        } else {
+            return Vec::new();
+        }
+    }
+    if !succeeded || buf.len() < 4 {
         return Vec::new();
     }
 
@@ -1644,7 +1829,8 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
     }
 
     let mut map = std::collections::HashMap::new();
-    if let Ok(out) = win_cmd("powershell")
+    let ps_exe = system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    if let Ok(out) = win_cmd(&ps_exe)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1669,7 +1855,15 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
                 let medium = parts.get(4).map(|s| s.trim()).unwrap_or("");
                 let combined = format!("{} {} {}", name, desc, medium).to_ascii_lowercase();
 
-                let transport = if combined.contains("wi-fi")
+                let is_vpn = combined.contains("wintun")
+                    || combined.contains("wireguard")
+                    || combined.contains("tailscale")
+                    || combined.contains("zerotier")
+                    || combined.contains("tap-windows");
+
+                let transport = if is_vpn {
+                    LinkTransport::Unknown
+                } else if combined.contains("wi-fi")
                     || combined.contains("wireless")
                     || combined.contains("wlan")
                     || combined.contains("802.11")
@@ -1682,7 +1876,6 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
                     || combined.contains("cdc")
                     || combined.contains("rndis")
                     || combined.contains("apple mobile")
-                    || combined.contains("wintun")
                 {
                     LinkTransport::DirectUsb
                 } else {
@@ -1699,20 +1892,48 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
     map
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn parse_windows_link_speed(raw: &str) -> Option<u32> {
-    let lower = raw.to_ascii_lowercase().replace(',', ".");
-    let num_str: String = lower
+    let lower = raw.trim().to_ascii_lowercase();
+    let num_token: String = lower
         .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
         .collect();
-    let val: f64 = num_str.parse().ok()?;
-    if lower.contains("gbps") || lower.contains("gbit") {
-        Some((val * 1000.0).round() as u32)
-    } else if lower.contains("mbps") || lower.contains("mbit") {
-        Some(val.round() as u32)
+    if num_token.is_empty() {
+        return None;
+    }
+
+    let is_gbps = lower.contains("gbps") || lower.contains("gbit");
+    let is_mbps = lower.contains("mbps") || lower.contains("mbit");
+    if !is_gbps && !is_mbps {
+        return None;
+    }
+
+    // Distinguish English thousands separators ("1,000 Mbps", "10,000 Mbps")
+    // from locale decimal commas ("2,5 Gbps").
+    let normalized = if num_token.contains('.') {
+        num_token.replace(',', "")
+    } else if num_token.contains(',') {
+        let parts: Vec<&str> = num_token.split(',').collect();
+        let is_thousands_grouping = parts.len() >= 2
+            && parts.iter().skip(1).all(|p| p.len() == 3 && p.chars().all(|c| c.is_ascii_digit()));
+        if is_thousands_grouping && is_mbps {
+            num_token.replace(',', "")
+        } else {
+            num_token.replacen(',', ".", 1).replace(',', "")
+        }
     } else {
-        None
+        num_token
+    };
+
+    let val: f64 = normalized.parse().ok()?;
+    if !val.is_finite() || val <= 0.0 {
+        return None;
+    }
+    if is_gbps {
+        Some((val * 1000.0).round() as u32)
+    } else {
+        Some(val.round() as u32)
     }
 }
 
@@ -1728,7 +1949,9 @@ pub fn is_local_file_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ioreg_usb_ncm_bsd_names;
+    use super::{
+        parse_ioreg_usb_ncm_bsd_names, parse_windows_link_speed, validate_sunshine_adapter_name,
+    };
 
     #[test]
     fn test_parse_ioreg_usb_ncm_bsd_names() {
@@ -1752,5 +1975,21 @@ mod tests {
         assert!(parsed.contains("en5"));
         assert!(!parsed.contains("anpi0"));
         assert!(!parsed.contains("en0"));
+    }
+
+    #[test]
+    fn test_windows_link_speed_thousands_and_decimals() {
+        assert_eq!(parse_windows_link_speed("1,000 Mbps"), Some(1000));
+        assert_eq!(parse_windows_link_speed("10,000 Mbps"), Some(10000));
+        assert_eq!(parse_windows_link_speed("2.5 Gbps"), Some(2500));
+        assert_eq!(parse_windows_link_speed("2,5 Gbps"), Some(2500));
+        assert_eq!(parse_windows_link_speed("100 Mbps"), Some(100));
+        assert_eq!(parse_windows_link_speed("Disconnected"), None);
+    }
+
+    #[test]
+    fn test_sunshine_adapter_name_rejects_control_chars() {
+        assert!(validate_sunshine_adapter_name("NVIDIA GeForce RTX 4090\nport = 1").is_err());
+        assert!(validate_sunshine_adapter_name("NVIDIA GeForce RTX 4090").is_ok());
     }
 }

@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::TELEMETRY_PORT;
+use crate::features::FeatureManager;
 use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
 
@@ -21,8 +22,10 @@ const MODE_DOWNLOAD: u8 = 3;
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KiB (matches TransportV2 MAX_RECORD_PLAINTEXT_LEN)
 const DEFAULT_BENCHMARK_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB adaptive baseline
 const MAX_BENCHMARK_BYTES: u64 = 128 * 1024 * 1024; // Hard 128 MiB cap per direction
+const MAX_PRE_AUTH_BENCH_CONNS: usize = 16;
 const MAX_CONCURRENT_BENCH_CONNS: usize = 4;
 const BENCH_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_BENCH_SESSION_DURATION: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedTestResult {
@@ -41,27 +44,40 @@ pub struct BenchmarkServer;
 
 impl BenchmarkServer {
     /// Starts the background benchmark receiver listening on TELEMETRY_PORT (58285).
-    pub async fn start() -> Result<()> {
+    pub async fn start(features: Arc<FeatureManager>) -> Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", TELEMETRY_PORT))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind benchmark server on port {}: {}", TELEMETRY_PORT, e))?;
         info!("⚡ Speed Benchmark Server active on port {}", TELEMETRY_PORT);
 
-        let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_BENCH_CONNS));
+        let pre_auth_limiter = Arc::new(Semaphore::new(MAX_PRE_AUTH_BENCH_CONNS));
+        let post_auth_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_BENCH_CONNS));
 
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
-                        let Ok(permit) = Arc::clone(&conn_limiter).try_acquire_owned() else {
-                            warn!("Dropped benchmark connection from {}: concurrency limit reached", addr);
+                        if !features.is_enabled("benchmark") {
+                            debug!(
+                                "Dropped benchmark connection from {}: benchmark feature is disabled",
+                                addr
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                        let Ok(pre_permit) = Arc::clone(&pre_auth_limiter).try_acquire_owned() else {
+                            warn!(
+                                "Dropped pre-auth benchmark connection from {}: pre-auth concurrency limit reached",
+                                addr
+                            );
                             drop(socket);
                             continue;
                         };
                         let peer_ip = addr.ip();
                         let _ = socket.set_nodelay(true);
+                        let post_lim = Arc::clone(&post_auth_limiter);
+                        let features_ref = Arc::clone(&features);
                         tokio::spawn(async move {
-                            let _permit = permit;
                             let session = match trust::accept_transport_from_stream(
                                 socket,
                                 peer_ip,
@@ -76,9 +92,29 @@ impl BenchmarkServer {
                                     return;
                                 }
                             };
+                            drop(pre_permit);
+
+                            if !features_ref.is_enabled("benchmark") {
+                                return;
+                            }
+                            let Ok(_post_permit) = post_lim.try_acquire_owned() else {
+                                warn!(
+                                    "Dropped authenticated benchmark connection from {}: active benchmark concurrency limit reached",
+                                    addr
+                                );
+                                return;
+                            };
+
                             debug!("Authenticated TransportV2 benchmark connection from {}", addr);
-                            if let Err(e) = Self::handle_connection(session).await {
-                                debug!("Benchmark session ended: {}", e);
+                            match tokio::time::timeout(
+                                MAX_BENCH_SESSION_DURATION,
+                                Self::handle_connection(session, features_ref),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => debug!("Benchmark session ended: {}", e),
+                                Err(_) => warn!("Benchmark session timed out after {:?}", MAX_BENCH_SESSION_DURATION),
                             }
                         });
                     }
@@ -93,10 +129,16 @@ impl BenchmarkServer {
         Ok(())
     }
 
-    async fn handle_connection(mut session: TransportSessionV2<TcpStream>) -> Result<()> {
+    async fn handle_connection(
+        mut session: TransportSessionV2<TcpStream>,
+        features: Arc<FeatureManager>,
+    ) -> Result<()> {
         let dummy_chunk = vec![0xAAu8; CHUNK_SIZE];
 
         loop {
+            if !features.is_enabled("benchmark") {
+                anyhow::bail!("Benchmark feature disabled");
+            }
             let cmd = match tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message()).await {
                 Ok(Ok(msg)) if msg.len() == 9 => msg,
                 _ => break,
@@ -163,7 +205,10 @@ pub struct BenchmarkClient;
 
 impl BenchmarkClient {
     /// Executes a live active throughput & latency benchmark against peer_ip with a 20-second safety timeout.
-    pub async fn run_test(peer_ip: &str) -> Result<SpeedTestResult> {
+    pub async fn run_test(peer_ip: &str, features: &FeatureManager) -> Result<SpeedTestResult> {
+        if !features.is_enabled("benchmark") {
+            anyhow::bail!("Speed benchmark is disabled in feature settings.");
+        }
         tokio::time::timeout(Duration::from_secs(20), Self::run_test_internal(peer_ip))
             .await
             .map_err(|_| anyhow::anyhow!("Speed benchmark timed out after 20 seconds"))?
@@ -185,18 +230,23 @@ impl BenchmarkClient {
             let start = Instant::now();
             let mut cmd = [0u8; 9];
             cmd[0] = MODE_PING;
-            cmd[1..9].copy_from_slice(&seq.to_be_bytes());
-            session
-                .send_message(&cmd)
+            let expected_seq = seq.to_be_bytes();
+            cmd[1..9].copy_from_slice(&expected_seq);
+            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&cmd))
                 .await
+                .map_err(|_| anyhow::anyhow!("Benchmark ping send timed out"))?
                 .map_err(|e| anyhow::anyhow!("Benchmark ping send error: {}", e))?;
 
-            let reply = session
-                .recv_message()
+            let reply = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
                 .await
+                .map_err(|_| anyhow::anyhow!("Benchmark ping recv timed out"))?
                 .map_err(|e| anyhow::anyhow!("Benchmark ping recv error: {}", e))?;
-            if reply.len() != 8 {
-                anyhow::bail!("Invalid benchmark ping reply length {}", reply.len());
+            if reply.as_slice() != expected_seq {
+                anyhow::bail!(
+                    "Invalid benchmark ping echo payload (expected seq {}, got {} bytes)",
+                    seq,
+                    reply.len()
+                );
             }
             latencies.push(start.elapsed().as_secs_f64() * 1000.0);
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -219,24 +269,24 @@ impl BenchmarkClient {
         let mut up_cmd = [0u8; 9];
         up_cmd[0] = MODE_UPLOAD;
         up_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
-        session
-            .send_message(&up_cmd)
+        tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&up_cmd))
             .await
+            .map_err(|_| anyhow::anyhow!("Benchmark upload command timed out"))?
             .map_err(|e| anyhow::anyhow!("Benchmark upload command error: {}", e))?;
 
         let mut remaining = bench_bytes;
         while remaining > 0 {
             let to_write = std::cmp::min(remaining, dummy_chunk.len() as u64) as usize;
-            session
-                .send_message(&dummy_chunk[..to_write])
+            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&dummy_chunk[..to_write]))
                 .await
+                .map_err(|_| anyhow::anyhow!("Benchmark upload frame timed out"))?
                 .map_err(|e| anyhow::anyhow!("Benchmark upload frame error: {}", e))?;
             remaining -= to_write as u64;
         }
 
-        let ack = session
-            .recv_message()
+        let ack = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
             .await
+            .map_err(|_| anyhow::anyhow!("Benchmark upload ack timed out"))?
             .map_err(|e| anyhow::anyhow!("Benchmark upload ack recv error: {}", e))?;
         if ack.as_slice() != [1u8] {
             anyhow::bail!("Invalid benchmark upload ACK from {}", peer_ip);
@@ -250,16 +300,16 @@ impl BenchmarkClient {
         let mut down_cmd = [0u8; 9];
         down_cmd[0] = MODE_DOWNLOAD;
         down_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
-        session
-            .send_message(&down_cmd)
+        tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&down_cmd))
             .await
+            .map_err(|_| anyhow::anyhow!("Benchmark download command timed out"))?
             .map_err(|e| anyhow::anyhow!("Benchmark download command error: {}", e))?;
 
         let mut remaining = bench_bytes;
         while remaining > 0 {
-            let chunk = session
-                .recv_message()
+            let chunk = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
                 .await
+                .map_err(|_| anyhow::anyhow!("Benchmark download frame timed out"))?
                 .map_err(|e| anyhow::anyhow!("Benchmark download frame error: {}", e))?;
             if chunk.is_empty() || (chunk.len() as u64) > remaining {
                 anyhow::bail!("Benchmark download invalid chunk size {}", chunk.len());
@@ -290,5 +340,20 @@ impl BenchmarkClient {
             peer_ip: peer_ip.to_string(),
             summary,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::FeatureFlags;
+
+    #[tokio::test]
+    async fn client_refuses_when_benchmark_feature_disabled() {
+        let mut flags = FeatureFlags::default();
+        flags.benchmark = false;
+        let mgr = FeatureManager::from_flags_for_test(flags);
+        let res = BenchmarkClient::run_test("127.0.0.1", &mgr).await;
+        assert!(res.is_err());
     }
 }

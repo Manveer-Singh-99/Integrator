@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +29,7 @@ pub type UiEventCallback = extern "C" fn(event_name: *const c_char, payload_json
 
 pub static GLOBAL_CORE: OnceLock<Arc<IntegratorCore>> = OnceLock::new();
 static UI_EVENT_CALLBACK: Mutex<Option<UiEventCallback>> = Mutex::new(None);
+static IN_FLIGHT_UI_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 static LOG_RING: Mutex<Option<VecDeque<LogEntry>>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
@@ -164,21 +167,39 @@ pub struct IntegratorCore {
 #[derive(Default)]
 struct LogVisitor {
     msg: String,
+    fields: Vec<String>,
+}
+
+impl LogVisitor {
+    fn into_message(self) -> String {
+        if self.fields.is_empty() {
+            self.msg
+        } else if self.msg.is_empty() {
+            self.fields.join(", ")
+        } else {
+            format!("{} [{}]", self.msg, self.fields.join(", "))
+        }
+    }
 }
 
 impl tracing::field::Visit for LogVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let mut rendered = format!("{:?}", value);
+        if rendered.starts_with('"') && rendered.ends_with('"') && rendered.len() >= 2 {
+            rendered = rendered[1..rendered.len() - 1].to_string();
+        }
         if field.name() == "message" {
-            self.msg = format!("{:?}", value);
-            if self.msg.starts_with('"') && self.msg.ends_with('"') && self.msg.len() >= 2 {
-                self.msg = self.msg[1..self.msg.len() - 1].to_string();
-            }
+            self.msg = rendered;
+        } else {
+            self.fields.push(format!("{}={}", field.name(), rendered));
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
             self.msg = value.to_string();
+        } else {
+            self.fields.push(format!("{}={}", field.name(), value));
         }
     }
 }
@@ -193,7 +214,8 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
     ) {
         let mut vis = LogVisitor::default();
         event.record(&mut vis);
-        if vis.msg.is_empty() {
+        let formatted_msg = vis.into_message();
+        if formatted_msg.is_empty() {
             return;
         }
         let ts_ms = SystemTime::now()
@@ -203,7 +225,7 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
         let entry = LogEntry {
             ts_ms,
             level: event.metadata().level().to_string(),
-            message: vis.msg,
+            message: formatted_msg,
         };
         if let Ok(mut guard) = LOG_RING.lock() {
             let deque = guard.get_or_insert_with(|| VecDeque::with_capacity(200));
@@ -218,17 +240,42 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
     }
 }
 
+struct InFlightCallbackGuard;
+
+impl Drop for InFlightCallbackGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_UI_CALLBACKS.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub fn register_ui_callback(cb: Option<UiEventCallback>) {
     if let Ok(mut guard) = UI_EVENT_CALLBACK.lock() {
         *guard = cb;
     }
+    if cb.is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while IN_FLIGHT_UI_CALLBACKS.load(Ordering::Acquire) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
 }
 
 pub fn emit_ui_event(event_name: &str, payload_json: &str) {
-    let cb_opt = UI_EVENT_CALLBACK.lock().ok().and_then(|g| *g);
-    let Some(cb) = cb_opt else { return };
     let Ok(ev) = CString::new(event_name) else { return };
     let Ok(pl) = CString::new(payload_json) else { return };
+    let (cb, _guard) = {
+        let Ok(guard) = UI_EVENT_CALLBACK.lock() else {
+            return;
+        };
+        let Some(cb) = *guard else {
+            return;
+        };
+        IN_FLIGHT_UI_CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        (cb, InFlightCallbackGuard)
+    };
     cb(ev.as_ptr(), pl.as_ptr());
 }
 
@@ -250,20 +297,37 @@ pub fn get_recent_logs() -> Vec<LogEntry> {
     Vec::new()
 }
 
+fn spawn_and_reap(mut cmd: std::process::Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        let _ = std::thread::Builder::new()
+            .name("process-reaper".to_string())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+}
+
 pub fn open_app_data_folder() {
     let cache_dir = system_info::app_data_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&cache_dir).spawn();
+    {
+        let mut cmd = std::process::Command::new("/usr/bin/open");
+        cmd.arg(&cache_dir);
+        spawn_and_reap(cmd);
+    }
 
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("explorer")
-            .arg(&cache_dir)
-            .creation_flags(0x08000000)
-            .spawn();
+        let windir = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        let explorer = std::path::PathBuf::from(windir).join("explorer.exe");
+        let mut cmd = std::process::Command::new(explorer);
+        cmd.arg(&cache_dir).creation_flags(0x08000000);
+        spawn_and_reap(cmd);
     }
 }
 
@@ -319,16 +383,15 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     Ok(resp) => {
                         println!("{}", resp.message);
                         if !resp.success {
-                            std::process::exit(1);
+                            anyhow::bail!("Remote paste failed: {}", resp.message);
                         }
                         Ok(())
                     }
                     Err(e) => {
-                        eprintln!(
+                        anyhow::bail!(
                             "Failed to connect to Integrator daemon: {}. Is Integrator running?",
                             e
                         );
-                        std::process::exit(1);
                     }
                 }
             })
@@ -341,21 +404,16 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     .map(|s| s.as_str())
                     .filter(|s| !s.trim().is_empty())
                 else {
-                    eprintln!("Missing target peer IP. Usage: integrator benchmark <peer_ip>");
-                    std::process::exit(1);
+                    anyhow::bail!("Missing target peer IP. Usage: integrator benchmark <peer_ip>");
                 };
-                match benchmark::BenchmarkClient::run_test(target_ip).await {
-                    Ok(res) => {
-                        println!("Max Bandwidth: {:.2} Gbps | Upload: {:.2} Gbps | Download: {:.2} Gbps | RTT: {:.2} ms",
-                            res.max_gbps, res.upload_gbps, res.download_gbps, res.latency_ms);
-                        println!("{}", res.summary);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("Speed benchmark failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                let features = FeatureManager::new();
+                let res = benchmark::BenchmarkClient::run_test(target_ip, &features).await?;
+                println!(
+                    "Max Bandwidth: {:.2} Gbps | Upload: {:.2} Gbps | Download: {:.2} Gbps | RTT: {:.2} ms",
+                    res.max_gbps, res.upload_gbps, res.download_gbps, res.latency_ms
+                );
+                println!("{}", res.summary);
+                Ok(())
             })
         })()),
         "telemetry" => Some((|| {
@@ -366,54 +424,43 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     .map(|s| s.as_str())
                     .filter(|s| !s.trim().is_empty())
                 else {
-                    eprintln!("Missing target peer IP. Usage: integrator telemetry <peer_ip>");
-                    std::process::exit(1);
+                    anyhow::bail!("Missing target peer IP. Usage: integrator telemetry <peer_ip>");
                 };
-                match DisplayController::send_remote_rpc(
+                let resp = DisplayController::send_remote_rpc(
                     target_ip,
                     &DisplayRpcRequest::GetGpuTelemetry,
                 )
-                .await
-                {
-                    Ok(resp) => {
-                        if let Some(t) = resp.gpu_telemetry {
-                            println!(
-                                "{} | Temp: {}°C | Power: {:.1}W | Clock: {}MHz | VRAM: {}/{} MB ({}%) | Util: {}%",
-                                t.gpu_name,
-                                t.temperature_c,
-                                t.power_usage_watts,
-                                t.core_clock_mhz,
-                                t.memory_used_mb,
-                                t.memory_total_mb,
-                                t.memory_utilization_percent,
-                                t.gpu_utilization_percent
-                            );
-                        } else {
-                            println!("{}", resp.message);
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to query telemetry: {}", e);
-                        std::process::exit(1);
-                    }
+                .await?;
+                if let Some(t) = resp.gpu_telemetry {
+                    println!(
+                        "{} | Temp: {}°C | Power: {:.1}W | Clock: {}MHz | VRAM: {}/{} MB ({}%) | Util: {}%",
+                        t.gpu_name,
+                        t.temperature_c,
+                        t.power_usage_watts,
+                        t.core_clock_mhz,
+                        t.memory_used_mb,
+                        t.memory_total_mb,
+                        t.memory_utilization_percent,
+                        t.gpu_utilization_percent
+                    );
+                } else {
+                    println!("{}", resp.message);
                 }
+                Ok(())
             })
         })()),
         "touchbar" => Some((|| {
             #[cfg(target_os = "macos")]
             {
                 if !system_info::has_touch_bar_hardware() {
-                    eprintln!("No Touch Bar hardware detected on this Mac.");
-                    std::process::exit(1);
+                    anyhow::bail!("No Touch Bar hardware detected on this Mac.");
                 }
                 let Some(peer_ip) = args
                     .get(2)
                     .map(|s| s.as_str())
                     .filter(|s| !s.trim().is_empty())
                 else {
-                    eprintln!("Usage: integrator touchbar <peer_ip>");
-                    std::process::exit(1);
+                    anyhow::bail!("Usage: integrator touchbar <peer_ip>");
                 };
                 let c_ip = CString::new(peer_ip)?;
                 unsafe { run_touchbar_cli_loop(c_ip.as_ptr()) };
@@ -434,44 +481,26 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     "toggle-pc-to-mac" => DisplayRpcRequest::TogglePcToMac,
                     "stop" | "stop-all" => DisplayRpcRequest::StopAll,
                     "status" => DisplayRpcRequest::GetStatus,
-                    _ => {
-                        eprintln!("Unknown display subcommand: {}", subcmd);
-                        std::process::exit(1);
-                    }
+                    _ => anyhow::bail!("Unknown display subcommand: {}", subcmd),
                 };
-                match DisplayController::send_remote_rpc("127.0.0.1", &req).await {
-                    Ok(resp) => {
-                        println!("{}", resp.message);
-                        if !resp.success {
-                            std::process::exit(1);
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("Bridge daemon not reachable: {}", e);
-                        std::process::exit(1);
-                    }
+                let resp = DisplayController::send_remote_rpc("127.0.0.1", &req).await?;
+                println!("{}", resp.message);
+                if !resp.success {
+                    anyhow::bail!("Display command failed: {}", resp.message);
                 }
+                Ok(())
             })
         })()),
         "pin" => Some((|| {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                match DisplayController::send_remote_rpc(
+                let resp = DisplayController::send_remote_rpc(
                     "127.0.0.1",
                     &DisplayRpcRequest::GetPairingPin,
                 )
-                .await
-                {
-                    Ok(resp) => {
-                        println!("{}", resp.pairing_token.unwrap_or(resp.message));
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to query pairing PIN: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                .await?;
+                println!("{}", resp.pairing_token.unwrap_or(resp.message));
+                Ok(())
             })
         })()),
         "pair" => Some((|| {
@@ -482,39 +511,64 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                 else {
-                    eprintln!("Usage: integrator pair <peer_ip> <6_digit_pin>");
-                    std::process::exit(1);
+                    anyhow::bail!("Usage: integrator pair <peer_ip> <6_digit_pin>");
                 };
                 let Some(pin) = args
                     .get(3)
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                 else {
-                    eprintln!("Usage: integrator pair <peer_ip> <6_digit_pin>");
-                    std::process::exit(1);
+                    anyhow::bail!("Usage: integrator pair <peer_ip> <6_digit_pin>");
                 };
-                match DisplayController::send_remote_rpc(
+                let resp = DisplayController::send_remote_rpc(
                     "127.0.0.1",
                     &DisplayRpcRequest::PairWithPeer { ip, pin },
                 )
-                .await
-                {
-                    Ok(resp) => {
-                        println!("{}", resp.message);
-                        if !resp.success {
-                            std::process::exit(1);
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to pair via local daemon: {}", e);
-                        std::process::exit(1);
-                    }
+                .await?;
+                println!("{}", resp.message);
+                if !resp.success {
+                    anyhow::bail!("Failed to pair: {}", resp.message);
                 }
+                Ok(())
             })
         })()),
         _ => None,
     }
+}
+
+const MAX_LOG_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            eprintln!(
+                "Refusing to open symlinked log file at {}",
+                path.display()
+            );
+            return None;
+        }
+        if meta.len() > MAX_LOG_FILE_BYTES {
+            let backup = path.with_extension("log.1");
+            let backup_is_symlink = std::fs::symlink_metadata(&backup)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !backup_is_symlink {
+                let _ = std::fs::remove_file(&backup);
+                let _ = std::fs::rename(path, &backup);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).ok()
 }
 
 impl IntegratorCore {
@@ -523,13 +577,9 @@ impl IntegratorCore {
             return Ok(Arc::clone(existing));
         }
 
-        // 1. Logging setup
+        // 1. Logging setup (private file permissions, symlink guard, 5 MiB rotation cap)
         let log_path = system_info::user_home_dir().join(".integrator.log");
-        let file_opt = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .ok();
+        let file_opt = open_private_rotating_log(&log_path);
 
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
@@ -569,23 +619,29 @@ impl IntegratorCore {
 
         let (discovery, display_ctrl, clipboard, kvm) = rt.block_on(async {
             let discovery = DiscoveryManager::new(&device_name);
-            discovery.start().await.expect("Failed to start discovery");
+            discovery
+                .start()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start discovery: {e}"))?;
 
-            let clipboard =
-                ClipboardService::new(discovery.clone()).expect("Failed to initialize clipboard");
+            let clipboard = ClipboardService::new(discovery.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to initialize clipboard: {e}"))?;
             clipboard.set_feature_manager(Arc::clone(&feature_manager));
-            clipboard.start().await.expect("Failed to start clipboard");
+            clipboard
+                .start()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start clipboard: {e}"))?;
 
-            let display_ctrl = DisplayController::new(discovery.clone());
-            let display_server = DisplayServer::new(display_ctrl.clone());
+            let display_ctrl = DisplayController::new(discovery.clone(), Arc::clone(&feature_manager));
+            let display_server = DisplayServer::new(display_ctrl.clone(), Arc::clone(&feature_manager));
             display_server
                 .start()
                 .await
-                .expect("Failed to start display RPC server");
+                .map_err(|e| anyhow::anyhow!("Failed to start display RPC server: {e}"))?;
 
-            benchmark::BenchmarkServer::start()
+            benchmark::BenchmarkServer::start(Arc::clone(&feature_manager))
                 .await
-                .expect("Failed to start benchmark server");
+                .map_err(|e| anyhow::anyhow!("Failed to start benchmark server: {e}"))?;
 
             if let Err(e) = audio::AudioManager::start_sink_server().await {
                 tracing::warn!("Failed to start dynamic audio sink server: {}", e);
@@ -596,10 +652,12 @@ impl IntegratorCore {
                 clipboard.clone(),
                 Arc::clone(&feature_manager),
             );
-            kvm.start().await.expect("Failed to start KVM engine");
+            kvm.start()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start KVM engine: {e}"))?;
 
-            (discovery, display_ctrl, clipboard, kvm)
-        });
+            Ok::<_, anyhow::Error>((discovery, display_ctrl, clipboard, kvm))
+        })?;
 
         #[cfg(target_os = "macos")]
         unsafe {
@@ -636,50 +694,75 @@ impl IntegratorCore {
         let best_ip = best.as_ref().map(|p| p.addr.ip().to_string());
         let best_share = best.as_ref().and_then(|p| p.share_name.clone());
 
-        let (storage_status, preferred_peer_share, autostart_enabled, (enc_gpu, dec_gpu)) =
-            tokio::task::spawn_blocking({
-                let bip = best_ip.clone();
-                let bsh = best_share.clone();
-                move || {
-                    let st = storage::StorageManager::status_with_share(bip.as_deref(), bsh.as_deref());
-                    let pref = storage::StorageManager::get_preferred_peer_share();
-                    let auto = autostart::AutostartManager::is_enabled();
-                    #[cfg(target_os = "windows")]
-                    let gpus = crate::display::win_display::WinDisplayManager::get_gpu_preferences();
-                    #[cfg(not(target_os = "windows"))]
-                    let gpus = ("auto".to_string(), "auto".to_string());
-                    (st, pref, auto, gpus)
-                }
-            })
-            .await
-            .unwrap_or_else(|_| {
-                (
-                    StorageStatus {
-                        is_mounted: false,
-                        mount_path: String::new(),
-                        remote_ip: String::new(),
-                        remote_share: String::new(),
-                        message: String::new(),
-                    },
-                    None,
-                    false,
-                    ("auto".to_string(), "auto".to_string()),
-                )
-            });
-
         let feature_flags = self.features.get_flags();
-        let als = if feature_flags.truetone {
-            truetone::read_ambient_light()
-        } else {
-            truetone::AmbientLightData {
-                lux: 0.0,
-                cct_kelvin: 6500,
-                supported: false,
-                updated_at_secs: 0,
+        let truetone_enabled = feature_flags.truetone;
+        let (
+            storage_status,
+            preferred_peer_share,
+            autostart_enabled,
+            (enc_gpu, dec_gpu),
+            als,
+            (trust_cfg, pending_peers),
+        ) = tokio::task::spawn_blocking({
+            let bip = best_ip.clone();
+            let bsh = best_share.clone();
+            move || {
+                let st =
+                    storage::StorageManager::status_with_share(bip.as_deref(), bsh.as_deref());
+                let pref = storage::StorageManager::get_preferred_peer_share();
+                let auto = autostart::AutostartManager::is_enabled();
+                #[cfg(target_os = "windows")]
+                let gpus = crate::display::win_display::WinDisplayManager::get_gpu_preferences();
+                #[cfg(not(target_os = "windows"))]
+                let gpus = ("auto".to_string(), "auto".to_string());
+                let als = if truetone_enabled {
+                    truetone::read_ambient_light()
+                } else {
+                    truetone::AmbientLightData {
+                        lux: 0.0,
+                        cct_kelvin: 6500,
+                        supported: false,
+                        updated_at_secs: 0,
+                    }
+                };
+                let trust_snap = trust::get_trust_snapshot();
+                (st, pref, auto, gpus, als, trust_snap)
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                StorageStatus {
+                    is_mounted: false,
+                    mount_path: String::new(),
+                    remote_ip: String::new(),
+                    remote_share: String::new(),
+                    message: String::new(),
+                },
+                None,
+                false,
+                ("auto".to_string(), "auto".to_string()),
+                truetone::AmbientLightData {
+                    lux: 0.0,
+                    cct_kelvin: 6500,
+                    supported: false,
+                    updated_at_secs: 0,
+                },
+                (
+                    trust::TrustConfigFile {
+                        auto_trust_direct_cable: false,
+                        require_pairing_on_lan: true,
+                        pairing_pin: String::new(),
+                        pin_created_at_epoch: 0,
+                        trusted_peers: Vec::new(),
+                        blocked_device_ids: Vec::new(),
+                        blocked_ips: Vec::new(),
+                    },
+                    Vec::new(),
+                ),
+            )
+        });
 
-        let (trust_cfg, pending_peers) = trust::get_trust_snapshot();
         let blocked_set: HashMap<String, bool> = trust_cfg
             .blocked_device_ids
             .iter()
@@ -744,7 +827,10 @@ impl IntegratorCore {
             has_touch_bar: local_prof.has_touch_bar,
 
             peer_connected: best.is_some(),
-            peer_trusted: best.as_ref().map(|p| p.trusted).unwrap_or(false),
+            peer_trusted: best
+                .as_ref()
+                .map(|p| p.trusted || *trusted_set.get(&p.device_id).unwrap_or(&false))
+                .unwrap_or(false),
             peer_device_id: best.as_ref().map(|p| p.device_id.clone()),
             peer_ip: best_ip,
             peer_os: best.as_ref().map(|p| p.os.clone()),
@@ -911,12 +997,15 @@ impl IntegratorCore {
                     }
                 }
                 "run_speed_test" => {
+                    if !self.features.is_enabled("benchmark") {
+                        return Err("Network speed benchmark is disabled by master switch".into());
+                    }
                     let peer_ip = self
                         .discovery
                         .get_peer_ip()
                         .await
                         .ok_or_else(|| "No connected peer for speed benchmark".to_string())?;
-                    let r = benchmark::BenchmarkClient::run_test(&peer_ip)
+                    let r = benchmark::BenchmarkClient::run_test(&peer_ip, &self.features)
                         .await
                         .map_err(|e| e.to_string())?;
                     Ok(serde_json::to_value(r).map_err(|e| e.to_string())?)
@@ -985,7 +1074,14 @@ impl IntegratorCore {
                             updated_at_secs: 0,
                         }
                     } else {
-                        let als = truetone::read_ambient_light();
+                        let als = tokio::task::spawn_blocking(truetone::read_ambient_light)
+                            .await
+                            .unwrap_or(truetone::AmbientLightData {
+                                lux: 0.0,
+                                cct_kelvin: 6500,
+                                supported: false,
+                                updated_at_secs: 0,
+                            });
                         if !als.supported || !als.lux.is_finite() || als.lux < 0.0 {
                             truetone::AmbientLightData {
                                 lux: 0.0,
@@ -1010,9 +1106,27 @@ impl IntegratorCore {
                         comp_factor: f32,
                     }
                     let args: TtArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    if !(2500..=9000).contains(&args.cct) {
+                        return Err(format!(
+                            "Invalid color temperature {}K (must be 2500..=9000K)",
+                            args.cct
+                        ));
+                    }
+                    if !args.comp_factor.is_finite() || !(0.5..=1.5).contains(&args.comp_factor) {
+                        return Err(format!(
+                            "Invalid gamma compensation factor {} (must be 0.5..=1.5)",
+                            args.comp_factor
+                        ));
+                    }
                     if cfg!(target_os = "windows") {
-                        truetone::apply_hardware_gamma_ramp(args.cct, args.comp_factor)
-                            .map_err(|e| e.to_string())?;
+                        let cct = args.cct;
+                        let comp = args.comp_factor;
+                        tokio::task::spawn_blocking(move || {
+                            truetone::apply_hardware_gamma_ramp(cct, comp)
+                        })
+                        .await
+                        .map_err(|e| format!("TrueTone task panicked: {}", e))?
+                        .map_err(|e| e.to_string())?;
                         Ok(serde_json::json!(format!(
                             "Injected Bradford CAT Gamma LUT on Windows: {}K ({:.2}x)",
                             args.cct, args.comp_factor
@@ -1023,7 +1137,14 @@ impl IntegratorCore {
                             .get_peer_ip()
                             .await
                             .ok_or_else(|| "No peer connected to sync True Tone calibration".to_string())?;
-                        let als = truetone::read_ambient_light();
+                        let als = tokio::task::spawn_blocking(truetone::read_ambient_light)
+                            .await
+                            .unwrap_or(truetone::AmbientLightData {
+                                lux: 0.0,
+                                cct_kelvin: 6500,
+                                supported: false,
+                                updated_at_secs: 0,
+                            });
                         let lux = if als.supported && als.lux.is_finite() && als.lux >= 0.0 {
                             als.lux
                         } else {
@@ -1102,7 +1223,10 @@ impl IntegratorCore {
                     if !self.features.is_enabled("audio") {
                         return Err("Dynamic Audio Routing is disabled".into());
                     }
-                    let msg = audio::AudioManager::play_spatial_test_chime().map_err(|e| e.to_string())?;
+                    let msg = tokio::task::spawn_blocking(audio::AudioManager::play_spatial_test_chime)
+                        .await
+                        .map_err(|e| format!("Audio chime task panicked: {}", e))?
+                        .map_err(|e| e.to_string())?;
                     Ok(serde_json::json!(msg))
                 }
                 "get_feature_flags" => {
@@ -1115,9 +1239,10 @@ impl IntegratorCore {
                         enabled: bool,
                     }
                     let args: FlagArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
-                    let flags = self.features.set_flag_checked(&args.feature, args.enabled)?;
+                    let feat = args.feature.trim();
+                    let flags = self.features.set_flag_checked(feat, args.enabled)?;
                     if !args.enabled {
-                        match args.feature.as_str() {
+                        match feat {
                             "display" => {
                                 if self.display_ctrl.is_active().await
                                     || self.display_ctrl.get_active_mode().await.is_some()
@@ -1130,7 +1255,7 @@ impl IntegratorCore {
                                 let _ = tokio::task::spawn_blocking(storage::StorageManager::unmount).await;
                             }
                             "truetone" => {
-                                let _ = truetone::reset_hardware_gamma_ramp();
+                                let _ = tokio::task::spawn_blocking(truetone::reset_hardware_gamma_ramp).await;
                             }
                             "touchbar" => {
                                 #[cfg(target_os = "macos")]
@@ -1138,8 +1263,8 @@ impl IntegratorCore {
                                     unsafe { dismiss_touchbar_in_app() };
                                 }
                             }
-                            "input_kvm" | "dragdrop" | "clipboard" => {
-                                if args.feature == "input_kvm" {
+                            "input_kvm" | "input" | "dragdrop" | "clipboard" => {
+                                if matches!(feat, "input_kvm" | "input") {
                                     self.kvm.force_release_all(true);
                                 }
                                 if !self.features.is_enabled("clipboard")
@@ -1185,9 +1310,9 @@ impl IntegratorCore {
                         .await
                         .unwrap_or(false);
                         if !trusted {
-                            let _ = std::process::Command::new("open")
-                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                                .spawn();
+                            let mut cmd = std::process::Command::new("/usr/bin/open");
+                            cmd.arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+                            spawn_and_reap(cmd);
                         }
                         Ok(serde_json::json!(if trusted {
                             "Accessibility permission verified and KVM hook active"
@@ -1347,6 +1472,11 @@ impl IntegratorCore {
         }
     }
 
+    pub fn shutdown(&self) {
+        self.kvm.shutdown();
+        register_ui_callback(None);
+    }
+
     pub fn trigger_tray_action(&self, action: &str) {
         match action {
             "paste_remote" => {
@@ -1359,6 +1489,10 @@ impl IntegratorCore {
                 });
             }
             "toggle_display" => {
+                if !self.features.is_enabled("display") {
+                    emit_ui_toast("error", "Display Extension & Mirroring is disabled");
+                    return;
+                }
                 let ctrl = self.display_ctrl.clone();
                 self.rt.spawn(async move {
                     let res = if cfg!(target_os = "macos") {
@@ -1375,7 +1509,7 @@ impl IntegratorCore {
             "open_cache" => open_app_data_folder(),
             "quit" => {
                 self.kvm.force_release_all(true);
-                std::process::exit(0);
+                emit_ui_event("quit", "{}");
             }
             _ => {}
         }

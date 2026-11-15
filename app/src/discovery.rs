@@ -7,18 +7,129 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::config::{CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT};
 use crate::system_info::{self, LinkTransport};
 use crate::trust;
 
 pub const DISCOVERY_PROTOCOL_VERSION: u16 = 2;
+const PEER_CANDIDATE_TTL: Duration = Duration::from_secs(10);
+const MAX_PEER_CANDIDATES: usize = 64;
+const MAX_RTT_CACHE_ENTRIES: usize = 128;
+const RTT_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_REPLAY_DEVICES: usize = 128;
+const MAX_REPLAY_IPS_PER_DEVICE: usize = 8;
+const REPLAY_WINDOW_TTL: Duration = Duration::from_secs(130);
+const MAX_REPLAY_CROSS_IP_SKEW_MS: u64 = 3_000;
+const MAX_MANUAL_IPS: usize = 32;
+const MAX_RECENT_SEEN: usize = 64;
+const MAX_CONCURRENT_RTT_PROBES: usize = 8;
+
+static HISTORY_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static HISTORY_TMP_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn history_file_lock() -> &'static Mutex<()> {
+    HISTORY_FILE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Debug)]
+struct DeviceReplayState {
+    max_ts_ms: u64,
+    last_updated: Instant,
+    per_ip: HashMap<IpAddr, (u64, Instant)>,
+}
+
+#[derive(Debug, Default)]
+struct BeaconReplayCache {
+    devices: HashMap<String, DeviceReplayState>,
+}
+
+impl BeaconReplayCache {
+    fn accept(&mut self, device_id: &str, ip: IpAddr, timestamp_ms: u64, now: Instant) -> bool {
+        // Prune expired IP entries and stale devices first.
+        self.devices.retain(|_, state| {
+            state
+                .per_ip
+                .retain(|_, (_, seen_at)| now.saturating_duration_since(*seen_at) <= REPLAY_WINDOW_TTL);
+            !state.per_ip.is_empty()
+                && now.saturating_duration_since(state.last_updated) <= REPLAY_WINDOW_TTL
+        });
+
+        if !self.devices.contains_key(device_id) && self.devices.len() >= MAX_REPLAY_DEVICES {
+            if let Some(oldest_key) = self
+                .devices
+                .iter()
+                .min_by_key(|(_, s)| s.last_updated)
+                .map(|(k, _)| k.clone())
+            {
+                self.devices.remove(&oldest_key);
+            }
+        }
+
+        let state = self
+            .devices
+            .entry(device_id.to_string())
+            .or_insert_with(|| DeviceReplayState {
+                max_ts_ms: 0,
+                last_updated: now,
+                per_ip: HashMap::new(),
+            });
+
+        // Reject replayed older beacons routed through a spoofed source IP.
+        if state.max_ts_ms > timestamp_ms.saturating_add(MAX_REPLAY_CROSS_IP_SKEW_MS) {
+            return false;
+        }
+
+        // Reject duplicate or backwards timestamps arriving on the same source IP.
+        if let Some((last_ip_ts, _)) = state.per_ip.get(&ip) {
+            if timestamp_ms <= *last_ip_ts {
+                return false;
+            }
+        } else if state.per_ip.len() >= MAX_REPLAY_IPS_PER_DEVICE {
+            if let Some(oldest_ip) = state
+                .per_ip
+                .iter()
+                .min_by_key(|(_, (_, seen_at))| *seen_at)
+                .map(|(k, _)| *k)
+            {
+                state.per_ip.remove(&oldest_ip);
+            }
+        }
+
+        state.per_ip.insert(ip, (timestamp_ms, now));
+        state.max_ts_ms = state.max_ts_ms.max(timestamp_ms);
+        state.last_updated = now;
+        true
+    }
+}
+
+fn is_bidi_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn contains_unsafe_text_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control() || is_bidi_format_char(c))
+}
+
+fn sanitize_display_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() && !is_bidi_format_char(c))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryBeacon {
@@ -122,7 +233,7 @@ impl DiscoveryManager {
     pub async fn get_all_peers(&self) -> Vec<PeerCandidate> {
         let mut guard = self.candidates.write().await;
         let now = Instant::now();
-        guard.retain(|c| now.duration_since(c.last_seen) < Duration::from_secs(10));
+        guard.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
         guard.clone()
     }
 
@@ -134,24 +245,38 @@ impl DiscoveryManager {
         {
             let mut m = self.manual_ips.write().await;
             if !m.contains(&trimmed) {
+                if m.len() >= MAX_MANUAL_IPS {
+                    anyhow::bail!("Manual peer IP limit reached (max {})", MAX_MANUAL_IPS);
+                }
                 m.push(trimmed.clone());
             }
         }
-        let mut hist = load_peer_history();
-        if !hist.manual_ips.contains(&trimmed) {
-            hist.manual_ips.push(trimmed);
-            save_peer_history(&hist);
-        }
+        let ip_for_disk = trimmed;
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut hist = load_peer_history();
+            if !hist.manual_ips.contains(&ip_for_disk) {
+                hist.manual_ips.push(ip_for_disk);
+                hist.manual_ips.truncate(MAX_MANUAL_IPS);
+                save_peer_history(&hist);
+            }
+        })
+        .await;
         Ok(())
     }
 
     pub async fn remove_manual_peer_ip(&self, ip: &str) {
         let trimmed = ip.trim().to_string();
-        let mut m = self.manual_ips.write().await;
-        m.retain(|x| x != &trimmed);
-        let mut hist = load_peer_history();
-        hist.manual_ips.retain(|x| x != &trimmed);
-        save_peer_history(&hist);
+        {
+            let mut m = self.manual_ips.write().await;
+            m.retain(|x| x != &trimmed);
+        }
+        let ip_for_disk = trimmed;
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut hist = load_peer_history();
+            hist.manual_ips.retain(|x| x != &ip_for_disk);
+            save_peer_history(&hist);
+        })
+        .await;
     }
 
     pub async fn get_manual_peer_ips(&self) -> Vec<String> {
@@ -161,7 +286,7 @@ impl DiscoveryManager {
     async fn best_candidate_inner(&self) -> Option<PeerCandidate> {
         let mut guard = self.candidates.write().await;
         let now = Instant::now();
-        guard.retain(|c| now.duration_since(c.last_seen) < Duration::from_secs(8));
+        guard.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
 
         let mut active = self.active_peer_ip.write().await;
         let selected = select_best_peer(&guard);
@@ -181,7 +306,10 @@ impl DiscoveryManager {
         let active_peer_ip = Arc::clone(&self.active_peer_ip);
         let rtt_cache = Arc::clone(&self.rtt_cache);
         let my_device_id = self.local_device_id.clone();
-        let my_name = self.local_name.clone();
+        let my_trust_device_id = trust::local_device_id_hex();
+        let my_name = sanitize_display_text(&self.local_name, 128);
+        let replay_cache = Arc::new(Mutex::new(BeaconReplayCache::default()));
+        let rtt_probe_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_RTT_PROBES));
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -199,40 +327,96 @@ impl DiscoveryManager {
                                 beacon.device_id.trim().to_ascii_lowercase()
                             };
 
-                            if dev_id == my_device_id || addr.ip().is_loopback() {
+                            if dev_id == my_device_id
+                                || dev_id == my_trust_device_id
+                                || addr.ip().is_loopback()
+                            {
                                 continue;
                             }
 
-                            let valid_control_port = if beacon.control_port >= 1024 {
-                                beacon.control_port
-                            } else {
-                                CONTROL_PORT
-                            };
-                            let valid_clipboard_port = if beacon.clipboard_port >= 1024 {
-                                beacon.clipboard_port
-                            } else {
-                                CLIPBOARD_PORT
-                            };
-
-                            if !trust::verify_discovery_beacon_v2(
-                                &dev_id,
-                                &beacon.ed25519_pubkey,
-                                &beacon.sender_name,
-                                beacon.timestamp_ms,
-                                valid_control_port,
-                                valid_clipboard_port,
-                                &beacon.beacon_sig,
-                            ) {
+                            if beacon.control_port < 1024 || beacon.clipboard_port < 1024 {
                                 tracing::debug!(
-                                    "Dropped invalid or stale discovery beacon from {}",
+                                    "Dropped discovery beacon with privileged/invalid ports from {}",
                                     peer_ip
                                 );
                                 continue;
                             }
 
+                            if contains_unsafe_text_chars(&beacon.sender_name)
+                                || contains_unsafe_text_chars(&beacon.os)
+                                || contains_unsafe_text_chars(&beacon.hardware_model)
+                                || beacon
+                                    .share_name
+                                    .as_deref()
+                                    .is_some_and(contains_unsafe_text_chars)
+                                || beacon
+                                    .sunshine_name
+                                    .as_deref()
+                                    .is_some_and(contains_unsafe_text_chars)
+                                || beacon.gpus.iter().any(|g| contains_unsafe_text_chars(g))
+                            {
+                                tracing::debug!(
+                                    "Dropped discovery beacon containing control/bidi characters from {}",
+                                    peer_ip
+                                );
+                                continue;
+                            }
+
+                            let signed_meta = trust::DiscoveryBeaconSignedMeta {
+                                protocol_version: beacon.protocol_version,
+                                sender_name: &beacon.sender_name,
+                                os: &beacon.os,
+                                hardware_model: &beacon.hardware_model,
+                                display_width: beacon.display_width,
+                                display_height: beacon.display_height,
+                                display_fps: beacon.display_fps,
+                                share_name: beacon.share_name.as_deref(),
+                                sunshine_name: beacon.sunshine_name.as_deref(),
+                                sunshine_port: beacon.sunshine_port,
+                                gpus: &beacon.gpus,
+                            };
+
+                            if !trust::verify_discovery_beacon_v2_full(
+                                &dev_id,
+                                &beacon.ed25519_pubkey,
+                                beacon.timestamp_ms,
+                                beacon.control_port,
+                                beacon.clipboard_port,
+                                Some(addr.ip()),
+                                &signed_meta,
+                                &beacon.beacon_sig,
+                            ) {
+                                tracing::debug!(
+                                    "Dropped invalid, blocked, or stale discovery beacon from {}",
+                                    peer_ip
+                                );
+                                continue;
+                            }
+
+                            let replay_ok = {
+                                let mut rc = replay_cache
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                rc.accept(&dev_id, addr.ip(), beacon.timestamp_ms, Instant::now())
+                            };
+                            if !replay_ok {
+                                tracing::debug!(
+                                    "Dropped replayed discovery beacon for device {} from {}",
+                                    dev_id,
+                                    peer_ip
+                                );
+                                continue;
+                            }
+
+                            let valid_control_port = beacon.control_port;
                             let peer_ip_for_route = peer_ip.clone();
                             let my_name_clone = my_name.clone();
-                            let sender_name_clone = beacon.sender_name.clone();
+                            let sender_name_clean =
+                                sanitize_display_text(&beacon.sender_name, 128);
+                            if sender_name_clean.is_empty() {
+                                continue;
+                            }
+                            let sender_name_clone = sender_name_clean.clone();
                             let dev_id_clone = dev_id.clone();
 
                             let Ok((is_self_ip, transport, speed_mbps, link_desc, local_ip, trusted)) =
@@ -257,7 +441,10 @@ impl DiscoveryManager {
                                         &peer_ip_for_route,
                                         transport.is_direct_cable(),
                                     );
-                                    record_recent_peer_ip(&peer_ip_for_route);
+                                    // Persist verified paired peer IPs only, preventing spoofed LAN history pollution.
+                                    if trusted {
+                                        record_recent_peer_ip(&peer_ip_for_route);
+                                    }
                                     (false, transport, speed_mbps, link_desc, local_ip, trusted)
                                 })
                                 .await
@@ -269,7 +456,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
-                            // Refresh real TCP RTT in background at most once every 3s per IP
+                            // Refresh real TCP RTT in background at most once every 4s per IP (bounded probes & cache)
                             let cached_rtt = {
                                 let cache_guard = rtt_cache.read().await;
                                 cache_guard.get(&peer_ip).map(|(t, r)| (t.elapsed(), *r))
@@ -277,26 +464,44 @@ impl DiscoveryManager {
                             let rtt_ms = match cached_rtt {
                                 Some((age, r)) if age < Duration::from_secs(4) => Some(r),
                                 _ => {
-                                    let probe_ip = peer_ip.clone();
-                                    let probe_port = valid_control_port;
-                                    let rtt_map = Arc::clone(&rtt_cache);
-                                    let cands_ref = Arc::clone(&candidates);
-                                    tokio::spawn(async move {
-                                        if let Some(measured) =
-                                            measure_tcp_connect_rtt(&probe_ip, probe_port).await
-                                        {
-                                            rtt_map.write().await.insert(
-                                                probe_ip.clone(),
-                                                (Instant::now(), measured),
-                                            );
-                                            let mut list = cands_ref.write().await;
-                                            for c in list.iter_mut() {
-                                                if c.addr.ip().to_string() == probe_ip {
-                                                    c.rtt_ms = Some(measured);
+                                    if let Ok(permit) = Arc::clone(&rtt_probe_limiter).try_acquire_owned() {
+                                        let probe_ip = peer_ip.clone();
+                                        let probe_port = valid_control_port;
+                                        let rtt_map = Arc::clone(&rtt_cache);
+                                        let cands_ref = Arc::clone(&candidates);
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            if let Some(measured) =
+                                                measure_tcp_connect_rtt(&probe_ip, probe_port).await
+                                            {
+                                                {
+                                                    let mut cache = rtt_map.write().await;
+                                                    let now = Instant::now();
+                                                    cache.retain(|_, (ts, _)| {
+                                                        now.saturating_duration_since(*ts) < RTT_CACHE_TTL
+                                                    });
+                                                    if !cache.contains_key(&probe_ip)
+                                                        && cache.len() >= MAX_RTT_CACHE_ENTRIES
+                                                    {
+                                                        if let Some(oldest_ip) = cache
+                                                            .iter()
+                                                            .min_by_key(|(_, (ts, _))| *ts)
+                                                            .map(|(k, _)| k.clone())
+                                                        {
+                                                            cache.remove(&oldest_ip);
+                                                        }
+                                                    }
+                                                    cache.insert(probe_ip.clone(), (now, measured));
+                                                }
+                                                let mut list = cands_ref.write().await;
+                                                for c in list.iter_mut() {
+                                                    if c.addr.ip().to_string() == probe_ip {
+                                                        c.rtt_ms = Some(measured);
+                                                    }
                                                 }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                     cached_rtt.map(|(_, r)| r)
                                 }
                             };
@@ -309,27 +514,29 @@ impl DiscoveryManager {
                                 .gpus
                                 .into_iter()
                                 .take(8)
-                                .map(|g| g.chars().take(128).collect())
+                                .map(|g| sanitize_display_text(&g, 128))
+                                .filter(|g| !g.is_empty())
                                 .collect();
 
                             let mut list = candidates.write().await;
                             let now = Instant::now();
-                            list.retain(|c| now.duration_since(c.last_seen) < Duration::from_secs(8));
+                            list.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
 
                             let candidate = PeerCandidate {
                                 addr: SocketAddr::new(addr.ip(), valid_control_port),
                                 last_seen: now,
-                                os: beacon.os.chars().take(64).collect(),
+                                os: sanitize_display_text(&beacon.os, 64),
                                 device_id: dev_id,
-                                device_name: beacon.sender_name.chars().take(128).collect(),
-                                hardware_model: beacon.hardware_model.chars().take(128).collect(),
+                                device_name: sender_name_clean,
+                                hardware_model: sanitize_display_text(&beacon.hardware_model, 128),
                                 display_width: beacon.display_width.clamp(0, 7680),
                                 display_height: beacon.display_height.clamp(0, 4320),
                                 display_fps: beacon.display_fps.clamp(0, 240),
                                 share_name: sanitized_share,
                                 sunshine_name: beacon
                                     .sunshine_name
-                                    .map(|s| s.chars().take(128).collect()),
+                                    .map(|s| sanitize_display_text(&s, 128))
+                                    .filter(|s| !s.is_empty()),
                                 sunshine_port: if beacon.sunshine_port >= 1024 {
                                     beacon.sunshine_port
                                 } else {
@@ -349,6 +556,20 @@ impl DiscoveryManager {
                             {
                                 *existing = candidate;
                             } else {
+                                if list.len() >= MAX_PEER_CANDIDATES {
+                                    if let Some(evict_idx) = list
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, c)| !c.trusted)
+                                        .min_by_key(|(_, c)| c.last_seen)
+                                        .or_else(|| {
+                                            list.iter().enumerate().min_by_key(|(_, c)| c.last_seen)
+                                        })
+                                        .map(|(i, _)| i)
+                                    {
+                                        list.swap_remove(evict_idx);
+                                    }
+                                }
                                 list.push(candidate);
                             }
 
@@ -390,29 +611,71 @@ impl DiscoveryManager {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    let sender_name = sanitize_display_text(
+                        if profile.hostname.is_empty() {
+                            &fallback_clone
+                        } else {
+                            &profile.hostname
+                        },
+                        128,
+                    );
+                    let os = sanitize_display_text(&profile.os, 64);
+                    let hardware_model = sanitize_display_text(&profile.hardware_model, 128);
+                    let share_name = profile
+                        .default_share_names
+                        .first()
+                        .and_then(|s| crate::storage::validate_smb_share_name(s).ok());
+                    let sunshine_name = profile
+                        .sunshine_name
+                        .as_deref()
+                        .map(|s| sanitize_display_text(s, 128))
+                        .filter(|s| !s.is_empty());
+                    let gpus: Vec<String> = profile
+                        .gpus
+                        .iter()
+                        .take(8)
+                        .map(|g| sanitize_display_text(&g.name, 128))
+                        .filter(|g| !g.is_empty())
+                        .collect();
+
+                    let signed_meta = trust::DiscoveryBeaconSignedMeta {
+                        protocol_version: DISCOVERY_PROTOCOL_VERSION,
+                        sender_name: &sender_name,
+                        os: &os,
+                        hardware_model: &hardware_model,
+                        display_width: profile.primary_display.width,
+                        display_height: profile.primary_display.height,
+                        display_fps: profile.primary_display.fps,
+                        share_name: share_name.as_deref(),
+                        sunshine_name: sunshine_name.as_deref(),
+                        sunshine_port: profile.sunshine_port,
+                        gpus: &gpus,
+                    };
+
                     let (signed_dev_id, ed25519_pubkey, sig) =
-                        trust::sign_discovery_beacon_v2(ts, CONTROL_PORT, CLIPBOARD_PORT);
+                        trust::sign_discovery_beacon_v2_full(
+                            ts,
+                            CONTROL_PORT,
+                            CLIPBOARD_PORT,
+                            &signed_meta,
+                        );
 
                     let beacon = DiscoveryBeacon {
                         protocol_version: DISCOVERY_PROTOCOL_VERSION,
                         device_id: signed_dev_id,
                         ed25519_pubkey,
-                        sender_name: if profile.hostname.is_empty() {
-                            fallback_clone
-                        } else {
-                            profile.hostname.clone()
-                        },
-                        os: profile.os.clone(),
-                        hardware_model: profile.hardware_model.clone(),
+                        sender_name,
+                        os,
+                        hardware_model,
                         control_port: CONTROL_PORT,
                         clipboard_port: CLIPBOARD_PORT,
                         display_width: profile.primary_display.width,
                         display_height: profile.primary_display.height,
                         display_fps: profile.primary_display.fps,
-                        share_name: profile.default_share_names.first().cloned(),
-                        sunshine_name: profile.sunshine_name.clone(),
+                        share_name,
+                        sunshine_name,
                         sunshine_port: profile.sunshine_port,
-                        gpus: profile.gpus.iter().map(|g| g.name.clone()).collect(),
+                        gpus,
                         timestamp_ms: ts,
                         beacon_sig: sig,
                     };
@@ -432,8 +695,10 @@ impl DiscoveryManager {
                 {
                     if !bytes.is_empty() {
                         for ip in targets {
-                            let target = format!("{}:{}", ip, DISCOVERY_PORT);
-                            let _ = broadcaster_socket.send_to(&bytes, &target).await;
+                            if let Ok(parsed) = ip.parse::<IpAddr>() {
+                                let target = SocketAddr::new(parsed, DISCOVERY_PORT);
+                                let _ = broadcaster_socket.send_to(&bytes, target).await;
+                            }
                         }
                     }
                 }
@@ -474,10 +739,13 @@ fn is_own_local_ip(ip: &str) -> bool {
 }
 
 async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
-    let target = format!("{}:{}", ip, port);
+    let Ok(parsed) = ip.parse::<IpAddr>() else {
+        return None;
+    };
+    let target = SocketAddr::new(parsed, port);
     let start = Instant::now();
     if let Ok(Ok(stream)) =
-        tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(&target)).await
+        tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(target)).await
     {
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         drop(stream);
@@ -491,31 +759,106 @@ fn history_path() -> std::path::PathBuf {
 }
 
 fn load_peer_history() -> PeerHistoryFile {
-    std::fs::read_to_string(history_path())
+    let _guard = history_file_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut parsed: PeerHistoryFile = std::fs::read_to_string(history_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    parsed
+        .recent_ips
+        .retain(|ip| system_info::is_valid_ipv4(ip));
+    parsed.recent_ips.truncate(8);
+    parsed
+        .manual_ips
+        .retain(|ip| system_info::is_valid_ipv4(ip));
+    parsed.manual_ips.truncate(MAX_MANUAL_IPS);
+    parsed
 }
 
 fn save_peer_history(hist: &PeerHistoryFile) {
-    if let Ok(json) = serde_json::to_string_pretty(hist) {
-        let _ = std::fs::write(history_path(), json);
+    let _guard = history_file_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(json) = serde_json::to_string_pretty(hist) else {
+        return;
+    };
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let seq = HISTORY_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 fn record_recent_peer_ip(ip: &str) {
-    static RECENT_SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let seen = RECENT_SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
-    if let Ok(mut guard) = seen.lock() {
-        if !guard.insert(ip.to_string()) {
+    static RECENT_SEEN: OnceLock<Mutex<(VecDeque<String>, HashSet<String>)>> = OnceLock::new();
+    let seen = RECENT_SEEN.get_or_init(|| Mutex::new((VecDeque::new(), HashSet::new())));
+    {
+        let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.1.contains(ip) {
             return;
         }
+        if guard.0.len() >= MAX_RECENT_SEEN {
+            if let Some(evicted) = guard.0.pop_front() {
+                guard.1.remove(&evicted);
+            }
+        }
+        guard.0.push_back(ip.to_string());
+        guard.1.insert(ip.to_string());
     }
     let mut hist = load_peer_history();
     if !hist.recent_ips.iter().any(|x| x == ip) {
         hist.recent_ips.insert(0, ip.to_string());
         hist.recent_ips.truncate(8);
         save_peer_history(&hist);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_cache_rejects_duplicate_and_stale_but_allows_dual_interface_burst() {
+        let mut cache = BeaconReplayCache::default();
+        let usb_ip: IpAddr = "169.254.10.2".parse().unwrap();
+        let wifi_ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let spoof_ip: IpAddr = "10.0.0.99".parse().unwrap();
+        let now = Instant::now();
+
+        assert!(cache.accept("dev1", usb_ip, 100_000, now));
+        // Duplicate exact beacon from same IP rejected
+        assert!(!cache.accept("dev1", usb_ip, 100_000, now));
+        // Older beacon on same IP rejected
+        assert!(!cache.accept("dev1", usb_ip, 99_500, now));
+        // Same timestamp burst arriving on second interface (Wi-Fi) accepted
+        assert!(cache.accept("dev1", wifi_ip, 100_000, now));
+
+        // Newer beacon advances max_ts_ms
+        assert!(cache.accept("dev1", usb_ip, 110_000, now));
+        // Stale beacon (>3s older than max_ts_ms) replayed on spoofed IP rejected
+        assert!(!cache.accept("dev1", spoof_ip, 105_000, now));
+    }
+
+    #[test]
+    fn sanitize_strips_control_and_bidi_chars() {
+        assert!(contains_unsafe_text_chars("evil\u{202E}name"));
+        assert!(contains_unsafe_text_chars("bad\nline"));
+        assert_eq!(sanitize_display_text("  Mac\u{202E}Book\x07Pro  ", 64), "MacBookPro");
     }
 }

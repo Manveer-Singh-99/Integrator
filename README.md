@@ -162,31 +162,33 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 ## ⚡ Integrator: The Unified Desktop Companion App (`v1.0.0` - Current Progress)
 
 > [!IMPORTANT]
-> **Project Status: Companion App Built & Operational!**  
-> What originally began as a collection of standalone shell scripts and PowerShell drivers has officially evolved into **Integrator**: a single, unified desktop companion application for macOS and Windows 11 built with memory-safe **Rust (Tauri v2)**.
+> **Project Status: Companion App Built & Operational!**
+> What originally began as a collection of standalone shell scripts and PowerShell drivers has officially evolved into **Integrator**: a single, unified desktop companion application powered by a memory-safe **Rust core library** (`integrator_core` + CLI binary `integrator`) paired with native OS frontends — **SwiftUI / Liquid Glass on macOS** (`app/ui-macos`) and **WinUI 3 / Mica on Windows 11** (`app/ui-windows`).
 >
 > * **Icon & Branding**: Features a custom mathematical integration icon ($\int_{\text{Windows 11}}^{\text{macOS}}$) featuring a centered integral sign with pixel-matched Windows 11 (bottom-left) and macOS Finder (top-right) limits separated by a clean 54 px air-gap.
-> * **Zero Ghost Daemons**: Enforces strict single-instance mutual exclusion. Quitting the application cleanly terminates all background threads with zero persistent `launchd` or `schtasks` reload daemons.
+> * **Zero Ghost Daemons**: Enforces strict single-instance mutual exclusion (`Integrator` OS named `Mutex` on Windows + local control socket lock). Quitting the application cleanly terminates all background threads and hooks.
 > * **Master ON/OFF Switches**: Every single fusion feature has an independent, persistent master toggle that gracefully winds down active socket streams, unmounts volumes, or dismisses HUDs when disabled.
-> * **Clean Launch at Login**: Autostart is managed natively via macOS Login Items (`System Settings ➔ Login Items`) and Windows `HKCU\...\Run` with `CREATE_NO_WINDOW`.
+> * **Clean Launch at Login**: Autostart is managed natively via macOS LaunchAgents (`~/Library/LaunchAgents`) and an elevated Windows Scheduled Task (`IntegratorAutostart`, `RunLevel Highest`) for UIPI-safe KVM input injection.
 
 ### Feature Implementation Status Matrix
 
 | Fusion Feature | Platform | Status | Implementation Details |
 | :--- | :---: | :---: | :--- |
-| **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Zero-polling `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, 0.00% idle CPU) |
+| **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Hardened `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, locked `C:\ProgramData\AppleUsbNcm` ACLs) |
 | **Dual-Subnet Networking & ICS** | macOS & Win 11 | ✅ **Live** | Bidirectional Internet Sharing simultaneously alongside direct USB-C link |
-| **Tauri v2 Glassmorphic UI** | macOS & Win 11 | ✅ **Live** | Real-time latency, peer IP discovery, category filters, and live status pills |
-| **Cryptographic Pairing & Transport** | macOS & Win 11 | ✅ **Live** | OS CSPRNG 6-digit PIN pairing with rate-limiting/lockout + ChaCha20 & HMAC-SHA256 authenticated transport |
+| **Native SwiftUI & WinUI 3 UI** | macOS & Win 11 | ✅ **Live** | Real-time latency, peer discovery/block controls, category filters, Light/Dark contrast & live status pills |
+| **Cryptographic Pairing & Transport** | macOS & Win 11 | ✅ **Live** | OS CSPRNG 6-digit PIN SPAKE2 RFC 9382 + Ed25519 mutual auth + ChaCha20-Poly1305 AEAD & SAS verification |
 | **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 verification and echo-loop prevention |
-| **Universal Clipboard (Folders & Files)** | macOS & Win 11 | ✅ **Live** | Multi-GB recursive folder copy-paste streaming over NVMe buffers with LRU pruning |
+| **Universal Clipboard (Folders & Files)** | macOS & Win 11 | ✅ **Live** | Multi-GB, multi-item recursive folder copy-paste streaming over NVMe buffers with LRU pruning |
 | **Live Network Benchmark Engine** | macOS & Win 11 | ✅ **Live** | Built-in real-time throughput benchmark saturating USB-C NVMe transfer speeds |
 | **Touch Bar NVIDIA Performance HUD** | macOS (client) | ✅ **Live** | Liquid Glass OLED HUD with interactive physics and native Control Strip integration |
-| **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Dynamic peer SMB share discovery, mount & clean teardown on macOS (`/Volumes/<Share>`) and Windows |
+| **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Dynamic peer SMB share discovery (trust-gated), mount & clean teardown on macOS (`/Volumes/<Share>`) and Windows |
 | **True Tone & Chromatic Adaptation** | macOS & Win 11 | ✅ **Live** | Mac ambient sensor (Kelvin) $\to$ Bradford CAT GPU gamma ramp injection |
 | **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional streaming via Sunshine host + Moonlight client with dynamic resolution & refresh rate |
+| **Universal Input KVM & Edge Hopping** | macOS & Win 11 | ✅ **Live** | Edge-hopping mouse/keyboard sharing, 2D desk alignment schematic, corner guard & panic key (`Ctrl+Alt+Shift+Esc`) |
+| **Cross-Border File Drag & Drop** | macOS & Win 11 | ✅ **Live** | Cursor-following cross-screen file staging & transfer over authenticated AEAD transport |
 | **Master ON/OFF Feature Switches** | macOS & Win 11 | ✅ **Live** | Independent persistent toggles saved to `~/.usbc_clipboard_cache/features.json` |
-| **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | System Events Login Item (macOS) & `HKCU\...\Run` (Win 11) |
+| **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | User LaunchAgent (macOS) & Elevated Scheduled Task (`IntegratorAutostart` on Win 11) |
 | **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental UDP packet sink (`58284`) & local 24-bit/48kHz spatial test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
 | **Cross-Border File Drag & Drop** | macOS & Win 11 | 📋 **Planned** | Cursor-following cross-screen drag & drop (`dragdrop` feature toggle) |
@@ -214,12 +216,13 @@ To run the packaged bundle or copy to your Applications folder:
 open /Applications/Integrator.app
 ```
 
-#### On Windows 11:
+#### On Windows 11 (x64 or ARM64):
 ```powershell
 cd app
 cargo build --release
+dotnet build ui-windows\IntegratorUI.csproj -c Release -p:Platform=x64
 ```
-The compiled release executable with the embedded $\int_{\text{Win11}}^{\text{macOS}}$ multi-resolution icon will be located at `target\release\integrator.exe`.
+`cargo build --release` builds `target\release\integrator.exe` (CLI) and `target\release\integrator_core.dll` (core FFI library), which `IntegratorUI.csproj` automatically copies alongside the elevated (`requireAdministrator`) WinUI 3 GUI binary `IntegratorUI.exe`.
 
 ---
 
@@ -291,7 +294,7 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
 * **📋 Universal Clipboard (✅ Live):**
   * Bidirectional clipboard synchronization for plain text, image bitmaps (PNG/TIFF), and recursive folder/file trees over authenticated ChaCha20 + HMAC-SHA256 transport.
   * Cryptographic SHA-256 payload verification and hash-based deduplication to prevent infinite ping-pong echo loops between devices.
-* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens" — 📋 Planned):**
+* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens" — ✅ Live):**
   * Click and drag any file from macOS Finder past the screen boundary onto the Windows desktop (or vice versa).
   * A semi-transparent ghost thumbnail follows the cursor across operating systems, and releasing the mouse button streams the file buffer over the USB-C link directly into the target folder in milliseconds.
 * **📁 Auto-Mounted Shared Folders (✅ Live):**

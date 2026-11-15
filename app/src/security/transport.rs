@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 use zeroize::{Zeroize, Zeroizing};
@@ -52,8 +52,11 @@ pub const AEAD_TAG_LEN: usize = 16;
 
 pub const HANDSHAKE_TIMESTAMP_WINDOW_MS: u64 = 300_000; // ±5 minutes
 pub const MAX_HANDSHAKE_REPLAY_CACHE: usize = 2048;
+pub const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RECORD_IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_REKEY_FRAME_LIMIT: u64 = 1u64 << 32;
 pub const DEFAULT_REKEY_AGE_SECS: u64 = 3600; // 1 hour
+const REKEY_MAGIC_PAYLOAD: &[u8] = b"REKEY-V2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -253,16 +256,41 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Bounded replay cache for `(client_device_id, client_random)` in `TransportHello`.
-static HELLO_REPLAY_CACHE: OnceLock<Mutex<VecDeque<([u8; 16], [u8; 32])>>> = OnceLock::new();
+/// Bounded replay cache for authenticated `(client_device_id, client_random, recorded_at_ms)` tuples.
+static HELLO_REPLAY_CACHE: OnceLock<Mutex<VecDeque<([u8; 16], [u8; 32], u64)>>> = OnceLock::new();
 
-fn check_and_record_hello_nonce(
+fn prune_hello_replay_cache(guard: &mut VecDeque<([u8; 16], [u8; 32], u64)>, now_ms: u64) {
+    let max_age = HANDSHAKE_TIMESTAMP_WINDOW_MS
+        .saturating_mul(2)
+        .saturating_add(60_000);
+    guard.retain(|(_, _, ts)| now_ms.saturating_sub(*ts) <= max_age);
+}
+
+fn check_hello_nonce_not_replayed(
     client_device_id: &[u8; 16],
     client_random: &[u8; 32],
+    now_ms: u64,
 ) -> Result<(), TransportError> {
     let cache = HELLO_REPLAY_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    for (id, rnd) in guard.iter() {
+    prune_hello_replay_cache(&mut guard, now_ms);
+    for (id, rnd, _) in guard.iter() {
+        if constant_time_eq(id, client_device_id) && constant_time_eq(rnd, client_random) {
+            return Err(TransportError::ReplayedHandshakeHello);
+        }
+    }
+    Ok(())
+}
+
+fn record_authenticated_hello_nonce(
+    client_device_id: &[u8; 16],
+    client_random: &[u8; 32],
+    now_ms: u64,
+) -> Result<(), TransportError> {
+    let cache = HELLO_REPLAY_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    prune_hello_replay_cache(&mut guard, now_ms);
+    for (id, rnd, _) in guard.iter() {
         if constant_time_eq(id, client_device_id) && constant_time_eq(rnd, client_random) {
             return Err(TransportError::ReplayedHandshakeHello);
         }
@@ -270,7 +298,7 @@ fn check_and_record_hello_nonce(
     if guard.len() >= MAX_HANDSHAKE_REPLAY_CACHE {
         guard.pop_front();
     }
-    guard.push_back((*client_device_id, *client_random));
+    guard.push_back((*client_device_id, *client_random, now_ms));
     Ok(())
 }
 
@@ -456,6 +484,13 @@ impl DirectionalCipherState {
             )
             .map_err(|_| TransportError::AeadDecryptionFailed)?;
 
+        if header[6] != 0 {
+            return Err(TransportError::MalformedHandshake(format!(
+                "unsupported record flags 0x{:02x}",
+                header[6]
+            )));
+        }
+
         self.seq = self
             .seq
             .checked_add(1)
@@ -475,8 +510,9 @@ pub struct TransportSessionV2<S> {
     session_id: [u8; 16],
     tx_state: DirectionalCipherState,
     rx_state: DirectionalCipherState,
-    established_at: Instant,
+    last_rekeyed_at: Instant,
     rekey_frame_limit: u64,
+    closed: bool,
 }
 
 impl<S> TransportSessionV2<S>
@@ -508,7 +544,7 @@ where
     }
 
     pub fn set_rekey_frame_limit(&mut self, limit: u64) {
-        self.rekey_frame_limit = limit.max(1);
+        self.rekey_frame_limit = limit.clamp(1, u64::MAX - 1);
     }
 
     /// Initiates a mutually authenticated `TransportV2` client session with a specific pinned `peer`.
@@ -624,8 +660,9 @@ where
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
-            established_at: Instant::now(),
+            last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
+            closed: false,
         })
     }
 
@@ -706,9 +743,6 @@ where
             return Err(TransportError::KeyIdMismatch);
         }
 
-        // Check replay cache for (client_dev_id, client_random).
-        check_and_record_hello_nonce(&client_dev_id, &client_random)?;
-
         // Sample server ephemeral X25519 key and reject all-zero / low-order client public keys.
         let server_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
@@ -720,6 +754,10 @@ where
         if constant_time_eq(dh_shared.as_bytes(), &[0u8; 32]) || !dh_shared.was_contributory() {
             return Err(TransportError::LowOrderEphemeralPoint);
         }
+
+        // Read-only replay check AFTER validating key_id and contributory X25519 exchange
+        // so unauthenticated callers cannot fill or evict HELLO_REPLAY_CACHE.
+        check_hello_nonce_not_replayed(&client_dev_id, &client_random, now_ms)?;
 
         let server_dev_id = keystore.local_device_id();
         let h2 = compute_transcript_h2(
@@ -772,6 +810,8 @@ where
         KeystoreV2::verify_signature(&peer_creds.ed25519_pubkey, &cli_sig_payload, &cli_sig)
             .map_err(|_| TransportError::HandshakeSignatureInvalid)?;
 
+        record_authenticated_hello_nonce(&client_dev_id, &client_random, unix_epoch_millis())?;
+
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
 
@@ -784,36 +824,58 @@ where
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
-            established_at: Instant::now(),
+            last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
+            closed: false,
         })
     }
 
     /// Triggers an explicit in-band outbound rekey (`FrameType::Rekey`) and ratchets `tx_state` to `epoch + 1`.
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
+        if self.tx_state.current_epoch() == u16::MAX {
+            self.closed = true;
+            return Err(TransportError::SequenceExhausted);
+        }
         let rekey_frame = self.tx_state.seal_record(
             RecordFrameType::Rekey,
-            b"REKEY-V2",
+            REKEY_MAGIC_PAYLOAD,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.stream
-            .write_all(&rekey_frame)
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.tx_state.ratchet_epoch()?;
+        let write_res = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&rekey_frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("rekey write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("rekey flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        }
+        .await;
+        if let Err(e) = write_res {
+            self.closed = true;
+            return Err(e);
+        }
+        if let Err(e) = self.tx_state.ratchet_epoch() {
+            self.closed = true;
+            return Err(e);
+        }
+        self.last_rekeyed_at = Instant::now();
         Ok(())
     }
 
     /// Encrypts and writes an application data frame, automatically ratcheting the outbound key
     /// if `rekey_frame_limit` or `DEFAULT_REKEY_AGE_SECS` has been reached.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
         if self.tx_state.current_seq() >= self.rekey_frame_limit
-            || (self.tx_state.current_epoch() == 0
-                && self.established_at.elapsed().as_secs() >= DEFAULT_REKEY_AGE_SECS)
+            || self.last_rekeyed_at.elapsed().as_secs() >= DEFAULT_REKEY_AGE_SECS
         {
             self.initiate_rekey().await?;
         }
@@ -823,41 +885,55 @@ where
             plaintext,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.stream
-            .write_all(&frame)
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        let write_res = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("record write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("record flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        }
+        .await;
+        if let Err(e) = write_res {
+            self.closed = true;
+            return Err(e);
+        }
         Ok(())
     }
 
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
     /// in-band `Rekey` and `KeepAlive` control frames.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
         let max_ciphertext = max_plaintext + AEAD_TAG_LEN;
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
-            self.stream
-                .read_exact(&mut hdr)
-                .await
-                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            if let Err(e) = self.stream.read_exact(&mut hdr).await {
+                self.closed = true;
+                return Err(TransportError::IoFailure(e.to_string()));
+            }
 
             let mut magic = [0u8; 4];
             magic.copy_from_slice(&hdr[0..4]);
             if magic != TRANSPORT_WIRE_MAGIC {
+                self.closed = true;
                 return Err(TransportError::InvalidMagic(magic));
             }
             if hdr[4] != TRANSPORT_HEADER_VERSION_BYTE {
+                self.closed = true;
                 return Err(TransportError::UnsupportedVersion(hdr[4] as u16));
             }
 
             let ct_len = u32::from_be_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]) as usize;
             if ct_len < AEAD_TAG_LEN || ct_len > max_ciphertext {
+                self.closed = true;
                 return Err(TransportError::OversizedFrame {
                     len: ct_len,
                     max: max_ciphertext,
@@ -865,19 +941,44 @@ where
             }
 
             let mut ciphertext = vec![0u8; ct_len];
-            self.stream
-                .read_exact(&mut ciphertext)
-                .await
-                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            let body_res = tokio::time::timeout(
+                RECORD_IO_TIMEOUT,
+                self.stream.read_exact(&mut ciphertext),
+            )
+            .await
+            .map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
+            .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())));
+            if let Err(e) = body_res {
+                self.closed = true;
+                return Err(e);
+            }
 
-            let (frame_type, plaintext) = self.rx_state.open_record(&hdr, &ciphertext)?;
+            let (frame_type, plaintext) = match self.rx_state.open_record(&hdr, &ciphertext) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.closed = true;
+                    return Err(e);
+                }
+            };
             match frame_type {
                 RecordFrameType::ApplicationData => return Ok(plaintext),
                 RecordFrameType::Rekey => {
-                    self.rx_state.ratchet_epoch()?;
+                    if plaintext.as_slice() != REKEY_MAGIC_PAYLOAD {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "unexpected Rekey control payload".into(),
+                        ));
+                    }
+                    if let Err(e) = self.rx_state.ratchet_epoch() {
+                        self.closed = true;
+                        return Err(e);
+                    }
                 }
                 RecordFrameType::KeepAlive => continue,
-                RecordFrameType::CloseNotify => return Err(TransportError::ConnectionClosed),
+                RecordFrameType::CloseNotify => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
             }
         }
     }
@@ -943,18 +1044,22 @@ where
 
     /// Sends an authenticated `CloseNotify` frame before closing the session.
     pub async fn close_notify(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
+        self.closed = true;
         let frame = self.tx_state.seal_record(
             RecordFrameType::CloseNotify,
             b"",
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.stream
-            .write_all(&frame)
+        tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&frame))
             .await
+            .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
             .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.stream
-            .flush()
+        tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.flush())
             .await
+            .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
             .map_err(|e| TransportError::IoFailure(e.to_string()))?;
         Ok(())
     }
@@ -1078,8 +1183,9 @@ where
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
-            established_at: Instant::now(),
+            last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
+            closed: false,
         })
     }
 
@@ -1146,8 +1252,6 @@ where
             return Err(TransportError::KeyIdMismatch);
         }
 
-        check_and_record_hello_nonce(&client_dev_id, &client_random)?;
-
         let server_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
         let eph_sk_s = X25519SecretKey::from(*eph_sk_bytes);
@@ -1158,6 +1262,8 @@ where
         if constant_time_eq(dh_shared.as_bytes(), &[0u8; 32]) || !dh_shared.was_contributory() {
             return Err(TransportError::LowOrderEphemeralPoint);
         }
+
+        check_hello_nonce_not_replayed(&client_dev_id, &client_random, now_ms)?;
 
         let h2 = compute_transcript_h2(
             expected_service,
@@ -1212,6 +1318,8 @@ where
         KeystoreV2::verify_signature(&peer_creds.ed25519_pubkey, &cli_sig_payload, &cli_sig)
             .map_err(|_| TransportError::HandshakeSignatureInvalid)?;
 
+        record_authenticated_hello_nonce(&client_dev_id, &client_random, unix_epoch_millis())?;
+
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
 
@@ -1224,8 +1332,9 @@ where
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
-            established_at: Instant::now(),
+            last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
+            closed: false,
         })
     }
 }
@@ -1237,6 +1346,7 @@ pub struct TransportReaderV2<R> {
     peer_device_id: [u8; 16],
     peer_device_id_hex: String,
     rx_state: DirectionalCipherState,
+    closed: bool,
 }
 
 /// Write half of a full-duplex split `TransportSessionV2`, owning independent outbound AEAD state.
@@ -1246,8 +1356,9 @@ pub struct TransportWriterV2<W> {
     peer_device_id: [u8; 16],
     peer_device_id_hex: String,
     tx_state: DirectionalCipherState,
-    established_at: Instant,
+    last_rekeyed_at: Instant,
     rekey_frame_limit: u64,
+    closed: bool,
 }
 
 impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
@@ -1260,27 +1371,33 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
     }
 
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
         let max_ciphertext = max_plaintext + AEAD_TAG_LEN;
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
-            self.reader
-                .read_exact(&mut hdr)
-                .await
-                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            if let Err(e) = self.reader.read_exact(&mut hdr).await {
+                self.closed = true;
+                return Err(TransportError::IoFailure(e.to_string()));
+            }
 
             let mut magic = [0u8; 4];
             magic.copy_from_slice(&hdr[0..4]);
             if magic != TRANSPORT_WIRE_MAGIC {
+                self.closed = true;
                 return Err(TransportError::InvalidMagic(magic));
             }
             if hdr[4] != TRANSPORT_HEADER_VERSION_BYTE {
+                self.closed = true;
                 return Err(TransportError::UnsupportedVersion(hdr[4] as u16));
             }
 
             let ct_len = u32::from_be_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]) as usize;
             if ct_len < AEAD_TAG_LEN || ct_len > max_ciphertext {
+                self.closed = true;
                 return Err(TransportError::OversizedFrame {
                     len: ct_len,
                     max: max_ciphertext,
@@ -1288,19 +1405,44 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
             }
 
             let mut ciphertext = vec![0u8; ct_len];
-            self.reader
-                .read_exact(&mut ciphertext)
-                .await
-                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            let body_res = tokio::time::timeout(
+                RECORD_IO_TIMEOUT,
+                self.reader.read_exact(&mut ciphertext),
+            )
+            .await
+            .map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
+            .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())));
+            if let Err(e) = body_res {
+                self.closed = true;
+                return Err(e);
+            }
 
-            let (frame_type, plaintext) = self.rx_state.open_record(&hdr, &ciphertext)?;
+            let (frame_type, plaintext) = match self.rx_state.open_record(&hdr, &ciphertext) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.closed = true;
+                    return Err(e);
+                }
+            };
             match frame_type {
                 RecordFrameType::ApplicationData => return Ok(plaintext),
                 RecordFrameType::Rekey => {
-                    self.rx_state.ratchet_epoch()?;
+                    if plaintext.as_slice() != REKEY_MAGIC_PAYLOAD {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "unexpected Rekey control payload".into(),
+                        ));
+                    }
+                    if let Err(e) = self.rx_state.ratchet_epoch() {
+                        self.closed = true;
+                        return Err(e);
+                    }
                 }
                 RecordFrameType::KeepAlive => continue,
-                RecordFrameType::CloseNotify => return Err(TransportError::ConnectionClosed),
+                RecordFrameType::CloseNotify => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
             }
         }
     }
@@ -1316,27 +1458,48 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
     }
 
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
+        if self.tx_state.current_epoch() == u16::MAX {
+            self.closed = true;
+            return Err(TransportError::SequenceExhausted);
+        }
         let rekey_frame = self.tx_state.seal_record(
             RecordFrameType::Rekey,
-            b"REKEY-V2",
+            REKEY_MAGIC_PAYLOAD,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.writer
-            .write_all(&rekey_frame)
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.tx_state.ratchet_epoch()?;
+        let write_res = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&rekey_frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("rekey write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("rekey flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        }
+        .await;
+        if let Err(e) = write_res {
+            self.closed = true;
+            return Err(e);
+        }
+        if let Err(e) = self.tx_state.ratchet_epoch() {
+            self.closed = true;
+            return Err(e);
+        }
+        self.last_rekeyed_at = Instant::now();
         Ok(())
     }
 
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
         if self.tx_state.current_seq() >= self.rekey_frame_limit
-            || (self.tx_state.current_epoch() == 0
-                && self.established_at.elapsed().as_secs() >= DEFAULT_REKEY_AGE_SECS)
+            || self.last_rekeyed_at.elapsed().as_secs() >= DEFAULT_REKEY_AGE_SECS
         {
             self.initiate_rekey().await?;
         }
@@ -1346,30 +1509,42 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
             plaintext,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.writer
-            .write_all(&frame)
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        let write_res = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("record write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("record flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        }
+        .await;
+        if let Err(e) = write_res {
+            self.closed = true;
+            return Err(e);
+        }
         Ok(())
     }
 
     pub async fn close_notify(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::ConnectionClosed);
+        }
+        self.closed = true;
         let frame = self.tx_state.seal_record(
             RecordFrameType::CloseNotify,
             b"",
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        self.writer
-            .write_all(&frame)
+        tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&frame))
             .await
+            .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
             .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        self.writer
-            .flush()
+        tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.flush())
             .await
+            .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
             .map_err(|e| TransportError::IoFailure(e.to_string()))?;
         Ok(())
     }
@@ -1391,6 +1566,7 @@ impl TransportSessionV2<tokio::net::TcpStream> {
                 peer_device_id: self.peer_device_id,
                 peer_device_id_hex: self.peer_device_id_hex.clone(),
                 rx_state: self.rx_state,
+                closed: self.closed,
             },
             TransportWriterV2 {
                 writer: write_half,
@@ -1398,8 +1574,9 @@ impl TransportSessionV2<tokio::net::TcpStream> {
                 peer_device_id: self.peer_device_id,
                 peer_device_id_hex: self.peer_device_id_hex,
                 tx_state: self.tx_state,
-                established_at: self.established_at,
+                last_rekeyed_at: self.last_rekeyed_at,
                 rekey_frame_limit: self.rekey_frame_limit,
+                closed: self.closed,
             },
         )
     }
@@ -1458,13 +1635,13 @@ where
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(&payload);
 
-    writer
-        .write_all(&frame)
+    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, writer.write_all(&frame))
         .await
+        .map_err(|_| TransportError::IoFailure("handshake write timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-    writer
-        .flush()
+    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, writer.flush())
         .await
+        .map_err(|_| TransportError::IoFailure("handshake flush timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
     Ok(payload)
 }
@@ -1480,9 +1657,9 @@ where
         Some(m) => m,
         None => {
             let mut m = [0u8; 4];
-            reader
-                .read_exact(&mut m)
+            tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut m))
                 .await
+                .map_err(|_| TransportError::IoFailure("handshake magic read timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             m
         }
@@ -1492,9 +1669,9 @@ where
     }
 
     let mut rest_hdr = [0u8; 4];
-    reader
-        .read_exact(&mut rest_hdr)
+    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut rest_hdr))
         .await
+        .map_err(|_| TransportError::IoFailure("handshake header read timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
 
     if rest_hdr[0] != TRANSPORT_HEADER_VERSION_BYTE {
@@ -1511,9 +1688,9 @@ where
     }
 
     let mut payload = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload)
+    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut payload))
         .await
+        .map_err(|_| TransportError::IoFailure("handshake payload read timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
     Ok((hs_type, payload))
 }
@@ -1827,26 +2004,79 @@ mod tests {
     #[tokio::test]
     async fn test_transport_v2_record_tamper_and_sequence_enforcement() {
         let (dir_c, ks_c, srv_creds, dir_s, ks_s, _) = create_paired_keystores("tamper");
-        let (c_stream, s_stream) = tokio::io::duplex(65_536);
 
-        let (c_res, s_res) = tokio::join!(
-            TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
-            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
-        );
-        let mut client_sess = c_res.unwrap();
-        let mut server_sess = s_res.unwrap();
+        // 1. Ciphertext bitflip must fail with AeadDecryptionFailed and poison session
+        {
+            let (c_stream, s_stream) = tokio::io::duplex(65_536);
+            let (c_res, s_res) = tokio::join!(
+                TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+                TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+            );
+            let mut client_sess = c_res.unwrap();
+            let mut server_sess = s_res.unwrap();
 
-        // Seal a valid record at seq=0, then tamper with 1 bit in the AAD header (sequence number)
-        let mut raw_frame = client_sess
-            .tx_state
-            .seal_record(RecordFrameType::ApplicationData, b"secret-rpc", 65_536)
-            .unwrap();
-        raw_frame[21] ^= 0x01; // flip 1 bit in ciphertext
-        client_sess.stream.write_all(&raw_frame).await.unwrap();
-        client_sess.stream.flush().await.unwrap();
+            let mut raw_frame = client_sess
+                .tx_state
+                .seal_record(RecordFrameType::ApplicationData, b"secret-rpc", 65_536)
+                .unwrap();
+            raw_frame[21] ^= 0x01; // flip 1 bit in ciphertext
+            client_sess.stream.write_all(&raw_frame).await.unwrap();
+            client_sess.stream.flush().await.unwrap();
 
-        let err = server_sess.recv_message().await.unwrap_err();
-        assert_eq!(err, TransportError::AeadDecryptionFailed);
+            let err = server_sess.recv_message().await.unwrap_err();
+            assert_eq!(err, TransportError::AeadDecryptionFailed);
+            assert_eq!(server_sess.recv_message().await.unwrap_err(), TransportError::ConnectionClosed);
+        }
+
+        // 2. Actual AAD header bitflip (flags byte 6) must fail AEAD verification
+        {
+            let (c_stream, s_stream) = tokio::io::duplex(65_536);
+            let (c_res, s_res) = tokio::join!(
+                TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+                TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+            );
+            let mut client_sess = c_res.unwrap();
+            let mut server_sess = s_res.unwrap();
+
+            let mut raw_frame = client_sess
+                .tx_state
+                .seal_record(RecordFrameType::ApplicationData, b"secret-rpc-aad", 65_536)
+                .unwrap();
+            raw_frame[6] ^= 0x01; // flip 1 bit in authenticated header AAD
+            client_sess.stream.write_all(&raw_frame).await.unwrap();
+            client_sess.stream.flush().await.unwrap();
+
+            let err = server_sess.recv_message().await.unwrap_err();
+            assert_eq!(err, TransportError::AeadDecryptionFailed);
+        }
+
+        // 3. Sequence number header tamper (byte 16) must trigger SequenceMismatch
+        {
+            let (c_stream, s_stream) = tokio::io::duplex(65_536);
+            let (c_res, s_res) = tokio::join!(
+                TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+                TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+            );
+            let mut client_sess = c_res.unwrap();
+            let mut server_sess = s_res.unwrap();
+
+            let mut raw_frame = client_sess
+                .tx_state
+                .seal_record(RecordFrameType::ApplicationData, b"secret-rpc-seq", 65_536)
+                .unwrap();
+            raw_frame[16] ^= 0x01; // tamper sequence number in header
+            client_sess.stream.write_all(&raw_frame).await.unwrap();
+            client_sess.stream.flush().await.unwrap();
+
+            let err = server_sess.recv_message().await.unwrap_err();
+            assert_eq!(
+                err,
+                TransportError::SequenceMismatch {
+                    expected: 0,
+                    received: 1,
+                }
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir_c);
         let _ = std::fs::remove_dir_all(&dir_s);

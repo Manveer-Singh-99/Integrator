@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton};
@@ -10,6 +10,7 @@ use crate::kvm::service::{HookDecision, KvmService};
 
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
 static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static START_TAP_LOCK: Mutex<()> = Mutex::new(());
 
 type KvmEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
 type KvmDragEndedCallback = extern "C" fn(bool, *const c_char);
@@ -19,6 +20,7 @@ extern "C" {
         cb: Option<KvmEventCallback>,
         drag_ended_cb: Option<KvmDragEndedCallback>,
     ) -> bool;
+    fn integrator_kvm_macos_stop_tap();
     fn integrator_kvm_macos_is_tap_active() -> bool;
     fn integrator_kvm_macos_request_accessibility() -> bool;
     fn integrator_kvm_macos_screen_rect(
@@ -35,7 +37,6 @@ extern "C" {
         restore_y: f64,
     );
     fn integrator_kvm_macos_set_controlled(controlled: bool, entry_x: f64, entry_y: f64);
-    fn integrator_kvm_macos_warp_cursor(x: f64, y: f64);
     fn integrator_kvm_macos_probe_drag_paths() -> *mut c_char;
     fn integrator_kvm_macos_cancel_local_drag();
     fn integrator_kvm_macos_icon_png_b64(path: *const c_char) -> *mut c_char;
@@ -70,6 +71,7 @@ extern "C" {
 
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
+    let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ok = unsafe {
         integrator_kvm_macos_start_tap(Some(on_cg_event), Some(on_drag_ended))
     };
@@ -86,9 +88,12 @@ pub fn start(service: Arc<KvmService>) {
             .spawn(|| {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    if TAP_ACTIVE.load(Ordering::Acquire) {
+                    let active_now = unsafe { integrator_kvm_macos_is_tap_active() };
+                    if active_now {
+                        TAP_ACTIVE.store(true, Ordering::Release);
                         break;
                     }
+                    let _g = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                     let activated = unsafe {
                         integrator_kvm_macos_start_tap(Some(on_cg_event), Some(on_drag_ended))
                     };
@@ -103,20 +108,24 @@ pub fn start(service: Arc<KvmService>) {
     }
 }
 
+pub fn stop() {
+    let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    TAP_ACTIVE.store(false, Ordering::Release);
+    unsafe {
+        integrator_kvm_macos_stop_tap();
+    }
+}
+
 pub fn is_hook_active() -> bool {
-    if TAP_ACTIVE.load(Ordering::Acquire) {
-        return true;
-    }
     let active = unsafe { integrator_kvm_macos_is_tap_active() };
-    if active {
-        TAP_ACTIVE.store(true, Ordering::Release);
-    }
+    TAP_ACTIVE.store(active, Ordering::Release);
     active
 }
 
 pub fn request_accessibility() -> bool {
     let trusted = unsafe { integrator_kvm_macos_request_accessibility() };
     if trusted {
+        let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let activated = unsafe {
             integrator_kvm_macos_start_tap(Some(on_cg_event), Some(on_drag_ended))
         };
@@ -165,12 +174,6 @@ pub fn set_controlling_mode(
 pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
     unsafe {
         integrator_kvm_macos_set_controlled(controlled, entry_x as f64, entry_y as f64);
-    }
-}
-
-pub fn warp_cursor(x: f32, y: f32) {
-    unsafe {
-        integrator_kvm_macos_warp_cursor(x as f64, y as f64);
     }
 }
 
@@ -230,8 +233,10 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: 
 }
 
 pub fn inject_scroll(dx: f32, dy: f32) {
+    let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
+    let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
     unsafe {
-        integrator_kvm_macos_inject_scroll(dx as f64, dy as f64);
+        integrator_kvm_macos_inject_scroll(safe_dx as f64, safe_dy as f64);
     }
 }
 
@@ -327,6 +332,8 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
             let kc = a as u16;
             if let Some(key) = macos_keycode_to_logical(kc) {
                 svc.on_local_key_event(key, b > 0.5, cg_flags_to_modifiers(extra))
+            } else if svc.is_controlling_peer_fast() {
+                HookDecision::Swallow
             } else {
                 HookDecision::PassThrough
             }
@@ -341,6 +348,8 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
                 decision
             } else if let Some((key, pressed)) = macos_flags_changed_key(kc, extra, mods) {
                 svc.on_local_key_event(key, pressed, mods)
+            } else if svc.is_controlling_peer_fast() {
+                HookDecision::Swallow
             } else {
                 HookDecision::PassThrough
             }

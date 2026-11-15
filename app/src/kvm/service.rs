@@ -3,16 +3,17 @@
 //! Runs full-duplex over `TransportSessionV2` (`ServiceId::InputKvm`, TCP port `INPUT_PORT = 58286`),
 //! strictly requiring paired + pinned peer trust (zero IP bypass, zero v1 fallback).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
 use crate::clipboard::ClipboardService;
@@ -37,6 +38,8 @@ use super::windows_backend;
 
 const MAX_WIRE_MESSAGE_BYTES: usize = 96 * 1024;
 const OUTBOUND_QUEUE_CAP: usize = 1024;
+const RESERVED_CONTROL_SLOTS: usize = 128;
+const MAX_ACCEPT_HANDSHAKES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookDecision {
@@ -98,6 +101,7 @@ pub struct KvmService {
 
     layout: RwLock<KvmLayoutConfig>,
     role: Mutex<KvmRole>,
+    controlling_peer_fast: AtomicBool,
     local_rect: RwLock<ScreenRect>,
     peer_rect: RwLock<ScreenRect>,
     connected_peer_ip: RwLock<Option<String>>,
@@ -109,7 +113,16 @@ pub struct KvmService {
     last_edge_transition: Mutex<Instant>,
     held_remote_keys: Mutex<HashSet<LogicalKey>>,
     held_remote_buttons: Mutex<HashSet<RemoteMouseButton>>,
+    sent_remote_keys: Mutex<HashMap<LogicalKey, (LogicalKey, ModifierMask)>>,
     outbound_tx: RwLock<Option<mpsc::Sender<KvmOutboundCmd>>>,
+    next_session_id: AtomicU64,
+    active_session_id: AtomicU64,
+    connect_in_flight: AtomicBool,
+    shutting_down: AtomicBool,
+    active_tasks: Mutex<Vec<AbortHandle>>,
+    session_abort: Mutex<Option<(AbortHandle, AbortHandle)>>,
+    staging_task: Mutex<Option<AbortHandle>>,
+    drag_stage_dirs: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl KvmService {
@@ -125,6 +138,7 @@ impl KvmService {
             features,
             layout: RwLock::new(initial_layout),
             role: Mutex::new(KvmRole::Idle),
+            controlling_peer_fast: AtomicBool::new(false),
             local_rect: RwLock::new(ScreenRect {
                 x: 0.0,
                 y: 0.0,
@@ -146,10 +160,86 @@ impl KvmService {
             last_edge_transition: Mutex::new(Instant::now() - Duration::from_secs(5)),
             held_remote_keys: Mutex::new(HashSet::new()),
             held_remote_buttons: Mutex::new(HashSet::new()),
+            sent_remote_keys: Mutex::new(HashMap::new()),
             outbound_tx: RwLock::new(None),
+            next_session_id: AtomicU64::new(0),
+            active_session_id: AtomicU64::new(0),
+            connect_in_flight: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            active_tasks: Mutex::new(Vec::new()),
+            session_abort: Mutex::new(None),
+            staging_task: Mutex::new(None),
+            drag_stage_dirs: Mutex::new(HashMap::new()),
         });
         svc.refresh_local_rect();
         svc
+    }
+
+    pub fn is_controlling_peer_fast(&self) -> bool {
+        self.controlling_peer_fast.load(Ordering::Acquire)
+    }
+
+    fn set_role_locked(&self, role_guard: &mut KvmRole, next_role: KvmRole) -> KvmRole {
+        let is_controlling = matches!(next_role, KvmRole::ControllingPeer { .. });
+        let prev = std::mem::replace(role_guard, next_role);
+        self.controlling_peer_fast
+            .store(is_controlling, Ordering::Release);
+        prev
+    }
+
+    fn abort_active_session_tasks(&self) {
+        if let Some((r_abort, w_abort)) = self
+            .session_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            r_abort.abort();
+            w_abort.abort();
+        }
+    }
+
+    fn teardown_active_session(&self) {
+        self.active_session_id.store(0, Ordering::Release);
+        self.abort_active_session_tasks();
+        *self
+            .connected_peer_ip
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .outbound_tx
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.force_release_all(false);
+        self.sync_platform_probe();
+    }
+
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.force_release_all(true);
+        self.teardown_active_session();
+        if let Some(handle) = self
+            .staging_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+        let handles: Vec<AbortHandle> = self
+            .active_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for handle in handles {
+            handle.abort();
+        }
+        self.cleanup_all_drag_stage_dirs();
+        #[cfg(target_os = "macos")]
+        macos_backend::stop();
+        #[cfg(target_os = "windows")]
+        windows_backend::stop();
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
@@ -169,73 +259,124 @@ impl KvmService {
             INPUT_PORT
         );
 
+        let accept_sem = Arc::new(Semaphore::new(MAX_ACCEPT_HANDSHAKES));
         let svc_accept = Arc::clone(self);
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             loop {
+                if svc_accept.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
                 match listener.accept().await {
                     Ok((socket, addr)) => {
+                        if svc_accept.shutting_down.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if !svc_accept.features.is_enabled("input_kvm") {
+                            continue;
+                        }
+                        let Ok(permit) = accept_sem.clone().try_acquire_owned() else {
+                            warn!(
+                                "🚫 Dropping excess incoming KVM handshake from {} (limit={})",
+                                addr.ip(),
+                                MAX_ACCEPT_HANDSHAKES
+                            );
+                            continue;
+                        };
                         let peer_ip = addr.ip();
                         let s = Arc::clone(&svc_accept);
                         tokio::spawn(async move {
                             let _ = socket.set_nodelay(true);
                             let mut magic = [0u8; 4];
                             use tokio::io::AsyncReadExt;
-                            if tokio::time::timeout(
-                                Duration::from_secs(5),
-                                socket.readable(),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                return;
-                            }
                             let mut sock = socket;
-                            if sock.read_exact(&mut magic).await.is_err() {
-                                return;
+                            let read_res = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                sock.read_exact(&mut magic),
+                            )
+                            .await;
+                            match read_res {
+                                Ok(Ok(_)) => {}
+                                _ => {
+                                    drop(permit);
+                                    return;
+                                }
                             }
                             if magic != TRANSPORT_WIRE_MAGIC {
                                 warn!("🚫 Rejected non-ITR2 magic on KVM port from {}", peer_ip);
+                                drop(permit);
                                 return;
                             }
-                            match trust::accept_transport_from_stream(
-                                sock,
-                                peer_ip,
-                                Some(magic),
-                                ServiceId::InputKvm,
+                            let auth_res = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                trust::accept_transport_from_stream(
+                                    sock,
+                                    peer_ip,
+                                    Some(magic),
+                                    ServiceId::InputKvm,
+                                ),
                             )
-                            .await
-                            {
-                                Ok(sess) => {
+                            .await;
+                            drop(permit);
+                            match auth_res {
+                                Ok(Ok(sess)) => {
                                     s.attach_transport_session(peer_ip.to_string(), sess).await;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!("🚫 Rejected KVM connection from {}: {}", peer_ip, e);
+                                }
+                                Err(_) => {
+                                    warn!("🚫 Timed out KVM TransportV2 handshake from {}", peer_ip);
                                 }
                             }
                         });
                     }
                     Err(e) => {
+                        if svc_accept.shutting_down.load(Ordering::Acquire) {
+                            break;
+                        }
                         warn!("KVM TCP accept error: {}", e);
                         tokio::time::sleep(Duration::from_millis(250)).await;
                     }
                 }
             }
         });
+        self.active_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(accept_task.abort_handle());
 
         // 2. Persistent peer connector & feature-gate watcher
         let svc_loop = Arc::clone(self);
-        tokio::spawn(async move {
+        let loop_task = tokio::spawn(async move {
             let local_id = crate::system_info::get_or_create_device_id();
             let mut unconnected_ticks: u32 = 0;
 
             loop {
+                if svc_loop.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
                 svc_loop.refresh_local_rect();
                 svc_loop.sync_platform_probe();
 
                 let kvm_on = svc_loop.features.is_enabled("input_kvm");
                 if !kvm_on {
-                    if !matches!(*svc_loop.role.lock().unwrap_or_else(|e| e.into_inner()), KvmRole::Idle) {
+                    let has_active_session = svc_loop.active_session_id.load(Ordering::Acquire) != 0
+                        || svc_loop
+                            .connected_peer_ip
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
+                    if !matches!(
+                        *svc_loop.role.lock().unwrap_or_else(|e| e.into_inner()),
+                        KvmRole::Idle
+                    ) {
                         svc_loop.force_release_all(true);
+                        if has_active_session {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    }
+                    if has_active_session {
+                        svc_loop.teardown_active_session();
                     }
                     unconnected_ticks = 0;
                     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -270,21 +411,47 @@ impl KvmService {
 
                             let i_am_preferred_client = local_id < peer.device_id;
                             unconnected_ticks += 1;
-                            if i_am_preferred_client || unconnected_ticks >= 3 {
-                                if let Ok(sess) = trust::connect_transport_to_ip(
-                                    &peer_ip,
-                                    INPUT_PORT,
-                                    ServiceId::InputKvm,
-                                    Duration::from_secs(3),
-                                )
-                                .await
-                                {
-                                    unconnected_ticks = 0;
-                                    let s = Arc::clone(&svc_loop);
-                                    tokio::spawn(async move {
-                                        s.attach_transport_session(peer_ip, sess).await;
-                                    });
-                                }
+                            if (i_am_preferred_client || unconnected_ticks >= 3)
+                                && svc_loop
+                                    .connect_in_flight
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            {
+                                unconnected_ticks = 0;
+                                let s = Arc::clone(&svc_loop);
+                                tokio::spawn(async move {
+                                    struct ResetGuard<'a>(&'a AtomicBool);
+                                    impl Drop for ResetGuard<'_> {
+                                        fn drop(&mut self) {
+                                            self.0.store(false, Ordering::Release);
+                                        }
+                                    }
+                                    let _guard = ResetGuard(&s.connect_in_flight);
+                                    if let Ok(sess) = trust::connect_transport_to_ip(
+                                        &peer_ip,
+                                        INPUT_PORT,
+                                        ServiceId::InputKvm,
+                                        Duration::from_secs(3),
+                                    )
+                                    .await
+                                    {
+                                        if s.features.is_enabled("input_kvm")
+                                            && !s.shutting_down.load(Ordering::Acquire)
+                                        {
+                                            let s_attach = Arc::clone(&s);
+                                            tokio::spawn(async move {
+                                                s_attach
+                                                    .attach_transport_session(peer_ip, sess)
+                                                    .await;
+                                            });
+                                        }
+                                    }
+                                });
                             }
                         }
                     } else {
@@ -297,6 +464,10 @@ impl KvmService {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         });
+        self.active_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(loop_task.abort_handle());
 
         Ok(())
     }
@@ -387,27 +558,60 @@ impl KvmService {
         if notify_peer {
             self.try_send_wire(KvmWireMessage::ReleaseAll);
         }
+        if let Some(handle) = self
+            .staging_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
         let prev = {
             let mut r = self.role.lock().unwrap_or_else(|e| e.into_inner());
-            let old = r.clone();
-            *r = KvmRole::Idle;
-            old
+            self.set_role_locked(&mut r, KvmRole::Idle)
         };
+        self.sent_remote_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self
             .pending_drag_drop_label
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.remote_left_down.store(false, Ordering::Release);
+        self.cleanup_all_drag_stage_dirs();
+
+        let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
+        let park_x = local_rect.x + local_rect.width * 0.5;
+        let park_y = local_rect.y + local_rect.height * 0.5;
 
         match prev {
             KvmRole::ControllingPeer {
                 restore_x,
                 restore_y,
+                active_drag_session,
                 ..
             } => {
-                Self::platform_set_controlling(false, 400.0, 300.0, restore_x, restore_y);
+                if let Some(sid) = active_drag_session {
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let clipboard = self.clipboard.clone();
+                        handle.spawn(async move {
+                            clipboard.remove_drag_session(&sid).await;
+                        });
+                    }
+                }
+                Self::platform_set_controlling(false, park_x, park_y, restore_x, restore_y);
             }
-            KvmRole::ControlledByPeer { cur_x, cur_y, .. } => {
+            KvmRole::ControlledByPeer {
+                cur_x,
+                cur_y,
+                active_drag_session,
+                ..
+            } => {
+                if active_drag_session.is_some() {
+                    #[cfg(target_os = "windows")]
+                    windows_backend::cancel_remote_drag();
+                }
                 self.release_all_injected_inputs(cur_x, cur_y);
                 Self::platform_hide_ghost();
                 Self::platform_set_controlled(false, cur_x, cur_y);
@@ -425,6 +629,15 @@ impl KvmService {
         peer_ip: String,
         session: crate::security::transport::TransportSessionV2<tokio::net::TcpStream>,
     ) {
+        if !self.features.is_enabled("input_kvm") || self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+
+        let my_session_id = self.next_session_id.fetch_add(1, Ordering::AcqRel) + 1;
+        self.abort_active_session_tasks();
+        self.force_release_all(false);
+        self.active_session_id.store(my_session_id, Ordering::Release);
+
         let (mut reader, writer) = session.into_split_tcp();
         let (tx, mut rx) = mpsc::channel::<KvmOutboundCmd>(OUTBOUND_QUEUE_CAP);
 
@@ -437,10 +650,22 @@ impl KvmService {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
-        if let Some(peer) = self.discovery.get_best_peer().await {
+        let peers = self.discovery.get_all_peers().await;
+        if let Some(peer) = peers
+            .into_iter()
+            .find(|p| p.addr.ip().to_string() == peer_ip)
+        {
             let diff_os = !peer.os.eq_ignore_ascii_case(std::env::consts::OS);
             self.peer_diff_os.store(diff_os, Ordering::Relaxed);
             *self.peer_os.write().unwrap_or_else(|e| e.into_inner()) = Some(peer.os);
+            if peer.display_width >= 320 && peer.display_height >= 200 {
+                *self.peer_rect.write().unwrap_or_else(|e| e.into_inner()) = ScreenRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: peer.display_width as f32,
+                    height: peer.display_height as f32,
+                };
+            }
         }
 
         self.sync_platform_probe();
@@ -464,24 +689,51 @@ impl KvmService {
         let writer_task = tokio::spawn(async move {
             Self::run_writer_loop(&svc_w, writer, &mut rx, &peer_ip_w).await;
         });
+        let writer_abort = writer_task.abort_handle();
 
-        Self::run_reader_loop(self, &mut reader, &peer_ip).await;
+        let svc_r = Arc::clone(self);
+        let peer_ip_r = peer_ip.clone();
+        let reader_task = tokio::spawn(async move {
+            Self::run_reader_loop(&svc_r, &mut reader, &peer_ip_r).await;
+        });
+        let reader_abort = reader_task.abort_handle();
+
+        if self.active_session_id.load(Ordering::Acquire) == my_session_id
+            && !self.shutting_down.load(Ordering::Acquire)
+        {
+            let mut slot = self
+                .session_abort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((old_r, old_w)) = slot.replace((reader_abort.clone(), writer_abort.clone())) {
+                old_r.abort();
+                old_w.abort();
+            }
+        } else {
+            reader_abort.abort();
+            writer_abort.abort();
+        }
+
+        let _ = reader_task.await;
 
         drop(tx);
-        writer_task.abort();
+        writer_abort.abort();
 
-        // Clean disconnect teardown
-        let mut cur_ip = self
-            .connected_peer_ip
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if cur_ip.as_deref() == Some(peer_ip.as_str()) {
-            *cur_ip = None;
+        // Clean disconnect teardown only if we are still the active session
+        if self
+            .active_session_id
+            .compare_exchange(my_session_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.abort_active_session_tasks();
+            *self
+                .connected_peer_ip
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             *self
                 .outbound_tx
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = None;
-            drop(cur_ip);
             self.force_release_all(false);
             self.sync_platform_probe();
         }
@@ -504,13 +756,15 @@ impl KvmService {
                     paths,
                 } => {
                     let paths_clone = paths.clone();
+                    let first_path = paths.first().cloned();
                     let collected = tokio::task::spawn_blocking(move || {
-                        ClipboardService::collect_drag_items(&paths_clone)
+                        let copy = ClipboardService::collect_drag_items(&paths_clone)?;
+                        let icon_b64 = Self::extract_icon_b64(first_path.as_deref());
+                        Ok::<_, anyhow::Error>((copy, icon_b64))
                     })
                     .await;
                     let drag_offer = match collected {
-                        Ok(Ok(copy)) => {
-                            let icon_b64 = Self::extract_icon_b64(paths.first().map(|p| p.as_path()));
+                        Ok(Ok((copy, icon_b64))) => {
                             let offer = DragOffer {
                                 session_id: copy.session_id.clone(),
                                 root_name: copy.root_name.clone(),
@@ -520,21 +774,30 @@ impl KvmService {
                                 is_directory: !copy.directories.is_empty(),
                                 icon_png_b64: icon_b64,
                             };
-                            {
-                                let mut role_lock = svc.role.lock().unwrap_or_else(|e| e.into_inner());
+                            let still_controlling = {
+                                let mut role_lock =
+                                    svc.role.lock().unwrap_or_else(|e| e.into_inner());
                                 if let KvmRole::ControllingPeer {
                                     ref mut active_drag_session,
                                     ..
                                 } = *role_lock
                                 {
                                     *active_drag_session = Some(copy.session_id.clone());
+                                    true
+                                } else {
+                                    false
                                 }
+                            };
+                            if still_controlling {
+                                *svc.pending_drag_drop_label
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner()) =
+                                    Some(offer.root_name.clone());
+                                svc.clipboard.register_drag_session(copy).await;
+                                Some(offer)
+                            } else {
+                                None
                             }
-                            *svc.pending_drag_drop_label
-                                .write()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(offer.root_name.clone());
-                            svc.clipboard.register_drag_session(copy).await;
-                            Some(offer)
                         }
                         Ok(Err(e)) => {
                             warn!("Could not prepare drag session paths: {}", e);
@@ -610,7 +873,15 @@ impl KvmService {
                 }
             }
             KvmWireMessage::SyncLayout(mut incoming) => {
+                if !incoming.alignment_offset.is_finite() {
+                    return;
+                }
                 sanitize_layout(&mut incoming);
+                let cur_drop_folder = {
+                    let cur = self.layout.read().unwrap_or_else(|e| e.into_inner());
+                    cur.drop_folder.clone()
+                };
+                incoming.drop_folder = cur_drop_folder;
                 let should_apply = {
                     let cur = self.layout.read().unwrap_or_else(|e| e.into_inner());
                     incoming.updated_at_ms >= cur.updated_at_ms
@@ -627,6 +898,19 @@ impl KvmService {
                 left_button_held,
                 drag_offer,
             } => {
+                if !norm_pos.is_finite() {
+                    return;
+                }
+                if let Some(handle) = self
+                    .staging_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    handle.abort();
+                }
+                self.cleanup_all_drag_stage_dirs();
+
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
                 let (ex, ey) = resolve_entry_point(local_rect, entry_edge, norm_pos, 24.0);
 
@@ -637,15 +921,18 @@ impl KvmService {
 
                 {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
-                    *role = KvmRole::ControlledByPeer {
-                        peer_ip: peer_ip.to_string(),
-                        entry_edge,
-                        cur_x: ex,
-                        cur_y: ey,
-                        active_drag_session: drag_sid.clone(),
-                        active_drag_label: drag_label.clone(),
-                        native_drag_started: false,
-                    };
+                    self.set_role_locked(
+                        &mut role,
+                        KvmRole::ControlledByPeer {
+                            peer_ip: peer_ip.to_string(),
+                            entry_edge,
+                            cur_x: ex,
+                            cur_y: ey,
+                            active_drag_session: drag_sid.clone(),
+                            active_drag_label: drag_label.clone(),
+                            native_drag_started: false,
+                        },
+                    );
                 }
                 *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
                     Instant::now();
@@ -687,7 +974,7 @@ impl KvmService {
 
                     let svc_stage = Arc::clone(self);
                     let peer_ip_s = peer_ip.to_string();
-                    tokio::spawn(async move {
+                    let stage_handle = tokio::spawn(async move {
                         match svc_stage
                             .clipboard
                             .stream_drag_session_to_staging(
@@ -699,16 +986,45 @@ impl KvmService {
                             )
                             .await
                         {
-                            Ok((_stage_dir, top_paths)) => {
-                                svc_stage.on_drag_staging_ready(&offer.session_id, top_paths).await;
+                            Ok((stage_dir, top_paths)) => {
+                                {
+                                    let mut dirs = svc_stage
+                                        .drag_stage_dirs
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    dirs.insert(offer.session_id.clone(), stage_dir);
+                                }
+                                svc_stage
+                                    .on_drag_staging_ready(&offer.session_id, top_paths)
+                                    .await;
                             }
                             Err(e) => {
                                 warn!("🚫 Drag staging failed for '{}': {}", offer.root_name, e);
                                 Self::platform_hide_ghost();
+                                svc_stage.remote_left_down.store(false, Ordering::Release);
                                 *svc_stage
                                     .pending_drag_drop_label
                                     .write()
                                     .unwrap_or_else(|e| e.into_inner()) = None;
+                                {
+                                    let mut role = svc_stage
+                                        .role
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if let KvmRole::ControlledByPeer {
+                                        ref mut active_drag_session,
+                                        ref mut active_drag_label,
+                                        ..
+                                    } = *role
+                                    {
+                                        if active_drag_session.as_deref()
+                                            == Some(offer.session_id.as_str())
+                                        {
+                                            *active_drag_session = None;
+                                            *active_drag_label = None;
+                                        }
+                                    }
+                                }
                                 svc_stage.try_send_wire(KvmWireMessage::DragDropResult {
                                     session_id: offer.session_id,
                                     accepted: false,
@@ -717,6 +1033,10 @@ impl KvmService {
                             }
                         }
                     });
+                    *self
+                        .staging_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(stage_handle.abort_handle());
                 } else if left_button_held {
                     // Normal window/selection drag across border without files
                     Self::platform_inject_mouse_button(RemoteMouseButton::Left, true, ex, ey);
@@ -730,12 +1050,18 @@ impl KvmService {
                 exit_edge: _,
                 norm_pos,
             } => {
+                if !norm_pos.is_finite() {
+                    return;
+                }
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
                 let layout_cfg = self.get_layout();
                 let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, 16.0);
 
                 let old_drag_sid = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+                    if !matches!(*role, KvmRole::ControllingPeer { .. }) {
+                        return;
+                    }
                     let sid = match *role {
                         KvmRole::ControllingPeer {
                             ref active_drag_session,
@@ -743,9 +1069,13 @@ impl KvmService {
                         } => active_drag_session.clone(),
                         _ => None,
                     };
-                    *role = KvmRole::Idle;
+                    self.set_role_locked(&mut role, KvmRole::Idle);
                     sid
                 };
+                self.sent_remote_keys
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 if let Some(sid) = old_drag_sid {
                     self.clipboard.remove_drag_session(&sid).await;
                 }
@@ -759,10 +1089,16 @@ impl KvmService {
                     "↩️ KVM control returned from peer at ({:.0}, {:.0})",
                     rx, ry
                 );
-                Self::platform_set_controlling(false, 400.0, 300.0, rx, ry);
+                let park_x = local_rect.x + local_rect.width * 0.5;
+                let park_y = local_rect.y + local_rect.height * 0.5;
+                Self::platform_set_controlling(false, park_x, park_y, rx, ry);
             }
             KvmWireMessage::MouseMoveDelta { dx, dy } => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return;
+                }
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
+                let cfg = self.get_layout();
                 let (new_x, new_y, left_down, crossed_back) = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                     let KvmRole::ControlledByPeer {
@@ -794,19 +1130,17 @@ impl KvmService {
                         >= Duration::from_millis(180);
 
                     if crossed && active_drag_session.is_none() && cooldown_elapsed {
-                        let dead = {
-                            let cfg = self.get_layout();
-                            cfg.dead_corners && is_in_dead_corner(local_rect, entry_edge, next_x, next_y)
-                        };
+                        let dead = cfg.dead_corners
+                            && is_in_dead_corner(local_rect, entry_edge, next_x, next_y);
                         if !dead {
                             let norm = compute_normalized_edge_pos(
                                 local_rect,
                                 entry_edge,
                                 next_x,
                                 next_y,
-                                0.0,
+                                cfg.alignment_offset,
                             );
-                            *role = KvmRole::Idle;
+                            self.set_role_locked(&mut role, KvmRole::Idle);
                             (next_x, next_y, false, Some((entry_edge, norm)))
                         } else {
                             *cur_x = next_x.clamp(local_rect.x + 1.0, local_rect.max_x() - 1.0);
@@ -831,6 +1165,8 @@ impl KvmService {
                 };
 
                 if let Some((exit_edge, norm_pos)) = crossed_back {
+                    *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Instant::now();
                     info!(
                         "⬅️ Returning KVM control across {:?} edge (next={:.0},{:.0})",
                         exit_edge, new_x, new_y
@@ -875,6 +1211,9 @@ impl KvmService {
                 Self::platform_inject_mouse_button(button, pressed, cx, cy);
             }
             KvmWireMessage::MouseScroll { dx, dy } => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return;
+                }
                 let is_controlled = matches!(
                     *self.role.lock().unwrap_or_else(|e| e.into_inner()),
                     KvmRole::ControlledByPeer { .. }
@@ -909,13 +1248,47 @@ impl KvmService {
                 Self::platform_inject_key(key, pressed, modifiers);
             }
             KvmWireMessage::DragCancel { session_id } => {
+                if let Some(handle) = self
+                    .staging_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    handle.abort();
+                }
                 #[cfg(target_os = "windows")]
                 windows_backend::cancel_remote_drag();
                 Self::platform_hide_ghost();
+                self.remote_left_down.store(false, Ordering::Release);
                 *self
                     .pending_drag_drop_label
                     .write()
                     .unwrap_or_else(|e| e.into_inner()) = None;
+                {
+                    let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+                    match *role {
+                        KvmRole::ControlledByPeer {
+                            ref mut active_drag_session,
+                            ref mut active_drag_label,
+                            ..
+                        } => {
+                            if active_drag_session.as_deref() == Some(session_id.as_str()) {
+                                *active_drag_session = None;
+                                *active_drag_label = None;
+                            }
+                        }
+                        KvmRole::ControllingPeer {
+                            ref mut active_drag_session,
+                            ..
+                        } => {
+                            if active_drag_session.as_deref() == Some(session_id.as_str()) {
+                                *active_drag_session = None;
+                            }
+                        }
+                        KvmRole::Idle => {}
+                    }
+                }
+                self.remove_drag_stage_dir(&session_id);
                 self.clipboard.remove_drag_session(&session_id).await;
             }
             KvmWireMessage::DragDropResult {
@@ -938,9 +1311,12 @@ impl KvmService {
                         ..
                     } = *role
                     {
-                        *active_drag_session = None;
+                        if active_drag_session.as_deref() == Some(session_id.as_str()) {
+                            *active_drag_session = None;
+                        }
                     }
                 }
+                self.remove_drag_stage_dir(&session_id);
                 self.clipboard.remove_drag_session(&session_id).await;
                 crate::core::emit_ui_toast(
                     if accepted { "success" } else { "info" },
@@ -957,6 +1333,26 @@ impl KvmService {
     async fn on_drag_staging_ready(self: &Arc<Self>, session_id: &str, top_paths: Vec<PathBuf>) {
         if top_paths.is_empty() {
             Self::platform_hide_ghost();
+            self.remote_left_down.store(false, Ordering::Release);
+            *self
+                .pending_drag_drop_label
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            {
+                let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+                if let KvmRole::ControlledByPeer {
+                    ref mut active_drag_session,
+                    ref mut active_drag_label,
+                    ..
+                } = *role
+                {
+                    if active_drag_session.as_deref() == Some(session_id) {
+                        *active_drag_session = None;
+                        *active_drag_label = None;
+                    }
+                }
+            }
+            self.remove_drag_stage_dir(session_id);
             return;
         }
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -982,6 +1378,7 @@ impl KvmService {
 
         if !matches_session {
             Self::platform_hide_ghost();
+            self.remove_drag_stage_dir(session_id);
             return;
         }
 
@@ -1017,12 +1414,17 @@ impl KvmService {
                 let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                 if let KvmRole::ControlledByPeer {
                     ref mut active_drag_session,
+                    ref mut active_drag_label,
                     ..
                 } = *role
                 {
-                    *active_drag_session = None;
+                    if active_drag_session.as_deref() == Some(session_id) {
+                        *active_drag_session = None;
+                        *active_drag_label = None;
+                    }
                 }
             }
+            self.remove_drag_stage_dir(session_id);
 
             let (ok, msg) = match commit_res {
                 Ok(Ok(dest)) => (
@@ -1048,6 +1450,7 @@ impl KvmService {
 
     pub fn on_native_drag_ended(&self, session_id: &str, accepted: bool) {
         Self::platform_hide_ghost();
+        self.remote_left_down.store(false, Ordering::Release);
         *self
             .pending_drag_drop_label
             .write()
@@ -1056,12 +1459,17 @@ impl KvmService {
             let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
             if let KvmRole::ControlledByPeer {
                 ref mut active_drag_session,
+                ref mut active_drag_label,
                 ..
             } = *role
             {
-                *active_drag_session = None;
+                if active_drag_session.as_deref() == Some(session_id) {
+                    *active_drag_session = None;
+                    *active_drag_label = None;
+                }
             }
         }
+        self.remove_drag_stage_dir(session_id);
         let msg = if accepted {
             "Cross-screen drop completed".to_string()
         } else {
@@ -1086,147 +1494,164 @@ impl KvmService {
         dy: f32,
         left_button_held: bool,
     ) -> HookDecision {
+        if !x.is_finite() || !y.is_finite() || !dx.is_finite() || !dy.is_finite() {
+            return HookDecision::PassThrough;
+        }
         if !self.features.is_enabled("input_kvm") {
             return HookDecision::PassThrough;
         }
 
-        let role_snapshot = self.role.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match role_snapshot {
-            KvmRole::ControllingPeer { .. } => {
-                if dx != 0.0 || dy != 0.0 {
-                    self.try_send_wire(KvmWireMessage::MouseMoveDelta { dx, dy });
+        let is_idle = {
+            let role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+            match *role {
+                KvmRole::ControllingPeer { .. } => {
+                    drop(role);
+                    if dx != 0.0 || dy != 0.0 {
+                        self.try_send_wire(KvmWireMessage::MouseMoveDelta { dx, dy });
+                    }
+                    return HookDecision::SwallowAndParkCenter;
                 }
-                HookDecision::SwallowAndParkCenter
+                KvmRole::ControlledByPeer { .. } => return HookDecision::PassThrough,
+                KvmRole::Idle => true,
             }
-            KvmRole::ControlledByPeer { .. } => HookDecision::PassThrough,
-            KvmRole::Idle => {
-                let connected_ip = self
-                    .connected_peer_ip
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let Some(peer_ip) = connected_ip else {
-                    return HookDecision::PassThrough;
-                };
+        };
+        if !is_idle {
+            return HookDecision::PassThrough;
+        }
 
+        let connected_ip = self
+            .connected_peer_ip
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(peer_ip) = connected_ip else {
+            return HookDecision::PassThrough;
+        };
+
+        {
+            let last = self
+                .last_edge_transition
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if last.elapsed() < Duration::from_millis(180) {
+                return HookDecision::PassThrough;
+            }
+        }
+
+        let layout_cfg = self.get_layout();
+        let rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
+
+        let at_edge = match layout_cfg.peer_edge {
+            ScreenEdge::Left => x <= rect.x + 1.5,
+            ScreenEdge::Right => x >= rect.max_x() - 2.0,
+            ScreenEdge::Top => y <= rect.y + 1.5,
+            ScreenEdge::Bottom => y >= rect.max_y() - 2.0,
+        };
+
+        if !at_edge {
+            *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return HookDecision::PassThrough;
+        }
+
+        if layout_cfg.dead_corners && is_in_dead_corner(rect, layout_cfg.peer_edge, x, y) {
+            *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return HookDecision::PassThrough;
+        }
+
+        let effective_delay_ms = if left_button_held && self.features.is_enabled("dragdrop") {
+            layout_cfg.hop_delay_ms.max(25)
+        } else {
+            layout_cfg.hop_delay_ms
+        };
+        if effective_delay_ms > 0 {
+            let mut dwell = self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            match *dwell {
+                Some((e, started))
+                    if e == layout_cfg.peer_edge
+                        && now.duration_since(started) <= Duration::from_secs(2) =>
                 {
-                    let last = self
-                        .last_edge_transition
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if last.elapsed() < Duration::from_millis(180) {
+                    if now.duration_since(started)
+                        < Duration::from_millis(effective_delay_ms as u64)
+                    {
                         return HookDecision::PassThrough;
                     }
                 }
-
-                let layout_cfg = self.get_layout();
-                let rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
-
-                let at_edge = match layout_cfg.peer_edge {
-                    ScreenEdge::Left => x <= rect.x + 1.5,
-                    ScreenEdge::Right => x >= rect.max_x() - 2.0,
-                    ScreenEdge::Top => y <= rect.y + 1.5,
-                    ScreenEdge::Bottom => y >= rect.max_y() - 2.0,
-                };
-
-                if !at_edge {
-                    *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                _ => {
+                    *dwell = Some((layout_cfg.peer_edge, now));
                     return HookDecision::PassThrough;
                 }
-
-                if layout_cfg.dead_corners && is_in_dead_corner(rect, layout_cfg.peer_edge, x, y) {
-                    *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    return HookDecision::PassThrough;
-                }
-
-                let effective_delay_ms = if left_button_held && self.features.is_enabled("dragdrop") {
-                    layout_cfg.hop_delay_ms.max(25)
-                } else {
-                    layout_cfg.hop_delay_ms
-                };
-                if effective_delay_ms > 0 {
-                    let mut dwell = self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner());
-                    let now = Instant::now();
-                    match *dwell {
-                        Some((e, started)) if e == layout_cfg.peer_edge => {
-                            if now.duration_since(started)
-                                < Duration::from_millis(effective_delay_ms as u64)
-                            {
-                                return HookDecision::PassThrough;
-                            }
-                        }
-                        _ => {
-                            *dwell = Some((layout_cfg.peer_edge, now));
-                            return HookDecision::PassThrough;
-                        }
-                    }
-                    *dwell = None;
-                }
-
-                let drag_paths = if left_button_held && self.features.is_enabled("dragdrop") {
-                    Self::platform_probe_drag_paths()
-                } else {
-                    Vec::new()
-                };
-
-                let park_x = rect.x + rect.width * 0.5;
-                let park_y = rect.y + rect.height * 0.5;
-                let norm_pos = compute_normalized_edge_pos(
-                    rect,
-                    layout_cfg.peer_edge,
-                    x,
-                    y,
-                    layout_cfg.alignment_offset,
-                );
-
-                {
-                    let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
-                    *role = KvmRole::ControllingPeer {
-                        peer_ip,
-                        active_drag_session: None,
-                        restore_x: x,
-                        restore_y: y,
-                    };
-                }
-                *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Instant::now();
-                info!(
-                    "➡️ Handing KVM control to peer across {:?} edge from ({:.0}, {:.0})",
-                    layout_cfg.peer_edge, x, y
-                );
-
-                if !drag_paths.is_empty() {
-                    Self::platform_cancel_local_drag();
-                }
-                Self::platform_set_controlling(true, park_x, park_y, x, y);
-
-                let entry_edge = layout_cfg.peer_edge.opposite();
-                if !drag_paths.is_empty() {
-                    if let Some(tx) = self
-                        .outbound_tx
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                    {
-                        let _ = tx.try_send(KvmOutboundCmd::EnterWithDragPaths {
-                            entry_edge,
-                            norm_pos,
-                            left_button_held,
-                            paths: drag_paths,
-                        });
-                    }
-                } else {
-                    self.try_send_wire(KvmWireMessage::EnterScreen {
-                        entry_edge,
-                        norm_pos,
-                        left_button_held,
-                        drag_offer: None,
-                    });
-                }
-
-                HookDecision::SwallowAndParkCenter
             }
+            *dwell = None;
         }
+
+        let drag_paths = if left_button_held && self.features.is_enabled("dragdrop") {
+            Self::platform_probe_drag_paths()
+        } else {
+            Vec::new()
+        };
+
+        let park_x = rect.x + rect.width * 0.5;
+        let park_y = rect.y + rect.height * 0.5;
+        let norm_pos = compute_normalized_edge_pos(
+            rect,
+            layout_cfg.peer_edge,
+            x,
+            y,
+            layout_cfg.alignment_offset,
+        );
+
+        {
+            let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*role, KvmRole::Idle) || !self.features.is_enabled("input_kvm") {
+                return HookDecision::PassThrough;
+            }
+            self.set_role_locked(
+                &mut role,
+                KvmRole::ControllingPeer {
+                    peer_ip,
+                    active_drag_session: None,
+                    restore_x: x,
+                    restore_y: y,
+                },
+            );
+        }
+        *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        info!(
+            "➡️ Handing KVM control to peer across {:?} edge from ({:.0}, {:.0})",
+            layout_cfg.peer_edge, x, y
+        );
+
+        if !drag_paths.is_empty() {
+            Self::platform_cancel_local_drag();
+        }
+        Self::platform_set_controlling(true, park_x, park_y, x, y);
+
+        let entry_edge = layout_cfg.peer_edge.opposite();
+        if !drag_paths.is_empty() {
+            if let Some(tx) = self
+                .outbound_tx
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                let _ = tx.try_send(KvmOutboundCmd::EnterWithDragPaths {
+                    entry_edge,
+                    norm_pos,
+                    left_button_held,
+                    paths: drag_paths,
+                });
+            }
+        } else {
+            self.try_send_wire(KvmWireMessage::EnterScreen {
+                entry_edge,
+                norm_pos,
+                left_button_held,
+                drag_offer: None,
+            });
+        }
+
+        HookDecision::SwallowAndParkCenter
     }
 
     pub fn on_local_mouse_button(
@@ -1236,6 +1661,9 @@ impl KvmService {
         _x: f32,
         _y: f32,
     ) -> HookDecision {
+        if !self.features.is_enabled("input_kvm") {
+            return HookDecision::PassThrough;
+        }
         let controlling = matches!(
             *self.role.lock().unwrap_or_else(|e| e.into_inner()),
             KvmRole::ControllingPeer { .. }
@@ -1248,12 +1676,18 @@ impl KvmService {
     }
 
     pub fn on_local_mouse_scroll(&self, dx: f32, dy: f32) -> HookDecision {
+        if !self.features.is_enabled("input_kvm") {
+            return HookDecision::PassThrough;
+        }
         let controlling = matches!(
             *self.role.lock().unwrap_or_else(|e| e.into_inner()),
             KvmRole::ControllingPeer { .. }
         );
         if !controlling {
             return HookDecision::PassThrough;
+        }
+        if !dx.is_finite() || !dy.is_finite() {
+            return HookDecision::Swallow;
         }
         self.try_send_wire(KvmWireMessage::MouseScroll { dx, dy });
         HookDecision::Swallow
@@ -1265,6 +1699,9 @@ impl KvmService {
         pressed: bool,
         modifiers: ModifierMask,
     ) -> HookDecision {
+        if !self.features.is_enabled("input_kvm") {
+            return HookDecision::PassThrough;
+        }
         let controlling = matches!(
             *self.role.lock().unwrap_or_else(|e| e.into_inner()),
             KvmRole::ControllingPeer { .. }
@@ -1285,7 +1722,31 @@ impl KvmService {
             return HookDecision::Swallow;
         }
 
-        let (tx_key, tx_mods) = self.translate_key_for_peer(key, modifiers);
+        let (tx_key, tx_mods) = if pressed {
+            let translated = self.translate_key_for_peer(key, modifiers);
+            if key != LogicalKey::CapsLock {
+                self.sent_remote_keys
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, translated);
+            }
+            translated
+        } else if key != LogicalKey::CapsLock {
+            let prev = self
+                .sent_remote_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            if let Some((prev_key, _prev_mods)) = prev {
+                let (_, cur_mods) = self.translate_key_for_peer(key, modifiers);
+                (prev_key, cur_mods)
+            } else {
+                self.translate_key_for_peer(key, modifiers)
+            }
+        } else {
+            self.translate_key_for_peer(key, modifiers)
+        };
+
         self.try_send_wire(KvmWireMessage::KeyEvent {
             key: tx_key,
             pressed,
@@ -1310,6 +1771,42 @@ impl KvmService {
     // Internal Helpers
     // =========================================================================
 
+    fn remove_drag_stage_dir(&self, session_id: &str) {
+        let dir = self
+            .drag_stage_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        if let Some(dir) = dir {
+            self.spawn_or_sync_remove_dir(dir);
+        }
+    }
+
+    fn cleanup_all_drag_stage_dirs(&self) {
+        let dirs: Vec<PathBuf> = self
+            .drag_stage_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, d)| d)
+            .collect();
+        for dir in dirs {
+            self.spawn_or_sync_remove_dir(dir);
+        }
+    }
+
+    fn spawn_or_sync_remove_dir(&self, dir: PathBuf) {
+        if !self.shutting_down.load(Ordering::Acquire) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                });
+                return;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn try_send_wire(&self, msg: KvmWireMessage) {
         if let Some(tx) = self
             .outbound_tx
@@ -1317,6 +1814,13 @@ impl KvmService {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
+            let is_lossy = matches!(
+                msg,
+                KvmWireMessage::MouseMoveDelta { .. } | KvmWireMessage::MouseScroll { .. }
+            );
+            if is_lossy && tx.capacity() < RESERVED_CONTROL_SLOTS {
+                return;
+            }
             let _ = tx.try_send(KvmOutboundCmd::Wire(msg));
         }
     }
@@ -1352,35 +1856,64 @@ impl KvmService {
             "cache" => crate::system_info::app_data_dir().join("clipboard_cache"),
             _ => home.join("Downloads"),
         };
-        std::fs::create_dir_all(&dest_dir)?;
+        Self::commit_staged_to_dest_dir(top_paths, &dest_dir)?;
+        Ok(dest_dir)
+    }
+
+    fn commit_staged_to_dest_dir(top_paths: &[PathBuf], dest_dir: &Path) -> Result<()> {
+        const MAX_COLLISION_INDEX: usize = 10_000;
+        std::fs::create_dir_all(dest_dir)?;
 
         for src in top_paths {
             let Some(name) = src.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                continue;
+            }
+            let src_is_dir = std::fs::symlink_metadata(src)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
             let mut dest = dest_dir.join(name);
-            if dest.exists() {
+            if std::fs::symlink_metadata(&dest).is_ok() {
                 let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
                 let ext = src.extension().and_then(|s| s.to_str());
-                let mut idx = 1usize;
-                loop {
+                let mut found = None;
+                for idx in 1..=MAX_COLLISION_INDEX {
                     let cand = match ext {
-                        Some(e) if !src.is_dir() => format!("{} ({}).{}", stem, idx, e),
+                        Some(e) if !src_is_dir => format!("{} ({}).{}", stem, idx, e),
                         _ => format!("{} ({})", name, idx),
                     };
                     let p = dest_dir.join(cand);
-                    if !p.exists() {
-                        dest = p;
+                    if std::fs::symlink_metadata(&p).is_err() {
+                        found = Some(p);
                         break;
                     }
-                    idx += 1;
                 }
+                dest = match found {
+                    Some(p) => p,
+                    None => anyhow::bail!(
+                        "Exceeded {} destination name collision attempts for '{}'",
+                        MAX_COLLISION_INDEX,
+                        name
+                    ),
+                };
             }
             if std::fs::rename(src, &dest).is_err() {
                 ClipboardService::copy_entry_all(src, &dest)?;
+                if src_is_dir {
+                    let _ = std::fs::remove_dir_all(src);
+                } else {
+                    let _ = std::fs::remove_file(src);
+                }
             }
         }
-        Ok(dest_dir)
+        Ok(())
     }
 
     fn platform_is_hook_active() -> bool {
@@ -1603,5 +2136,201 @@ mod tests {
             let (vk, _) = windows_backend::logical_to_win_vk(k).unwrap();
             assert_eq!(windows_backend::win_vk_to_logical(vk), Some(k));
         }
+    }
+
+    fn make_test_kvm_service() -> Arc<KvmService> {
+        let mut flags = crate::features::FeatureFlags::fail_closed();
+        flags.input_kvm = true;
+        let features = Arc::new(FeatureManager::from_flags_for_test(flags));
+        let discovery = DiscoveryManager::new("test-node");
+        let clipboard = ClipboardService::new(discovery.clone()).expect("test clipboard");
+        KvmService::new(discovery, clipboard, features)
+    }
+
+    #[test]
+    fn alignment_offset_roundtrip_is_symmetric() {
+        let mut cfg_a = KvmLayoutConfig::default();
+        cfg_a.peer_edge = ScreenEdge::Right;
+        cfg_a.alignment_offset = 0.15;
+        let cfg_b = mirror_layout_for_peer(&cfg_a);
+
+        let rect_a = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let rect_b = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let y_a = 500.0;
+        let norm_to_b = compute_normalized_edge_pos(
+            rect_a,
+            cfg_a.peer_edge,
+            rect_a.max_x(),
+            y_a,
+            cfg_a.alignment_offset,
+        );
+        let (_bx, y_b) = resolve_entry_point(rect_b, cfg_b.peer_edge, norm_to_b, 24.0);
+        let norm_back = compute_normalized_edge_pos(
+            rect_b,
+            cfg_b.peer_edge,
+            rect_b.x,
+            y_b,
+            cfg_b.alignment_offset,
+        );
+        let (_ax, y_a_back) = resolve_entry_point(rect_a, cfg_a.peer_edge, norm_back, 16.0);
+        assert!(
+            (y_a_back - y_a).abs() <= 2.0,
+            "Expected symmetric return y near {y_a}, got {y_a_back}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_screen_is_ignored_when_idle_or_controlled() {
+        let svc = make_test_kvm_service();
+        svc.handle_inbound_message(
+            "10.99.99.2",
+            KvmWireMessage::LeaveScreen {
+                exit_edge: ScreenEdge::Left,
+                norm_pos: 0.5,
+            },
+        )
+        .await;
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
+        assert!(!svc.is_controlling_peer_fast());
+
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControlledByPeer {
+                    peer_ip: "10.99.99.2".to_string(),
+                    entry_edge: ScreenEdge::Left,
+                    cur_x: 100.0,
+                    cur_y: 200.0,
+                    active_drag_session: None,
+                    active_drag_label: None,
+                    native_drag_started: false,
+                },
+            );
+        }
+        svc.handle_inbound_message(
+            "10.99.99.2",
+            KvmWireMessage::LeaveScreen {
+                exit_edge: ScreenEdge::Left,
+                norm_pos: 0.5,
+            },
+        )
+        .await;
+        assert!(matches!(
+            *svc.role.lock().unwrap(),
+            KvmRole::ControlledByPeer { .. }
+        ));
+    }
+
+    #[test]
+    fn sent_remote_keys_release_matches_key_down_when_translation_toggles() {
+        let svc = make_test_kvm_service();
+        let (tx, mut rx) = mpsc::channel(32);
+        *svc.outbound_tx.write().unwrap() = Some(tx);
+        svc.peer_diff_os.store(true, Ordering::Relaxed);
+        {
+            let mut cfg = svc.get_layout();
+            cfg.modifier_translation = true;
+            *svc.layout.write().unwrap() = cfg;
+        }
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControllingPeer {
+                    peer_ip: "10.99.99.2".to_string(),
+                    active_drag_session: None,
+                    restore_x: 10.0,
+                    restore_y: 10.0,
+                },
+            );
+        }
+
+        let mods = ModifierMask {
+            shift: false,
+            control: false,
+            alt: false,
+            meta: true,
+        };
+        assert_eq!(
+            svc.on_local_key_event(LogicalKey::MetaLeft, true, mods),
+            HookDecision::Swallow
+        );
+        // Toggle modifier_translation OFF while MetaLeft is physically still held
+        {
+            let mut cfg = svc.get_layout();
+            cfg.modifier_translation = false;
+            *svc.layout.write().unwrap() = cfg;
+        }
+        assert_eq!(
+            svc.on_local_key_event(LogicalKey::MetaLeft, false, ModifierMask::default()),
+            HookDecision::Swallow
+        );
+
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        match (first, second) {
+            (
+                KvmOutboundCmd::Wire(KvmWireMessage::KeyEvent {
+                    key: k_down,
+                    pressed: true,
+                    ..
+                }),
+                KvmOutboundCmd::Wire(KvmWireMessage::KeyEvent {
+                    key: k_up,
+                    pressed: false,
+                    ..
+                }),
+            ) => {
+                assert_eq!(k_down, LogicalKey::ControlLeft);
+                assert_eq!(k_up, LogicalKey::ControlLeft);
+            }
+            other => panic!("Unexpected outbound key events: {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_avoids_overwriting_broken_symlink() {
+        let base = std::env::temp_dir().join(format!(
+            "integrator_kvm_symlink_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let stage_dir = base.join("stage");
+        let dest_dir = base.join("dest");
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let src_file = stage_dir.join("report.txt");
+        std::fs::write(&src_file, b"hello").unwrap();
+
+        // Create a dangling symlink at dest/report.txt
+        let dangling = dest_dir.join("report.txt");
+        std::os::unix::fs::symlink(base.join("nonexistent_target.txt"), &dangling).unwrap();
+        assert!(!dangling.exists());
+        assert!(std::fs::symlink_metadata(&dangling).is_ok());
+
+        KvmService::commit_staged_to_dest_dir(&[src_file], &dest_dir).unwrap();
+        // Original broken symlink untouched; file moved to "report (1).txt"
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("report (1).txt")).unwrap(),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

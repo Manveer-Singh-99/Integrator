@@ -3,15 +3,59 @@
 
 use crate::system_info;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
-#[allow(dead_code)]
-const INTEGRATOR_VD_VENDOR: u32 = 0x494E; // 'IN'
-#[allow(dead_code)]
-const INTEGRATOR_VD_PRODUCT: u32 = 0x0165;
+fn reap_child(mut child: Child, label: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name(format!("reap-{}", label))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn create_private_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Refusing to open symlinked log file",
+            ));
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+pub(crate) fn update_sunshine_output_content(content: &str, display_id: u32) -> String {
+    let mut new_lines = Vec::new();
+    let mut found = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#') {
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim() == "output_name" {
+                    new_lines.push(format!("output_name = {}", display_id));
+                    found = true;
+                    continue;
+                }
+            }
+        }
+        new_lines.push(line.to_string());
+    }
+    if !found {
+        new_lines.push(format!("output_name = {}", display_id));
+    }
+    new_lines.join("\n") + "\n"
+}
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -19,14 +63,6 @@ extern "C" {
     fn stop_virtual_display_in_app();
     fn get_virtual_display_id_in_app() -> u32;
     fn is_virtual_display_active_in_app() -> bool;
-
-    fn CGGetOnlineDisplayList(
-        max_displays: u32,
-        online_displays: *mut u32,
-        display_count: *mut u32,
-    ) -> i32;
-    fn CGDisplayVendorNumber(display: u32) -> u32;
-    fn CGDisplayModelNumber(display: u32) -> u32;
 }
 
 pub struct MacDisplayManager;
@@ -38,26 +74,10 @@ impl MacDisplayManager {
     pub fn get_active_virtual_display() -> Option<u32> {
         let in_app_id = unsafe { get_virtual_display_id_in_app() };
         if in_app_id != 0 {
-            return Some(in_app_id);
+            Some(in_app_id)
+        } else {
+            None
         }
-
-        let mut displays = [0u32; 16];
-        let mut count: u32 = 0;
-        let err = unsafe { CGGetOnlineDisplayList(16, displays.as_mut_ptr(), &mut count) };
-        if err != 0 {
-            return None;
-        }
-        for i in 0..count as usize {
-            let id = displays[i];
-            unsafe {
-                if CGDisplayVendorNumber(id) == INTEGRATOR_VD_VENDOR
-                    && CGDisplayModelNumber(id) == INTEGRATOR_VD_PRODUCT
-                {
-                    return Some(id);
-                }
-            }
-        }
-        None
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -72,31 +92,14 @@ impl MacDisplayManager {
             system_info::user_home_dir().join(".config/sunshine/sunshine.conf")
         });
 
-        if let Some(parent) = conf_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let content = if conf_path.exists() {
             std::fs::read_to_string(&conf_path)?
         } else {
             String::new()
         };
 
-        let mut new_lines = Vec::new();
-        let mut found = false;
-        for line in content.lines() {
-            if line.trim().starts_with("output_name") {
-                new_lines.push(format!("output_name = {}", display_id));
-                found = true;
-            } else {
-                new_lines.push(line.to_string());
-            }
-        }
-        if !found {
-            new_lines.push(format!("output_name = {}", display_id));
-        }
-
-        std::fs::write(&conf_path, new_lines.join("\n") + "\n")?;
+        let updated = update_sunshine_output_content(&content, display_id);
+        system_info::atomic_write_private(&conf_path, updated.as_bytes())?;
         info!(
             "Configured Sunshine {} output_name = {}",
             conf_path.display(),
@@ -180,8 +183,12 @@ impl MacDisplayManager {
             .ancestors()
             .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
         {
-            let _ = std::fs::File::create(&log_path);
-            let _ = std::fs::File::create(&err_log_path);
+            if let Err(e) = create_private_log_file(&log_path) {
+                warn!("Could not prepare Sunshine stdout log {}: {}", log_path.display(), e);
+            }
+            if let Err(e) = create_private_log_file(&err_log_path) {
+                warn!("Could not prepare Sunshine stderr log {}: {}", err_log_path.display(), e);
+            }
             let mut cmd = Command::new("/usr/bin/open");
             cmd.arg("-g")
                 .arg("-n")
@@ -206,15 +213,18 @@ impl MacDisplayManager {
             }
             info!("Launched Sunshine bundle ({}) via LaunchServices", app_bundle.display());
         } else {
-            let log_file = std::fs::File::create(&log_path)?;
+            let log_file = create_private_log_file(&log_path)?;
             let mut cmd = Command::new(&sunshine_bin);
             if let Some(conf) = &conf_path {
                 cmd.arg(conf);
             }
-            cmd.stdout(Stdio::from(log_file.try_clone()?))
+            let child = cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file.try_clone()?))
                 .stderr(Stdio::from(log_file))
                 .spawn()
                 .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
+            reap_child(child, "sunshine");
 
             info!("Launched Sunshine server ({})", sunshine_bin.display());
         }
@@ -224,15 +234,17 @@ impl MacDisplayManager {
     pub fn stop_sunshine() -> Result<()> {
         let is_running = || {
             ["Sunshine", "sunshine"].iter().any(|proc_name| {
-                Command::new("pgrep")
+                Command::new("/usr/bin/pgrep")
                     .args(["-x", proc_name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false)
             })
         };
 
-        let _ = Command::new("killall")
+        let _ = Command::new("/usr/bin/killall")
             .args(["-q", "-TERM", "Sunshine", "sunshine"])
             .status();
         for _ in 0..10 {
@@ -242,7 +254,7 @@ impl MacDisplayManager {
             std::thread::sleep(Duration::from_millis(100));
         }
         if is_running() {
-            let _ = Command::new("killall")
+            let _ = Command::new("/usr/bin/killall")
                 .args(["-q", "-KILL", "Sunshine", "sunshine"])
                 .status();
         }
@@ -253,23 +265,17 @@ impl MacDisplayManager {
     /// Waits until Sunshine binds its configured local port.
     pub async fn wait_for_sunshine_ready(timeout_dur: Duration) -> bool {
         let (_, port, _) = system_info::read_sunshine_config_info();
-        let addr = format!("127.0.0.1:{}", port);
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout_dur {
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        false
+        Self::wait_for_port("127.0.0.1", port, timeout_dur).await
     }
 
-    #[allow(dead_code)]
     pub async fn wait_for_port(ip: &str, port: u16, timeout: Duration) -> bool {
         let addr = format!("{}:{}", ip, port);
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            if matches!(
+                tokio::time::timeout(Duration::from_millis(300), tokio::net::TcpStream::connect(&addr)).await,
+                Ok(Ok(_))
+            ) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -288,8 +294,11 @@ impl MacDisplayManager {
         bitrate_kbps: u32,
         audio_on_host: bool,
     ) -> Result<()> {
-        let _ = Command::new("killall").arg("Moonlight").status();
-        std::thread::sleep(Duration::from_millis(250));
+        if !system_info::is_valid_ipv4(pc_ip) {
+            anyhow::bail!("Invalid host IPv4 address for Moonlight: {}", pc_ip);
+        }
+
+        let _ = Self::stop_moonlight_client();
 
         let moonlight_bin = system_info::find_moonlight_binary().context(
             "Moonlight.app not found. Install Moonlight in /Applications or ~/Applications.",
@@ -297,8 +306,17 @@ impl MacDisplayManager {
 
         let host_target = resolve_or_refresh_mac_moonlight_slot(pc_ip, port, host_name)
             .unwrap_or_else(|| pc_ip.to_string());
+        let host_target = host_target.trim().to_string();
+        if host_target.is_empty()
+            || host_target.starts_with('-')
+            || host_target.chars().any(|c| c.is_control())
+        {
+            anyhow::bail!("Invalid Moonlight host target '{}'", host_target);
+        }
 
-        let res_arg = format!("{}x{}", width.max(800), height.max(600));
+        let w = (width.clamp(800, 7680)) & !1;
+        let h = (height.clamp(600, 4320)) & !1;
+        let res_arg = format!("{}x{}", w, h);
         let fps_arg = fps.clamp(30, 240).to_string();
         let bitrate_arg = bitrate_kbps.clamp(5000, 500000).to_string();
 
@@ -322,9 +340,13 @@ impl MacDisplayManager {
         if audio_on_host {
             cmd.arg("--audio-on-host");
         }
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        cmd.spawn()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd
+            .spawn()
             .with_context(|| format!("Failed to spawn {}", moonlight_bin.display()))?;
+        reap_child(child, "moonlight");
 
         info!(
             "Launched Moonlight on macOS -> '{}' ({}:{}) at {} @ {}Hz",
@@ -334,16 +356,47 @@ impl MacDisplayManager {
     }
 
     pub fn stop_moonlight_client() -> Result<()> {
-        let _ = Command::new("killall").arg("Moonlight").status();
+        let is_running = || {
+            Command::new("/usr/bin/pgrep")
+                .args(["-x", "Moonlight"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if is_running() {
+            let _ = Command::new("/usr/bin/killall")
+                .args(["-q", "Moonlight"])
+                .status();
+            for _ in 0..8 {
+                if !is_running() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        }
         info!("Stopped Moonlight on macOS");
         Ok(())
     }
 
     pub fn show_notification(title: &str, message: &str) {
-        let t = title.replace('"', "\\\"");
-        let m = message.replace('"', "\\\"");
-        let script = format!("display notification \"{}\" with title \"{}\"", m, t);
-        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+        let safe_title: String = title.chars().filter(|c| !c.is_control()).take(128).collect();
+        let safe_msg: String = message.chars().filter(|c| !c.is_control()).take(256).collect();
+        if let Ok(child) = Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run",
+                safe_msg.as_str(),
+                safe_title.as_str(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            reap_child(child, "osascript");
+        }
     }
 }
 
@@ -354,7 +407,11 @@ fn resolve_or_refresh_mac_moonlight_slot(
     port: u16,
     host_name: &str,
 ) -> Option<String> {
-    let out = Command::new("defaults")
+    if !system_info::is_valid_ipv4(pc_ip) {
+        return None;
+    }
+
+    let out = Command::new("/usr/bin/defaults")
         .args(["read", "com.moonlight-stream.Moonlight"])
         .output()
         .ok()?;
@@ -364,6 +421,7 @@ fn resolve_or_refresh_mac_moonlight_slot(
 
     let text = String::from_utf8_lossy(&out.stdout);
     let mut size: usize = 0;
+    let mut indices = std::collections::BTreeSet::new();
     let mut props: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for line in text.lines() {
@@ -373,20 +431,28 @@ fn resolve_or_refresh_mac_moonlight_slot(
             let val = v.trim().trim_matches('"').to_string();
             if key == "hosts.size" {
                 size = val.parse().unwrap_or(0);
-            } else if key.starts_with("hosts.") {
+            } else if let Some(rest) = key.strip_prefix("hosts.") {
+                if let Some((idx_str, _)) = rest.split_once('.') {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        indices.insert(idx);
+                    }
+                }
                 props.insert(key, val);
             }
         }
     }
 
-    if size == 0 {
+    for idx in 1..=size {
+        indices.insert(idx);
+    }
+    if indices.is_empty() {
         return None;
     }
 
     let wanted_port = port.to_string();
     let mut best_slot: Option<usize> = None;
 
-    for idx in 1..=size {
+    for idx in indices {
         let h_name = props
             .get(&format!("hosts.{}.hostname", idx))
             .map(String::as_str)
@@ -403,11 +469,21 @@ fn resolve_or_refresh_mac_moonlight_slot(
             .get(&format!("hosts.{}.localport", idx))
             .map(String::as_str)
             .unwrap_or("47989");
+        let h_manual_port = props
+            .get(&format!("hosts.{}.manualport", idx))
+            .map(String::as_str)
+            .unwrap_or("");
+        let h_http_port = props
+            .get(&format!("hosts.{}.httpport", idx))
+            .map(String::as_str)
+            .unwrap_or("");
 
         let ip_match = h_local_ip == pc_ip || h_manual_ip == pc_ip;
         let name_match =
             !host_name.is_empty() && h_name.eq_ignore_ascii_case(host_name);
-        let port_match = h_local_port == wanted_port;
+        let port_match = h_local_port == wanted_port
+            || h_manual_port == wanted_port
+            || h_http_port == wanted_port;
 
         if name_match && port_match {
             best_slot = Some(idx);
@@ -425,22 +501,42 @@ fn resolve_or_refresh_mac_moonlight_slot(
     // Update the matched slot's active direct route IP so USB-C/Wi-Fi switching works seamlessly
     for field in ["localaddress", "manualaddress"] {
         let key = format!("hosts.{}.{}", idx, field);
-        let _ = Command::new("defaults")
+        match Command::new("/usr/bin/defaults")
             .args(["write", "com.moonlight-stream.Moonlight", &key, "-string", pc_ip])
-            .status();
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => warn!("defaults write {} exited with status {}", key, s),
+            Err(e) => warn!("Failed to invoke defaults write {}: {}", key, e),
+        }
     }
 
     // Prefer UUID if stored so Moonlight binds deterministically when multiple entries exist
     if let Some(uuid) = props.get(&format!("hosts.{}.uuid", idx)) {
-        if !uuid.is_empty() {
-            return Some(uuid.clone());
+        let trimmed = uuid.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.chars().any(|c| c.is_control())
+        {
+            return Some(trimmed.to_string());
         }
     }
     props
         .get(&format!("hosts.{}.hostname", idx))
-        .cloned()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_control()))
         .or_else(|| Some(pc_ip.to_string()))
 }
 
-#[allow(dead_code)]
-fn _unused_pathbuf_marker(_p: PathBuf) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_sunshine_output_preserves_comments_and_other_keys() {
+        let initial = "# output_name = 99\noutput_name_secondary = 2\nport = 47989\noutput_name = 1\n";
+        let updated = update_sunshine_output_content(initial, 42);
+        assert_eq!(
+            updated,
+            "# output_name = 99\noutput_name_secondary = 2\nport = 47989\noutput_name = 42\n"
+        );
+    }
+}

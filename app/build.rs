@@ -9,11 +9,13 @@ fn main() {
         "SDKROOT",
         "CC",
         "CFLAGS",
+        "PROFILE",
     ] {
         println!("cargo:rerun-if-env-changed={}", env_key);
     }
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
     if target_os == "macos" {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -43,6 +45,9 @@ fn main() {
             "-o",
             &lib_path,
         ]);
+        if is_release {
+            swift_cmd.arg("-O");
+        }
         if let Some(ref target) = swift_target {
             swift_cmd.args(["-target", target]);
         }
@@ -54,11 +59,13 @@ fn main() {
             panic!("swiftc failed to compile swift sources into static library");
         }
 
-        // Also compile macos_clip_files.swift with explicit target architecture for CLI fallback
+        // Also compile macos_clip_files.swift into target/<profile>/macos_clip_files (not repo root)
         let clip_helper_out = PathBuf::from(&out_dir).join("macos_clip_files");
         let mut clip_cmd = Command::new("swiftc");
+        if is_release {
+            clip_cmd.arg("-O");
+        }
         clip_cmd.args([
-            "-O",
             "macos_clip_files.swift",
             "-o",
             &clip_helper_out.to_string_lossy(),
@@ -68,7 +75,14 @@ fn main() {
         }
         if let Ok(s) = clip_cmd.status() {
             if s.success() {
-                let _ = std::fs::copy(&clip_helper_out, "macos_clip_files");
+                // OUT_DIR is <target>/<profile>/build/<pkg>/out -> parent x3 is <target>/<profile>
+                if let Some(profile_dir) = PathBuf::from(&out_dir)
+                    .ancestors()
+                    .nth(3)
+                    .map(|p| p.to_path_buf())
+                {
+                    let _ = std::fs::copy(&clip_helper_out, profile_dir.join("macos_clip_files"));
+                }
             }
         }
 

@@ -145,6 +145,7 @@ struct FeatureFlagsModel: Codable, Hashable {
     var touchbar: Bool
     var storage: Bool
     var audio: Bool
+    var benchmark: Bool? = true
 }
 
 struct KvmLayoutConfigModel: Codable, Hashable {
@@ -174,10 +175,15 @@ struct KvmStatusSnapshotModel: Codable, Hashable {
 }
 
 struct LogEntryModel: Codable, Identifiable, Hashable {
-    var id: String { "\(ts_ms)-\(message.prefix(24))-\(level)" }
+    var id: String { "\(ts_ms)-\(level)-\(message)" }
     var ts_ms: UInt64
     var level: String
     var message: String
+}
+
+private struct RenderedLogEntry: Identifiable {
+    let id: String
+    let entry: LogEntryModel
 }
 
 struct SpeedTestResultModel: Codable, Hashable {
@@ -303,15 +309,19 @@ final class IntegratorViewModel: ObservableObject {
     // Local interactive form states
     @Published var selectedEncodeGpu: String = "auto"
     @Published var selectedDecodeGpu: String = "auto"
+    @Published var encodeGpuDirty: Bool = false
+    @Published var decodeGpuDirty: Bool = false
     @Published var manualIpInput: String = ""
     @Published var pairPinInputs: [String: String] = [:]
     @Published var preferredShareInput: String = ""
+    @Published var preferredShareDirty: Bool = false
     @Published var trueToneCct: Double = 6500
     @Published var trueToneComp: Double = 1.0
 
     // Editable KVM Layout draft synced with server
     private var kvmLayoutDirty = false
     private var isApplyingRemoteLayout = false
+    private var lastServerLayoutUpdatedMs: UInt64 = 0
     @Published var kvmLayout = KvmLayoutConfigModel(
         peer_edge: "right",
         alignment_offset: 0.0,
@@ -332,13 +342,39 @@ final class IntegratorViewModel: ObservableObject {
     }
 
     private var pollTimer: Timer? = nil
+    private var isPollingPaused: Bool = false
+    private var isRefreshInFlight: Bool = false
 
     func startPolling() {
+        isPollingPaused = false
         refresh()
+        schedulePollTimer()
+    }
+
+    func setPollingPaused(_ paused: Bool) {
+        isPollingPaused = paused
+        if paused {
+            pollTimer?.invalidate()
+            pollTimer = nil
+        } else {
+            refresh()
+            schedulePollTimer()
+        }
+    }
+
+    func stopPolling() {
+        isPollingPaused = true
         pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    private func schedulePollTimer() {
+        pollTimer?.invalidate()
+        guard !isPollingPaused else { return }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.refresh()
+                guard let self = self, !self.isPollingPaused else { return }
+                self.refresh()
             }
         }
     }
@@ -353,34 +389,94 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
+    static func gpuVendorTag(for gpu: GpuDeviceInfo) -> String {
+        let combined = "\(gpu.vendor) \(gpu.name)".lowercased()
+        if combined.contains("nvidia") || combined.contains("geforce") || combined.contains("rtx") || combined.contains("gtx") || combined.contains("quadro") {
+            return "nvidia"
+        }
+        if combined.contains("amd") || combined.contains("radeon") {
+            return "amd"
+        }
+        if combined.contains("intel") || combined.contains("arc") || combined.contains("iris") || combined.contains("uhd") {
+            return "intel"
+        }
+        if combined.contains("apple") {
+            return "apple"
+        }
+        return gpu.is_discrete ? "discrete" : "integrated"
+    }
+
+    static func gpuPickerOptions(from gpus: [GpuDeviceInfo]) -> [(tag: String, label: String)] {
+        var options: [(tag: String, label: String)] = [("auto", "Auto (Recommended)")]
+        var usedTags: Set<String> = ["auto"]
+        for g in gpus {
+            if g.vendor == "System" && g.name == "Default System GPU" {
+                continue
+            }
+            let baseTag = gpuVendorTag(for: g)
+            let tag = usedTags.contains(baseTag) ? g.name : baseTag
+            if usedTags.insert(tag).inserted {
+                options.append((tag, g.name))
+            }
+        }
+        return options
+    }
+
+    static func resolveGpuSelection(_ raw: String, gpus: [GpuDeviceInfo]) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "auto" }
+        let lower = trimmed.lowercased()
+        let options = gpuPickerOptions(from: gpus)
+        if let exact = options.first(where: { $0.tag.lowercased() == lower }) {
+            return exact.tag
+        }
+        if let byName = options.first(where: { $0.label.lowercased() == lower }) {
+            return byName.tag
+        }
+        return "auto"
+    }
+
     func refresh() {
+        guard !isRefreshInFlight else { return }
+        isRefreshInFlight = true
         invoke("get_bridge_status", params: "{}", as: BridgeStatusModel.self) { [weak self] res in
             guard let self = self else { return }
+            self.isRefreshInFlight = false
             switch res {
             case .success(let model):
                 self.status = model
-                if !self.kvmLayoutDirty || model.kvm.layout.updated_at_ms > self.kvmLayout.updated_at_ms {
+                if !self.kvmLayoutDirty {
                     self.isApplyingRemoteLayout = true
                     self.kvmLayout = model.kvm.layout
+                    self.lastServerLayoutUpdatedMs = model.kvm.layout.updated_at_ms
                     self.kvmLayoutDirty = false
                     self.isApplyingRemoteLayout = false
                 }
-                if self.selectedEncodeGpu == "auto" {
-                    self.selectedEncodeGpu = model.encode_gpu
+                if !self.encodeGpuDirty {
+                    self.selectedEncodeGpu = Self.resolveGpuSelection(model.encode_gpu, gpus: model.local_gpus)
                 }
-                if self.selectedDecodeGpu == "auto" {
-                    self.selectedDecodeGpu = model.decode_gpu
+                if !self.decodeGpuDirty {
+                    self.selectedDecodeGpu = Self.resolveGpuSelection(model.decode_gpu, gpus: model.local_gpus)
                 }
-                if self.preferredShareInput.isEmpty, let pref = model.preferred_peer_share {
-                    self.preferredShareInput = pref
+                if !self.preferredShareDirty {
+                    self.preferredShareInput = model.preferred_peer_share ?? ""
+                }
+                for peer in model.discovered_peers where peer.trusted {
+                    self.pairPinInputs.removeValue(forKey: peer.ip)
                 }
             case .failure(let err):
-                self.showToast("error", err)
+                self.showToast("error", err.message)
             }
         }
     }
 
-    func runAction(_ method: String, params: [String: Any] = [:], refreshAfter: Bool = true) {
+    func runAction(
+        _ method: String,
+        params: [String: Any] = [:],
+        refreshAfter: Bool = true,
+        suppressDataToast: Bool = false,
+        successToast: String? = nil
+    ) {
         let jsonStr: String
         if let data = try? JSONSerialization.data(withJSONObject: params),
            let s = String(data: data, encoding: .utf8)
@@ -393,7 +489,9 @@ final class IntegratorViewModel: ObservableObject {
             guard let self = self else { return }
             if !ok {
                 self.showToast("error", errMsg ?? "Command failed")
-            } else if let str = Self.decodeStringResult(dataJson) {
+            } else if let custom = successToast {
+                self.showToast("success", custom)
+            } else if !suppressDataToast, let str = Self.decodeStringResult(dataJson) {
                 self.showToast("success", str)
             }
             if refreshAfter {
@@ -417,6 +515,24 @@ final class IntegratorViewModel: ObservableObject {
         runAction("set_kvm_layout", params: ["layout": dict])
     }
 
+    func updateEdgeAndSyncPreservingDirty(_ edge: String) {
+        let baseLayout = status?.kvm.layout ?? kvmLayout
+        var payload = baseLayout
+        payload.peer_edge = edge
+        payload.updated_at_ms = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        let wasDirty = kvmLayoutDirty
+        isApplyingRemoteLayout = true
+        kvmLayout.peer_edge = edge
+        isApplyingRemoteLayout = false
+        kvmLayoutDirty = wasDirty
+
+        guard let encoded = try? JSONEncoder().encode(payload),
+              let dict = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        else { return }
+        runAction("set_kvm_layout", params: ["layout": dict])
+    }
+
     func runSpeedBenchmark() {
         isRunningSpeedTest = true
         invoke("run_speed_test", params: "{}", as: SpeedTestResultModel.self) { [weak self] res in
@@ -426,13 +542,13 @@ final class IntegratorViewModel: ObservableObject {
                 self?.speedResult = r
                 self?.showToast("success", r.summary)
             case .failure(let e):
-                self?.showToast("error", e)
+                self?.showToast("error", e.message)
             }
         }
     }
 
     func queryGpuTelemetry() {
-        invoke("get_gpu_telemetry", params: "{}", as: GpuTelemetryModel?.self) { [weak self] res in
+        invokeOptional("get_gpu_telemetry", params: "{}", as: GpuTelemetryModel.self) { [weak self] res in
             switch res {
             case .success(let t):
                 self?.gpuTelemetry = t
@@ -440,7 +556,7 @@ final class IntegratorViewModel: ObservableObject {
                     self?.showToast("info", "No discrete telemetry returned by peer")
                 }
             case .failure(let e):
-                self?.showToast("error", e)
+                self?.showToast("error", e.message)
             }
         }
     }
@@ -456,7 +572,7 @@ final class IntegratorViewModel: ObservableObject {
         _ method: String,
         params: String,
         as type: T.Type,
-        completion: @escaping @MainActor (Result<T, String>) -> Void
+        completion: @escaping @MainActor (Result<T, RpcErrorMessage>) -> Void
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
             let rawPtr = method.withCString { mPtr in
@@ -465,13 +581,13 @@ final class IntegratorViewModel: ObservableObject {
                 }
             }
             guard let ptr = rawPtr else {
-                Task { @MainActor in completion(.failure("Empty native response")) }
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Empty native response"))) }
                 return
             }
             let str = String(cString: ptr)
             rustCoreFreeString(ptr)
             guard let data = str.data(using: .utf8) else {
-                Task { @MainActor in completion(.failure("Invalid UTF-8 response")) }
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Invalid UTF-8 response"))) }
                 return
             }
             do {
@@ -479,10 +595,45 @@ final class IntegratorViewModel: ObservableObject {
                 if env.ok, let d = env.data {
                     Task { @MainActor in completion(.success(d)) }
                 } else {
-                    Task { @MainActor in completion(.failure(env.error ?? "Command failed")) }
+                    Task { @MainActor in completion(.failure(RpcErrorMessage(env.error ?? "Command failed"))) }
                 }
             } catch {
-                Task { @MainActor in completion(.failure("Decode error: \(error.localizedDescription)")) }
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(error.localizedDescription)"))) }
+            }
+        }
+    }
+
+    private func invokeOptional<T: Decodable>(
+        _ method: String,
+        params: String,
+        as type: T.Type,
+        completion: @escaping @MainActor (Result<T?, RpcErrorMessage>) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let rawPtr = method.withCString { mPtr in
+                params.withCString { pPtr in
+                    rustCoreInvoke(mPtr, pPtr)
+                }
+            }
+            guard let ptr = rawPtr else {
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Empty native response"))) }
+                return
+            }
+            let str = String(cString: ptr)
+            rustCoreFreeString(ptr)
+            guard let data = str.data(using: .utf8) else {
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Invalid UTF-8 response"))) }
+                return
+            }
+            do {
+                let env = try JSONDecoder().decode(RpcEnvelope<T>.self, from: data)
+                if env.ok {
+                    Task { @MainActor in completion(.success(env.data)) }
+                } else {
+                    Task { @MainActor in completion(.failure(RpcErrorMessage(env.error ?? "Command failed"))) }
+                }
+            } catch {
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(error.localizedDescription)"))) }
             }
         }
     }
@@ -521,7 +672,11 @@ final class IntegratorViewModel: ObservableObject {
     }
 }
 
-extension String: @retroactive Error {}
+struct RpcErrorMessage: Error, LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
 
 // MARK: - Liquid Glass Styling Modifiers
 
@@ -529,6 +684,7 @@ private struct LiquidGlassCardModifier: ViewModifier {
     var cornerRadius: CGFloat = 16
 
     func body(content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             content
                 .padding(16)
@@ -539,14 +695,24 @@ private struct LiquidGlassCardModifier: ViewModifier {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
                 )
         }
+        #else
+        content
+            .padding(16)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+            )
+        #endif
     }
 }
 
 private struct LiquidGlassSidebarModifier: ViewModifier {
     func body(content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         } else {
@@ -554,9 +720,17 @@ private struct LiquidGlassSidebarModifier: ViewModifier {
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
                 )
         }
+        #else
+        content
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+            )
+        #endif
     }
 }
 
@@ -645,8 +819,8 @@ struct MainDashboardView: View {
                     ScrollView {
                         LazyVGrid(
                             columns: [
-                                GridItem(.flexible(minimum: 340), spacing: 14, alignment: .top),
-                                GridItem(.flexible(minimum: 340), spacing: 14, alignment: .top),
+                                GridItem(.flexible(minimum: 310), spacing: 14, alignment: .top),
+                                GridItem(.flexible(minimum: 310), spacing: 14, alignment: .top),
                             ],
                             alignment: .leading,
                             spacing: 14
@@ -820,7 +994,8 @@ struct MainDashboardView: View {
     // MARK: - Card 1: Extended Screen & GPU
 
     private var extendedDisplayCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let gpuOptions = IntegratorViewModel.gpuPickerOptions(from: s?.local_gpus ?? [])
+        return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "display.2",
                 title: "Extended Screen & GPU Acceleration",
@@ -835,10 +1010,15 @@ struct MainDashboardView: View {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Encode GPU").font(.caption).foregroundStyle(.secondary)
-                    Picker("", selection: $vm.selectedEncodeGpu) {
-                        Text("Auto (Recommended)").tag("auto")
-                        ForEach(s?.local_gpus ?? []) { g in
-                            Text(g.name).tag(g.name)
+                    Picker("", selection: Binding(
+                        get: { vm.selectedEncodeGpu },
+                        set: {
+                            vm.selectedEncodeGpu = $0
+                            vm.encodeGpuDirty = true
+                        }
+                    )) {
+                        ForEach(gpuOptions, id: \.tag) { opt in
+                            Text(opt.label).tag(opt.tag)
                         }
                     }
                     .labelsHidden()
@@ -846,10 +1026,15 @@ struct MainDashboardView: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Decode GPU").font(.caption).foregroundStyle(.secondary)
-                    Picker("", selection: $vm.selectedDecodeGpu) {
-                        Text("Auto (Recommended)").tag("auto")
-                        ForEach(s?.local_gpus ?? []) { g in
-                            Text(g.name).tag(g.name)
+                    Picker("", selection: Binding(
+                        get: { vm.selectedDecodeGpu },
+                        set: {
+                            vm.selectedDecodeGpu = $0
+                            vm.decodeGpuDirty = true
+                        }
+                    )) {
+                        ForEach(gpuOptions, id: \.tag) { opt in
+                            Text(opt.label).tag(opt.tag)
                         }
                     }
                     .labelsHidden()
@@ -890,6 +1075,8 @@ struct MainDashboardView: View {
                 }
                 HStack(spacing: 8) {
                     Button("Apply GPU") {
+                        vm.encodeGpuDirty = false
+                        vm.decodeGpuDirty = false
                         vm.runAction("set_gpu_preferences", params: [
                             "encodeGpu": vm.selectedEncodeGpu,
                             "decodeGpu": vm.selectedDecodeGpu
@@ -1031,8 +1218,7 @@ struct MainDashboardView: View {
     private func edgeButton(_ title: String, edge: String) -> some View {
         let active = vm.kvmLayout.peer_edge == edge
         return Button(title) {
-            vm.kvmLayout.peer_edge = edge
-            vm.syncKvmLayout()
+            vm.updateEdgeAndSyncPreservingDirty(edge)
         }
         .buttonStyle(.bordered)
         .tint(active ? .accentColor : .secondary)
@@ -1074,7 +1260,7 @@ struct MainDashboardView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(accent ? Color.accentColor.opacity(0.6) : Color.white.opacity(0.18), lineWidth: 1)
+                    .stroke(accent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.16), lineWidth: 1)
             )
     }
 
@@ -1192,8 +1378,10 @@ struct MainDashboardView: View {
                 Text(s?.trust.pairing_pin ?? "------")
                     .font(.system(.title3, design: .monospaced).bold())
                 Spacer()
-                Button("Regenerate PIN") { vm.runAction("regenerate_pairing_pin") }
-                    .buttonStyle(.bordered)
+                Button("Regenerate PIN") {
+                    vm.runAction("regenerate_pairing_pin", suppressDataToast: true, successToast: "Pairing PIN rotated")
+                }
+                .buttonStyle(.bordered)
             }
 
             HStack(spacing: 8) {
@@ -1208,7 +1396,31 @@ struct MainDashboardView: View {
                 .buttonStyle(.bordered)
             }
 
+            if let manualIps = s?.manual_peer_ips, !manualIps.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(manualIps, id: \.self) { ip in
+                            HStack(spacing: 4) {
+                                Text(ip).font(.caption2.monospaced())
+                                Button {
+                                    vm.runAction("remove_manual_peer_ip", params: ["ip": ip])
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove manual IP \(ip)")
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.primary.opacity(0.08), in: Capsule())
+                        }
+                    }
+                }
+            }
+
             ForEach(s?.discovered_peers ?? []) { peer in
+                let pinDraft = (vm.pairPinInputs[peer.ip] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(peer.hostname).font(.subheadline.weight(.semibold))
@@ -1220,7 +1432,13 @@ struct MainDashboardView: View {
                         )
                     }
                     HStack(spacing: 6) {
-                        if !peer.trusted {
+                        if peer.blocked {
+                            Button("Unblock") {
+                                vm.runAction("untrust_or_block_peer", params: ["deviceId": peer.device_id, "block": false])
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        } else if !peer.trusted {
                             TextField(
                                 "6-digit PIN",
                                 text: Binding(
@@ -1232,14 +1450,28 @@ struct MainDashboardView: View {
                             .frame(width: 110)
 
                             Button("Pair v2.0") {
-                                let pin = vm.pairPinInputs[peer.ip] ?? ""
+                                let pin = (vm.pairPinInputs[peer.ip] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                                vm.pairPinInputs.removeValue(forKey: peer.ip)
                                 vm.runAction("pair_with_peer", params: ["ip": peer.ip, "pin": pin])
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
+                            .disabled(pinDraft.count != 6)
+
+                            Button("Block") {
+                                vm.pairPinInputs.removeValue(forKey: peer.ip)
+                                vm.runAction("untrust_or_block_peer", params: ["deviceId": peer.device_id, "block": true])
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         } else {
                             Button("Untrust") {
                                 vm.runAction("untrust_or_block_peer", params: ["deviceId": peer.device_id, "block": false])
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            Button("Block") {
+                                vm.runAction("untrust_or_block_peer", params: ["deviceId": peer.device_id, "block": true])
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -1269,9 +1501,32 @@ struct MainDashboardView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    Button("Block") {
+                        vm.runAction("untrust_or_block_peer", params: ["deviceId": tp.device_id, "block": true])
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
                 .padding(10)
                 .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            }
+
+            ForEach(s?.trust.blocked_device_ids.filter { bid in
+                !(s?.discovered_peers ?? []).contains(where: { $0.device_id == bid && $0.blocked })
+            } ?? [], id: \.self) { blockedId in
+                HStack(spacing: 8) {
+                    Text("Blocked Device: \(String(blockedId.prefix(12)))…")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Unblock") {
+                        vm.runAction("untrust_or_block_peer", params: ["deviceId": blockedId, "block": false])
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(8)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             }
 
             Label("SPAKE2 + Ed25519 Mutual Auth Enforced on USB-C & LAN (v2.0 Locked)", systemImage: "checkmark.seal.fill")
@@ -1315,7 +1570,7 @@ struct MainDashboardView: View {
                     vm.runSpeedBenchmark()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(vm.isRunningSpeedTest || s?.peer_connected != true)
+                .disabled(vm.isRunningSpeedTest || s?.peer_connected != true || !(flags.benchmark ?? true))
                 Spacer()
             }
         }
@@ -1353,10 +1608,17 @@ struct MainDashboardView: View {
                 .lineLimit(2)
 
             HStack(spacing: 8) {
-                TextField("Preferred Share Name", text: $vm.preferredShareInput)
-                    .textFieldStyle(.roundedBorder)
+                TextField("Preferred Share Name", text: Binding(
+                    get: { vm.preferredShareInput },
+                    set: {
+                        vm.preferredShareInput = $0
+                        vm.preferredShareDirty = true
+                    }
+                ))
+                .textFieldStyle(.roundedBorder)
                 Button("Set Share") {
                     let trimmed = vm.preferredShareInput.trimmingCharacters(in: .whitespaces)
+                    vm.preferredShareDirty = false
                     vm.runAction("set_preferred_peer_share", params: ["share": trimmed.isEmpty ? NSNull() : trimmed])
                 }
                 .buttonStyle(.bordered)
@@ -1510,8 +1772,19 @@ struct MainDashboardView: View {
 
     // MARK: - Card 12: Live Logs Console
 
+    private var renderedLogs: [RenderedLogEntry] {
+        var counts: [String: Int] = [:]
+        return (s?.recent_logs ?? []).suffix(40).map { entry in
+            let base = "\(entry.ts_ms)-\(entry.level)-\(entry.message)"
+            let n = counts[base, default: 0]
+            counts[base] = n + 1
+            return RenderedLogEntry(id: "\(base)#\(n)", entry: entry)
+        }
+    }
+
     private var logsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let rows = renderedLogs
+        return VStack(alignment: .leading, spacing: 10) {
             CardHeader(
                 icon: "terminal",
                 title: "Live Telemetry & Security Logs",
@@ -1521,7 +1794,8 @@ struct MainDashboardView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
-                    ForEach((s?.recent_logs ?? []).suffix(40)) { entry in
+                    ForEach(rows) { row in
+                        let entry = row.entry
                         Text("[\(entry.level)] \(entry.message)")
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(entry.level == "WARN" || entry.level == "ERROR" ? .orange : .primary)
@@ -1531,7 +1805,8 @@ struct MainDashboardView: View {
                 .padding(8)
             }
             .frame(height: 140)
-            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.10), lineWidth: 1))
         }
         .modifier(LiquidGlassCardModifier())
     }
@@ -1557,18 +1832,21 @@ private struct VisualEffectBackdrop: NSViewRepresentable {
 
 // MARK: - AppKit Shell + Menu Bar Tray + Event Callback
 
+@MainActor
 private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem?
     var mainWindow: NSWindow?
     var startHidden: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setupMainMenu()
         setupStatusBar()
         setupMainWindow()
 
         if startHidden {
             NSApp.setActivationPolicy(.accessory)
             mainWindow?.orderOut(nil)
+            IntegratorViewModel.shared.setPollingPaused(true)
         } else {
             NSApp.setActivationPolicy(.regular)
             showDashboard()
@@ -1582,7 +1860,49 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
+        IntegratorViewModel.shared.setPollingPaused(true)
         return false
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        IntegratorViewModel.shared.setPollingPaused(true)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        IntegratorViewModel.shared.setPollingPaused(false)
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Integrator")
+        appMenu.addItem(withTitle: "Show Dashboard", action: #selector(onShowDashboard), keyEquivalent: "d").target = self
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit Integrator", action: #selector(onQuit), keyEquivalent: "q").target = self
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileMenuItem.submenu = fileMenu
+        mainMenu.addItem(fileMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     private func setupStatusBar() {
@@ -1611,7 +1931,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         let win = NSWindow(contentViewController: hosting)
         win.title = "Integrator"
         win.setContentSize(NSSize(width: 1240, height: 820))
-        win.minSize = NSSize(width: 880, height: 620)
+        win.minSize = NSSize(width: 960, height: 640)
         win.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden
@@ -1626,10 +1946,12 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         NSApp.setActivationPolicy(.regular)
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        IntegratorViewModel.shared.setPollingPaused(false)
     }
 
     func hideDashboard() {
         mainWindow?.orderOut(nil)
+        IntegratorViewModel.shared.setPollingPaused(true)
     }
 
     @objc private func onShowDashboard() { showDashboard() }
@@ -1637,6 +1959,8 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     @objc private func onToggleDisplay() { "toggle_display".withCString { rustCoreTrayAction($0) } }
     @objc private func onOpenCache() { "open_cache".withCString { rustCoreTrayAction($0) } }
     @objc private func onQuit() {
+        IntegratorViewModel.shared.stopPolling()
+        rustCoreSetUiCallback(nil)
         rustCoreShutdown()
         NSApp.terminate(nil)
     }
@@ -1646,6 +1970,9 @@ private var gMacAppDelegate: MacAppDelegate? = nil
 
 private let swiftUiEventTrampoline: RustUiCallback = { evPtr, payloadPtr in
     let eventName = evPtr.map { String(cString: $0) } ?? ""
+    if eventName == "log_entry" {
+        return
+    }
     let payloadStr = payloadPtr.map { String(cString: $0) } ?? "{}"
     DispatchQueue.main.async {
         switch eventName {
@@ -1661,12 +1988,17 @@ private let swiftUiEventTrampoline: RustUiCallback = { evPtr, payloadPtr in
                 let kind = (obj["kind"] as? String) ?? "info"
                 IntegratorViewModel.shared.showToast(kind, msg)
             }
+        case "quit":
+            IntegratorViewModel.shared.stopPolling()
+            rustCoreSetUiCallback(nil)
+            NSApp.terminate(nil)
         default:
             break
         }
     }
 }
 
+@MainActor
 @_cdecl("integrator_macos_run_app")
 public func integrator_macos_run_app(isHidden: Bool) {
     let app = NSApplication.shared

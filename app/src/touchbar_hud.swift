@@ -131,11 +131,11 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     override func touchesEnded(with event: NSEvent) {
-        endInteraction()
+        endInteraction(triggerTap: true)
     }
 
     override func touchesCancelled(with event: NSEvent) {
-        endInteraction()
+        endInteraction(triggerTap: false)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -150,7 +150,9 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        endInteraction()
+        let pt = convert(event.locationInWindow, from: nil)
+        let inside = bounds.contains(pt)
+        endInteraction(triggerTap: inside)
     }
 
     // MARK: - Goopy Liquid Physics Engine
@@ -209,7 +211,7 @@ class GoopyLiquidGlassPillView: NSView {
         CATransaction.commit()
     }
 
-    private func endInteraction() {
+    private func endInteraction(triggerTap: Bool) {
         guard isHeld else { return }
         isHeld = false
 
@@ -239,7 +241,9 @@ class GoopyLiquidGlassPillView: NSView {
             self.visualEffectView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.18).cgColor
         }
 
-        onTap?()
+        if triggerTap {
+            onTap?()
+        }
     }
 }
 
@@ -271,9 +275,16 @@ class GoopyLiquidGlassPillView: NSView {
         }
     }
 
+    private var _generation: UInt64 = 0
     private var isPollingInFlight: Bool = false
     private var lastKnownGpuName: String? = nil
     private var pendingPasteText: String? = nil
+
+    private func isGenerationCurrent(_ gen: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isActive && _generation == gen
+    }
 
     var touchBar: NSTouchBar?
     var pollTimer: Timer?
@@ -300,9 +311,7 @@ class GoopyLiquidGlassPillView: NSView {
         return nil
     }
 
-    /// Detects whether this Mac has Touch Bar hardware / ControlStrip / DFR runtime
-    /// and NSTouchBar system-modal presentation support.
-    public static func isTouchBarSupported() -> Bool {
+    private static let cachedTouchBarSupported: Bool = {
         let presentSelPlacement = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
         let presentSelLegacy = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
         let hasModalApi =
@@ -314,13 +323,15 @@ class GoopyLiquidGlassPillView: NSView {
             return true
         }
 
-        if let dfrHandle = dlopen("/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation", RTLD_LAZY),
-           let dfrSym = dlsym(dfrHandle, "DFRGetScreenSize") {
-            typealias DfrSizeFn = @convention(c) () -> CGSize
-            let fn = unsafeBitCast(dfrSym, to: DfrSizeFn.self)
-            let size = fn()
-            if size.width > 0 && size.height > 0 {
-                return true
+        if let dfrHandle = dlopen("/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation", RTLD_LAZY) {
+            defer { dlclose(dfrHandle) }
+            if let dfrSym = dlsym(dfrHandle, "DFRGetScreenSize") {
+                typealias DfrSizeFn = @convention(c) () -> CGSize
+                let fn = unsafeBitCast(dfrSym, to: DfrSizeFn.self)
+                let size = fn()
+                if size.width > 0 && size.height > 0 {
+                    return true
+                }
             }
         }
 
@@ -342,6 +353,32 @@ class GoopyLiquidGlassPillView: NSView {
         }
 
         return false
+    }()
+
+    /// Detects whether this Mac has Touch Bar hardware / ControlStrip / DFR runtime
+    /// and NSTouchBar system-modal presentation support (cached after first probe).
+    public static func isTouchBarSupported() -> Bool {
+        return cachedTouchBarSupported
+    }
+
+    private static func formatByteSize(_ totalBytes: UInt64) -> String {
+        let bytes = Double(totalBytes)
+        let gb = 1024.0 * 1024.0 * 1024.0
+        let mb = 1024.0 * 1024.0
+        let kb = 1024.0
+        if bytes >= gb {
+            return String(format: "%.1f GB", bytes / gb)
+        }
+        if bytes >= 10.0 * mb {
+            return String(format: "%.0f MB", bytes / mb)
+        }
+        if bytes >= mb {
+            return String(format: "%.1f MB", bytes / mb)
+        }
+        if totalBytes >= 1024 {
+            return String(format: "%.0f KB", bytes / kb)
+        }
+        return "\(totalBytes) B"
     }
 
     public func showRemotePasteButton(name: String, totalBytes: UInt64) {
@@ -349,8 +386,7 @@ class GoopyLiquidGlassPillView: NSView {
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let mb = Double(totalBytes) / (1024.0 * 1024.0)
-            let sizeStr = mb >= 1024.0 ? String(format: "%.1f GB", mb / 1024.0) : String(format: "%.0f MB", mb)
+            let sizeStr = Self.formatByteSize(totalBytes)
             let btnText = "📥 Paste \(name) (\(sizeStr))"
             self.pendingPasteText = btnText
 
@@ -410,9 +446,18 @@ class GoopyLiquidGlassPillView: NSView {
             return
         }
 
-        if let normalized = Self.normalizedIp(peerIp) {
-            self.peerIp = normalized
-        } else if peerIp == nil || peerIp?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+        if let raw = peerIp {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                self.peerIp = nil
+            } else if let normalized = Self.normalizedIp(trimmed) {
+                self.peerIp = normalized
+            } else {
+                NSLog("⚠️ [TouchBarHud] Ignoring invalid peer IP argument; refusing launch.")
+                self.peerIp = nil
+                return
+            }
+        } else {
             self.peerIp = nil
         }
 
@@ -438,6 +483,7 @@ class GoopyLiquidGlassPillView: NSView {
         guard self.setupTouchBar() else { return }
 
         stateLock.lock()
+        _generation &+= 1
         _isActive = true
         stateLock.unlock()
 
@@ -448,11 +494,13 @@ class GoopyLiquidGlassPillView: NSView {
     public func dismiss() {
         let block = { [weak self] in
             guard let self = self else { return }
-            guard self.isActive else { return }
-
             self.stateLock.lock()
+            let wasActive = self._isActive
             self._isActive = false
+            self._generation &+= 1
             self.stateLock.unlock()
+
+            guard wasActive || self.touchBar != nil || self.pollTimer != nil else { return }
 
             self.pollTimer?.invalidate()
             self.pollTimer = nil
@@ -566,9 +614,11 @@ class GoopyLiquidGlassPillView: NSView {
         case "paste_remote":
             let initialText = self.pendingPasteText ?? "📥 Paste"
             let v = GoopyLiquidGlassPillView(text: initialText, accent: NSColor.systemCyan, width: 155)
-            v.onTap = {
-                v.setText("⏳ Streaming...")
-                trigger_rust_remote_paste()
+            v.onTap = { [weak v] in
+                v?.setText("⏳ Streaming...")
+                DispatchQueue.global(qos: .userInitiated).async {
+                    trigger_rust_remote_paste()
+                }
             }
             self.viewPaste = v
             item.view = v
@@ -590,13 +640,12 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     func queryTelemetry() {
-        guard self.isActive else { return }
-
         stateLock.lock()
-        if isPollingInFlight {
+        guard _isActive, !isPollingInFlight else {
             stateLock.unlock()
             return
         }
+        let gen = _generation
         isPollingInFlight = true
         stateLock.unlock()
 
@@ -607,22 +656,23 @@ class GoopyLiquidGlassPillView: NSView {
                 self.isPollingInFlight = false
                 self.stateLock.unlock()
             }
-            guard self.isActive else { return }
+            guard self.isGenerationCurrent(gen) else { return }
 
             guard let host = self.peerIp else {
-                self.updateOfflineUi(statusText: "Peer Offline")
+                self.updateOfflineUi(statusText: "Peer Offline", expectedGeneration: gen)
                 return
             }
 
             guard let response = self.sendRpcRequest(host: host, port: Self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
-                self.updateOfflineUi(statusText: "Peer Offline")
+                self.updateOfflineUi(statusText: "Peer Offline", expectedGeneration: gen)
                 return
             }
+            guard self.isGenerationCurrent(gen) else { return }
 
             if response.success, let telemetry = response.gpu_telemetry {
-                self.updateUi(with: telemetry)
+                self.updateUi(with: telemetry, expectedGeneration: gen)
             } else {
-                self.updateOfflineUi(statusText: "Telemetry N/A")
+                self.updateOfflineUi(statusText: "Telemetry N/A", expectedGeneration: gen)
             }
         }
     }
@@ -637,9 +687,15 @@ class GoopyLiquidGlassPillView: NSView {
                 fetch_rust_gpu_telemetry_json(cHost, bufPtr.baseAddress, bufCap)
             }
         }
-        guard n > 0 && n < bufCap else { return nil }
+        guard n > 0 && n <= bufCap else { return nil }
         let respData = Data(outBuf.prefix(n))
-        return try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData)
+        guard let decoded = try? JSONDecoder().decode(DisplayRpcResponseData.self, from: respData) else {
+            return nil
+        }
+        if let t = decoded.gpu_telemetry, !t.power_usage_watts.isFinite {
+            return nil
+        }
+        return decoded
     }
 
     private func compactGpuName(_ raw: String) -> String {
@@ -675,9 +731,14 @@ class GoopyLiquidGlassPillView: NSView {
         return name
     }
 
-    func updateOfflineUi(statusText: String = "Peer Offline") {
+    func updateOfflineUi(statusText: String = "Peer Offline", expectedGeneration: UInt64? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if let gen = expectedGeneration {
+                guard self.isGenerationCurrent(gen) else { return }
+            } else {
+                guard self.isActive else { return }
+            }
             self.viewGpu?.setText(statusText)
             self.viewGpu?.setAccent(.systemGray)
 
@@ -698,13 +759,18 @@ class GoopyLiquidGlassPillView: NSView {
         }
     }
 
-    func updateUi(with t: GpuTelemetryData) {
+    func updateUi(with t: GpuTelemetryData, expectedGeneration: UInt64? = nil) {
         self.stateLock.lock()
         self.lastKnownGpuName = t.gpu_name
         self.stateLock.unlock()
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            if let gen = expectedGeneration {
+                guard self.isGenerationCurrent(gen) else { return }
+            } else {
+                guard self.isActive else { return }
+            }
             let hasLiveCounters =
                 t.temperature_c > 0 ||
                 t.power_usage_watts > 0.05 ||
@@ -795,12 +861,20 @@ class GoopyLiquidGlassPillView: NSView {
         let gpuName = lastKnownGpuName ?? "Remote GPU"
         stateLock.unlock()
 
+        let memPercent: UInt32
+        if vramTotal > 0 {
+            let pct = (Double(vramUsed) * 100.0) / Double(vramTotal)
+            memPercent = UInt32(min(100.0, max(0.0, pct)))
+        } else {
+            memPercent = 0
+        }
+
         let t = GpuTelemetryData(
             gpu_name: gpuName,
             temperature_c: temp,
-            power_usage_watts: power,
+            power_usage_watts: power.isFinite ? power : 0.0,
             gpu_utilization_percent: util,
-            memory_utilization_percent: vramTotal > 0 ? UInt32((vramUsed * 100) / vramTotal) : 0,
+            memory_utilization_percent: memPercent,
             memory_used_mb: vramUsed,
             memory_total_mb: vramTotal,
             core_clock_mhz: clock
@@ -845,6 +919,8 @@ public func update_touchbar_telemetry_in_app(
     )
 }
 
+private var touchBarCliSignalSources: [DispatchSourceSignal] = []
+
 @_cdecl("run_touchbar_cli_loop")
 public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
     guard TouchBarHudController.isTouchBarSupported() else {
@@ -853,20 +929,37 @@ public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
     }
 
     let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil
-    TouchBarHudController.shared.launch_touchbar_hud(peerIp: peerIp)
-
-    signal(SIGINT) { _ in
-        TouchBarHudController.shared.dismiss()
-        CFRunLoopStop(CFRunLoopGetMain())
-        exit(0)
+    let initMain = {
+        let app = NSApplication.shared
+        if app.activationPolicy() == .prohibited {
+            app.setActivationPolicy(.accessory)
+        }
+        TouchBarHudController.shared.launch_touchbar_hud(peerIp: peerIp)
     }
-    signal(SIGTERM) { _ in
-        TouchBarHudController.shared.dismiss()
-        CFRunLoopStop(CFRunLoopGetMain())
-        exit(0)
+    if Thread.isMainThread {
+        initMain()
+    } else {
+        DispatchQueue.main.sync(execute: initMain)
+    }
+
+    signal(SIGINT, SIG_IGN)
+    signal(SIGTERM, SIG_IGN)
+    touchBarCliSignalSources.forEach { $0.cancel() }
+    touchBarCliSignalSources.removeAll()
+
+    for sig in [SIGINT, SIGTERM] {
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        src.setEventHandler {
+            TouchBarHudController.shared.dismiss()
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+        src.resume()
+        touchBarCliSignalSources.append(src)
     }
 
     CFRunLoopRun()
+    touchBarCliSignalSources.forEach { $0.cancel() }
+    touchBarCliSignalSources.removeAll()
 }
 
 // MARK: - On-Demand Remote Paste & Telemetry C FFI Bridge
@@ -885,11 +978,13 @@ public func notify_touchbar_remote_file(namePtr: UnsafePointer<CChar>?, totalByt
 
 @_cdecl("update_touchbar_paste_progress")
 public func update_touchbar_paste_progress(percent: Float, mbPerSec: Float) {
+    PasteboardShortcutInterceptor.shared.touchPasteActivity()
     TouchBarHudController.shared.updatePasteProgress(percent: percent, mbPerSec: mbPerSec)
 }
 
 @_cdecl("reset_touchbar_paste_progress")
 public func reset_touchbar_paste_progress() {
+    PasteboardShortcutInterceptor.shared.isPasting = false
     TouchBarHudController.shared.resetPasteButton()
 }
 
@@ -897,10 +992,59 @@ public func reset_touchbar_paste_progress() {
 public class PasteboardShortcutInterceptor: NSObject {
     public static let shared = PasteboardShortcutInterceptor()
 
-    public var hasPendingRemoteFile: Bool = false
-    public var isPasting: Bool = false
+    private let lock = NSLock()
+    private var _hasPendingRemoteFile: Bool = false
+    private var _isPasting: Bool = false
+    private var _pasteStartedAt: Date? = nil
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+
+    public var hasPendingRemoteFile: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _hasPendingRemoteFile
+        }
+        set {
+            lock.lock()
+            _hasPendingRemoteFile = newValue
+            if !newValue {
+                _isPasting = false
+                _pasteStartedAt = nil
+            }
+            lock.unlock()
+        }
+    }
+
+    public var isPasting: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            expireStalePastingLocked()
+            return _isPasting
+        }
+        set {
+            lock.lock()
+            _isPasting = newValue
+            _pasteStartedAt = newValue ? Date() : nil
+            lock.unlock()
+        }
+    }
+
+    func touchPasteActivity() {
+        lock.lock()
+        if _isPasting {
+            _pasteStartedAt = Date()
+        }
+        lock.unlock()
+    }
+
+    private func expireStalePastingLocked() {
+        if _isPasting, let started = _pasteStartedAt, Date().timeIntervalSince(started) > 30.0 {
+            _isPasting = false
+            _pasteStartedAt = nil
+        }
+    }
 
     private override init() {
         super.init()
@@ -908,7 +1052,11 @@ public class PasteboardShortcutInterceptor: NSObject {
 
     public func start() {
         let block = { [weak self] in
-            guard let self = self, self.eventTap == nil else { return }
+            guard let self = self else { return }
+            self.lock.lock()
+            let alreadyStarted = self.eventTap != nil
+            self.lock.unlock()
+            guard !alreadyStarted else { return }
 
             if !AXIsProcessTrusted() {
                 NSLog("ℹ️ [PasteboardShortcutInterceptor] Accessibility permissions not granted. Using automatic background stream & native pasteboard registration.")
@@ -930,9 +1078,12 @@ public class PasteboardShortcutInterceptor: NSObject {
                 return
             }
 
-            self.eventTap = tap
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            self.lock.lock()
+            self.eventTap = tap
             self.runLoopSource = source
+            self.lock.unlock()
+
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
             CGEvent.tapEnable(tap: tap, enable: true)
@@ -946,11 +1097,33 @@ public class PasteboardShortcutInterceptor: NSObject {
         }
     }
 
+    private func isPasteShortcutEvent(_ event: CGEvent) -> Bool {
+        let flags = event.flags
+        guard flags.contains(.maskCommand),
+              !flags.contains(.maskAlternate),
+              !flags.contains(.maskControl) else {
+            return false
+        }
+        if let nsEvent = NSEvent(cgEvent: event),
+           let chars = nsEvent.charactersIgnoringModifiers?.lowercased(),
+           !chars.isEmpty {
+            return chars == "v"
+        }
+        return event.getIntegerValueField(.keyboardEventKeycode) == 9
+    }
+
     func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap {
+        if type == .tapDisabledByTimeout {
+            lock.lock()
+            let tap = eventTap
+            lock.unlock()
+            if let tap = tap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
+            return Unmanaged.passUnretained(event)
+        }
+        if type == .tapDisabledByUserInput {
+            NSLog("ℹ️ [PasteboardShortcutInterceptor] CGEventTap disabled by user input / permission change; not forcing re-enable.")
             return Unmanaged.passUnretained(event)
         }
 
@@ -958,19 +1131,18 @@ public class PasteboardShortcutInterceptor: NSObject {
             return Unmanaged.passUnretained(event)
         }
 
-        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let flags = event.flags
-
-        // KeyCode 9 is 'v' / 'V'
-        if keyCode == 9 && flags.contains(.maskCommand) && !flags.contains(.maskAlternate) && !flags.contains(.maskControl) {
+        if isPasteShortcutEvent(event) {
             let frontApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
-            NSLog("🎯 [PasteboardShortcutInterceptor] Cmd+V pressed. frontApp=%@, hasPending=%d, isPasting=%d", frontApp, hasPendingRemoteFile ? 1 : 0, isPasting ? 1 : 0)
-            if hasPendingRemoteFile && !isPasting {
-                if frontApp == "com.apple.finder" {
-                    NSLog("🎯 [PasteboardShortcutInterceptor] Intercepting Cmd+V in Finder! Streaming remote files...")
-                    triggerPaste()
-                    return nil // Intercept & swallow event so Finder does not paste stale text clippings or beep!
-                }
+            lock.lock()
+            expireStalePastingLocked()
+            let pending = _hasPendingRemoteFile
+            let pasting = _isPasting
+            lock.unlock()
+
+            if pending && !pasting && frontApp == "com.apple.finder" {
+                NSLog("🎯 [PasteboardShortcutInterceptor] Intercepting Cmd+V in Finder! Streaming remote files...")
+                triggerPaste()
+                return nil // Intercept & swallow event so Finder does not paste stale text clippings or beep!
             }
         }
 
@@ -978,8 +1150,15 @@ public class PasteboardShortcutInterceptor: NSObject {
     }
 
     func triggerPaste() {
-        guard !isPasting else { return }
-        isPasting = true
+        lock.lock()
+        expireStalePastingLocked()
+        guard _hasPendingRemoteFile && !_isPasting else {
+            lock.unlock()
+            return
+        }
+        _isPasting = true
+        _pasteStartedAt = Date()
+        lock.unlock()
 
         DispatchQueue.main.async {
             NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
@@ -987,7 +1166,9 @@ public class PasteboardShortcutInterceptor: NSObject {
             TouchBarHudController.shared.viewPaste?.setAccent(NSColor.systemGreen)
         }
 
-        trigger_rust_remote_paste()
+        DispatchQueue.global(qos: .userInitiated).async {
+            trigger_rust_remote_paste()
+        }
     }
 }
 
@@ -1000,52 +1181,89 @@ public func init_shortcut_interceptor() {
 @_cdecl("set_has_pending_remote_file")
 public func set_has_pending_remote_file(pending: Bool) {
     PasteboardShortcutInterceptor.shared.hasPendingRemoteFile = pending
-    if !pending {
-        PasteboardShortcutInterceptor.shared.isPasting = false
+}
+
+private func onMainPasteboardSync<T>(_ work: () -> T) -> T {
+    if Thread.isMainThread || !(NSApp?.isRunning ?? false) {
+        return work()
     }
+    return DispatchQueue.main.sync(execute: work)
 }
 
 @_cdecl("clear_pasteboard_in_app")
 public func clear_pasteboard_in_app() {
-    NSPasteboard.general.clearContents()
+    onMainPasteboardSync {
+        NSPasteboard.general.clearContents()
+    }
 }
 
+/// Reads file URLs from `NSPasteboard.general` into `outBuf` as `\0`-delimited UTF-8 paths.
+/// Returns `0` when no file URLs are present, `-1` when `outBuf` is invalid or `cap` is too small,
+/// or the exact byte count written into `outBuf`.
 @_cdecl("read_pasteboard_files_in_app")
 public func read_pasteboard_files_in_app(_ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int {
-    guard let outBuf = outBuf, cap > 1 else { return 0 }
-    let pb = NSPasteboard.general
-    let options: [NSPasteboard.ReadingOptionKey: Any] = [
-        .urlReadingFileURLsOnly: true
-    ]
-    guard let urls = pb.readObjects(forClasses: [NSURL.self], options: options) as? [URL], !urls.isEmpty else {
+    guard let outBuf = outBuf, cap > 0 else { return -1 }
+    let ordered: [String] = onMainPasteboardSync {
+        let pb = NSPasteboard.general
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true
+        ]
+        guard let urls = pb.readObjects(forClasses: [NSURL.self], options: options) as? [URL], !urls.isEmpty else {
+            return []
+        }
+        var seen = Set<String>()
+        var result: [String] = []
+        for url in urls {
+            guard url.isFileURL else { continue }
+            let path = url.path
+            guard !path.isEmpty, !path.contains("\0") else { continue }
+            if seen.insert(path).inserted {
+                result.append(path)
+            }
+        }
+        return result
+    }
+    if ordered.isEmpty {
         return 0
     }
-    let joined = urls
-        .filter { $0.isFileURL }
-        .map { $0.path }
-        .filter { !$0.isEmpty }
-        .joined(separator: "\n")
-    let utf8 = Array(joined.utf8)
-    guard !utf8.isEmpty && utf8.count < cap else { return 0 }
-    for i in 0..<utf8.count {
-        outBuf[i] = utf8[i]
+    var bytes: [UInt8] = []
+    for (idx, path) in ordered.enumerated() {
+        if idx > 0 {
+            bytes.append(0)
+        }
+        bytes.append(contentsOf: path.utf8)
     }
-    outBuf[utf8.count] = 0
-    return utf8.count
+    if bytes.isEmpty {
+        return 0
+    }
+    guard bytes.count <= cap else {
+        return -1
+    }
+    for i in 0..<bytes.count {
+        outBuf[i] = bytes[i]
+    }
+    return bytes.count
 }
 
+/// Writes `\0`-delimited UTF-8 file paths in `pathsPtr[0..<len]` onto `NSPasteboard.general`.
 @_cdecl("write_pasteboard_files_in_app")
-public func write_pasteboard_files_in_app(_ pathsPtr: UnsafePointer<CChar>?) -> Bool {
-    guard let pathsPtr = pathsPtr else { return false }
-    let joined = String(cString: pathsPtr)
-    let urls: [NSURL] = joined
-        .split(separator: "\n")
-        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
-        .map { URL(fileURLWithPath: $0) as NSURL }
+public func write_pasteboard_files_in_app(_ pathsPtr: UnsafePointer<UInt8>?, _ len: Int) -> Bool {
+    guard let pathsPtr = pathsPtr, len > 0 else { return false }
+    let buf = UnsafeBufferPointer(start: pathsPtr, count: len)
+    var seen = Set<String>()
+    var urls: [NSURL] = []
+    for slice in buf.split(separator: 0, omittingEmptySubsequences: true) {
+        let path = String(decoding: slice, as: UTF8.self)
+        guard !path.isEmpty else { continue }
+        if seen.insert(path).inserted {
+            urls.append(URL(fileURLWithPath: path) as NSURL)
+        }
+    }
     guard !urls.isEmpty else { return false }
-    let pb = NSPasteboard.general
-    pb.clearContents()
-    return pb.writeObjects(urls)
+    return onMainPasteboardSync {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        return pb.writeObjects(urls)
+    }
 }
 

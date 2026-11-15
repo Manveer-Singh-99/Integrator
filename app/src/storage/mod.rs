@@ -4,10 +4,33 @@
 //! or sudo `/Volumes` directories in favor of discovered/configured share names,
 //! NetFS `mount volume` on macOS, and dynamic `net use *` drive assignment on Windows.
 
-use crate::system_info;
+use crate::{system_info, trust};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(target_os = "macos")]
+const OSASCRIPT_BIN: &str = "/usr/bin/osascript";
+#[cfg(target_os = "macos")]
+const DISKUTIL_BIN: &str = "/usr/sbin/diskutil";
+#[cfg(target_os = "macos")]
+const UMOUNT_BIN: &str = "/sbin/umount";
+#[cfg(target_os = "macos")]
+const SMBUTIL_BIN: &str = "/usr/bin/smbutil";
+#[cfg(target_os = "macos")]
+const MOUNT_BIN: &str = "/sbin/mount";
+#[cfg(target_os = "windows")]
+const NET_EXE_BIN: &str = r"C:\Windows\System32\net.exe";
+
+static MOUNT_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MOUNT_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn mount_state_lock() -> &'static Mutex<()> {
+    MOUNT_STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
@@ -88,8 +111,21 @@ impl StorageManager {
         if !system_info::is_valid_ipv4(clean_ip) {
             anyhow::bail!("Invalid peer IPv4 address for SMB mount: '{}'", peer_ip);
         }
+        let parsed_ip: IpAddr = clean_ip
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid peer IP address for SMB mount: '{}'", peer_ip))?;
+        if !trust::has_paired_peer_at_ip(parsed_ip) {
+            anyhow::bail!(
+                "Refusing SMB mount: peer {} is not cryptographically paired or is blocked.",
+                clean_ip
+            );
+        }
 
-        if let Some(existing) = detect_active_mount(Some(clean_ip)) {
+        let requested_share = Self::get_preferred_peer_share().or_else(|| {
+            share_hint.and_then(|s| validate_smb_share_name(s).ok())
+        });
+
+        if let Some(existing) = detect_active_mount_matching(Some(clean_ip), requested_share.as_deref()) {
             return Ok(StorageStatus {
                 is_mounted: true,
                 mount_path: existing.mount_path.clone(),
@@ -118,20 +154,28 @@ impl StorageManager {
 
             let encoded_share = percent_encode_path_segment(&share);
             let smb_url = format!("smb://{}/{}", clean_ip, encoded_share);
-            let escaped_url = smb_url.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = format!("mount volume \"{}\"", escaped_url);
 
             tracing::info!("📂 Mounting macOS SMB volume via NetFS: {}", smb_url);
-            let output = Command::new("osascript")
-                .args(["-e", &script])
+            let output = Command::new(OSASCRIPT_BIN)
+                .args([
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    "mount volume (item 1 of argv)",
+                    "-e",
+                    "end run",
+                    "--",
+                    &smb_url,
+                ])
                 .output()?;
 
             if output.status.success() {
-                let detected = detect_active_mount(Some(clean_ip)).unwrap_or(ActiveMountRecord {
-                    peer_ip: clean_ip.to_string(),
-                    remote_share: share.clone(),
-                    mount_path: format!("/Volumes/{}", share),
-                });
+                let detected = detect_active_mount_matching(Some(clean_ip), Some(&share))
+                    .unwrap_or(ActiveMountRecord {
+                        peer_ip: clean_ip.to_string(),
+                        remote_share: share.clone(),
+                        mount_path: format!("/Volumes/{}", share),
+                    });
                 save_active_mount(&detected);
                 return Ok(StorageStatus {
                     is_mounted: true,
@@ -169,7 +213,7 @@ impl StorageManager {
             let unc_path = format!(r"\\{}\{}", clean_ip, share);
             tracing::info!("📂 Mounting Windows network drive via dynamic letter: {}", unc_path);
 
-            let mut cmd = Command::new("net");
+            let mut cmd = Command::new(NET_EXE_BIN);
             cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.args(["use", "*", &unc_path, "/persistent:no"]);
             let out = cmd.output()?;
@@ -186,7 +230,7 @@ impl StorageManager {
                 };
 
                 let rec = ActiveMountRecord {
-                    peer_ip: peer_ip.to_string(),
+                    peer_ip: clean_ip.to_string(),
                     remote_share: share.clone(),
                     mount_path: mount_path.clone(),
                 };
@@ -195,7 +239,7 @@ impl StorageManager {
                 return Ok(StorageStatus {
                     is_mounted: true,
                     mount_path: mount_path.clone(),
-                    remote_ip: peer_ip.to_string(),
+                    remote_ip: clean_ip.to_string(),
                     remote_share: share,
                     message: format!("Mounted {} at {}", unc_path, mount_path),
                 });
@@ -214,7 +258,7 @@ impl StorageManager {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = target_share;
+            let _ = (target_share, requested_share);
             anyhow::bail!("Storage mounting not supported on this OS")
         }
     }
@@ -234,12 +278,12 @@ impl StorageManager {
 
         #[cfg(target_os = "macos")]
         {
-            let diskutil_out = Command::new("diskutil")
+            let diskutil_out = Command::new(DISKUTIL_BIN)
                 .args(["unmount", &rec.mount_path])
                 .output();
             let mut ok = diskutil_out.map(|o| o.status.success()).unwrap_or(false);
             if !ok {
-                ok = Command::new("umount")
+                ok = Command::new(UMOUNT_BIN)
                     .arg(&rec.mount_path)
                     .output()
                     .map(|o| o.status.success())
@@ -262,7 +306,7 @@ impl StorageManager {
         {
             use std::os::windows::process::CommandExt;
             let target = rec.mount_path.trim_end_matches('\\');
-            let mut cmd = Command::new("net");
+            let mut cmd = Command::new(NET_EXE_BIN);
             cmd.creation_flags(0x08000000);
             cmd.args(["use", target, "/delete", "/yes"]);
             let out = cmd.output()?;
@@ -298,7 +342,10 @@ impl StorageManager {
     }
 
     pub fn status_with_share(peer_ip: Option<&str>, share_hint: Option<&str>) -> StorageStatus {
-        if let Some(rec) = detect_active_mount(peer_ip) {
+        let valid_hint = share_hint.and_then(|h| validate_smb_share_name(h).ok());
+        let expected_share = Self::get_preferred_peer_share().or_else(|| valid_hint.clone());
+
+        if let Some(rec) = detect_active_mount_matching(peer_ip, expected_share.as_deref()) {
             return StorageStatus {
                 is_mounted: true,
                 mount_path: rec.mount_path,
@@ -312,14 +359,8 @@ impl StorageManager {
             };
         }
 
-        let ip = peer_ip.unwrap_or("");
-        let planned_share = if let Some(pref) = Self::get_preferred_peer_share() {
-            pref
-        } else if let Some(hint) = share_hint {
-            hint.to_string()
-        } else {
-            "Not configured".to_string()
-        };
+        let ip = peer_ip.unwrap_or("").trim();
+        let planned_share = expected_share.unwrap_or_else(|| "Not configured".to_string());
 
         StorageStatus {
             is_mounted: false,
@@ -336,22 +377,53 @@ fn active_mount_file() -> std::path::PathBuf {
 }
 
 fn load_active_mount() -> Option<ActiveMountRecord> {
-    std::fs::read_to_string(active_mount_file())
+    let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let rec = std::fs::read_to_string(active_mount_file())
         .ok()
-        .and_then(|s| serde_json::from_str::<ActiveMountRecord>(&s).ok())
+        .and_then(|s| serde_json::from_str::<ActiveMountRecord>(&s).ok())?;
+    let valid_ip = rec.peer_ip.trim().parse::<IpAddr>().is_ok();
+    let valid_share =
+        rec.remote_share.is_empty() || validate_smb_share_name(&rec.remote_share).is_ok();
+    if valid_ip && valid_share && !rec.mount_path.trim().is_empty() {
+        Some(rec)
+    } else {
+        None
+    }
 }
 
 fn save_active_mount(rec: &ActiveMountRecord) {
+    let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = active_mount_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
     if let Ok(json) = serde_json::to_string_pretty(rec) {
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)) {
+        let seq = MOUNT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
+        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("Failed to write temp active mount state {}: {}", tmp.display(), e);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
             tracing::warn!("Failed to persist active mount state to {}: {}", path.display(), e);
         }
     }
 }
 
 fn clear_active_mount() {
+    let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = active_mount_file();
     if path.exists() {
         if let Err(e) = std::fs::remove_file(&path) {
@@ -385,6 +457,11 @@ fn parse_smbutil_disk_shares(stdout: &str) -> Vec<String> {
 }
 
 fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<String> {
+    let parsed_ip: IpAddr = peer_ip.trim().parse().ok()?;
+    if !trust::has_paired_peer_at_ip(parsed_ip) {
+        return None;
+    }
+
     if let Some(pref) = StorageManager::get_preferred_peer_share() {
         return Some(pref);
     }
@@ -398,7 +475,7 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
     #[cfg(target_os = "macos")]
     {
         for target in [format!("//{}", peer_ip), format!("//guest@{}", peer_ip)] {
-            if let Ok(out) = Command::new("smbutil")
+            if let Ok(out) = Command::new(SMBUTIL_BIN)
                 .args(["view", "-N", &target])
                 .output()
             {
@@ -416,7 +493,7 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("net");
+        let mut cmd = Command::new(NET_EXE_BIN);
         cmd.creation_flags(0x08000000);
         cmd.args(["view", &format!(r"\\{}", peer_ip)]);
         if let Ok(out) = cmd.output() {
@@ -438,9 +515,16 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
 }
 
 fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord> {
+    detect_active_mount_matching(peer_ip_filter, None)
+}
+
+fn detect_active_mount_matching(
+    peer_ip_filter: Option<&str>,
+    share_filter: Option<&str>,
+) -> Option<ActiveMountRecord> {
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("/sbin/mount").output().ok()?;
+        let out = Command::new(MOUNT_BIN).output().ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let saved = load_active_mount();
 
@@ -448,20 +532,35 @@ fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord
             if !line.contains("(smbfs") {
                 continue;
             }
-            // Format: "//user@10.x.x.x/Share on /Volumes/Share (smbfs, ...)"
-            let Some((src, rest)) = line.split_once(" on ") else {
+            // Format: "//user@10.x.x.x/Share%20Name on /Volumes/Share Name (smbfs, ...)"
+            let Some((left, _opts)) = line.rsplit_once(" (smbfs") else {
                 continue;
             };
-            let Some((mount_path, _opts)) = rest.split_once(" (smbfs") else {
+            let Some((src, raw_mount_path)) = left.split_once(" on ") else {
                 continue;
             };
+            let mount_path = raw_mount_path.trim();
             let (ip_part, share_part) = parse_smbfs_source(src);
+            if validate_smb_share_name(&share_part).is_err() {
+                continue;
+            }
             if let Some(filter_ip) = peer_ip_filter {
-                if !ip_part.is_empty() && ip_part != filter_ip {
+                if ip_part.is_empty() || !ip_part.eq_ignore_ascii_case(filter_ip.trim()) {
                     continue;
                 }
+                if let Some(req_share) = share_filter {
+                    if !share_part.eq_ignore_ascii_case(req_share.trim()) {
+                        continue;
+                    }
+                }
             } else if let Some(ref s) = saved {
-                if mount_path != s.mount_path && ip_part != s.peer_ip {
+                let matches_saved_path =
+                    !s.mount_path.is_empty() && mount_path == s.mount_path.trim();
+                let matches_saved_ip_share = !ip_part.is_empty()
+                    && ip_part.eq_ignore_ascii_case(&s.peer_ip)
+                    && (s.remote_share.is_empty()
+                        || share_part.eq_ignore_ascii_case(&s.remote_share));
+                if !matches_saved_path && !matches_saved_ip_share {
                     continue;
                 }
             } else {
@@ -471,7 +570,7 @@ fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord
             return Some(ActiveMountRecord {
                 peer_ip: ip_part,
                 remote_share: share_part,
-                mount_path: mount_path.trim().to_string(),
+                mount_path: mount_path.to_string(),
             });
         }
         None
@@ -481,56 +580,46 @@ fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord
     {
         use std::os::windows::process::CommandExt;
         let saved = load_active_mount();
-        let mut cmd = Command::new("net");
+        let mut cmd = Command::new(NET_EXE_BIN);
         cmd.creation_flags(0x08000000);
         cmd.arg("use");
         let out = cmd.output().ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         for line in stdout.lines() {
-            // Typical line: "OK           Z:        \\10.0.0.2\Public  ..."
-            if !line.contains(r"\\") {
-                continue;
-            }
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            let Some(unc_idx) = tokens.iter().position(|t| t.starts_with(r"\\")) else {
+            let Some((drive_opt, host, share_root, full_unc)) = parse_windows_net_use_line(line)
+            else {
                 continue;
             };
-            let unc = tokens[unc_idx];
-            let trimmed_unc = unc.trim_start_matches('\\');
-            let (host, share) = trimmed_unc.split_once('\\').unwrap_or((trimmed_unc, ""));
-            let share_root = share.split('\\').next().unwrap_or("");
-            if host.is_empty()
-                || share_root.is_empty()
-                || share_root.eq_ignore_ascii_case("IPC$")
-                || share_root.ends_with('$')
-            {
-                continue;
-            }
 
             if let Some(filter_ip) = peer_ip_filter {
-                if host != filter_ip {
+                if !host.eq_ignore_ascii_case(filter_ip.trim()) {
                     continue;
                 }
+                if let Some(req_share) = share_filter {
+                    if !share_root.eq_ignore_ascii_case(req_share.trim()) {
+                        continue;
+                    }
+                }
             } else if let Some(ref s) = saved {
-                if host != s.peer_ip {
+                if !host.eq_ignore_ascii_case(&s.peer_ip)
+                    || (!s.remote_share.is_empty()
+                        && !share_root.eq_ignore_ascii_case(&s.remote_share))
+                {
                     continue;
                 }
             } else {
                 continue;
             }
 
-            let drive = tokens
-                .iter()
-                .take(unc_idx)
-                .find(|t| t.len() == 2 && t.ends_with(':'))
+            let mount_path = drive_opt
                 .map(|d| format!("{}\\", d))
-                .unwrap_or_else(|| unc.to_string());
+                .unwrap_or(full_unc);
 
             return Some(ActiveMountRecord {
-                peer_ip: host.to_string(),
-                remote_share: share.to_string(),
-                mount_path: drive,
+                peer_ip: host,
+                remote_share: share_root,
+                mount_path,
             });
         }
         None
@@ -538,9 +627,40 @@ fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = peer_ip_filter;
+        let _ = (peer_ip_filter, share_filter);
         None
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_net_use_line(line: &str) -> Option<(Option<String>, String, String, String)> {
+    let unc_pos = line.find(r"\\")?;
+    let prefix = &line[..unc_pos];
+    let after_unc = &line[unc_pos..];
+    // SMB provider column on `net use` is separated by 2+ spaces or tab.
+    let unc_end = after_unc
+        .find("  ")
+        .into_iter()
+        .chain(after_unc.find('\t'))
+        .min()
+        .unwrap_or(after_unc.len());
+    let full_unc = after_unc[..unc_end].trim_end();
+    let trimmed_unc = full_unc.trim_start_matches('\\');
+    let (host, share) = trimmed_unc.split_once('\\')?;
+    let share_root = share.split('\\').next().unwrap_or("").trim();
+    if host.is_empty() || validate_smb_share_name(share_root).is_err() {
+        return None;
+    }
+    let drive = prefix
+        .split_whitespace()
+        .find(|t| t.len() == 2 && t.ends_with(':') && t.as_bytes()[0].is_ascii_alphabetic())
+        .map(|d| d.to_string());
+    Some((
+        drive,
+        host.to_string(),
+        share_root.to_string(),
+        full_unc.to_string(),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -605,17 +725,15 @@ fn parse_assigned_windows_drive(stdout: &str) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn find_windows_drive_for_unc(unc: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new("net");
+    let mut cmd = Command::new(NET_EXE_BIN);
     cmd.creation_flags(0x08000000);
     cmd.arg("use");
     let out = cmd.output().ok()?;
     let txt = String::from_utf8_lossy(&out.stdout);
     for line in txt.lines() {
-        if line.to_ascii_lowercase().contains(&unc.to_ascii_lowercase()) {
-            for tok in line.split_whitespace() {
-                if tok.len() == 2 && tok.ends_with(':') && tok.as_bytes()[0].is_ascii_alphabetic() {
-                    return Some(tok.to_string());
-                }
+        if let Some((Some(drive), _, _, full_unc)) = parse_windows_net_use_line(line) {
+            if full_unc.eq_ignore_ascii_case(unc.trim()) {
+                return Some(drive);
             }
         }
     }
@@ -657,6 +775,30 @@ Workspace Drive                                 Disk    Shared SSD
                 "Workspace Drive".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn windows_net_use_parser_handles_spaced_shares_and_skips_ipc() {
+        assert!(parse_windows_net_use_line(
+            r"OK                     \\10.0.0.2\IPC$              Microsoft Windows Network"
+        )
+        .is_none());
+        let parsed = parse_windows_net_use_line(
+            r"OK           Z:        \\10.0.0.2\Shared Public Folder  Microsoft Windows Network",
+        )
+        .unwrap();
+        assert_eq!(parsed.0.as_deref(), Some("Z:"));
+        assert_eq!(parsed.1, "10.0.0.2");
+        assert_eq!(parsed.2, "Shared Public Folder");
+    }
+
+    #[test]
+    fn status_with_share_rejects_invalid_hint() {
+        let st = StorageManager::status_with_share(Some("203.0.113.55"), Some("../C$"));
+        assert!(!st.is_mounted);
+        if StorageManager::get_preferred_peer_share().is_none() {
+            assert_eq!(st.remote_share, "Not configured");
+        }
     }
 }
 

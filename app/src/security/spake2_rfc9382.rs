@@ -48,6 +48,8 @@ pub const RFC9382_ED25519_N_BYTES: [u8; 32] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spake2Error {
     EmptyPassword,
+    ZeroEphemeralScalar,
+    OversizedTranscriptInput,
     NonCanonicalPeerShare,
     SmallOrderPeerShare,
     IdentitySharedElement,
@@ -59,6 +61,10 @@ impl std::fmt::Display for Spake2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Spake2Error::EmptyPassword => write!(f, "SPAKE2 password/PIN must not be empty"),
+            Spake2Error::ZeroEphemeralScalar => write!(f, "SPAKE2 ephemeral scalar must be non-zero"),
+            Spake2Error::OversizedTranscriptInput => {
+                write!(f, "SPAKE2 identity or AAD input exceeds maximum permitted size")
+            }
             Spake2Error::NonCanonicalPeerShare => {
                 write!(f, "SPAKE2 peer point is not a valid canonical compressed Edwards25519 point")
             }
@@ -194,6 +200,18 @@ impl Drop for Spake2State {
     fn drop(&mut self) {
         self.xy_scalar.zeroize();
         self.w_scalar.zeroize();
+        self.my_share.zeroize();
+    }
+}
+
+fn sample_nonzero_scalar() -> Result<Scalar, Spake2Error> {
+    let mut scalar_wide = Zeroizing::new([0u8; 64]);
+    loop {
+        super::try_csprng_fill(&mut *scalar_wide).map_err(|_| Spake2Error::ZeroEphemeralScalar)?;
+        let s = Scalar::from_bytes_mod_order_wide(&scalar_wide);
+        if !bool::from(s.ct_eq(&Scalar::ZERO)) {
+            return Ok(s);
+        }
     }
 }
 
@@ -239,12 +257,7 @@ impl Spake2State {
         id_a: &[u8],
         id_b: &[u8],
     ) -> Result<(Self, [u8; 32]), Spake2Error> {
-        let mut scalar_wide = Zeroizing::new([0u8; 64]);
-        super::csprng_fill(&mut *scalar_wide);
-        let mut x = Scalar::from_bytes_mod_order_wide(&scalar_wide);
-        if bool::from(x.ct_eq(&Scalar::ZERO)) {
-            x = Scalar::ONE;
-        }
+        let x = sample_nonzero_scalar()?;
         Self::start_with_scalar(Spake2Role::InitiatorA, password, salt_pw, id_a, id_b, x)
     }
 
@@ -255,26 +268,24 @@ impl Spake2State {
         id_a: &[u8],
         id_b: &[u8],
     ) -> Result<(Self, [u8; 32]), Spake2Error> {
-        let mut scalar_wide = Zeroizing::new([0u8; 64]);
-        super::csprng_fill(&mut *scalar_wide);
-        let mut y = Scalar::from_bytes_mod_order_wide(&scalar_wide);
-        if bool::from(y.ct_eq(&Scalar::ZERO)) {
-            y = Scalar::ONE;
-        }
+        let y = sample_nonzero_scalar()?;
         Self::start_with_scalar(Spake2Role::ResponderB, password, salt_pw, id_a, id_b, y)
     }
 
-    /// Deterministic constructor for RFC 9382 test vectors.
+    /// Deterministic constructor (rejecting zero scalars and oversized identity inputs).
     pub fn start_with_scalar(
         role: Spake2Role,
         password: &[u8],
         salt_pw: &[u8],
         id_a: &[u8],
         id_b: &[u8],
-        mut xy_scalar: Scalar,
+        xy_scalar: Scalar,
     ) -> Result<(Self, [u8; 32]), Spake2Error> {
         if bool::from(xy_scalar.ct_eq(&Scalar::ZERO)) {
-            xy_scalar = Scalar::ONE;
+            return Err(Spake2Error::ZeroEphemeralScalar);
+        }
+        if id_a.len() > 4096 || id_b.len() > 4096 {
+            return Err(Spake2Error::OversizedTranscriptInput);
         }
         let w_scalar = derive_password_scalar(password, salt_pw)?;
         let blinding_point = match role {
@@ -305,6 +316,9 @@ impl Spake2State {
         peer_share_bytes: &[u8; 32],
         aad: &[u8],
     ) -> Result<Spake2TranscriptOutput, Spake2Error> {
+        if aad.len() > 4096 {
+            return Err(Spake2Error::OversizedTranscriptInput);
+        }
         let peer_point = decode_valid_peer_share(peer_share_bytes)?;
 
         let (unblind_point, p_a, p_b) = match self.role {

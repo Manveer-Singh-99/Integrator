@@ -26,32 +26,56 @@ namespace AppleUsbNcmBridge {
             public IntPtr Reserved;
         }
 
+        private const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
+        private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string Enumerator, IntPtr hwndParent, uint Flags);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("setupapi.dll", SetLastError = true)]
         public static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("setupapi.dll", SetLastError = true)]
         public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool SetEvent(IntPtr hEvent);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CancelIoEx(SafeFileHandle hFile, IntPtr lpOverlapped);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetDefaultDllDirectories(uint DirectoryFlags);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        public static extern bool SetDllDirectory(string lpPathName);
+        public static extern IntPtr LoadLibraryExW(string lpLibFileName, IntPtr hFile, uint dwFlags);
 
         [StructLayout(LayoutKind.Sequential)]
         public unsafe struct CM_NOTIFY_FILTER {
@@ -66,35 +90,45 @@ namespace AppleUsbNcmBridge {
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         public delegate uint CM_NOTIFY_CALLBACK(IntPtr hNotify, IntPtr Context, int Action, IntPtr EventData, int EventDataSize);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("cfgmgr32.dll")]
         public static extern int CM_Register_Notification(ref CM_NOTIFY_FILTER pFilter, IntPtr pContext, CM_NOTIFY_CALLBACK pCallback, out IntPtr pNotifyContext);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("cfgmgr32.dll")]
+        public static extern int CM_Unregister_Notification(IntPtr NotifyContext);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_Initialize(SafeFileHandle DeviceHandle, out IntPtr InterfaceHandle);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_Free(IntPtr InterfaceHandle);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_GetAssociatedInterface(IntPtr InterfaceHandle, byte AssociatedInterfaceIndex, out IntPtr AssociatedInterfaceHandle);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_SetCurrentAlternateSetting(IntPtr InterfaceHandle, byte SettingNumber);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_ReadPipe(IntPtr InterfaceHandle, byte PipeID, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
         public static extern bool WinUsb_WritePipe(IntPtr InterfaceHandle, byte PipeID, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("winusb.dll", SetLastError = true)]
-        public static extern bool WinUsb_SetPipePolicy(IntPtr InterfaceHandle, byte PipeID, uint PolicyType, uint ValueLength, ref byte Value);
-
-        [DllImport("winusb.dll", SetLastError = true)]
-        public static extern bool WinUsb_ResetPipe(IntPtr InterfaceHandle, byte PipeID);
+        public static extern bool WinUsb_AbortPipe(IntPtr InterfaceHandle, byte PipeID);
 
         [DllImport("wintun.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr WintunCreateAdapter(string Name, string TunnelType, ref Guid RequestedGUID);
@@ -127,12 +161,18 @@ namespace AppleUsbNcmBridge {
         public static extern void WintunSendPacket(IntPtr Session, IntPtr Packet);
 
         static volatile bool running = false;
-        // Initialized to Ethernet broadcast until the connected Mac's MAC is learned from incoming frames
-        static byte[] macPeerAddr = new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        static volatile bool serviceStop = false;
+        // Initialized to Ethernet broadcast until the connected Mac's unicast MAC is learned from incoming frames
+        const long BroadcastMacPacked = 0x0000FFFFFFFFFFFFL;
+        static long peerMacPacked = BroadcastMacPacked;
         static readonly byte[] winVirtualMac = new byte[] { 0x02, 0x00, 0x5E, 0x99, 0x99, 0x01 };
         static ushort txSeq = 0;
         static readonly object txLock = new object();
+        static readonly object logLock = new object();
         static readonly byte[] singleTxBuf = new byte[2048];
+        const string ProgramDataDir = "C:\\ProgramData\\AppleUsbNcm";
+        const string LogFilePath = "C:\\ProgramData\\AppleUsbNcm\\bridge.log";
+        const long MaxLogBytes = 2 * 1024 * 1024;
 
         // macOS Internet Sharing gateway tracking (Mac = 192.168.2.1, PC = 192.168.2.2).
         // The default route + DNS via the Mac are only installed while the Mac is proven to be sharing,
@@ -145,16 +185,53 @@ namespace AppleUsbNcmBridge {
         static readonly byte[] SharePc = { 192, 168, 2, 2 };
         static long gwLastSeenTicks = 0;
         static volatile bool gwDesired = false;
-        static bool gwApplied = false;
-        static bool gwAppliedKnown = false;
+        static volatile bool gwApplied = false;
+        static volatile bool gwAppliedKnown = false;
         static volatile int linkGen = 0;
         static readonly AutoResetEvent gwApplyEvent = new AutoResetEvent(false);
         static readonly AutoResetEvent gwProbeWake = new AutoResetEvent(false);
 
+        static void SetPeerMac(byte[] buf, int off) {
+            if (buf == null || off < 0 || off + 6 > buf.Length) return;
+            // Ignore multicast/broadcast source MACs
+            if ((buf[off] & 0x01) != 0) return;
+            long packed = ((long)buf[off])
+                | ((long)buf[off + 1] << 8)
+                | ((long)buf[off + 2] << 16)
+                | ((long)buf[off + 3] << 24)
+                | ((long)buf[off + 4] << 32)
+                | ((long)buf[off + 5] << 40);
+            Interlocked.Exchange(ref peerMacPacked, packed);
+        }
+
+        static void WritePeerMac(byte[] dst, int off) {
+            long packed = Interlocked.Read(ref peerMacPacked);
+            dst[off]     = (byte)(packed & 0xFF);
+            dst[off + 1] = (byte)((packed >> 8) & 0xFF);
+            dst[off + 2] = (byte)((packed >> 16) & 0xFF);
+            dst[off + 3] = (byte)((packed >> 24) & 0xFF);
+            dst[off + 4] = (byte)((packed >> 32) & 0xFF);
+            dst[off + 5] = (byte)((packed >> 40) & 0xFF);
+        }
+
+        static void ResetPeerMac() {
+            Interlocked.Exchange(ref peerMacPacked, BroadcastMacPacked);
+        }
+
         static void Log(string msg) {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + msg;
             Console.WriteLine(line);
-            try { File.AppendAllText("C:\\ProgramData\\AppleUsbNcm\\bridge.log", line + "\r\n"); } catch {}
+            lock (logLock) {
+                try {
+                    FileInfo fi = new FileInfo(LogFilePath);
+                    if (fi.Exists && fi.Length > MaxLogBytes) {
+                        string rotated = LogFilePath + ".1";
+                        if (File.Exists(rotated)) File.Delete(rotated);
+                        File.Move(LogFilePath, rotated);
+                    }
+                    File.AppendAllText(LogFilePath, line + "\r\n");
+                } catch {}
+            }
         }
 
         static string FindAppleUsbPath() {
@@ -199,6 +276,7 @@ namespace AppleUsbNcmBridge {
                 int totalLen = 28 + frameLen;
                 if (totalLen < 64) totalLen = 64;
                 if ((totalLen % 512) == 0) totalLen += 4;
+                if (totalLen > singleTxBuf.Length) return;
 
                 byte[] buf = singleTxBuf;
                 // NTH16: "NCMH" (0x4E, 0x43, 0x4D, 0x48)
@@ -215,8 +293,14 @@ namespace AppleUsbNcmBridge {
                 buf[18] = 0; buf[19] = 0;
                 buf[20] = 28; buf[21] = 0;
                 buf[22] = (byte)(frameLen & 0xFF); buf[23] = (byte)((frameLen >> 8) & 0xFF);
+                // Explicit NDP16 zero terminator entry
+                buf[24] = 0; buf[25] = 0; buf[26] = 0; buf[27] = 0;
 
                 Buffer.BlockCopy(frame, 0, buf, 28, frameLen);
+                int padBytes = totalLen - (28 + frameLen);
+                if (padBytes > 0) {
+                    Array.Clear(buf, 28 + frameLen, padBytes);
+                }
                 uint written = 0;
                 WinUsb_WritePipe(hIntf1, 0x01, buf, (uint)totalLen, out written, IntPtr.Zero);
             }
@@ -232,7 +316,8 @@ namespace AppleUsbNcmBridge {
 
         // Consumes UDP hints from the macOS daemon ("ON" = sharing started, "OFF" = sharing stopped).
         static bool HandleControlHint(byte[] b, int ip, int ipLen) {
-            if (b == null || ip < 0 || ipLen < 28 || ip + ipLen > b.Length || b[ip + 9] != 17) return false;
+            if (b == null || ip < 0 || ipLen < 28 || ipLen > b.Length - ip) return false;
+            if ((b[ip] >> 4) != 4 || b[ip + 9] != 17) return false;
             // Only accept control hints from local USB-C link subnets (10.99.99.x, 192.168.2.x, 169.254.x.x)
             byte s0 = b[ip + 12], s1 = b[ip + 13], s2 = b[ip + 14];
             bool validSrc = (s0 == 10 && s1 == 99 && s2 == 99)
@@ -246,8 +331,9 @@ namespace AppleUsbNcmBridge {
             int dport = (b[udp + 2] << 8) | b[udp + 3];
             if (dport != HintPort) return false;
             int ulen = (b[udp + 4] << 8) | b[udp + 5];
+            if (ulen < 8) return false;
             int maxAvail = Math.Min(ipLen - ihl - 8, b.Length - (udp + 8));
-            int plen = Math.Min(ulen - 8, maxAvail);
+            int plen = Math.Max(0, Math.Min(ulen - 8, maxAvail));
             string msg = plen > 0 ? Encoding.ASCII.GetString(b, udp + 8, Math.Min(plen, 16)).Trim() : "";
             if (msg == "ON") {
                 gwProbeWake.Set(); // probe 192.168.2.1 right away; the ARP reply confirms sharing
@@ -302,10 +388,11 @@ namespace AppleUsbNcmBridge {
                     int err = Marshal.GetLastWin32Error();
                     Log("WinUsb_ReadPipe ended err=" + err);
                     running = false;
-                    SetEvent(WintunGetReadWaitEvent(session));
+                    IntPtr waitEvt = WintunGetReadWaitEvent(session);
+                    if (waitEvt != IntPtr.Zero) SetEvent(waitEvt);
                     break;
                 }
-                if (transferred < 12) continue;
+                if (transferred < 12 || transferred > rxBuf.Length) continue;
                 if (rxBuf[0] != 0x4E || rxBuf[1] != 0x43 || rxBuf[2] != 0x4D || rxBuf[3] != 0x48) continue;
 
                 ushort ndpIdx = BitConverter.ToUInt16(rxBuf, 10);
@@ -321,18 +408,19 @@ namespace AppleUsbNcmBridge {
                         ushort dgLen = BitConverter.ToUInt16(rxBuf, pos + 2);
                         pos += 4;
                         if (dgIdx == 0 || dgLen == 0) break;
-                        if (dgIdx + dgLen <= transferred && dgLen >= 14) {
-                            Buffer.BlockCopy(rxBuf, dgIdx + 6, macPeerAddr, 0, 6);
+                        if (dgIdx <= transferred && dgLen <= transferred - dgIdx && dgLen >= 14) {
+                            SetPeerMac(rxBuf, dgIdx + 6);
                             ushort etherType = (ushort)((rxBuf[dgIdx + 12] << 8) | rxBuf[dgIdx + 13]);
                             if (etherType == 0x0806) {
                                 HandleArpRequest(hIntf1, rxBuf, dgIdx, dgLen);
                             } else if ((etherType == 0x0800 || etherType == 0x86DD) && dgLen > 14) {
                                 if (etherType == 0x0800 && dgLen >= 34) {
                                     int ip4 = dgIdx + 14;
+                                    // Consume UDP OFF/ON control hints BEFORE marking gateway seen so an OFF hint does not re-arm the timer.
+                                    if (HandleControlHint(rxBuf, ip4, dgLen - 14)) continue;
                                     if (rxBuf[ip4 + 12] == 192 && rxBuf[ip4 + 13] == 168 && rxBuf[ip4 + 14] == 2 && rxBuf[ip4 + 15] == 1) {
                                         MarkGatewaySeen();
                                     }
-                                    if (HandleControlHint(rxBuf, ip4, dgLen - 14)) continue;
                                 }
                                 uint ipLen = (uint)(dgLen - 14);
                                 IntPtr pkt = WintunAllocateSendPacket(session, ipLen);
@@ -358,30 +446,36 @@ namespace AppleUsbNcmBridge {
             while (running) {
                 int count = 0;
                 int payloadBytes = 0;
-                while (count < 30 && payloadBytes < 14000) {
+                while (running && count < 30 && payloadBytes < 14000) {
                     uint pktSize = 0;
                     IntPtr pkt = WintunReceivePacket(session, out pktSize);
                     if (pkt == IntPtr.Zero) break;
-                    if (pktSize > 0 && pktSize <= 1500) {
-                        byte ver = Marshal.ReadByte(pkt);
-                        int ipVer = (ver >> 4) & 0x0F;
-                        if (ipVer == 4 || ipVer == 6) {
-                            byte[] frame = batchFrames[count];
-                            Buffer.BlockCopy(macPeerAddr, 0, frame, 0, 6);
-                            Buffer.BlockCopy(winVirtualMac, 0, frame, 6, 6);
-                            if (ipVer == 4) { frame[12] = 0x08; frame[13] = 0x00; }
-                            else { frame[12] = 0x86; frame[13] = 0xDD; }
-                            Marshal.Copy(pkt, frame, 14, (int)pktSize);
-                            batchLens[count] = (int)pktSize + 14;
-                            payloadBytes += batchLens[count] + 4;
-                            count++;
+                    try {
+                        if (pktSize > 0 && pktSize <= 1500) {
+                            byte ver = Marshal.ReadByte(pkt);
+                            int ipVer = (ver >> 4) & 0x0F;
+                            if (ipVer == 4 || ipVer == 6) {
+                                byte[] frame = batchFrames[count];
+                                WritePeerMac(frame, 0);
+                                Buffer.BlockCopy(winVirtualMac, 0, frame, 6, 6);
+                                if (ipVer == 4) { frame[12] = 0x08; frame[13] = 0x00; }
+                                else { frame[12] = 0x86; frame[13] = 0xDD; }
+                                Marshal.Copy(pkt, frame, 14, (int)pktSize);
+                                batchLens[count] = (int)pktSize + 14;
+                                payloadBytes += batchLens[count] + 4;
+                                count++;
+                            }
                         }
+                    } finally {
+                        WintunReleaseReceivePacket(session, pkt);
                     }
-                    WintunReleaseReceivePacket(session, pkt);
                 }
 
+                if (!running) break;
+
                 if (count == 0) {
-                    WaitForSingleObject(waitEvent, 0xFFFFFFFF);
+                    if (waitEvent != IntPtr.Zero) WaitForSingleObject(waitEvent, 0xFFFFFFFF);
+                    else Thread.Sleep(10);
                     continue;
                 }
 
@@ -392,6 +486,9 @@ namespace AppleUsbNcmBridge {
                         int ndpLen = 8 + (count + 1) * 4;
                         int dataStart = 12 + ndpLen;
                         if ((dataStart % 4) != 0) dataStart += 4 - (dataStart % 4);
+                        if (dataStart > 12 + ndpLen) {
+                            Array.Clear(txBuf, 12 + ndpLen, dataStart - (12 + ndpLen));
+                        }
 
                         int curOffset = dataStart;
                         txBuf[0] = 0x4E; txBuf[1] = 0x43; txBuf[2] = 0x4D; txBuf[3] = 0x48;
@@ -411,6 +508,7 @@ namespace AppleUsbNcmBridge {
                                 for (int p = 0; p < pad; p++) txBuf[curOffset++] = 0;
                             }
                             int flen = batchLens[i];
+                            if (curOffset + flen + 4 > txBuf.Length) break;
                             txBuf[ndpPos] = (byte)(curOffset & 0xFF);
                             txBuf[ndpPos + 1] = (byte)((curOffset >> 8) & 0xFF);
                             txBuf[ndpPos + 2] = (byte)(flen & 0xFF);
@@ -422,8 +520,8 @@ namespace AppleUsbNcmBridge {
                         txBuf[ndpPos] = 0; txBuf[ndpPos + 1] = 0; txBuf[ndpPos + 2] = 0; txBuf[ndpPos + 3] = 0;
 
                         int totalLen = curOffset;
-                        if ((totalLen % 512) == 0) {
-                            txBuf[totalLen] = 0; txBuf[totalLen+1] = 0; txBuf[totalLen+2] = 0; txBuf[totalLen+3] = 0;
+                        if ((totalLen % 512) == 0 && totalLen + 4 <= txBuf.Length) {
+                            txBuf[totalLen] = 0; txBuf[totalLen + 1] = 0; txBuf[totalLen + 2] = 0; txBuf[totalLen + 3] = 0;
                             totalLen += 4;
                         }
                         txBuf[8] = (byte)(totalLen & 0xFF); txBuf[9] = (byte)((totalLen >> 8) & 0xFF);
@@ -439,11 +537,16 @@ namespace AppleUsbNcmBridge {
 
         static void Netsh(string args) {
             try {
-                ProcessStartInfo psi = new ProcessStartInfo("netsh.exe", args);
+                string netshPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "netsh.exe");
+                ProcessStartInfo psi = new ProcessStartInfo(netshPath, args);
                 psi.CreateNoWindow = true;
                 psi.UseShellExecute = false;
-                Process p = Process.Start(psi);
-                if (p != null) p.WaitForExit(5000);
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                using (Process p = Process.Start(psi)) {
+                    if (p != null && !p.WaitForExit(5000)) {
+                        try { p.Kill(); } catch {}
+                    }
+                }
             } catch {}
         }
 
@@ -522,22 +625,29 @@ namespace AppleUsbNcmBridge {
 
         static void Main(string[] args) {
             try {
+                // Restrict implicit DLL resolution to System32 first, then explicitly load wintun.dll by full path.
+                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                if (!string.IsNullOrEmpty(baseDir) && File.Exists(Path.Combine(baseDir, "wintun.dll"))) {
-                    SetDllDirectory(baseDir);
-                } else if (Directory.Exists("C:\\ProgramData\\AppleUsbNcm")) {
-                    SetDllDirectory("C:\\ProgramData\\AppleUsbNcm");
+                string wintunPath = (!string.IsNullOrEmpty(baseDir) && File.Exists(Path.Combine(baseDir, "wintun.dll")))
+                    ? Path.Combine(baseDir, "wintun.dll")
+                    : Path.Combine(ProgramDataDir, "wintun.dll");
+                if (!File.Exists(wintunPath) || LoadLibraryExW(wintunPath, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH) == IntPtr.Zero) {
+                    Log("Failed to load wintun.dll safely from " + wintunPath + " err=" + Marshal.GetLastWin32Error());
+                    return;
                 }
-            } catch {}
+            } catch (Exception ex) {
+                Log("DLL search initialization failed: " + ex.Message);
+                return;
+            }
             try {
                 Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
                 Thread.CurrentThread.Priority = ThreadPriority.Highest;
             } catch {}
-            Log("Starting AppleUsbNcmBridge service (High Priority, Zero-Alloc)...");
+            Log("Starting AppleUsbNcmBridge service (High Priority, Hardened)...");
             Guid adapterGuid = new Guid("62d67d44-480f-45ac-1902-109999000001");
-            IntPtr adapter = WintunOpenAdapter("Apple USB-C NCM");
+            IntPtr adapter = WintunOpenAdapter(AdapterName);
             if (adapter == IntPtr.Zero) {
-                adapter = WintunCreateAdapter("Apple USB-C NCM", "USB-C Direct", ref adapterGuid);
+                adapter = WintunCreateAdapter(AdapterName, "USB-C Direct", ref adapterGuid);
             }
             if (adapter == IntPtr.Zero) {
                 Log("Failed to create WinTun adapter: " + Marshal.GetLastWin32Error());
@@ -546,6 +656,7 @@ namespace AppleUsbNcmBridge {
             IntPtr session = WintunStartSession(adapter, 0x400000);
             if (session == IntPtr.Zero) {
                 Log("Failed to start WinTun session: " + Marshal.GetLastWin32Error());
+                WintunCloseAdapter(adapter);
                 return;
             }
             ConfigureAdapterIp();
@@ -561,15 +672,22 @@ namespace AppleUsbNcmBridge {
             filter.Flags = 2; // CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES
             filter.FilterType = 0; // CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE
             CM_NOTIFY_CALLBACK cb = (hN, ctx, act, ed, eds) => {
-                if (act == 0) SetEvent(hPlugEvent);
+                if (act == 0 && hPlugEvent != IntPtr.Zero) SetEvent(hPlugEvent);
                 return 0;
             };
             GCHandle cbHandle = GCHandle.Alloc(cb);
-            IntPtr hNotify;
+            IntPtr hNotify = IntPtr.Zero;
             CM_Register_Notification(ref filter, IntPtr.Zero, cb, out hNotify);
+            Console.CancelKeyPress += (s, e) => {
+                e.Cancel = true;
+                serviceStop = true;
+                running = false;
+                if (hPlugEvent != IntPtr.Zero) SetEvent(hPlugEvent);
+            };
             bool loggedSleep = false;
 
-            while (true) {
+            try {
+                while (!serviceStop) {
                 try {
                     string devPath = FindAppleUsbPath();
                     if (devPath == null) {
@@ -577,80 +695,102 @@ namespace AppleUsbNcmBridge {
                             Log("Cable unplugged. Waiting for USB-C connection...");
                             loggedSleep = true;
                         }
-                        WaitForSingleObject(hPlugEvent, 3000);
+                        if (hPlugEvent != IntPtr.Zero) WaitForSingleObject(hPlugEvent, 3000);
+                        else Thread.Sleep(3000);
                         continue;
                     }
                     loggedSleep = false;
                     Log("Found Apple USB-C device: " + devPath);
-                    SafeFileHandle hDev = CreateFile(devPath, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
-                    if (hDev.IsInvalid) {
-                        Thread.Sleep(1000);
-                        continue;
-                    }
-                    IntPtr hIntf0 = IntPtr.Zero;
-                    IntPtr hIntf1 = IntPtr.Zero;
-                    try {
-                        if (!WinUsb_Initialize(hDev, out hIntf0)) {
+                    using (SafeFileHandle hDev = CreateFile(devPath, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero)) {
+                        if (hDev.IsInvalid) {
                             Thread.Sleep(1000);
                             continue;
                         }
-                        WINUSB_SETUP_PACKET pkt = new WINUSB_SETUP_PACKET { RequestType = 0xA1, Request = 0x80, Value = 0, Index = 0, Length = 28 };
-                        byte[] ntbParams = new byte[28];
-                        uint transferred = 0;
-                        WinUsb_ControlTransfer(hIntf0, pkt, ntbParams, 28, out transferred, IntPtr.Zero);
-                        uint maxIn = BitConverter.ToUInt32(ntbParams, 4);
-                        if (maxIn < 2048 || maxIn > 65536) maxIn = 32764;
+                        IntPtr hIntf0 = IntPtr.Zero;
+                        IntPtr hIntf1 = IntPtr.Zero;
+                        Thread rxThread = null;
+                        Thread gwMonThread = null;
+                        try {
+                            if (!WinUsb_Initialize(hDev, out hIntf0)) {
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+                            WINUSB_SETUP_PACKET pkt = new WINUSB_SETUP_PACKET { RequestType = 0xA1, Request = 0x80, Value = 0, Index = 0, Length = 28 };
+                            byte[] ntbParams = new byte[28];
+                            uint transferred = 0;
+                            WinUsb_ControlTransfer(hIntf0, pkt, ntbParams, 28, out transferred, IntPtr.Zero);
+                            uint maxIn = BitConverter.ToUInt32(ntbParams, 4);
+                            if (maxIn < 2048 || maxIn > 65536) maxIn = 32764;
 
-                        WinUsb_GetAssociatedInterface(hIntf0, 0, out hIntf1);
-                        WinUsb_SetCurrentAlternateSetting(hIntf1, 0);
+                            if (!WinUsb_GetAssociatedInterface(hIntf0, 0, out hIntf1) || hIntf1 == IntPtr.Zero) {
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+                            WinUsb_SetCurrentAlternateSetting(hIntf1, 0);
 
-                        WINUSB_SETUP_PACKET setIn = new WINUSB_SETUP_PACKET { RequestType = 0x21, Request = 0x86, Value = 0, Index = 0, Length = 4 };
-                        byte[] inSizeBuf = BitConverter.GetBytes(maxIn);
-                        WinUsb_ControlTransfer(hIntf0, setIn, inSizeBuf, 4, out transferred, IntPtr.Zero);
+                            WINUSB_SETUP_PACKET setIn = new WINUSB_SETUP_PACKET { RequestType = 0x21, Request = 0x86, Value = 0, Index = 0, Length = 4 };
+                            byte[] inSizeBuf = BitConverter.GetBytes(maxIn);
+                            WinUsb_ControlTransfer(hIntf0, setIn, inSizeBuf, 4, out transferred, IntPtr.Zero);
 
-                        if (!WinUsb_SetCurrentAlternateSetting(hIntf1, 1)) {
-                            Thread.Sleep(1000);
-                            continue;
+                            if (!WinUsb_SetCurrentAlternateSetting(hIntf1, 1)) {
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+                            WINUSB_SETUP_PACKET filt = new WINUSB_SETUP_PACKET { RequestType = 0x21, Request = 0x43, Value = 0x000F, Index = 0, Length = 0 };
+                            WinUsb_ControlTransfer(hIntf0, filt, null, 0, out transferred, IntPtr.Zero);
+
+                            Log("CDC-NCM link active (maxIn=" + maxIn + "). Starting RX/TX threads...");
+                            running = true;
+                            IntPtr hIntf1Copy = hIntf1;
+                            rxThread = new Thread(() => UsbRxLoop(hIntf1Copy, session, maxIn));
+                            rxThread.IsBackground = true;
+                            rxThread.Priority = ThreadPriority.Highest;
+                            rxThread.Start();
+
+                            int gen = linkGen;
+                            gwMonThread = new Thread(() => GatewayMonitorLoop(hIntf1Copy, gen));
+                            gwMonThread.IsBackground = true;
+                            gwMonThread.Start();
+
+                            UsbTxLoop(hIntf1, session);
+                        } finally {
+                            // Signal shutdown and abort blocked WinUSB I/O BEFORE joining threads and freeing WinUSB handles.
+                            running = false;
+                            ResetPeerMac();
+                            linkGen++;
+                            gwProbeWake.Set();
+                            IntPtr waitEvt = WintunGetReadWaitEvent(session);
+                            if (waitEvt != IntPtr.Zero) SetEvent(waitEvt);
+                            if (hIntf1 != IntPtr.Zero) {
+                                WinUsb_AbortPipe(hIntf1, 0x81);
+                                WinUsb_AbortPipe(hIntf1, 0x01);
+                            }
+                            if (!hDev.IsInvalid && !hDev.IsClosed) {
+                                CancelIoEx(hDev, IntPtr.Zero);
+                            }
+                            if (rxThread != null && rxThread.IsAlive) rxThread.Join(5000);
+                            if (gwMonThread != null && gwMonThread.IsAlive) gwMonThread.Join(2000);
+                            Interlocked.Exchange(ref gwLastSeenTicks, 0);
+                            if (gwDesired || gwApplied) {
+                                gwDesired = false;
+                                gwApplyEvent.Set();
+                            }
+                            if (hIntf1 != IntPtr.Zero) WinUsb_Free(hIntf1);
+                            if (hIntf0 != IntPtr.Zero) WinUsb_Free(hIntf0);
                         }
-                        WINUSB_SETUP_PACKET filt = new WINUSB_SETUP_PACKET { RequestType = 0x21, Request = 0x43, Value = 0x000F, Index = 0, Length = 0 };
-                        WinUsb_ControlTransfer(hIntf0, filt, null, 0, out transferred, IntPtr.Zero);
-
-                        Log("CDC-NCM link active (maxIn=" + maxIn + "). Starting RX/TX threads...");
-                        running = true;
-                        Thread rxThread = new Thread(() => UsbRxLoop(hIntf1, session, maxIn));
-                        rxThread.IsBackground = true;
-                        rxThread.Priority = ThreadPriority.Highest;
-                        rxThread.Start();
-
-                        int gen = linkGen;
-                        IntPtr hIntf1Copy = hIntf1;
-                        Thread gwMonThread = new Thread(() => GatewayMonitorLoop(hIntf1Copy, gen));
-                        gwMonThread.IsBackground = true;
-                        gwMonThread.Start();
-
-                        UsbTxLoop(hIntf1, session);
-                        rxThread.Join(2000);
-
-                        // Link is down: stop probing, reset peer MAC to broadcast, and drop any gateway via the Mac
-                        running = false;
-                        for (int m = 0; m < 6; m++) macPeerAddr[m] = 0xFF;
-                        linkGen++;
-                        gwProbeWake.Set();
-                        gwMonThread.Join(1000);
-                        Interlocked.Exchange(ref gwLastSeenTicks, 0);
-                        if (gwDesired || gwApplied) {
-                            gwDesired = false;
-                            gwApplyEvent.Set();
-                        }
-                    } finally {
-                        if (hIntf1 != IntPtr.Zero) WinUsb_Free(hIntf1);
-                        if (hIntf0 != IntPtr.Zero) WinUsb_Free(hIntf0);
-                        hDev.Close();
                     }
                 } catch (Exception ex) {
                     Log("Loop exception: " + ex.Message);
                 }
-                Thread.Sleep(1000);
+                if (!serviceStop) Thread.Sleep(1000);
+            }
+            } finally {
+                running = false;
+                if (hNotify != IntPtr.Zero) CM_Unregister_Notification(hNotify);
+                if (cbHandle.IsAllocated) cbHandle.Free();
+                if (hPlugEvent != IntPtr.Zero) CloseHandle(hPlugEvent);
+                WintunEndSession(session);
+                WintunCloseAdapter(adapter);
             }
         }
     }

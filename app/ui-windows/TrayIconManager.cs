@@ -12,11 +12,15 @@ namespace IntegratorUI
     {
         private const int WM_USER = 0x0400;
         private const int WM_TRAYICON = WM_USER + 42;
-        private const int WM_COMMAND = 0x0111;
+        private const int NIN_SELECT = 0x0400;
+        private const int NIN_KEYSELECT = 0x0401;
         private const int WM_LBUTTONUP = 0x0202;
         private const int WM_LBUTTONDBLCLK = 0x0203;
         private const int WM_RBUTTONUP = 0x0205;
         private const int WM_CONTEXTMENU = 0x007B;
+
+        private const int SM_CXSMICON = 49;
+        private const int SM_CYSMICON = 50;
 
         private const uint NIF_MESSAGE = 0x00000001;
         private const uint NIF_ICON = 0x00000002;
@@ -31,6 +35,7 @@ namespace IntegratorUI
         private const uint IMAGE_ICON = 1;
         private const uint LR_LOADFROMFILE = 0x00000010;
         private const uint LR_DEFAULTSIZE = 0x00000040;
+        private const uint LR_SHARED = 0x00008000;
         private const uint MF_STRING = 0x00000000;
         private const uint MF_SEPARATOR = 0x00000800;
         private const uint TPM_RIGHTBUTTON = 0x0002;
@@ -45,8 +50,12 @@ namespace IntegratorUI
 
         private readonly Action _onShowWindow;
         private readonly Action _onQuit;
+        private IntPtr _hInst;
         private IntPtr _hwnd;
         private IntPtr _hIcon;
+        private bool _ownsIcon;
+        private string? _className;
+        private uint _taskbarCreatedMsg;
         private WndProcDelegate? _wndProcDelegate;
         private bool _added;
         private bool _disposed;
@@ -102,6 +111,15 @@ namespace IntegratorUI
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern ushort RegisterClassExW(ref WNDCLASSEXW lpwcx);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool UnregisterClassW(string lpClassName, IntPtr hInstance);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint RegisterWindowMessageW(string lpString);
+
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateWindowExW(
@@ -160,31 +178,46 @@ namespace IntegratorUI
         private void InitTray()
         {
             _wndProcDelegate = WndProc;
-            IntPtr hInst = GetModuleHandleW(null);
-            string clsName = "IntegratorTrayMsgWindow_" + Environment.ProcessId;
+            _hInst = GetModuleHandleW(null);
+            _className = "IntegratorTrayMsgWindow_" + Environment.ProcessId + "_" + Guid.NewGuid().ToString("N");
+            _taskbarCreatedMsg = RegisterWindowMessageW("TaskbarCreated");
 
             var wc = new WNDCLASSEXW
             {
                 cbSize = (uint)Marshal.SizeOf<WNDCLASSEXW>(),
                 lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
-                hInstance = hInst,
-                lpszClassName = clsName
+                hInstance = _hInst,
+                lpszClassName = _className
             };
             RegisterClassExW(ref wc);
 
             // Top-level zero-size helper window (supports TrackPopupMenu + NOTIFYICON_VERSION_4 cleanly).
-            _hwnd = CreateWindowExW(0, clsName, "Integrator Tray", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, hInst, IntPtr.Zero);
+            _hwnd = CreateWindowExW(0, _className, "Integrator Tray", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, _hInst, IntPtr.Zero);
+
+            int cx = GetSystemMetrics(SM_CXSMICON);
+            int cy = GetSystemMetrics(SM_CYSMICON);
+            if (cx <= 0) cx = 16;
+            if (cy <= 0) cy = 16;
 
             string iconPath = Path.Combine(AppContext.BaseDirectory, "icon.ico");
             if (File.Exists(iconPath))
             {
-                _hIcon = LoadImageW(IntPtr.Zero, iconPath, IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+                _hIcon = LoadImageW(IntPtr.Zero, iconPath, IMAGE_ICON, cx, cy, LR_LOADFROMFILE);
+                _ownsIcon = _hIcon != IntPtr.Zero;
             }
             if (_hIcon == IntPtr.Zero)
             {
-                // Standard application icon fallback
-                _hIcon = LoadImageW(hInst, "#32512", IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+                // Standard application icon fallback (IDI_APPLICATION requires hInst = IntPtr.Zero + LR_SHARED).
+                _hIcon = LoadImageW(IntPtr.Zero, "#32512", IMAGE_ICON, cx, cy, LR_DEFAULTSIZE | LR_SHARED);
+                _ownsIcon = false;
             }
+
+            AddTrayIcon();
+        }
+
+        private void AddTrayIcon()
+        {
+            if (_disposed || _hwnd == IntPtr.Zero) return;
 
             var nid = new NOTIFYICONDATAW
             {
@@ -194,7 +227,7 @@ namespace IntegratorUI
                 uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
                 uCallbackMessage = WM_TRAYICON,
                 hIcon = _hIcon,
-                szTip = "Integrator v2.0 — Cross-Device Bridge",
+                szTip = "Integrator v1.0 — Cross-Device Bridge",
                 szInfo = string.Empty,
                 szInfoTitle = string.Empty,
                 uTimeoutOrVersion = NOTIFYICON_VERSION_4
@@ -209,18 +242,30 @@ namespace IntegratorUI
 
         private IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
-            if (msg == WM_TRAYICON)
+            try
             {
-                int ev = unchecked((int)(lParam.ToInt64() & 0xFFFF));
-                if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK)
+                if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
                 {
-                    _onShowWindow();
+                    AddTrayIcon();
+                    return IntPtr.Zero;
                 }
-                else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU)
+                if (msg == WM_TRAYICON)
                 {
-                    ShowContextMenu();
+                    int ev = unchecked((int)(lParam.ToInt64() & 0xFFFF));
+                    if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK || ev == NIN_SELECT || ev == NIN_KEYSELECT)
+                    {
+                        _onShowWindow();
+                    }
+                    else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU)
+                    {
+                        ShowContextMenu();
+                    }
+                    return IntPtr.Zero;
                 }
-                return IntPtr.Zero;
+            }
+            catch
+            {
+                // Never allow managed exceptions to unwind across native Win32 WndProc boundaries.
             }
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
@@ -229,6 +274,7 @@ namespace IntegratorUI
         {
             IntPtr menu = CreatePopupMenu();
             if (menu == IntPtr.Zero) return;
+            uint cmd = 0;
             try
             {
                 AppendMenuW(menu, MF_STRING, (UIntPtr)ID_SHOW, "Show Dashboard");
@@ -241,31 +287,31 @@ namespace IntegratorUI
 
                 GetCursorPos(out POINT pt);
                 SetForegroundWindow(_hwnd);
-                uint cmd = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD, pt.X, pt.Y, _hwnd, IntPtr.Zero);
+                cmd = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD, pt.X, pt.Y, _hwnd, IntPtr.Zero);
                 PostMessageW(_hwnd, 0, IntPtr.Zero, IntPtr.Zero);
-
-                switch ((int)cmd)
-                {
-                    case ID_SHOW:
-                        _onShowWindow();
-                        break;
-                    case ID_PASTE:
-                        CoreBridge.TrayAction("paste_remote");
-                        break;
-                    case ID_DISPLAY:
-                        CoreBridge.TrayAction("toggle_display");
-                        break;
-                    case ID_CACHE:
-                        CoreBridge.TrayAction("open_cache");
-                        break;
-                    case ID_QUIT:
-                        _onQuit();
-                        break;
-                }
             }
             finally
             {
                 DestroyMenu(menu);
+            }
+
+            switch ((int)cmd)
+            {
+                case ID_SHOW:
+                    _onShowWindow();
+                    break;
+                case ID_PASTE:
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { CoreBridge.TrayAction("paste_remote"); } catch { } });
+                    break;
+                case ID_DISPLAY:
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { CoreBridge.TrayAction("toggle_display"); } catch { } });
+                    break;
+                case ID_CACHE:
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ => { try { CoreBridge.TrayAction("open_cache"); } catch { } });
+                    break;
+                case ID_QUIT:
+                    _onQuit();
+                    break;
             }
         }
 
@@ -287,16 +333,23 @@ namespace IntegratorUI
                 Shell_NotifyIconW(NIM_DELETE, ref nid);
                 _added = false;
             }
-            if (_hIcon != IntPtr.Zero)
+            if (_ownsIcon && _hIcon != IntPtr.Zero)
             {
                 DestroyIcon(_hIcon);
-                _hIcon = IntPtr.Zero;
             }
+            _hIcon = IntPtr.Zero;
+            _ownsIcon = false;
             if (_hwnd != IntPtr.Zero)
             {
                 DestroyWindow(_hwnd);
                 _hwnd = IntPtr.Zero;
             }
+            if (!string.IsNullOrEmpty(_className))
+            {
+                UnregisterClassW(_className, _hInst);
+                _className = null;
+            }
+            _wndProcDelegate = null;
         }
     }
 }

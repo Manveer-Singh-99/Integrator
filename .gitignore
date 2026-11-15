@@ -21,6 +21,10 @@ app/macos_clip_files
 app/win_clip_files.exe
 app/touchbar_hud
 
+# Windows WinUI build artifacts
+app/ui-windows/bin/
+app/ui-windows/obj/
+
 # IDE / Editor configs
 .vscode/
 .idea/

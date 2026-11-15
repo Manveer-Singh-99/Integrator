@@ -3,6 +3,7 @@ name = "integrator"
 version = "0.1.0"
 edition = "2021"
 authors = ["Manveer Singh"]
+license = "MIT"
 description = "Integrator: High-Performance macOS & Windows 11 Workstation Fusion"
 repository = "https://github.com/Manveer-Singh-99/Integrator"
 

@@ -5,10 +5,19 @@
 use crate::system_info;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "windows")]
 use std::time::Duration;
 #[allow(unused_imports)]
 use tracing::{info, warn};
+
+fn reap_child(mut child: Child, label: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name(format!("reap-{}", label))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -48,17 +57,27 @@ impl WinDisplayManager {
         bitrate_kbps: u32,
         audio_on_host: bool,
     ) -> Result<()> {
+        if !system_info::is_valid_ipv4(mac_ip) {
+            anyhow::bail!("Invalid host IPv4 address for Moonlight: {}", mac_ip);
+        }
+
         let exe = Self::find_moonlight_exe().context("Moonlight.exe not found on Windows")?;
 
-        // 1. Resolve existing paired slot non-destructively and refresh IP only if changed
-        let target = resolve_or_refresh_win_moonlight_slot(mac_ip, port, host_name);
-
-        // 2. Kill existing Moonlight cleanly
+        // 1. Stop existing Moonlight cleanly before refreshing registry so QSettings does not race
         let _ = Self::stop_moonlight_client();
-        std::thread::sleep(Duration::from_millis(250));
+
+        // 2. Resolve existing paired slot non-destructively and refresh IP only if changed
+        let target = resolve_or_refresh_win_moonlight_slot(mac_ip, port, host_name)
+            .trim()
+            .to_string();
+        if target.is_empty() || target.starts_with('-') || target.chars().any(|c| c.is_control()) {
+            anyhow::bail!("Invalid Moonlight host target '{}'", target);
+        }
 
         // 3. Build CLI arguments
-        let res_arg = format!("{}x{}", width.max(800), height.max(600));
+        let w = (width.clamp(800, 7680)) & !1;
+        let h = (height.clamp(600, 4320)) & !1;
+        let res_arg = format!("{}x{}", w, h);
         let fps_arg = fps.clamp(30, 240).to_string();
         let bitrate_arg = bitrate_kbps.clamp(5000, 500000).to_string();
 
@@ -82,7 +101,9 @@ impl WinDisplayManager {
         if audio_on_host {
             cmd.arg("--audio-on-host");
         }
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         #[cfg(target_os = "windows")]
         {
@@ -90,8 +111,10 @@ impl WinDisplayManager {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        cmd.spawn()
+        let child = cmd
+            .spawn()
             .with_context(|| format!("Failed to spawn {}", exe.display()))?;
+        reap_child(child, "moonlight");
         info!(
             "Launched Moonlight on Windows -> '{}' ({}:{}) at {} @ {}Hz",
             target, mac_ip, port, res_arg, fps_arg
@@ -103,23 +126,31 @@ impl WinDisplayManager {
     pub fn stop_moonlight_client() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
+            let taskkill = system_info::system32_exe("taskkill.exe");
             let image_name = Self::find_moonlight_exe()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .filter(|n| !n.is_empty())
+                .filter(|n| !n.is_empty() && !n.starts_with('/'))
                 .unwrap_or_else(|| "Moonlight.exe".to_string());
 
-            let _ = hidden_cmd("taskkill")
+            let _ = hidden_cmd(&taskkill)
                 .args(["/F", "/IM", &image_name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
 
             if !image_name.eq_ignore_ascii_case("Moonlight.exe") {
-                let _ = hidden_cmd("taskkill")
+                let _ = hidden_cmd(&taskkill)
                     .args(["/F", "/IM", "Moonlight.exe"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
+            }
+
+            for _ in 0..8 {
+                if !is_image_running(&image_name) && !is_image_running("Moonlight.exe") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(80));
             }
         }
         info!("Terminated Moonlight.exe on Windows");
@@ -130,6 +161,9 @@ impl WinDisplayManager {
     pub fn enable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
+            let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+            let schtasks = system_info::system32_exe("schtasks.exe");
+
             // 1. Discover virtual display PnP devices dynamically and enable if not already OK
             let vdd_devices = discover_vdd_pnp_devices();
             if vdd_devices.is_empty() {
@@ -141,7 +175,7 @@ impl WinDisplayManager {
                             "Enable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction Stop",
                             ps_single_quote(&dev.instance_id)
                         );
-                        match hidden_cmd("powershell.exe")
+                        let out = hidden_cmd(&ps_exe)
                             .args([
                                 "-NoProfile",
                                 "-NonInteractive",
@@ -151,18 +185,15 @@ impl WinDisplayManager {
                                 &ps,
                             ])
                             .output()
-                        {
-                            Ok(out) if !out.status.success() => {
-                                warn!(
-                                    "Enable-PnpDevice for {} exited with non-zero status (Administrator privileges may be required): {}",
-                                    dev.instance_id,
-                                    String::from_utf8_lossy(&out.stderr).trim()
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to invoke Enable-PnpDevice for {}: {}", dev.instance_id, e);
-                            }
-                            _ => {}
+                            .with_context(|| {
+                                format!("Failed to invoke Enable-PnpDevice for {}", dev.instance_id)
+                            })?;
+                        if !out.status.success() {
+                            anyhow::bail!(
+                                "Enable-PnpDevice for {} failed (Administrator privileges may be required): {}",
+                                dev.instance_id,
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
                         }
                     }
                     info!(
@@ -173,33 +204,53 @@ impl WinDisplayManager {
             }
 
             // 2. Ensure Sunshine host service, secondary task, or binary is running
-            ensure_sunshine_running();
+            ensure_sunshine_running()?;
 
             // 3. Attach virtual display slot 1 via VddCtl.exe if present, else optional task/marker
             if let Some(vdd_ctl) = find_vdd_ctl() {
-                let _ = hidden_cmd(&vdd_ctl)
+                let status = hidden_cmd(&vdd_ctl)
                     .args(["join", "1"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .status()
+                    .with_context(|| format!("Failed to invoke {}", vdd_ctl.display()))?;
+                if !status.success() {
+                    anyhow::bail!(
+                        "{} join 1 exited with status {}",
+                        vdd_ctl.display(),
+                        status
+                    );
+                }
                 info!("Attached virtual display slot 1 via {}", vdd_ctl.display());
             } else if scheduled_task_exists("ToggleSecondScreen") {
-                let _ = hidden_cmd("schtasks.exe")
+                let status = hidden_cmd(&schtasks)
                     .args(["/Run", "/TN", "ToggleSecondScreen"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .status()
+                    .context("Failed to run ToggleSecondScreen scheduled task")?;
+                if !status.success() {
+                    anyhow::bail!("Scheduled task ToggleSecondScreen exited with {}", status);
+                }
             } else if !vdd_devices.is_empty() {
-                let _ = std::fs::write(system_info::app_data_dir().join("win_vdd.active"), "1");
+                system_info::atomic_write_private(
+                    &system_info::app_data_dir().join("win_vdd.active"),
+                    b"1",
+                )?;
             }
 
             // 4. Start dynamic watcher only if that scheduled task exists
             if scheduled_task_exists("VddDynamicWatcher") {
-                let _ = hidden_cmd("schtasks.exe")
+                let status = hidden_cmd(&schtasks)
                     .args(["/Run", "/TN", "VddDynamicWatcher"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
+                if let Ok(s) = status {
+                    if !s.success() {
+                        warn!("Scheduled task VddDynamicWatcher exited with {}", s);
+                    }
+                }
             }
         }
         info!("Enabled Virtual Display Driver on Windows");
@@ -210,18 +261,36 @@ impl WinDisplayManager {
     pub fn disable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
+            let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
             let _ = std::fs::remove_file(system_info::app_data_dir().join("win_vdd.active"));
 
+            let mut first_err: Option<anyhow::Error> = None;
             let mut keep_pnp_for_other_slot = false;
             if let Some(vdd_ctl) = find_vdd_ctl() {
-                let _ = hidden_cmd(&vdd_ctl)
+                match hidden_cmd(&vdd_ctl)
                     .args(["leave", "1"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .status()
+                {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        first_err.get_or_insert_with(|| {
+                            anyhow::anyhow!("{} leave 1 exited with {}", vdd_ctl.display(), s)
+                        });
+                    }
+                    Err(e) => {
+                        first_err.get_or_insert_with(|| e.into());
+                    }
+                }
 
                 if let Some(dir) = vdd_ctl.parent() {
-                    let _ = std::fs::remove_file(dir.join("slot1.active"));
+                    let slot1 = dir.join("slot1.active");
+                    if slot1.exists() {
+                        if let Err(e) = std::fs::remove_file(&slot1) {
+                            warn!("Could not remove {}: {}", slot1.display(), e);
+                        }
+                    }
                     if dir.join("slot0.active").exists() {
                         keep_pnp_for_other_slot = true;
                     }
@@ -232,10 +301,10 @@ impl WinDisplayManager {
                 for dev in discover_vdd_pnp_devices() {
                     if dev.status.eq_ignore_ascii_case("OK") {
                         let ps = format!(
-                            "Disable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction SilentlyContinue",
+                            "Disable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction Stop",
                             ps_single_quote(&dev.instance_id)
                         );
-                        let _ = hidden_cmd("powershell.exe")
+                        match hidden_cmd(&ps_exe)
                             .args([
                                 "-NoProfile",
                                 "-NonInteractive",
@@ -244,15 +313,30 @@ impl WinDisplayManager {
                                 "-Command",
                                 &ps,
                             ])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-                        info!(
-                            "Disabled virtual display adapter: {} ({})",
-                            dev.instance_id, dev.friendly_name
-                        );
+                            .output()
+                        {
+                            Ok(out) if out.status.success() => {
+                                info!(
+                                    "Disabled virtual display adapter: {} ({})",
+                                    dev.instance_id, dev.friendly_name
+                                );
+                            }
+                            Ok(out) => {
+                                let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                warn!("Disable-PnpDevice failed for {}: {}", dev.instance_id, msg);
+                                first_err.get_or_insert_with(|| {
+                                    anyhow::anyhow!("Disable-PnpDevice failed for {}: {}", dev.instance_id, msg)
+                                });
+                            }
+                            Err(e) => {
+                                first_err.get_or_insert_with(|| e.into());
+                            }
+                        }
                     }
                 }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
             }
         }
         info!("Disabled Virtual Display Driver on Windows");
@@ -339,35 +423,25 @@ impl WinDisplayManager {
             let enc_target = resolve_gpu_target(encode_gpu, &gpus);
             if enc_target.is_auto {
                 if let Some(conf_path) = system_info::find_sunshine_conf() {
-                    if let Err(e) = update_sunshine_conf_encoder(&conf_path, None, true) {
-                        warn!(
-                            "Failed to reset GPU keys in {}: {}",
-                            conf_path.display(),
-                            e
-                        );
-                    }
+                    update_sunshine_conf_encoder(&conf_path, None, true).with_context(|| {
+                        format!("Failed to reset GPU keys in {}", conf_path.display())
+                    })?;
                 }
             } else {
                 if let Some(ref adapter_name) = enc_target.adapter_name {
-                    if let Err(e) = system_info::write_sunshine_adapter_name(adapter_name) {
-                        warn!("Could not update Sunshine adapter_name: {}", e);
-                    }
+                    system_info::write_sunshine_adapter_name(adapter_name)
+                        .context("Could not update Sunshine adapter_name")?;
                 }
                 if let Some(conf_path) = system_info::find_sunshine_conf() {
-                    if let Err(e) =
-                        update_sunshine_conf_encoder(&conf_path, enc_target.encoder, false)
-                    {
-                        warn!(
-                            "Failed to update encoder in {}: {}",
-                            conf_path.display(),
-                            e
-                        );
-                    }
+                    update_sunshine_conf_encoder(&conf_path, enc_target.encoder, false)
+                        .with_context(|| {
+                            format!("Failed to update encoder in {}", conf_path.display())
+                        })?;
                 }
             }
 
             if let Some(sunshine_exe) = system_info::find_sunshine_binary() {
-                set_user_gpu_preference(&sunshine_exe, enc_target.reg_pref);
+                set_user_gpu_preference(&sunshine_exe, enc_target.reg_pref)?;
             }
 
             // 2. Resolve & apply Moonlight decode GPU
@@ -375,7 +449,7 @@ impl WinDisplayManager {
             let moonlight_exe =
                 system_info::find_moonlight_binary().or_else(find_moonlight_legacy_dir_windows);
             if let Some(moonlight_path) = moonlight_exe {
-                set_user_gpu_preference(&moonlight_path, dec_target.reg_pref);
+                set_user_gpu_preference(&moonlight_path, dec_target.reg_pref)?;
             }
 
             info!(
@@ -425,49 +499,27 @@ fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn find_vdd_ctl() -> Option<PathBuf> {
-    if let Ok(env_path) = std::env::var("VDDCTL_PATH") {
-        let trimmed = env_path.trim();
-        if !trimmed.is_empty() {
-            let p = PathBuf::from(trimmed);
-            if p.is_file() {
-                return Some(p);
-            }
-            let joined = p.join("VddCtl.exe");
-            if joined.is_file() {
-                return Some(joined);
-            }
-        }
-    }
-
-    let mut candidates = Vec::new();
-    for env_key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+    // Only trust protected Program Files locations for VddCtl.exe to prevent standard-user LPE.
+    for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
         if let Ok(base) = std::env::var(env_key) {
-            candidates.push(
-                PathBuf::from(base)
-                    .join("VirtualDisplayDriver")
-                    .join("VddCtl.exe"),
-            );
+            let trimmed = base.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(trimmed)
+                .join("VirtualDisplayDriver")
+                .join("VddCtl.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    candidates.push(PathBuf::from(r"C:\VirtualDisplayDriver\VddCtl.exe"));
-    if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-        candidates.push(
-            PathBuf::from(local_app)
-                .join("VirtualDisplayDriver")
-                .join("VddCtl.exe"),
-        );
-    }
-
-    if let Some(found) = candidates.into_iter().find(|p| p.is_file()) {
-        return Some(found);
-    }
-
-    system_info::find_app_helper("VddCtl.exe").or_else(|| system_info::find_in_path("VddCtl.exe"))
+    None
 }
 
 #[cfg(target_os = "windows")]
 fn scheduled_task_exists(task_name: &str) -> bool {
-    hidden_cmd("schtasks.exe")
+    hidden_cmd(&system_info::system32_exe("schtasks.exe"))
         .args(["/Query", "/TN", task_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -478,7 +530,7 @@ fn scheduled_task_exists(task_name: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn is_sunshine_service_active() -> bool {
-    if let Ok(out) = hidden_cmd("sc.exe")
+    if let Ok(out) = hidden_cmd(&system_info::system32_exe("sc.exe"))
         .args(["query", "SunshineService"])
         .output()
     {
@@ -491,22 +543,31 @@ fn is_sunshine_service_active() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn is_sunshine_process_running() -> bool {
-    if let Ok(out) = hidden_cmd("tasklist")
-        .args(["/FI", "IMAGENAME eq sunshine.exe", "/NH"])
+fn is_image_running(image_name: &str) -> bool {
+    let filter = format!("IMAGENAME eq {}", image_name);
+    if let Ok(out) = hidden_cmd(&system_info::system32_exe("tasklist.exe"))
+        .args(["/FI", &filter, "/NH"])
         .output()
     {
         if out.status.success() {
             let txt = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-            return txt.contains("sunshine.exe");
+            return txt.contains(&image_name.to_ascii_lowercase());
         }
     }
     false
 }
 
 #[cfg(target_os = "windows")]
-fn ensure_sunshine_running() {
-    let svc_started = hidden_cmd("sc.exe")
+fn is_sunshine_process_running() -> bool {
+    is_image_running("sunshine.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_sunshine_running() -> Result<()> {
+    let sc_exe = system_info::system32_exe("sc.exe");
+    let schtasks = system_info::system32_exe("schtasks.exe");
+
+    let svc_started = hidden_cmd(&sc_exe)
         .args(["start", "SunshineService"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -515,16 +576,20 @@ fn ensure_sunshine_running() {
         .unwrap_or(false);
 
     if scheduled_task_exists("SunshineSecondary") {
-        let _ = hidden_cmd("schtasks.exe")
+        let status = hidden_cmd(&schtasks)
             .args(["/Run", "/TN", "SunshineSecondary"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        return;
+            .status()
+            .context("Failed to launch SunshineSecondary scheduled task")?;
+        if !status.success() {
+            anyhow::bail!("Scheduled task SunshineSecondary exited with {}", status);
+        }
+        return Ok(());
     }
 
     if svc_started || is_sunshine_service_active() || is_sunshine_process_running() {
-        return;
+        return Ok(());
     }
 
     if let Some(bin) = system_info::find_sunshine_binary() {
@@ -532,20 +597,25 @@ fn ensure_sunshine_running() {
         if let Some(dir) = bin.parent() {
             cmd.current_dir(dir);
         }
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        match cmd.spawn() {
-            Ok(_) => info!("Started Sunshine binary ({})", bin.display()),
-            Err(e) => warn!("Failed to spawn Sunshine {}: {}", bin.display(), e),
-        }
-    } else {
-        warn!("Neither SunshineSecondary task, SunshineService, nor sunshine.exe binary found");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn Sunshine {}", bin.display()))?;
+        reap_child(child, "sunshine");
+        info!("Started Sunshine binary ({})", bin.display());
+        return Ok(());
     }
+
+    anyhow::bail!("Neither SunshineSecondary task, SunshineService, nor sunshine.exe binary found")
 }
 
 #[cfg(target_os = "windows")]
 fn discover_vdd_pnp_devices() -> Vec<VddPnpDevice> {
-    let ps_script = "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.InstanceId)|$($_.FriendlyName)|$($_.Name)|$($_.Status)\" }";
-    let Ok(out) = hidden_cmd("powershell.exe")
+    let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    let ps_script = "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.InstanceId -replace '[\\r\\n\\|]',' ')|$(($_.FriendlyName) -replace '[\\r\\n\\|]',' ')|$(($_.Name) -replace '[\\r\\n\\|]',' ')|$($_.Status -replace '[\\r\\n\\|]',' ')\" }";
+    let Ok(out) = hidden_cmd(&ps_exe)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -566,7 +636,8 @@ fn discover_vdd_pnp_devices() -> Vec<VddPnpDevice> {
 
 #[cfg(target_os = "windows")]
 fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &str) -> String {
-    let Ok(out) = hidden_cmd("reg")
+    let reg_exe = system_info::system32_exe("reg.exe");
+    let Ok(out) = hidden_cmd(&reg_exe)
         .args(["query", MOONLIGHT_HOSTS_REG_KEY, "/s"])
         .output()
     else {
@@ -582,13 +653,13 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         return mac_ip.to_string();
     };
 
-    if !mac_ip.is_empty() {
+    if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
         let local_changed = slot.localaddress != mac_ip;
         let manual_changed = (!slot.manualaddress.is_empty() && slot.manualaddress != mac_ip)
             || (local_changed && slot.manualaddress != mac_ip);
 
         if local_changed {
-            let _ = hidden_cmd("reg")
+            let _ = hidden_cmd(&reg_exe)
                 .args([
                     "add",
                     &slot.reg_key,
@@ -605,7 +676,7 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
                 .status();
         }
         if manual_changed {
-            let _ = hidden_cmd("reg")
+            let _ = hidden_cmd(&reg_exe)
                 .args([
                     "add",
                     &slot.reg_key,
@@ -635,12 +706,16 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         }
     }
 
-    if !slot.uuid.trim().is_empty() {
-        slot.uuid.trim().to_string()
-    } else if !slot.hostname.trim().is_empty() {
-        slot.hostname.trim().to_string()
+    let uuid = slot.uuid.trim();
+    if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
+        uuid.to_string()
     } else {
-        mac_ip.to_string()
+        let hname = slot.hostname.trim();
+        if !hname.is_empty() && !hname.starts_with('-') && !hname.chars().any(|c| c.is_control()) {
+            hname.to_string()
+        } else {
+            mac_ip.to_string()
+        }
     }
 }
 
@@ -650,9 +725,10 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, _port: u16, _host_name: &
 }
 
 #[cfg(target_os = "windows")]
-fn query_user_gpu_preference(exe_path: &std::path::Path) -> Option<u8> {
+fn query_user_gpu_preference_raw(exe_path: &std::path::Path) -> Option<String> {
     let exe_str = exe_path.to_string_lossy();
-    let output = hidden_cmd("reg")
+    let reg_exe = system_info::system32_exe("reg.exe");
+    let output = hidden_cmd(&reg_exe)
         .args(["query", DIRECTX_GPU_PREFS_KEY, "/v", exe_str.as_ref()])
         .output()
         .ok()?;
@@ -660,21 +736,22 @@ fn query_user_gpu_preference(exe_path: &std::path::Path) -> Option<u8> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    if text.contains("GpuPreference=2") {
-        Some(2)
-    } else if text.contains("GpuPreference=1") {
-        Some(1)
-    } else if text.contains("GpuPreference=0") {
-        Some(0)
-    } else {
-        None
-    }
+    extract_reg_sz_value_data(&text)
 }
 
 #[cfg(target_os = "windows")]
-fn set_user_gpu_preference(exe_path: &std::path::Path, pref_val: &str) {
+fn query_user_gpu_preference(exe_path: &std::path::Path) -> Option<u8> {
+    let text = query_user_gpu_preference_raw(exe_path)?;
+    parse_user_gpu_preference_value(&text)
+}
+
+#[cfg(target_os = "windows")]
+fn set_user_gpu_preference(exe_path: &std::path::Path, pref_val: &str) -> Result<()> {
+    let existing = query_user_gpu_preference_raw(exe_path);
+    let merged = merge_user_gpu_preference_value(existing.as_deref(), pref_val);
     let exe_str = exe_path.to_string_lossy();
-    let _ = hidden_cmd("reg")
+    let reg_exe = system_info::system32_exe("reg.exe");
+    let status = hidden_cmd(&reg_exe)
         .args([
             "add",
             DIRECTX_GPU_PREFS_KEY,
@@ -683,12 +760,17 @@ fn set_user_gpu_preference(exe_path: &std::path::Path, pref_val: &str) {
             "/t",
             "REG_SZ",
             "/d",
-            pref_val,
+            &merged,
             "/f",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .with_context(|| format!("Failed to update UserGpuPreferences for {}", exe_str))?;
+    if !status.success() {
+        anyhow::bail!("reg.exe add UserGpuPreferences exited with {}", status);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -699,7 +781,7 @@ fn update_sunshine_conf_encoder(
 ) -> Result<()> {
     let content = std::fs::read_to_string(conf_path)?;
     if let Some(updated) = update_sunshine_encoder_content(&content, encoder, remove_adapter) {
-        std::fs::write(conf_path, updated)?;
+        system_info::atomic_write_private(conf_path, updated.as_bytes())?;
     }
     Ok(())
 }
@@ -718,6 +800,82 @@ struct MoonlightHostSlot {
     manualaddress: String,
     remoteaddress: String,
     ports: Vec<u16>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn split_reg_query_value_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    for reg_type in [
+        "REG_EXPAND_SZ",
+        "REG_MULTI_SZ",
+        "REG_DWORD",
+        "REG_QWORD",
+        "REG_BINARY",
+        "REG_SZ",
+    ] {
+        if let Some(pos) = trimmed.find(reg_type) {
+            if pos > 0 && trimmed.as_bytes()[pos - 1].is_ascii_whitespace() {
+                let after = &trimmed[pos + reg_type.len()..];
+                if after.is_empty() || after.as_bytes()[0].is_ascii_whitespace() {
+                    return Some((trimmed[..pos].trim(), after.trim()));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn extract_reg_sz_value_data(reg_output: &str) -> Option<String> {
+    for line in reg_output.lines() {
+        if let Some((_, val_data)) = split_reg_query_value_line(line) {
+            return Some(val_data.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_user_gpu_preference_value(raw: &str) -> Option<u8> {
+    for part in raw.split([';', ' ', '\t', '\r', '\n']) {
+        let token = part.trim();
+        if let Some(val) = token.strip_prefix("GpuPreference=") {
+            if let Ok(code) = val.trim().parse::<u8>() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn merge_user_gpu_preference_value(existing_raw: Option<&str>, new_pref: &str) -> String {
+    let new_token = new_pref.trim().trim_end_matches(';');
+    let mut parts: Vec<String> = Vec::new();
+    let mut replaced = false;
+
+    if let Some(existing) = existing_raw {
+        for raw_part in existing.split(';') {
+            let part = raw_part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.starts_with("GpuPreference=") {
+                if !replaced {
+                    parts.push(new_token.to_string());
+                    replaced = true;
+                }
+            } else {
+                parts.push(part.to_string());
+            }
+        }
+    }
+
+    if !replaced {
+        parts.insert(0, new_token.to_string());
+    }
+
+    parts.join(";") + ";"
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -769,20 +927,10 @@ fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
         let Some(slot_idx) = current_slot_idx else {
             continue;
         };
-        let trimmed = trimmed_end.trim();
-        let Some(reg_pos) = trimmed.find("REG_") else {
+        let Some((val_name_raw, val_data)) = split_reg_query_value_line(trimmed_end) else {
             continue;
         };
-        if reg_pos == 0 || !trimmed.as_bytes()[reg_pos - 1].is_ascii_whitespace() {
-            continue;
-        }
-
-        let val_name = trimmed[..reg_pos].trim().to_ascii_lowercase();
-        let after_reg = &trimmed[reg_pos..];
-        let val_data = match after_reg.find(char::is_whitespace) {
-            Some(ws) => after_reg[ws..].trim(),
-            None => "",
-        };
+        let val_name = val_name_raw.to_ascii_lowercase();
 
         let slot = &mut slots[slot_idx];
         match val_name.as_str() {
@@ -982,7 +1130,7 @@ fn gpu_label_for_preference(pref_code: u8, gpus: &[system_info::GpuDeviceInfo]) 
         .filter(|g| !(g.vendor == "System" && g.name == "Default System GPU"))
         .collect();
     match pref_code {
-        2 => real_gpus
+        2 | 4 => real_gpus
             .iter()
             .copied()
             .filter(|g| g.is_discrete)
@@ -1356,5 +1504,21 @@ ROOT\\BASICDISPLAY\\0000|Microsoft Basic Display Adapter|Microsoft Basic Display
         )
         .unwrap();
         assert_eq!(cleared, "port = 47989\n");
+    }
+
+    #[test]
+    fn test_user_gpu_preferences_parse_and_preserve() {
+        let reg_out = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences\n    C:\\Moonlight.exe    REG_SZ    AutoHDREnable=1;GpuPreference=4;SwapEffectUpgradeEnable=1;\n";
+        let raw = extract_reg_sz_value_data(reg_out).unwrap();
+        assert_eq!(parse_user_gpu_preference_value(&raw), Some(4));
+
+        let merged = merge_user_gpu_preference_value(Some(&raw), "GpuPreference=2;");
+        assert_eq!(
+            merged,
+            "AutoHDREnable=1;GpuPreference=2;SwapEffectUpgradeEnable=1;"
+        );
+
+        let inserted = merge_user_gpu_preference_value(Some("AutoHDREnable=1;"), "GpuPreference=1;");
+        assert_eq!(inserted, "GpuPreference=1;AutoHDREnable=1;");
     }
 }

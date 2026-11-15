@@ -13,7 +13,9 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -35,8 +37,9 @@ typedef int32_t (*KvmWinEventCallback)(
 );
 typedef void (*KvmWinDragEndedCallback)(bool accepted, const char* session_id);
 
-static KvmWinEventCallback g_kvm_cb = nullptr;
-static KvmWinDragEndedCallback g_drag_ended_cb = nullptr;
+static std::mutex g_lifecycle_mutex;
+static std::atomic<KvmWinEventCallback> g_kvm_cb{nullptr};
+static std::atomic<KvmWinDragEndedCallback> g_drag_ended_cb{nullptr};
 
 static std::atomic<bool> g_controlling_peer{false};
 static std::atomic<bool> g_controlled_by_peer{false};
@@ -77,14 +80,20 @@ static std::atomic<int32_t> g_park_y{300};
 static std::atomic<bool> g_park_pending{false};
 static std::atomic<int32_t> g_edge_mode{0}; // 0=Left, 1=Right, 2=Top, 3=Bottom
 
-static DWORD g_hook_thread_id = 0;
-static DWORD g_ole_thread_id = 0;
-static HWND g_guard_hwnd = nullptr;
-static HWND g_edge_hwnd = nullptr;
-static HWND g_ghost_hwnd = nullptr;
-static HHOOK g_mouse_hook = nullptr;
-static HHOOK g_kbd_hook = nullptr;
-static HCURSOR g_blank_cursor = nullptr;
+static std::atomic<int32_t> g_ghost_x{0};
+static std::atomic<int32_t> g_ghost_y{0};
+
+static std::atomic<DWORD> g_hook_thread_id{0};
+static std::atomic<DWORD> g_ole_thread_id{0};
+static HANDLE g_hook_thread = nullptr;
+static HANDLE g_ole_thread = nullptr;
+static std::atomic<HWND> g_guard_hwnd{nullptr};
+static std::atomic<HWND> g_edge_hwnd{nullptr};
+static std::atomic<HWND> g_ghost_hwnd{nullptr};
+static std::atomic<HWND> g_ole_hwnd{nullptr};
+static std::atomic<HHOOK> g_mouse_hook{nullptr};
+static std::atomic<HHOOK> g_kbd_hook{nullptr};
+static std::atomic<HCURSOR> g_blank_cursor{nullptr};
 
 static std::mutex g_captured_mutex;
 static std::vector<std::string> g_captured_paths;
@@ -92,6 +101,13 @@ static std::vector<std::string> g_captured_paths;
 static std::mutex g_ghost_mutex;
 static std::wstring g_ghost_title;
 static std::wstring g_ghost_subtitle;
+
+// Cached GDI resources created/destroyed on the ghost window thread
+static HBRUSH g_ghost_bg_brush = nullptr;
+static HBRUSH g_ghost_border_brush = nullptr;
+static HBRUSH g_ghost_accent_brush = nullptr;
+static HFONT g_ghost_title_font = nullptr;
+static HFONT g_ghost_sub_font = nullptr;
 
 enum CustomMsgs : UINT {
     WM_APP_SYNC_GUARD = WM_APP + 101,
@@ -106,6 +122,18 @@ enum CustomMsgs : UINT {
 struct OleDragPayload {
     std::vector<std::wstring> paths;
     std::string session_id;
+};
+
+struct StartHandshake {
+    HANDLE ev = nullptr;
+    std::atomic<int> refs{2};
+
+    void release() {
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (ev) CloseHandle(ev);
+            delete this;
+        }
+    }
 };
 
 static std::wstring utf8_to_wide(const char* s) {
@@ -152,6 +180,16 @@ static std::string json_escape(const std::string& src) {
     }
     out.push_back('"');
     return out;
+}
+
+static bool is_valid_local_drag_path(const std::wstring& path) {
+    if (path.empty() || path.size() > 32760) return false;
+    // Reject UNC network paths to avoid off-box NTLM coercion during OLE shell drag
+    if (path.rfind(L"\\\\", 0) == 0 && path.rfind(L"\\\\?\\", 0) != 0) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
 static uint64_t read_current_modifiers_with_swallowed(uint32_t sw) {
@@ -251,31 +289,37 @@ public:
             FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
             STGMEDIUM stg = {};
             if (SUCCEEDED(pDataObj->GetData(&fmt, &stg))) {
-                HDROP hdrop = static_cast<HDROP>(GlobalLock(stg.hGlobal));
-                if (hdrop) {
-                    UINT count = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
-                    for (UINT i = 0; i < count && i < 1000; ++i) {
-                        UINT len = DragQueryFileW(hdrop, i, nullptr, 0);
-                        if (len > 0) {
-                            std::wstring wpath(len + 1, L'\0');
-                            if (DragQueryFileW(hdrop, i, &wpath[0], len + 1) > 0) {
-                                wpath.resize(len);
-                                std::string u8 = wide_to_utf8(wpath.c_str());
-                                if (!u8.empty()) found.push_back(std::move(u8));
+                if (stg.tymed == TYMED_HGLOBAL && stg.hGlobal != nullptr) {
+                    HDROP hdrop = static_cast<HDROP>(GlobalLock(stg.hGlobal));
+                    if (hdrop) {
+                        UINT count = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
+                        for (UINT i = 0; i < count && i < 4096; ++i) {
+                            UINT len = DragQueryFileW(hdrop, i, nullptr, 0);
+                            if (len > 0 && len < 32760) {
+                                std::wstring wpath(len + 1, L'\0');
+                                if (DragQueryFileW(hdrop, i, &wpath[0], len + 1) > 0) {
+                                    wpath.resize(len);
+                                    if (is_valid_local_drag_path(wpath)) {
+                                        std::string u8 = wide_to_utf8(wpath.c_str());
+                                        if (!u8.empty()) found.push_back(std::move(u8));
+                                    }
+                                }
                             }
                         }
+                        GlobalUnlock(stg.hGlobal);
                     }
-                    GlobalUnlock(stg.hGlobal);
                 }
                 ReleaseStgMedium(&stg);
             }
         }
+        bool has_items = false;
         {
             std::lock_guard<std::mutex> lk(g_captured_mutex);
             g_captured_paths = std::move(found);
+            has_items = !g_captured_paths.empty();
         }
         if (pdwEffect) {
-            *pdwEffect = g_captured_paths.empty() ? DROPEFFECT_NONE : DROPEFFECT_COPY;
+            *pdwEffect = has_items ? DROPEFFECT_COPY : DROPEFFECT_NONE;
         }
         return S_OK;
     }
@@ -289,6 +333,8 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE DragLeave() override {
+        std::lock_guard<std::mutex> lk(g_captured_mutex);
+        g_captured_paths.clear();
         return S_OK;
     }
 
@@ -360,19 +406,25 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
 
+        HWND edge_hwnd = g_edge_hwnd.load();
         if (wParam == WM_LBUTTONDOWN) {
             g_physical_left_down.store(true);
-            if (g_edge_hwnd && g_drag_probe_enabled.load() && !g_controlling_peer.load()) {
-                PostMessageW(g_edge_hwnd, WM_APP_SYNC_EDGE, 1, 0);
+            if (edge_hwnd && g_drag_probe_enabled.load() && !g_controlling_peer.load()) {
+                PostMessageW(edge_hwnd, WM_APP_SYNC_EDGE, 1, 0);
             }
         } else if (wParam == WM_LBUTTONUP) {
             g_physical_left_down.store(false);
-            if (g_edge_hwnd) {
-                PostMessageW(g_edge_hwnd, WM_APP_SYNC_EDGE, 0, 0);
+            if (edge_hwnd) {
+                PostMessageW(edge_hwnd, WM_APP_SYNC_EDGE, 0, 0);
+            }
+            if (!g_controlling_peer.load()) {
+                std::lock_guard<std::mutex> lk(g_captured_mutex);
+                g_captured_paths.clear();
             }
         }
 
-        if (g_kvm_cb) {
+        KvmWinEventCallback cb = g_kvm_cb.load();
+        if (cb) {
             int32_t decision = 0;
             switch (wParam) {
             case WM_MOUSEMOVE: {
@@ -388,37 +440,37 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
                 double dx = static_cast<double>(ms->pt.x - px);
                 double dy = static_cast<double>(ms->pt.y - py);
                 uint64_t lbtn = g_physical_left_down.load() ? 1ULL : 0ULL;
-                decision = g_kvm_cb(1, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), dx, dy, lbtn);
+                decision = cb(1, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), dx, dy, lbtn);
                 break;
             }
             case WM_LBUTTONDOWN:
-                decision = g_kvm_cb(2, 0.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 0.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_LBUTTONUP:
-                decision = g_kvm_cb(2, 0.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 0.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_RBUTTONDOWN:
-                decision = g_kvm_cb(2, 1.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 1.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_RBUTTONUP:
-                decision = g_kvm_cb(2, 1.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 1.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_MBUTTONDOWN:
-                decision = g_kvm_cb(2, 2.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 2.0, 1.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_MBUTTONUP:
-                decision = g_kvm_cb(2, 2.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
+                decision = cb(2, 2.0, 0.0, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), read_current_modifiers());
                 break;
             case WM_MOUSEWHEEL: {
                 SHORT delta = static_cast<SHORT>(HIWORD(ms->mouseData));
                 double dy = static_cast<double>(delta) / 120.0 * 3.0;
-                decision = g_kvm_cb(3, 0.0, dy, 0.0, 0.0, read_current_modifiers());
+                decision = cb(3, 0.0, dy, 0.0, 0.0, read_current_modifiers());
                 break;
             }
             case WM_MOUSEHWHEEL: {
                 SHORT delta = static_cast<SHORT>(HIWORD(ms->mouseData));
                 double dx = static_cast<double>(delta) / 120.0 * 3.0;
-                decision = g_kvm_cb(3, dx, 0.0, 0.0, 0.0, read_current_modifiers());
+                decision = cb(3, dx, 0.0, 0.0, 0.0, read_current_modifiers());
                 break;
             }
             default:
@@ -448,8 +500,9 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
         if (sw_bit != 0 && g_controlling_peer.load()) {
             preview_sw = pressed ? (preview_sw | sw_bit) : (preview_sw & ~sw_bit);
         }
-        if (g_kvm_cb) {
-            int32_t decision = g_kvm_cb(
+        KvmWinEventCallback cb = g_kvm_cb.load();
+        if (cb) {
+            int32_t decision = cb(
                 4,
                 static_cast<double>(ks->vkCode),
                 pressed ? 1.0 : 0.0,
@@ -477,12 +530,22 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
 // MARK: - Window Procedures (Guard / Edge / Fluent Drag Ghost)
 
 static LRESULT CALLBACK guard_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_SETCURSOR && g_controlling_peer.load() && g_blank_cursor) {
-        SetCursor(g_blank_cursor);
+    HCURSOR blank = g_blank_cursor.load();
+    if (msg == WM_SETCURSOR && g_controlling_peer.load() && blank) {
+        SetCursor(blank);
         return TRUE;
     }
+    if (msg == WM_DISPLAYCHANGE && g_controlling_peer.load() && IsWindowVisible(hwnd)) {
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        SetWindowPos(hwnd, HWND_TOPMOST, vx, vy, vw, vh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        return 0;
+    }
     if (msg == WM_APP_SYNC_GUARD) {
-        if (wParam != 0) {
+        std::unique_ptr<POINT> pt(reinterpret_cast<POINT*>(lParam));
+        if (wParam != 0 && g_controlling_peer.load()) {
             int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -493,22 +556,27 @@ static LRESULT CALLBACK guard_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         } else {
             g_park_pending.store(false);
             ShowWindow(hwnd, SW_HIDE);
-            int rx = static_cast<int>(static_cast<int16_t>(LOWORD(lParam)));
-            int ry = static_cast<int>(static_cast<int16_t>(HIWORD(lParam)));
-            SetCursorPos(rx, ry);
+            if (pt) {
+                SetCursorPos(pt->x, pt->y);
+            }
         }
         return 0;
     }
     if (msg == WM_APP_WARP_CURSOR) {
-        int x = static_cast<int>(static_cast<int16_t>(LOWORD(lParam)));
-        int y = static_cast<int>(static_cast<int16_t>(HIWORD(lParam)));
-        SetCursorPos(x, y);
+        std::unique_ptr<POINT> pt(reinterpret_cast<POINT*>(lParam));
+        if (pt) {
+            SetCursorPos(pt->x, pt->y);
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 static LRESULT CALLBACK edge_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DISPLAYCHANGE && IsWindowVisible(hwnd)) {
+        position_edge_window(hwnd);
+        return 0;
+    }
     if (msg == WM_APP_SYNC_EDGE) {
         if (wParam != 0 && g_drag_probe_enabled.load() && !g_controlling_peer.load()) {
             position_edge_window(hwnd);
@@ -522,32 +590,39 @@ static LRESULT CALLBACK edge_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 }
 
 static LRESULT CALLBACK ghost_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_CREATE) {
+        g_ghost_bg_brush = CreateSolidBrush(RGB(28, 32, 42));
+        g_ghost_border_brush = CreateSolidBrush(RGB(86, 156, 255));
+        g_ghost_accent_brush = CreateSolidBrush(RGB(56, 189, 248));
+        g_ghost_title_font = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            VARIABLE_PITCH, L"Segoe UI");
+        g_ghost_sub_font = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            VARIABLE_PITCH, L"Segoe UI");
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        if (g_ghost_bg_brush) { DeleteObject(g_ghost_bg_brush); g_ghost_bg_brush = nullptr; }
+        if (g_ghost_border_brush) { DeleteObject(g_ghost_border_brush); g_ghost_border_brush = nullptr; }
+        if (g_ghost_accent_brush) { DeleteObject(g_ghost_accent_brush); g_ghost_accent_brush = nullptr; }
+        if (g_ghost_title_font) { DeleteObject(g_ghost_title_font); g_ghost_title_font = nullptr; }
+        if (g_ghost_sub_font) { DeleteObject(g_ghost_sub_font); g_ghost_sub_font = nullptr; }
+        return 0;
+    }
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc;
         GetClientRect(hwnd, &rc);
 
-        HBRUSH bg = CreateSolidBrush(RGB(28, 32, 42));
-        HBRUSH border = CreateSolidBrush(RGB(86, 156, 255));
-        FillRect(hdc, &rc, bg);
-        FrameRect(hdc, &rc, border);
-        DeleteObject(bg);
-        DeleteObject(border);
+        if (g_ghost_bg_brush) FillRect(hdc, &rc, g_ghost_bg_brush);
+        if (g_ghost_border_brush) FrameRect(hdc, &rc, g_ghost_border_brush);
 
         RECT accent = { 0, 0, 5, rc.bottom };
-        HBRUSH acc = CreateSolidBrush(RGB(56, 189, 248));
-        FillRect(hdc, &accent, acc);
-        DeleteObject(acc);
+        if (g_ghost_accent_brush) FillRect(hdc, &accent, g_ghost_accent_brush);
 
         SetBkMode(hdc, TRANSPARENT);
-        HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            VARIABLE_PITCH, L"Segoe UI");
-        HFONT subFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            VARIABLE_PITCH, L"Segoe UI");
-
         std::wstring title, sub;
         {
             std::lock_guard<std::mutex> lk(g_ghost_mutex);
@@ -555,33 +630,31 @@ static LRESULT CALLBACK ghost_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             sub = g_ghost_subtitle;
         }
 
-        HGDIOBJ oldFont = SelectObject(hdc, titleFont);
+        HGDIOBJ oldFont = g_ghost_title_font ? SelectObject(hdc, g_ghost_title_font) : nullptr;
         SetTextColor(hdc, RGB(244, 247, 252));
         RECT tr = { 16, 8, rc.right - 12, 30 };
         DrawTextW(hdc, title.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        SelectObject(hdc, subFont);
+        if (g_ghost_sub_font) SelectObject(hdc, g_ghost_sub_font);
         SetTextColor(hdc, RGB(165, 180, 200));
         RECT sr = { 16, 30, rc.right - 12, 50 };
         DrawTextW(hdc, sub.c_str(), -1, &sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        SelectObject(hdc, oldFont);
-        DeleteObject(titleFont);
-        DeleteObject(subFont);
+        if (oldFont) SelectObject(hdc, oldFont);
         EndPaint(hwnd, &ps);
         return 0;
     }
     if (msg == WM_APP_SHOW_GHOST) {
-        int x = static_cast<int>(static_cast<int16_t>(LOWORD(lParam))) + 18;
-        int y = static_cast<int>(static_cast<int16_t>(HIWORD(lParam))) + 18;
+        int x = g_ghost_x.load() + 18;
+        int y = g_ghost_y.load() + 18;
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, 272, 56, SWP_SHOWWINDOW | SWP_NOACTIVATE);
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     }
     if (msg == WM_APP_MOVE_GHOST) {
         if (IsWindowVisible(hwnd)) {
-            int x = static_cast<int>(static_cast<int16_t>(LOWORD(lParam))) + 18;
-            int y = static_cast<int>(static_cast<int16_t>(HIWORD(lParam))) + 18;
+            int x = g_ghost_x.load() + 18;
+            int y = g_ghost_y.load() + 18;
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
         return 0;
@@ -593,20 +666,113 @@ static LRESULT CALLBACK ghost_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static LRESULT CALLBACK ole_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_APP_START_OLE_DRAG && lParam) {
+        std::unique_ptr<OleDragPayload> payload(reinterpret_cast<OleDragPayload*>(lParam));
+        std::vector<PIDLIST_ABSOLUTE> owned_pidls;
+        std::vector<LPCITEMIDLIST> full_pidls;
+        std::vector<LPCITEMIDLIST> child_pidls;
+        PIDLIST_ABSOLUTE parent_pidl = nullptr;
+        bool same_parent = true;
+        std::wstring first_dir;
+
+        for (const auto& wp : payload->paths) {
+            if (!is_valid_local_drag_path(wp)) continue;
+            size_t slash = wp.find_last_of(L"\\/");
+            std::wstring dir = (slash == std::wstring::npos) ? L"" : wp.substr(0, slash);
+            if (owned_pidls.empty()) {
+                first_dir = dir;
+            } else if (_wcsicmp(dir.c_str(), first_dir.c_str()) != 0) {
+                same_parent = false;
+            }
+
+            PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(wp.c_str());
+            if (pidl) {
+                owned_pidls.push_back(pidl);
+                full_pidls.push_back(pidl);
+                PCUIDLIST_RELATIVE child = ILFindLastID(pidl);
+                if (child) child_pidls.push_back(child);
+            }
+        }
+        bool accepted = false;
+        if (!owned_pidls.empty()) {
+            IDataObject* pDataObj = nullptr;
+            HRESULT hr = E_FAIL;
+            if (same_parent && child_pidls.size() == owned_pidls.size()) {
+                parent_pidl = ILCloneFull(owned_pidls[0]);
+                if (parent_pidl && ILRemoveLastID(parent_pidl)) {
+                    hr = SHCreateDataObject(
+                        parent_pidl,
+                        static_cast<UINT>(child_pidls.size()),
+                        child_pidls.data(),
+                        nullptr,
+                        IID_IDataObject,
+                        reinterpret_cast<void**>(&pDataObj)
+                    );
+                }
+            }
+            if (FAILED(hr) || !pDataObj) {
+                hr = SHCreateDataObject(
+                    nullptr,
+                    static_cast<UINT>(full_pidls.size()),
+                    full_pidls.data(),
+                    nullptr,
+                    IID_IDataObject,
+                    reinterpret_cast<void**>(&pDataObj)
+                );
+            }
+            if (SUCCEEDED(hr) && pDataObj) {
+                RemoteDropSource* src = new RemoteDropSource();
+                DWORD effect = DROPEFFECT_NONE;
+                HWND ghost = g_ghost_hwnd.load();
+                if (ghost) {
+                    PostMessageW(ghost, WM_APP_HIDE_GHOST, 0, 0);
+                }
+                g_ole_drag_active.store(true);
+                HRESULT dhr = DoDragDrop(pDataObj, src, DROPEFFECT_COPY, &effect);
+                g_ole_drag_active.store(false);
+                accepted = (dhr == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE);
+                src->Release();
+                pDataObj->Release();
+            }
+            if (parent_pidl) ILFree(parent_pidl);
+            for (PIDLIST_ABSOLUTE p : owned_pidls) {
+                ILFree(p);
+            }
+        }
+        HWND ghost = g_ghost_hwnd.load();
+        if (ghost) {
+            PostMessageW(ghost, WM_APP_HIDE_GHOST, 0, 0);
+        }
+        KvmWinDragEndedCallback cb = g_drag_ended_cb.load();
+        if (cb) {
+            cb(accepted, payload->session_id.c_str());
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 static DWORD WINAPI hook_thread_main(LPVOID param) {
+    StartHandshake* hs = static_cast<StartHandshake*>(param);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     OleInitialize(nullptr);
 
-    BYTE and_mask = 0xFF;
-    BYTE xor_mask = 0x00;
-    g_blank_cursor = CreateCursor(GetModuleHandleW(nullptr), 0, 0, 1, 1, &and_mask, &xor_mask);
+    int cx = std::max(16, std::min(256, GetSystemMetrics(SM_CXCURSOR)));
+    int cy = std::max(16, std::min(256, GetSystemMetrics(SM_CYCURSOR)));
+    size_t row_bytes = static_cast<size_t>(((cx + 15) / 16) * 2);
+    size_t total_bytes = row_bytes * static_cast<size_t>(cy);
+    std::vector<BYTE> and_mask(total_bytes, 0xFF);
+    std::vector<BYTE> xor_mask(total_bytes, 0x00);
 
     HINSTANCE hinst = GetModuleHandleW(nullptr);
+    HCURSOR blank = CreateCursor(hinst, 0, 0, cx, cy, and_mask.data(), xor_mask.data());
+    g_blank_cursor.store(blank);
 
     WNDCLASSW gwc = {};
     gwc.lpfnWndProc = guard_wnd_proc;
     gwc.hInstance = hinst;
-    gwc.hCursor = g_blank_cursor;
+    gwc.hCursor = blank;
     gwc.lpszClassName = L"IntegratorKvmGuardWnd";
     RegisterClassW(&gwc);
 
@@ -622,41 +788,51 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     fwc.lpszClassName = L"IntegratorKvmGhostWnd";
     RegisterClassW(&fwc);
 
-    g_guard_hwnd = CreateWindowExW(
+    HWND guard_hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         gwc.lpszClassName, L"", WS_POPUP,
         0, 0, 1, 1, nullptr, nullptr, hinst, nullptr
     );
-    if (g_guard_hwnd) {
-        SetLayeredWindowAttributes(g_guard_hwnd, 0, 1, LWA_ALPHA);
+    if (guard_hw) {
+        SetLayeredWindowAttributes(guard_hw, 0, 1, LWA_ALPHA);
     }
+    g_guard_hwnd.store(guard_hw);
 
-    g_edge_hwnd = CreateWindowExW(
+    HWND edge_hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         ewc.lpszClassName, L"", WS_POPUP,
         0, 0, 4, 100, nullptr, nullptr, hinst, nullptr
     );
     EdgeDropTarget* drop_target = nullptr;
-    if (g_edge_hwnd) {
-        SetLayeredWindowAttributes(g_edge_hwnd, 0, 1, LWA_ALPHA);
+    if (edge_hw) {
+        SetLayeredWindowAttributes(edge_hw, 0, 1, LWA_ALPHA);
         drop_target = new EdgeDropTarget();
-        RegisterDragDrop(g_edge_hwnd, drop_target);
+        RegisterDragDrop(edge_hw, drop_target);
     }
+    g_edge_hwnd.store(edge_hw);
 
-    g_ghost_hwnd = CreateWindowExW(
+    HWND ghost_hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
         fwc.lpszClassName, L"", WS_POPUP,
         0, 0, 272, 56, nullptr, nullptr, hinst, nullptr
     );
-    if (g_ghost_hwnd) {
-        SetLayeredWindowAttributes(g_ghost_hwnd, 0, 238, LWA_ALPHA);
+    if (ghost_hw) {
+        SetLayeredWindowAttributes(ghost_hw, 0, 238, LWA_ALPHA);
     }
+    g_ghost_hwnd.store(ghost_hw);
 
-    g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, low_level_mouse_proc, hinst, 0);
-    g_kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, low_level_kbd_proc, hinst, 0);
+    MSG init_msg;
+    PeekMessageW(&init_msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
-    HANDLE ready_ev = static_cast<HANDLE>(param);
-    if (ready_ev) SetEvent(ready_ev);
+    HHOOK mh = SetWindowsHookExW(WH_MOUSE_LL, low_level_mouse_proc, hinst, 0);
+    HHOOK kh = SetWindowsHookExW(WH_KEYBOARD_LL, low_level_kbd_proc, hinst, 0);
+    g_mouse_hook.store(mh);
+    g_kbd_hook.store(kh);
+
+    if (hs) {
+        if (hs->ev) SetEvent(hs->ev);
+        hs->release();
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -664,136 +840,149 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
         DispatchMessageW(&msg);
     }
 
-    if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
-    if (g_kbd_hook) UnhookWindowsHookEx(g_kbd_hook);
-    if (g_edge_hwnd) RevokeDragDrop(g_edge_hwnd);
+    HHOOK mh_cur = g_mouse_hook.exchange(nullptr);
+    HHOOK kh_cur = g_kbd_hook.exchange(nullptr);
+    if (mh_cur) UnhookWindowsHookEx(mh_cur);
+    if (kh_cur) UnhookWindowsHookEx(kh_cur);
+
+    HWND guard_cur = g_guard_hwnd.exchange(nullptr);
+    HWND edge_cur = g_edge_hwnd.exchange(nullptr);
+    HWND ghost_cur = g_ghost_hwnd.exchange(nullptr);
+    if (edge_cur) {
+        RevokeDragDrop(edge_cur);
+        DestroyWindow(edge_cur);
+    }
+    if (guard_cur) DestroyWindow(guard_cur);
+    if (ghost_cur) DestroyWindow(ghost_cur);
     if (drop_target) drop_target->Release();
+
+    HCURSOR blank_cur = g_blank_cursor.exchange(nullptr);
+    if (blank_cur) DestroyCursor(blank_cur);
+
+    UnregisterClassW(gwc.lpszClassName, hinst);
+    UnregisterClassW(ewc.lpszClassName, hinst);
+    UnregisterClassW(fwc.lpszClassName, hinst);
+    g_hook_thread_id.store(0);
     OleUninitialize();
     return 0;
 }
 
 static DWORD WINAPI ole_drag_thread_main(LPVOID param) {
+    StartHandshake* hs = static_cast<StartHandshake*>(param);
     OleInitialize(nullptr);
-    HANDLE ready_ev = static_cast<HANDLE>(param);
+
+    HINSTANCE hinst = GetModuleHandleW(nullptr);
+    WNDCLASSW owc = {};
+    owc.lpfnWndProc = ole_wnd_proc;
+    owc.hInstance = hinst;
+    owc.lpszClassName = L"IntegratorKvmOleMsgWnd";
+    RegisterClassW(&owc);
+
+    HWND ole_hw = CreateWindowExW(
+        0, owc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hinst, nullptr
+    );
+    g_ole_hwnd.store(ole_hw);
+
     MSG msg;
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-    if (ready_ev) SetEvent(ready_ev);
+    if (hs) {
+        if (hs->ev) SetEvent(hs->ev);
+        hs->release();
+    }
 
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_APP_START_OLE_DRAG && msg.lParam) {
-            std::unique_ptr<OleDragPayload> payload(reinterpret_cast<OleDragPayload*>(msg.lParam));
-            std::vector<PIDLIST_ABSOLUTE> owned_pidls;
-            std::vector<LPCITEMIDLIST> full_pidls;
-            std::vector<LPCITEMIDLIST> child_pidls;
-            PIDLIST_ABSOLUTE parent_pidl = nullptr;
-            bool same_parent = true;
-            std::wstring first_dir;
-
-            for (const auto& wp : payload->paths) {
-                size_t slash = wp.find_last_of(L"\\/");
-                std::wstring dir = (slash == std::wstring::npos) ? L"" : wp.substr(0, slash);
-                if (owned_pidls.empty()) {
-                    first_dir = dir;
-                } else if (dir != first_dir) {
-                    same_parent = false;
-                }
-
-                PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(wp.c_str());
-                if (pidl) {
-                    owned_pidls.push_back(pidl);
-                    full_pidls.push_back(pidl);
-                    PCUIDLIST_RELATIVE child = ILFindLastID(pidl);
-                    if (child) child_pidls.push_back(child);
-                }
-            }
-            bool accepted = false;
-            if (!owned_pidls.empty()) {
-                IDataObject* pDataObj = nullptr;
-                HRESULT hr = E_FAIL;
-                if (same_parent && child_pidls.size() == owned_pidls.size()) {
-                    parent_pidl = ILCloneFull(owned_pidls[0]);
-                    if (parent_pidl && ILRemoveLastID(parent_pidl)) {
-                        hr = SHCreateDataObject(
-                            parent_pidl,
-                            static_cast<UINT>(child_pidls.size()),
-                            child_pidls.data(),
-                            nullptr,
-                            IID_IDataObject,
-                            reinterpret_cast<void**>(&pDataObj)
-                        );
-                    }
-                }
-                if (FAILED(hr) || !pDataObj) {
-                    hr = SHCreateDataObject(
-                        nullptr,
-                        static_cast<UINT>(full_pidls.size()),
-                        full_pidls.data(),
-                        nullptr,
-                        IID_IDataObject,
-                        reinterpret_cast<void**>(&pDataObj)
-                    );
-                }
-                if (SUCCEEDED(hr) && pDataObj) {
-                    RemoteDropSource* src = new RemoteDropSource();
-                    DWORD effect = DROPEFFECT_NONE;
-                    if (g_ghost_hwnd) {
-                        PostMessageW(g_ghost_hwnd, WM_APP_HIDE_GHOST, 0, 0);
-                    }
-                    g_ole_drag_active.store(true);
-                    HRESULT dhr = DoDragDrop(pDataObj, src, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
-                    g_ole_drag_active.store(false);
-                    accepted = (dhr == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE);
-                    src->Release();
-                    pDataObj->Release();
-                }
-                if (parent_pidl) ILFree(parent_pidl);
-                for (PIDLIST_ABSOLUTE p : owned_pidls) {
-                    ILFree(p);
-                }
-            }
-            if (g_ghost_hwnd) {
-                PostMessageW(g_ghost_hwnd, WM_APP_HIDE_GHOST, 0, 0);
-            }
-            if (g_drag_ended_cb) {
-                g_drag_ended_cb(accepted, payload->session_id.c_str());
-            }
-        } else {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
+
+    HWND ole_cur = g_ole_hwnd.exchange(nullptr);
+    if (ole_cur) {
+        MSG pending;
+        while (PeekMessageW(&pending, ole_cur, WM_APP_START_OLE_DRAG, WM_APP_START_OLE_DRAG, PM_REMOVE)) {
+            delete reinterpret_cast<OleDragPayload*>(pending.lParam);
+        }
+        DestroyWindow(ole_cur);
+    }
+    UnregisterClassW(owc.lpszClassName, hinst);
+    g_ole_thread_id.store(0);
     OleUninitialize();
     return 0;
 }
 
 extern "C" {
 
+bool integrator_kvm_win_is_hook_active() {
+    return g_mouse_hook.load() != nullptr && g_kbd_hook.load() != nullptr;
+}
+
 bool integrator_kvm_win_start_hooks(
     KvmWinEventCallback cb,
     KvmWinDragEndedCallback drag_ended_cb
 ) {
-    g_kvm_cb = cb;
-    g_drag_ended_cb = drag_ended_cb;
+    std::lock_guard<std::mutex> lk(g_lifecycle_mutex);
+    g_kvm_cb.store(cb);
+    g_drag_ended_cb.store(drag_ended_cb);
 
-    if (!g_hook_thread_id) {
-        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        HANDLE th = CreateThread(nullptr, 0, hook_thread_main, ev, 0, &g_hook_thread_id);
-        if (ev) {
-            WaitForSingleObject(ev, 2000);
-            CloseHandle(ev);
+    if (g_hook_thread_id.load() == 0) {
+        StartHandshake* hs = new StartHandshake();
+        hs->ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD tid = 0;
+        HANDLE th = CreateThread(nullptr, 0, hook_thread_main, hs, 0, &tid);
+        if (th) {
+            g_hook_thread_id.store(tid);
+            g_hook_thread = th;
+            if (hs->ev) WaitForSingleObject(hs->ev, 2000);
+            hs->release();
+        } else {
+            hs->release();
+            hs->release();
         }
-        if (th) CloseHandle(th);
     }
-    if (!g_ole_thread_id) {
-        HANDLE ev2 = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        HANDLE th2 = CreateThread(nullptr, 0, ole_drag_thread_main, ev2, 0, &g_ole_thread_id);
-        if (ev2) {
-            WaitForSingleObject(ev2, 2000);
-            CloseHandle(ev2);
+    if (g_ole_thread_id.load() == 0) {
+        StartHandshake* hs2 = new StartHandshake();
+        hs2->ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD tid2 = 0;
+        HANDLE th2 = CreateThread(nullptr, 0, ole_drag_thread_main, hs2, 0, &tid2);
+        if (th2) {
+            g_ole_thread_id.store(tid2);
+            g_ole_thread = th2;
+            if (hs2->ev) WaitForSingleObject(hs2->ev, 2000);
+            hs2->release();
+        } else {
+            hs2->release();
+            hs2->release();
         }
-        if (th2) CloseHandle(th2);
     }
-    return g_mouse_hook != nullptr && g_kbd_hook != nullptr;
+    return integrator_kvm_win_is_hook_active();
+}
+
+void integrator_kvm_win_stop_hooks() {
+    std::lock_guard<std::mutex> lk(g_lifecycle_mutex);
+    g_controlling_peer.store(false);
+    g_controlled_by_peer.store(false);
+    g_drag_cancelled.store(true);
+    g_kvm_cb.store(nullptr);
+    g_drag_ended_cb.store(nullptr);
+
+    DWORD htid = g_hook_thread_id.load();
+    if (htid != 0) {
+        PostThreadMessageW(htid, WM_QUIT, 0, 0);
+    }
+    if (g_hook_thread) {
+        WaitForSingleObject(g_hook_thread, 1500);
+        CloseHandle(g_hook_thread);
+        g_hook_thread = nullptr;
+    }
+
+    DWORD otid = g_ole_thread_id.load();
+    if (otid != 0) {
+        PostThreadMessageW(otid, WM_QUIT, 0, 0);
+    }
+    if (g_ole_thread) {
+        WaitForSingleObject(g_ole_thread, 1500);
+        CloseHandle(g_ole_thread);
+        g_ole_thread = nullptr;
+    }
 }
 
 void integrator_kvm_win_screen_rect(
@@ -811,17 +1000,18 @@ void integrator_kvm_win_screen_rect(
         w = GetSystemMetrics(SM_CXSCREEN);
         h = GetSystemMetrics(SM_CYSCREEN);
     }
-    *out_x = static_cast<double>(x);
-    *out_y = static_cast<double>(y);
-    *out_w = static_cast<double>(w);
-    *out_h = static_cast<double>(h);
+    if (out_x) *out_x = static_cast<double>(x);
+    if (out_y) *out_y = static_cast<double>(y);
+    if (out_w) *out_w = static_cast<double>(w);
+    if (out_h) *out_h = static_cast<double>(h);
 }
 
 void integrator_kvm_win_set_edge_probe(bool enabled, int32_t edge_mode) {
     g_drag_probe_enabled.store(enabled);
     g_edge_mode.store(edge_mode);
-    if (!enabled && g_edge_hwnd) {
-        PostMessageW(g_edge_hwnd, WM_APP_SYNC_EDGE, 0, 0);
+    HWND edge_hw = g_edge_hwnd.load();
+    if (!enabled && edge_hw) {
+        PostMessageW(edge_hw, WM_APP_SYNC_EDGE, 0, 0);
     }
 }
 
@@ -837,12 +1027,21 @@ void integrator_kvm_win_set_controlling(
     g_park_y.store(park_y);
     g_park_pending.store(controlling);
     g_controlling_peer.store(controlling);
-    if (g_edge_hwnd) {
-        PostMessageW(g_edge_hwnd, WM_APP_SYNC_EDGE, 0, 0);
+    HWND edge_hw = g_edge_hwnd.load();
+    if (edge_hw) {
+        PostMessageW(edge_hw, WM_APP_SYNC_EDGE, 0, 0);
     }
-    if (g_guard_hwnd) {
-        LPARAM lp = MAKELPARAM(static_cast<uint16_t>(restore_x), static_cast<uint16_t>(restore_y));
-        PostMessageW(g_guard_hwnd, WM_APP_SYNC_GUARD, controlling ? 1 : 0, lp);
+    HWND guard_hw = g_guard_hwnd.load();
+    if (guard_hw) {
+        POINT* pt = new POINT{ restore_x, restore_y };
+        if (!PostMessageW(guard_hw, WM_APP_SYNC_GUARD, controlling ? 1 : 0, reinterpret_cast<LPARAM>(pt))) {
+            delete pt;
+            if (!controlling) {
+                SetCursorPos(restore_x, restore_y);
+            }
+        }
+    } else if (!controlling) {
+        SetCursorPos(restore_x, restore_y);
     }
 }
 
@@ -851,26 +1050,23 @@ void integrator_kvm_win_set_controlled(bool controlled, int32_t entry_x, int32_t
     if (!controlled) {
         g_remote_drag_left_down.store(false);
         g_drag_cancelled.store(true);
-        if (g_ghost_hwnd) {
-            PostMessageW(g_ghost_hwnd, WM_APP_HIDE_GHOST, 0, 0);
+        HWND ghost_hw = g_ghost_hwnd.load();
+        if (ghost_hw) {
+            PostMessageW(ghost_hw, WM_APP_HIDE_GHOST, 0, 0);
         }
     } else {
         g_drag_cancelled.store(false);
-        if (g_guard_hwnd) {
-            PostMessageW(
-                g_guard_hwnd,
-                WM_APP_WARP_CURSOR,
-                0,
-                MAKELPARAM(static_cast<uint16_t>(entry_x), static_cast<uint16_t>(entry_y))
-            );
+        HWND guard_hw = g_guard_hwnd.load();
+        if (guard_hw) {
+            POINT* pt = new POINT{ entry_x, entry_y };
+            if (!PostMessageW(guard_hw, WM_APP_WARP_CURSOR, 0, reinterpret_cast<LPARAM>(pt))) {
+                delete pt;
+                SetCursorPos(entry_x, entry_y);
+            }
         } else {
             SetCursorPos(entry_x, entry_y);
         }
     }
-}
-
-void integrator_kvm_win_warp_cursor(int32_t x, int32_t y) {
-    SetCursorPos(x, y);
 }
 
 char* integrator_kvm_win_take_drag_paths() {
@@ -916,8 +1112,10 @@ void integrator_kvm_win_inject_mouse_move(int32_t abs_x, int32_t abs_y) {
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (vw <= 1 || vh <= 1) return;
 
-    LONG norm_x = static_cast<LONG>(((static_cast<double>(abs_x - vx) * 65535.0) / static_cast<double>(vw - 1)));
-    LONG norm_y = static_cast<LONG>(((static_cast<double>(abs_y - vy) * 65535.0) / static_cast<double>(vh - 1)));
+    int32_t cx = std::max(vx, std::min(vx + vw - 1, abs_x));
+    int32_t cy = std::max(vy, std::min(vy + vh - 1, abs_y));
+    LONG norm_x = static_cast<LONG>(((static_cast<double>(cx - vx) * 65535.0) / static_cast<double>(vw - 1)));
+    LONG norm_y = static_cast<LONG>(((static_cast<double>(cy - vy) * 65535.0) / static_cast<double>(vh - 1)));
 
     INPUT inp = {};
     inp.type = INPUT_MOUSE;
@@ -931,9 +1129,10 @@ void integrator_kvm_win_inject_mouse_move(int32_t abs_x, int32_t abs_y) {
 void integrator_kvm_win_inject_mouse_button(int32_t button, bool pressed) {
     if (button == 0) {
         g_remote_drag_left_down.store(pressed);
-        if (!pressed && g_ole_drag_active.load() && g_ole_thread_id) {
+        DWORD otid = g_ole_thread_id.load();
+        if (!pressed && g_ole_drag_active.load() && otid != 0) {
             // Nudge OLE DoDragDrop modal loop cleanly so QueryContinueDrag drops immediately
-            PostThreadMessageW(g_ole_thread_id, WM_NULL, 0, 0);
+            PostThreadMessageW(otid, WM_NULL, 0, 0);
             INPUT nudge = {};
             nudge.type = INPUT_MOUSE;
             nudge.mi.dwFlags = MOUSEEVENTF_MOVE;
@@ -958,21 +1157,29 @@ void integrator_kvm_win_inject_mouse_button(int32_t button, bool pressed) {
 }
 
 void integrator_kvm_win_inject_scroll(double dx, double dy) {
-    if (dy != 0.0) {
-        INPUT inp = {};
-        inp.type = INPUT_MOUSE;
-        inp.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        inp.mi.mouseData = static_cast<DWORD>(static_cast<int32_t>(dy * 40.0));
-        inp.mi.dwExtraInfo = kIntegratorEventTag;
-        SendInput(1, &inp, sizeof(INPUT));
+    if (std::isfinite(dy) && dy != 0.0) {
+        double scaled = std::max(-60000.0, std::min(60000.0, dy * 40.0));
+        int32_t delta = static_cast<int32_t>(std::lround(scaled));
+        if (delta != 0) {
+            INPUT inp = {};
+            inp.type = INPUT_MOUSE;
+            inp.mi.dwFlags = MOUSEEVENTF_WHEEL;
+            inp.mi.mouseData = static_cast<DWORD>(delta);
+            inp.mi.dwExtraInfo = kIntegratorEventTag;
+            SendInput(1, &inp, sizeof(INPUT));
+        }
     }
-    if (dx != 0.0) {
-        INPUT inp = {};
-        inp.type = INPUT_MOUSE;
-        inp.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        inp.mi.mouseData = static_cast<DWORD>(static_cast<int32_t>(dx * 40.0));
-        inp.mi.dwExtraInfo = kIntegratorEventTag;
-        SendInput(1, &inp, sizeof(INPUT));
+    if (std::isfinite(dx) && dx != 0.0) {
+        double scaled = std::max(-60000.0, std::min(60000.0, dx * 40.0));
+        int32_t delta = static_cast<int32_t>(std::lround(scaled));
+        if (delta != 0) {
+            INPUT inp = {};
+            inp.type = INPUT_MOUSE;
+            inp.mi.dwFlags = MOUSEEVENTF_HWHEEL;
+            inp.mi.mouseData = static_cast<DWORD>(delta);
+            inp.mi.dwExtraInfo = kIntegratorEventTag;
+            SendInput(1, &inp, sizeof(INPUT));
+        }
     }
 }
 
@@ -997,22 +1204,27 @@ void integrator_kvm_win_show_drag_ghost(
         g_ghost_title = utf8_to_wide(title ? title : "Universal Drag");
         g_ghost_subtitle = utf8_to_wide(subtitle ? subtitle : "Streaming securely...");
     }
-    if (g_ghost_hwnd) {
-        PostMessageW(g_ghost_hwnd, WM_APP_SHOW_GHOST, 0,
-            MAKELPARAM(static_cast<uint16_t>(x), static_cast<uint16_t>(y)));
+    g_ghost_x.store(x);
+    g_ghost_y.store(y);
+    HWND ghost_hw = g_ghost_hwnd.load();
+    if (ghost_hw) {
+        PostMessageW(ghost_hw, WM_APP_SHOW_GHOST, 0, 0);
     }
 }
 
 void integrator_kvm_win_move_drag_ghost(int32_t x, int32_t y) {
-    if (g_ghost_hwnd) {
-        PostMessageW(g_ghost_hwnd, WM_APP_MOVE_GHOST, 0,
-            MAKELPARAM(static_cast<uint16_t>(x), static_cast<uint16_t>(y)));
+    g_ghost_x.store(x);
+    g_ghost_y.store(y);
+    HWND ghost_hw = g_ghost_hwnd.load();
+    if (ghost_hw) {
+        PostMessageW(ghost_hw, WM_APP_MOVE_GHOST, 0, 0);
     }
 }
 
 void integrator_kvm_win_hide_drag_ghost() {
-    if (g_ghost_hwnd) {
-        PostMessageW(g_ghost_hwnd, WM_APP_HIDE_GHOST, 0, 0);
+    HWND ghost_hw = g_ghost_hwnd.load();
+    if (ghost_hw) {
+        PostMessageW(ghost_hw, WM_APP_HIDE_GHOST, 0, 0);
     }
 }
 
@@ -1022,7 +1234,8 @@ void integrator_kvm_win_begin_native_drag(
     const char* session_id,
     bool remote_left_still_held
 ) {
-    if (!paths_utf8 || count <= 0 || !g_ole_thread_id) return;
+    HWND ole_hw = g_ole_hwnd.load();
+    if (!paths_utf8 || count <= 0 || !ole_hw) return;
     g_drag_cancelled.store(false);
     g_remote_drag_left_down.store(remote_left_still_held);
 
@@ -1030,24 +1243,26 @@ void integrator_kvm_win_begin_native_drag(
     payload->session_id = session_id ? session_id : "";
     for (int32_t i = 0; i < count; ++i) {
         std::wstring wp = utf8_to_wide(paths_utf8[i]);
-        if (!wp.empty()) payload->paths.push_back(std::move(wp));
+        if (is_valid_local_drag_path(wp)) payload->paths.push_back(std::move(wp));
     }
     if (payload->paths.empty()) {
         delete payload;
         return;
     }
-    if (!PostThreadMessageW(g_ole_thread_id, WM_APP_START_OLE_DRAG, 0, reinterpret_cast<LPARAM>(payload))) {
+    if (!PostMessageW(ole_hw, WM_APP_START_OLE_DRAG, 0, reinterpret_cast<LPARAM>(payload))) {
         delete payload;
     }
 }
 
 void integrator_kvm_win_cancel_remote_drag() {
     g_drag_cancelled.store(true);
-    if (g_ole_thread_id) {
-        PostThreadMessageW(g_ole_thread_id, WM_NULL, 0, 0);
+    DWORD otid = g_ole_thread_id.load();
+    if (otid != 0) {
+        PostThreadMessageW(otid, WM_NULL, 0, 0);
     }
-    if (g_ghost_hwnd) {
-        PostMessageW(g_ghost_hwnd, WM_APP_HIDE_GHOST, 0, 0);
+    HWND ghost_hw = g_ghost_hwnd.load();
+    if (ghost_hw) {
+        PostMessageW(ghost_hw, WM_APP_HIDE_GHOST, 0, 0);
     }
 }
 

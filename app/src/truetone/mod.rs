@@ -57,84 +57,110 @@ pub fn read_ambient_light() -> AmbientLightData {
     }
 }
 
-/// Calculates Bradford Chromatic Adaptation Transform RGB scaling factors
+/// Calculates Bradford Chromatic Adaptation Transform linear sRGB scaling factors
 /// for target ambient CCT (Kelvin) relative to standard D65 (6500K) white point.
 #[allow(dead_code)]
 pub fn calculate_bradford_multipliers(cct_kelvin: u32, gamma_comp: f32) -> (f32, f32, f32) {
-    let t = (cct_kelvin.max(2500).min(9000)) as f32;
+    let safe_gamma = if gamma_comp.is_finite() {
+        gamma_comp.clamp(0.5, 1.5)
+    } else {
+        1.0
+    };
+    let t = cct_kelvin.clamp(2500, 9000) as f32;
 
-    // Approximate CIE 1931 chromaticity coordinates (x, y) from CCT Kelvin
-    let (x, y) = if t <= 4000.0 {
-        let inv_t = 1000.0 / t;
-        let x = -0.2661239 * inv_t.powi(3) - 0.2343580 * inv_t.powi(2) + 0.8776956 * inv_t + 0.179910;
-        let y = -1.1063814 * x.powi(3) - 1.34811020 * x.powi(2) + 2.18555832 * x - 0.20219683;
+    // CIE Daylight (D-illuminant) for >= 4000K so 6500K aligns with D65; Kang 2002 Planckian below 4000K.
+    let inv_t = 1000.0 / t;
+    let (x, y) = if t < 4000.0 {
+        let x = -0.2661239 * inv_t.powi(3) - 0.2343580 * inv_t.powi(2)
+            + 0.8776956 * inv_t
+            + 0.179910;
+        let y = if t <= 2222.0 {
+            -1.1063814 * x.powi(3) - 1.34811020 * x.powi(2) + 2.18555832 * x - 0.20219683
+        } else {
+            -0.9549476 * x.powi(3) - 1.37418593 * x.powi(2) + 2.09137015 * x - 0.16748867
+        };
         (x, y)
     } else {
-        let inv_t = 1000.0 / t;
-        let x = -3.0258469 * inv_t.powi(3) + 2.1070379 * inv_t.powi(2) + 0.2226347 * inv_t + 0.240390;
-        let y = -3.000 * x.powi(2) + 2.870 * x - 0.275;
+        let x = if t <= 7000.0 {
+            -4.6070 * inv_t.powi(3) + 2.9678 * inv_t.powi(2) + 0.09911 * inv_t + 0.244063
+        } else {
+            -2.0064 * inv_t.powi(3) + 1.9018 * inv_t.powi(2) + 0.24748 * inv_t + 0.237040
+        };
+        let y = -3.0 * x.powi(2) + 2.87 * x - 0.275;
         (x, y)
     };
 
-    // CIE XYZ for destination white point
+    // CIE XYZ for destination white point (Y = 1.0)
     let y_safe = y.max(0.0001);
     let xd = x / y_safe;
     let yd = 1.0f32;
-    let zd = (1.0 - x - y) / y_safe;
+    let zd = ((1.0 - x - y) / y_safe).max(0.0);
 
     // Reference white point D65
     let xs = 0.95047f32;
     let ys = 1.00000f32;
     let zs = 1.08883f32;
 
-    // Bradford cone response transformation
-    // [ rho, gamma, beta ]^T = M_BFD * [ X, Y, Z ]^T
-    let rho_s =  0.8951 * xs + 0.2664 * ys - 0.1614 * zs;
+    // Bradford cone response scaling adapted to XYZ -> linear sRGB
+    let rho_s = 0.8951 * xs + 0.2664 * ys - 0.1614 * zs;
     let gam_s = -0.7502 * xs + 1.7135 * ys + 0.0367 * zs;
-    let bet_s =  0.0389 * xs - 0.0685 * ys + 1.0296 * zs;
+    let bet_s = 0.0389 * xs - 0.0685 * ys + 1.0296 * zs;
 
-    let rho_d =  0.8951 * xd + 0.2664 * yd - 0.1614 * zd;
+    let rho_d = 0.8951 * xd + 0.2664 * yd - 0.1614 * zd;
     let gam_d = -0.7502 * xd + 1.7135 * yd + 0.0367 * zd;
-    let bet_d =  0.0389 * xd - 0.0685 * yd + 1.0296 * zd;
+    let bet_d = 0.0389 * xd - 0.0685 * yd + 1.0296 * zd;
 
-    let k_r = (rho_d / rho_s.max(0.0001)) * gamma_comp;
-    let k_g = (gam_d / gam_s.max(0.0001)) * gamma_comp;
-    let k_b = (bet_d / bet_s.max(0.0001)) * gamma_comp;
+    let s_r = (rho_d / rho_s.max(0.0001)).clamp(0.4, 2.0);
+    let s_g = (gam_d / gam_s.max(0.0001)).clamp(0.4, 2.0);
+    let s_b = (bet_d / bet_s.max(0.0001)).clamp(0.4, 2.0);
 
-    (k_r.clamp(0.5, 1.5), k_g.clamp(0.5, 1.5), k_b.clamp(0.5, 1.5))
+    // Adapted D65 white in Bradford cone space, mapped back via M_BFD^-1 to XYZ then linear sRGB
+    let a_rho = s_r * rho_s;
+    let a_gam = s_g * gam_s;
+    let a_bet = s_b * bet_s;
+
+    // Exact inverse Bradford M_BFD^-1
+    let ax = 0.9869929 * a_rho - 0.1470543 * a_gam + 0.1599627 * a_bet;
+    let ay = 0.4323053 * a_rho + 0.5183603 * a_gam + 0.0492912 * a_bet;
+    let az = -0.0085287 * a_rho + 0.0400428 * a_gam + 0.9684867 * a_bet;
+
+    // CIE XYZ -> linear sRGB (D65)
+    let r_lin = 3.2404542 * ax - 1.5371385 * ay - 0.4985314 * az;
+    let g_lin = -0.9692660 * ax + 1.8760108 * ay + 0.0415560 * az;
+    let b_lin = 0.0556434 * ax - 0.2040259 * ay + 1.0572252 * az;
+
+    let max_chan = r_lin.max(g_lin).max(b_lin).max(0.0001);
+    let k_r = ((r_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
+    let k_g = ((g_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
+    let k_b = ((b_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
+
+    (
+        if k_r.is_finite() { k_r } else { 1.0 },
+        if k_g.is_finite() { k_g } else { 1.0 },
+        if k_b.is_finite() { k_b } else { 1.0 },
+    )
 }
 
-/// Injects Bradford CAT calibrated Gamma LUT directly into the Windows GPU hardware ramp.
 #[cfg(target_os = "windows")]
-pub fn apply_hardware_gamma_ramp(cct_kelvin: u32, gamma_comp: f32) -> Result<()> {
+#[repr(C)]
+struct DdkGammaRamp {
+    red: [u16; 256],
+    green: [u16; 256],
+    blue: [u16; 256],
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_gamma_ramp(ramp: &DdkGammaRamp) -> Result<()> {
     use std::ffi::c_void;
 
-    #[repr(C)]
-    struct DDKGAMMARAMP {
-        red: [u16; 256],
-        green: [u16; 256],
-        blue: [u16; 256],
-    }
-
+    #[link(name = "gdi32")]
     extern "system" {
-        fn GetDC(hWnd: *mut c_void) -> *mut c_void;
-        fn ReleaseDC(hWnd: *mut c_void, hDC: *mut c_void) -> i32;
-        fn SetDeviceGammaRamp(hDC: *mut c_void, lpRamp: *const c_void) -> i32;
+        fn SetDeviceGammaRamp(h_dc: *mut c_void, lp_ramp: *const c_void) -> i32;
     }
-
-    let (kr, kg, kb) = calculate_bradford_multipliers(cct_kelvin, gamma_comp);
-
-    let mut ramp = DDKGAMMARAMP {
-        red: [0; 256],
-        green: [0; 256],
-        blue: [0; 256],
-    };
-
-    for i in 0..256 {
-        let base = (i as f32 / 255.0).powf(1.0 / 1.05) * 65535.0;
-        ramp.red[i] = ((base * kr).clamp(0.0, 65535.0)) as u16;
-        ramp.green[i] = ((base * kg).clamp(0.0, 65535.0)) as u16;
-        ramp.blue[i] = ((base * kb).clamp(0.0, 65535.0)) as u16;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDC(h_wnd: *mut c_void) -> *mut c_void;
+        fn ReleaseDC(h_wnd: *mut c_void, h_dc: *mut c_void) -> i32;
     }
 
     unsafe {
@@ -142,20 +168,51 @@ pub fn apply_hardware_gamma_ramp(cct_kelvin: u32, gamma_comp: f32) -> Result<()>
         if hdc.is_null() {
             anyhow::bail!("Failed to acquire screen device context via GetDC(NULL)");
         }
-        let res = SetDeviceGammaRamp(hdc, &ramp as *const _ as *const c_void);
+        let res = SetDeviceGammaRamp(hdc, ramp as *const _ as *const c_void);
         ReleaseDC(std::ptr::null_mut(), hdc);
         if res == 0 {
             anyhow::bail!("SetDeviceGammaRamp failed on Windows host display");
         }
     }
+    Ok(())
+}
 
-    tracing::info!("🎨 Windows GPU Gamma LUT updated via Bradford CAT: CCT={}K, Comp={:.2}x", cct_kelvin, gamma_comp);
+/// Injects Bradford CAT calibrated Gamma LUT directly into the Windows GPU hardware ramp.
+#[cfg(target_os = "windows")]
+pub fn apply_hardware_gamma_ramp(cct_kelvin: u32, gamma_comp: f32) -> Result<()> {
+    let (kr, kg, kb) = calculate_bradford_multipliers(cct_kelvin, gamma_comp);
+
+    let mut ramp = DdkGammaRamp {
+        red: [0; 256],
+        green: [0; 256],
+        blue: [0; 256],
+    };
+
+    for i in 0..256 {
+        let base = (i as f32 / 255.0).powf(1.0 / 1.05) * 65535.0;
+        ramp.red[i] = (base * kr).clamp(0.0, 65535.0).round() as u16;
+        ramp.green[i] = (base * kg).clamp(0.0, 65535.0).round() as u16;
+        ramp.blue[i] = (base * kb).clamp(0.0, 65535.0).round() as u16;
+    }
+
+    apply_windows_gamma_ramp(&ramp)?;
+
+    tracing::info!(
+        "🎨 Windows GPU Gamma LUT updated via Bradford CAT: CCT={}K, Comp={:.2}x",
+        cct_kelvin,
+        if gamma_comp.is_finite() { gamma_comp } else { 1.0 }
+    );
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn apply_hardware_gamma_ramp(cct_kelvin: u32, gamma_comp: f32) -> Result<()> {
-    tracing::info!("🎨 Simulated Gamma LUT Ramp on macOS/Unix: CCT={}K, Comp={:.2}x", cct_kelvin, gamma_comp);
+    let safe_gamma = if gamma_comp.is_finite() { gamma_comp } else { 1.0 };
+    tracing::info!(
+        "🎨 Simulated Gamma LUT Ramp on macOS/Unix: CCT={}K, Comp={:.2}x",
+        cct_kelvin,
+        safe_gamma
+    );
     Ok(())
 }
 
@@ -163,41 +220,20 @@ pub fn apply_hardware_gamma_ramp(cct_kelvin: u32, gamma_comp: f32) -> Result<()>
 #[allow(dead_code)]
 #[cfg(target_os = "windows")]
 pub fn reset_hardware_gamma_ramp() -> Result<()> {
-    use std::ffi::c_void;
-
-    #[repr(C)]
-    struct DDKGAMMARAMP {
-        red: [u16; 256],
-        green: [u16; 256],
-        blue: [u16; 256],
-    }
-
-    extern "system" {
-        fn GetDC(hWnd: *mut c_void) -> *mut c_void;
-        fn ReleaseDC(hWnd: *mut c_void, hDC: *mut c_void) -> i32;
-        fn SetDeviceGammaRamp(hDC: *mut c_void, lpRamp: *const c_void) -> i32;
-    }
-
-    let mut ramp = DDKGAMMARAMP {
+    let mut ramp = DdkGammaRamp {
         red: [0; 256],
         green: [0; 256],
         blue: [0; 256],
     };
 
     for i in 0..256 {
-        let val = ((i as f32 / 255.0) * 65535.0) as u16;
+        let val = ((i as f32 / 255.0) * 65535.0).round() as u16;
         ramp.red[i] = val;
         ramp.green[i] = val;
         ramp.blue[i] = val;
     }
 
-    unsafe {
-        let hdc = GetDC(std::ptr::null_mut());
-        if !hdc.is_null() {
-            SetDeviceGammaRamp(hdc, &ramp as *const _ as *const c_void);
-            ReleaseDC(std::ptr::null_mut(), hdc);
-        }
-    }
+    apply_windows_gamma_ramp(&ramp)?;
     tracing::info!("🎨 Restored neutral identity gamma ramp on Windows host");
     Ok(())
 }
@@ -206,4 +242,21 @@ pub fn reset_hardware_gamma_ramp() -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 pub fn reset_hardware_gamma_ramp() -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bradford_handles_nan_inf_and_preserves_finite_bounds() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0, 0.0] {
+            let (r, g, b) = calculate_bradford_multipliers(6500, bad);
+            assert!(r.is_finite() && (0.4..=1.5).contains(&r));
+            assert!(g.is_finite() && (0.4..=1.5).contains(&g));
+            assert!(b.is_finite() && (0.4..=1.5).contains(&b));
+        }
+        let (r65, g65, b65) = calculate_bradford_multipliers(6500, 1.0);
+        assert!((r65 - 1.0).abs() < 0.05 && (g65 - 1.0).abs() < 0.05 && (b65 - 1.0).abs() < 0.05);
+    }
 }
