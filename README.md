@@ -159,7 +159,7 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 
 ---
 
-## ⚡ Integrator: The Unified Desktop Companion App (`v1.0.0` - Current Progress)
+## ⚡ Integrator: The Unified Desktop Companion App (`v2.0` - Current Progress)
 
 > [!IMPORTANT]
 > **Project Status: Companion App Built & Operational!**
@@ -191,7 +191,6 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 | **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | User LaunchAgent (macOS) & Elevated Scheduled Task (`IntegratorAutostart` on Win 11) |
 | **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental UDP packet sink (`58284`) & local 24-bit/48kHz spatial test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
-| **Cross-Border File Drag & Drop** | macOS & Win 11 | 📋 **Planned** | Cursor-following cross-screen drag & drop (`dragdrop` feature toggle) |
 | **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver (`input_kvm` feature toggle) |
 | **Universal Camera & Virtual Mic** | macOS & Win 11 | 📋 **Planned** | Hardware-accelerated `CMIOExtension` & DirectShow virtual media pipelines (`camera` feature toggle) |
 | **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover (`multiwan` feature toggle) |
@@ -292,7 +291,7 @@ The unified app is designed around **two primary, mutually exclusive operating s
 Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mode, all other features are organized as modular background services with independent feature flags:
 
 * **📋 Universal Clipboard (✅ Live):**
-  * Bidirectional clipboard synchronization for plain text, image bitmaps (PNG/TIFF), and recursive folder/file trees over authenticated ChaCha20 + HMAC-SHA256 transport.
+  * Bidirectional clipboard synchronization for plain text, image bitmaps (PNG/TIFF), and recursive folder/file trees over authenticated `TransportSessionV2` (`ITR2`, X25519 + ChaCha20-Poly1305 AEAD) transport.
   * Cryptographic SHA-256 payload verification and hash-based deduplication to prevent infinite ping-pong echo loops between devices.
 * **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens" — ✅ Live):**
   * Click and drag any file from macOS Finder past the screen boundary onto the Windows desktop (or vice versa).
@@ -324,9 +323,9 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
     * **Windows PC / Headset Only**: Leaves audio on the PC (ideal when gaming with a low-latency headset or DAC plugged into Windows).
     * **Dual Stereo / Surround (Both Simultaneously)**: Plays across both physical machines with an integrated millisecond sync-calibration slider to eliminate room echo and comb-filtering.
 * **📡 Cryptographic Pairing & Automatic Handover (✅ Live):**
-  * Mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi/LAN with HMAC-SHA256 beacon verification for paired peers.
+  * Mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi/LAN with Ed25519-signed UDP beacon verification (`58280`).
   * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
-  * ChaCha20 + HMAC-SHA256 authenticated and encrypted control (`58281`) and clipboard (`58283`) channels with replay protection and an OS CSPRNG 6-digit PIN pairing handshake with per-IP/global rate-limiting and lockout.
+  * End-to-end encrypted control (`58281`), clipboard (`58283`), benchmark (`58285`), and KVM/drag-drop (`58286`) channels via `TransportSessionV2` (`ITR2`: ephemeral X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305 AEAD), paired via an OS CSPRNG 6-digit PIN SPAKE2 (RFC 9382) + Ed25519 + SAS handshake with per-IP/global rate-limiting and lockout.
 * **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing (📋 Planned):**
   * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
     * **Local Multi-Socket Balancing (Zero 3rd Device / Zero Cloud)**: Routes distinct connections and chunked downloads (HTTP range requests, Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput) without session breaking or account lockouts.
