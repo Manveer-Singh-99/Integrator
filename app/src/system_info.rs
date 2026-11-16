@@ -1333,6 +1333,41 @@ pub fn local_ip_for_peer(peer_ip: &str) -> Option<String> {
     Some(addr.ip().to_string())
 }
 
+#[inline]
+pub(crate) fn ipv4_in_subnet(iface_ip: Ipv4Addr, netmask: Ipv4Addr, target_ip: Ipv4Addr) -> bool {
+    let mask_u = u32::from(netmask);
+    if mask_u == 0 {
+        return false;
+    }
+    (u32::from(iface_ip) & mask_u) == (u32::from(target_ip) & mask_u)
+}
+
+/// Returns true if `peer_ip` shares an on-link subnet with `local_ip` (or any active local IPv4 interface
+/// when `local_ip` is `None`), distinguishing directly attached links (e.g., USB-C `10.99.99.x`,
+/// Thunderbolt `169.254.x.x`, Direct Ethernet, or PC Mobile Hotspot `192.168.137.x`) from unconfigured
+/// alias IPs routed out an unrelated default gateway.
+pub fn is_same_subnet_as_peer(local_ip: Option<&str>, peer_ip: &str) -> bool {
+    let Ok(peer_v4) = peer_ip.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    for iface in list_local_ipv4_interfaces() {
+        if let Some(expected_lip) = local_ip {
+            if iface.ip != expected_lip {
+                continue;
+            }
+        }
+        if let (Ok(ip_v4), Ok(mask_v4)) = (
+            iface.ip.parse::<Ipv4Addr>(),
+            iface.netmask.parse::<Ipv4Addr>(),
+        ) {
+            if ipv4_in_subnet(ip_v4, mask_v4, peer_v4) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Look up which local interface owns `local_ip`.
 pub fn interface_for_local_ip(local_ip: &str) -> Option<LocalInterfaceInfo> {
     list_local_ipv4_interfaces()
@@ -1370,6 +1405,7 @@ pub fn is_direct_cable_route(peer_ip: &str) -> bool {
 }
 
 /// Directed broadcast targets across all active local IPv4 interfaces plus `255.255.255.255`.
+#[allow(dead_code)]
 pub fn discovery_broadcast_targets() -> Vec<String> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
@@ -1383,6 +1419,24 @@ pub fn discovery_broadcast_targets() -> Vec<String> {
         targets.push(global);
     }
     targets
+}
+
+/// Enumerates `(iface_name, local_ip, broadcast_ip, transport)` across all active IPv4 interfaces
+/// so UDP discovery can bind per-interface sockets (vital for Thunderbolt Bridge, Direct Ethernet
+/// `169.254.x.x`, and Windows Mobile Hotspot `192.168.137.x` when Wi-Fi is also active).
+pub fn discovery_interface_endpoints() -> Vec<(String, String, String, LinkTransport)> {
+    let mut endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for iface in list_local_ipv4_interfaces() {
+        if iface.ip.is_empty() || iface.broadcast.is_empty() {
+            continue;
+        }
+        let key = (iface.name.clone(), iface.ip.clone(), iface.broadcast.clone());
+        if seen.insert(key) {
+            endpoints.push((iface.name, iface.ip, iface.broadcast, iface.transport));
+        }
+    }
+    endpoints
 }
 
 /// Enumerate all active non-loopback IPv4 interfaces with mask, broadcast, transport type, and link speed.
@@ -1487,11 +1541,13 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             .to_string_lossy()
             .into_owned();
 
-        // Skip virtual utun / awdl / llw tunnels unless no real interfaces exist
+        // Skip virtual utun / awdl / llw / point-to-point tunnel interfaces unless no real interfaces exist
         if name.starts_with("utun")
             || name.starts_with("awdl")
             || name.starts_with("llw")
             || name.starts_with("anpi")
+            || name.starts_with("gif")
+            || name.starts_with("stf")
         {
             continue;
         }
@@ -1571,39 +1627,95 @@ fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
     map
 }
 
-#[cfg(target_os = "macos")]
-fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option<u32>) {
+#[cfg(any(target_os = "macos", test))]
+fn classify_mac_friendly_name(friendly: &str) -> LinkTransport {
     let lower_friendly = friendly.to_ascii_lowercase();
-    let _lower_iface = iface.to_ascii_lowercase();
-
-    // Only classify as Thunderbolt if `networksetup` explicitly maps this device to Thunderbolt.
-    // Never classify arbitrary `bridge*` (e.g., Internet Sharing `bridge100` or VM bridges) as Thunderbolt.
-    // Likewise, only classify as DirectUsb for genuine point-to-point USB CDC/NCM/RNDIS/Apple bridges,
-    // not generic USB-to-RJ45 Ethernet LAN adapters.
-    let mut transport = if lower_friendly.contains("wi-fi") || lower_friendly.contains("airport") {
+    if lower_friendly.contains("wi-fi") || lower_friendly.contains("airport") {
         LinkTransport::Wifi
     } else if lower_friendly.contains("thunderbolt") {
         LinkTransport::Thunderbolt
-    } else if lower_friendly.contains("cdc")
-        || lower_friendly.contains("ncm")
-        || lower_friendly.contains("rndis")
-        || lower_friendly.contains("iphone")
+    } else if lower_friendly.contains("iphone")
         || lower_friendly.contains("ipad")
+        || lower_friendly.contains("rndis")
         || lower_friendly.contains("useth")
     {
         LinkTransport::DirectUsb
     } else if lower_friendly.contains("ethernet")
         || lower_friendly.contains("lan")
+        || lower_friendly.contains("ax88")
+        || lower_friendly.contains("realtek")
+        || lower_friendly.contains("gbe")
+        || lower_friendly.contains("2.5g")
+        || lower_friendly.contains("5gbe")
+        || lower_friendly.contains("10g")
+        || lower_friendly.contains("usb-c")
+        || lower_friendly.contains("type-c")
+        || lower_friendly.contains("belkin")
+        || lower_friendly.contains("anker")
+        || lower_friendly.contains("plugable")
+        || lower_friendly.contains("caldigit")
+        || lower_friendly.contains("dock")
         || lower_friendly.contains("usb")
     {
         LinkTransport::Ethernet
+    } else if lower_friendly.contains("cdc") || lower_friendly.contains("ncm") {
+        LinkTransport::DirectUsb
     } else {
         LinkTransport::Unknown
-    };
+    }
+}
 
-    // macOS presents direct host-to-host USB-C NCM links (`AppleUSBDeviceNCM11Data`) as generic
+#[cfg(any(target_os = "macos", test))]
+fn parse_mac_ifconfig_media(txt: &str) -> (Option<u32>, bool, bool) {
+    let mut speed_mbps = None;
+    let mut is_ncm_media = false;
+    let mut is_wired_media = false;
+    for line in txt.lines() {
+        let t = line.trim();
+        if let Some(media) = t.strip_prefix("media:") {
+            let ml = media.to_ascii_lowercase();
+            if ml.contains("10gbase") || ml.contains("10000") {
+                speed_mbps = Some(10000);
+                is_wired_media = true;
+            } else if ml.contains("5000base") {
+                speed_mbps = Some(5000);
+                is_wired_media = true;
+            } else if ml.contains("2500base") {
+                speed_mbps = Some(2500);
+                is_wired_media = true;
+            } else if ml.contains("1000base") {
+                speed_mbps = Some(1000);
+                is_wired_media = true;
+            } else if ml.contains("100base") {
+                speed_mbps = Some(100);
+                is_wired_media = true;
+            } else if ml.contains("10base") {
+                speed_mbps = Some(10);
+                is_wired_media = true;
+            } else if ml.contains("base") || ml.contains("ethernet") || ml.contains("full-duplex") {
+                is_wired_media = true;
+            }
+            if ml.contains("cdc") || ml.contains("ncm") {
+                is_ncm_media = true;
+            }
+        }
+    }
+    (speed_mbps, is_ncm_media, is_wired_media)
+}
+
+#[cfg(target_os = "macos")]
+fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option<u32>) {
+    let lower_friendly = friendly.to_ascii_lowercase();
+
+    // Only classify as Thunderbolt if `networksetup` explicitly maps this device to Thunderbolt.
+    // Never classify arbitrary `bridge*` (e.g., Internet Sharing `bridge100` or VM bridges) as Thunderbolt.
+    // Likewise, only classify as DirectUsb for genuine point-to-point USB CDC/NCM/RNDIS/Apple bridges,
+    // not generic USB-C-to-RJ45 Ethernet LAN adapters used on Intel & Apple Silicon Macs.
+    let mut transport = classify_mac_friendly_name(friendly);
+
+    // macOS presents Apple Silicon host-to-host USB-C NCM links (`AppleUSBDeviceNCM11Data`) as generic
     // "Ethernet Adapter (enN)" with `100baseTX` media. Confirm NCM backing via IORegistry so
-    // USB-C links get DirectUsb prioritization and full streaming bitrates.
+    // Apple Silicon USB-C links get DirectUsb prioritization and full streaming bitrates.
     if !lower_friendly.contains("wi-fi")
         && !lower_friendly.contains("airport")
         && !lower_friendly.contains("thunderbolt")
@@ -1616,29 +1728,13 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
     if let Ok(out) = Command::new("/sbin/ifconfig").arg(iface).output() {
         if out.status.success() {
             let txt = String::from_utf8_lossy(&out.stdout);
-            for line in txt.lines() {
-                let t = line.trim();
-                if let Some(media) = t.strip_prefix("media:") {
-                    let ml = media.to_ascii_lowercase();
-                    if ml.contains("10gbase") || ml.contains("10000") {
-                        speed_mbps = Some(10000);
-                    } else if ml.contains("5000base") {
-                        speed_mbps = Some(5000);
-                    } else if ml.contains("2500base") {
-                        speed_mbps = Some(2500);
-                    } else if ml.contains("1000base") {
-                        speed_mbps = Some(1000);
-                    } else if ml.contains("100base") {
-                        speed_mbps = Some(100);
-                    } else if ml.contains("10base") {
-                        speed_mbps = Some(10);
-                    }
-                    if (ml.contains("cdc") || ml.contains("ncm"))
-                        && matches!(transport, LinkTransport::Unknown | LinkTransport::Ethernet)
-                    {
-                        transport = LinkTransport::DirectUsb;
-                    }
-                }
+            let (parsed_speed, is_ncm_media, is_wired_media) = parse_mac_ifconfig_media(&txt);
+            speed_mbps = parsed_speed;
+            if is_ncm_media && transport == LinkTransport::Unknown {
+                transport = LinkTransport::DirectUsb;
+            } else if transport == LinkTransport::Unknown && is_wired_media {
+                // Ensure USB-C Ethernet adapters missing from cached `networksetup` never rank behind Wi-Fi
+                transport = LinkTransport::Ethernet;
             }
         }
     }
@@ -1808,6 +1904,50 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     out
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn classify_windows_adapter(name: &str, desc: &str, medium: &str) -> (bool, LinkTransport, bool) {
+    let combined = format!("{} {} {}", name, desc, medium).to_ascii_lowercase();
+    let is_apple_usb_ncm =
+        combined.contains("apple usb-c ncm") || combined.contains("appleusbncm");
+    let is_vpn = !is_apple_usb_ncm
+        && (combined.contains("wintun")
+            || combined.contains("wireguard")
+            || combined.contains("tailscale")
+            || combined.contains("zerotier")
+            || combined.contains("tap-windows")
+            || combined.contains("openvpn")
+            || combined.contains("vpn"));
+    let is_hotspot = combined.contains("wi-fi direct");
+
+    let transport = if is_vpn {
+        LinkTransport::Unknown
+    } else if combined.contains("wi-fi")
+        || combined.contains("wireless")
+        || combined.contains("wlan")
+        || combined.contains("802.11")
+        || combined.contains("native802_11")
+    {
+        LinkTransport::Wifi
+    } else if combined.contains("thunderbolt") || combined.contains("usb4") {
+        LinkTransport::Thunderbolt
+    } else if is_apple_usb_ncm || combined.contains("rndis") || combined.contains("apple mobile") {
+        LinkTransport::DirectUsb
+    } else if combined.contains("ethernet")
+        || combined.contains("gbe")
+        || combined.contains("lan")
+        || combined.contains("ax88")
+        || combined.contains("realtek")
+    {
+        LinkTransport::Ethernet
+    } else if combined.contains("ncm") || combined.contains("cdc") {
+        LinkTransport::DirectUsb
+    } else {
+        LinkTransport::Ethernet
+    };
+
+    (is_vpn, transport, is_hotspot)
+}
+
 #[cfg(target_os = "windows")]
 fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, String, LinkTransport, Option<u32>)> {
     static META_CACHE: OnceLock<
@@ -1850,36 +1990,14 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
                     continue;
                 };
                 let name = parts[1].trim().to_string();
-                let desc = parts[2].trim().to_string();
+                let raw_desc = parts[2].trim().to_string();
                 let speed = parse_windows_link_speed(parts[3].trim());
                 let medium = parts.get(4).map(|s| s.trim()).unwrap_or("");
-                let combined = format!("{} {} {}", name, desc, medium).to_ascii_lowercase();
-
-                let is_vpn = combined.contains("wintun")
-                    || combined.contains("wireguard")
-                    || combined.contains("tailscale")
-                    || combined.contains("zerotier")
-                    || combined.contains("tap-windows");
-
-                let transport = if is_vpn {
-                    LinkTransport::Unknown
-                } else if combined.contains("wi-fi")
-                    || combined.contains("wireless")
-                    || combined.contains("wlan")
-                    || combined.contains("802.11")
-                    || combined.contains("native802_11")
-                {
-                    LinkTransport::Wifi
-                } else if combined.contains("thunderbolt") || combined.contains("usb4") {
-                    LinkTransport::Thunderbolt
-                } else if combined.contains("ncm")
-                    || combined.contains("cdc")
-                    || combined.contains("rndis")
-                    || combined.contains("apple mobile")
-                {
-                    LinkTransport::DirectUsb
+                let (_is_vpn, transport, is_hotspot) = classify_windows_adapter(&name, &raw_desc, medium);
+                let desc = if is_hotspot && !raw_desc.to_ascii_lowercase().contains("hotspot") {
+                    format!("PC Wireless Hotspot - {}", raw_desc)
                 } else {
-                    LinkTransport::Ethernet
+                    raw_desc
                 };
                 map.insert(idx, (name, desc, transport, speed));
             }
@@ -1991,5 +2109,72 @@ mod tests {
     fn test_sunshine_adapter_name_rejects_control_chars() {
         assert!(validate_sunshine_adapter_name("NVIDIA GeForce RTX 4090\nport = 1").is_err());
         assert!(validate_sunshine_adapter_name("NVIDIA GeForce RTX 4090").is_ok());
+    }
+
+    #[test]
+    fn test_mac_classify_intel_usbc_ethernet_tb_wifi_and_ncm() {
+        use super::{classify_mac_friendly_name, parse_mac_ifconfig_media, LinkTransport};
+
+        assert_eq!(classify_mac_friendly_name("Thunderbolt Bridge"), LinkTransport::Thunderbolt);
+        assert_eq!(classify_mac_friendly_name("USB 10/100/1000 LAN"), LinkTransport::Ethernet);
+        assert_eq!(classify_mac_friendly_name("AX88179A"), LinkTransport::Ethernet);
+        assert_eq!(classify_mac_friendly_name("Belkin USB-C LAN"), LinkTransport::Ethernet);
+        assert_eq!(classify_mac_friendly_name("Wi-Fi"), LinkTransport::Wifi);
+        assert_eq!(classify_mac_friendly_name("en4"), LinkTransport::Unknown);
+
+        let ifc_sample = "en4: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tmedia: autoselect (2500base-T <full-duplex>)\n\tstatus: active\n";
+        assert_eq!(parse_mac_ifconfig_media(ifc_sample), (Some(2500), false, true));
+    }
+
+    #[test]
+    fn test_windows_classify_tb_usb4_ethernet_hotspot_and_apple_ncm() {
+        use super::{classify_windows_adapter, LinkTransport};
+
+        assert_eq!(
+            classify_windows_adapter("Apple USB-C NCM", "Wintun Userspace Tunnel", ""),
+            (false, LinkTransport::DirectUsb, false)
+        );
+        assert_eq!(
+            classify_windows_adapter("Ethernet 3", "Thunderbolt(TM) Networking", ""),
+            (false, LinkTransport::Thunderbolt, false)
+        );
+        assert_eq!(
+            classify_windows_adapter("Ethernet 4", "USB4(TM) P2P Network Adapter", ""),
+            (false, LinkTransport::Thunderbolt, false)
+        );
+        assert_eq!(
+            classify_windows_adapter("Ethernet 2", "Realtek USB GbE Family Controller", "802.3"),
+            (false, LinkTransport::Ethernet, false)
+        );
+        assert_eq!(
+            classify_windows_adapter("Local Area Connection* 10", "Microsoft Wi-Fi Direct Virtual Adapter #2", "Native802_11"),
+            (false, LinkTransport::Wifi, true)
+        );
+        assert_eq!(
+            classify_windows_adapter("Tailscale", "Tailscale Tunnel Wintun", ""),
+            (true, LinkTransport::Unknown, false)
+        );
+    }
+
+    #[test]
+    fn test_ipv4_in_subnet_covers_link_local_hotspot_and_usbc() {
+        use super::ipv4_in_subnet;
+        use std::net::Ipv4Addr;
+
+        assert!(ipv4_in_subnet(
+            Ipv4Addr::new(169, 254, 12, 5),
+            Ipv4Addr::new(255, 255, 0, 0),
+            Ipv4Addr::new(169, 254, 240, 9),
+        ));
+        assert!(ipv4_in_subnet(
+            Ipv4Addr::new(192, 168, 137, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::new(192, 168, 137, 88),
+        ));
+        assert!(!ipv4_in_subnet(
+            Ipv4Addr::new(10, 99, 99, 2),
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::new(192, 168, 2, 2),
+        ));
     }
 }

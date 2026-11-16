@@ -8,7 +8,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpStream, UdpSocket};
@@ -187,6 +187,7 @@ pub struct PeerCandidate {
     pub link_speed_mbps: Option<u32>,
     pub link_description: String,
     pub local_ip_used: Option<String>,
+    pub same_subnet: bool,
     pub rtt_ms: Option<f64>,
     pub trusted: bool,
 }
@@ -419,35 +420,55 @@ impl DiscoveryManager {
                             let sender_name_clone = sender_name_clean.clone();
                             let dev_id_clone = dev_id.clone();
 
-                            let Ok((is_self_ip, transport, speed_mbps, link_desc, local_ip, trusted)) =
-                                tokio::task::spawn_blocking(move || {
-                                    let is_self = sender_name_clone == my_name_clone
-                                        && is_own_local_ip(&peer_ip_for_route);
-                                    if is_self {
-                                        return (
-                                            true,
-                                            LinkTransport::Unknown,
-                                            None,
-                                            String::new(),
-                                            None,
-                                            false,
-                                        );
-                                    }
-                                    let (transport, speed_mbps, link_desc, local_ip) =
-                                        system_info::describe_route_to_peer(&peer_ip_for_route);
-                                    let trusted = trust::observe_discovered_peer(
-                                        &dev_id_clone,
-                                        &sender_name_clone,
-                                        &peer_ip_for_route,
-                                        transport.is_direct_cable(),
+                            let Ok((
+                                is_self_ip,
+                                transport,
+                                speed_mbps,
+                                link_desc,
+                                local_ip,
+                                same_subnet,
+                                trusted,
+                            )) = tokio::task::spawn_blocking(move || {
+                                let is_self = sender_name_clone == my_name_clone
+                                    && is_own_local_ip(&peer_ip_for_route);
+                                if is_self {
+                                    return (
+                                        true,
+                                        LinkTransport::Unknown,
+                                        None,
+                                        String::new(),
+                                        None,
+                                        false,
+                                        false,
                                     );
-                                    // Persist verified paired peer IPs only, preventing spoofed LAN history pollution.
-                                    if trusted {
-                                        record_recent_peer_ip(&peer_ip_for_route);
-                                    }
-                                    (false, transport, speed_mbps, link_desc, local_ip, trusted)
-                                })
-                                .await
+                                }
+                                let (transport, speed_mbps, link_desc, local_ip) =
+                                    system_info::describe_route_to_peer(&peer_ip_for_route);
+                                let same_subnet = system_info::is_same_subnet_as_peer(
+                                    local_ip.as_deref(),
+                                    &peer_ip_for_route,
+                                );
+                                let trusted = trust::observe_discovered_peer(
+                                    &dev_id_clone,
+                                    &sender_name_clone,
+                                    &peer_ip_for_route,
+                                    transport.is_direct_cable(),
+                                );
+                                // Persist verified paired peer IPs only, preventing spoofed LAN history pollution.
+                                if trusted {
+                                    record_recent_peer_ip(&peer_ip_for_route);
+                                }
+                                (
+                                    false,
+                                    transport,
+                                    speed_mbps,
+                                    link_desc,
+                                    local_ip,
+                                    same_subnet,
+                                    trusted,
+                                )
+                            })
+                            .await
                             else {
                                 continue;
                             };
@@ -547,6 +568,7 @@ impl DiscoveryManager {
                                 link_speed_mbps: speed_mbps,
                                 link_description: link_desc,
                                 local_ip_used: local_ip,
+                                same_subnet,
                                 rtt_ms,
                                 trusted,
                             };
@@ -605,7 +627,8 @@ impl DiscoveryManager {
                 let manual_snapshot = manual_ips_ref.read().await.clone();
                 let fallback_clone = fallback_name.clone();
 
-                if let Ok((bytes, targets)) = tokio::task::spawn_blocking(move || {
+                if let Ok((bytes, no_endpoints, unicast_targets)) =
+                    tokio::task::spawn_blocking(move || {
                     let profile = system_info::collect_local_profile();
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -681,20 +704,39 @@ impl DiscoveryManager {
                     };
 
                     let bytes = serde_json::to_vec(&beacon).unwrap_or_default();
-                    let mut targets: Vec<String> = system_info::discovery_broadcast_targets();
+                    let endpoints = system_info::discovery_interface_endpoints();
+                    let mut unicast_targets: Vec<String> = Vec::new();
+                    let mut seen: HashSet<String> = HashSet::new();
                     let hist = load_peer_history();
-                    let mut seen: HashSet<String> = targets.iter().cloned().collect();
                     for ip in manual_snapshot.iter().chain(hist.recent_ips.iter()) {
                         if seen.insert(ip.clone()) {
-                            targets.push(ip.clone());
+                            unicast_targets.push(ip.clone());
                         }
                     }
-                    (bytes, targets)
+                    if !bytes.is_empty() {
+                        for (iface_name, ip_str, bcast_str, _transport) in &endpoints {
+                            broadcast_beacon_on_interface(
+                                iface_name,
+                                ip_str,
+                                bcast_str,
+                                DISCOVERY_PORT,
+                                &bytes,
+                            );
+                        }
+                    }
+                    (bytes, endpoints.is_empty(), unicast_targets)
                 })
                 .await
                 {
                     if !bytes.is_empty() {
-                        for ip in targets {
+                        if no_endpoints {
+                            let global_bcast = SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::BROADCAST),
+                                DISCOVERY_PORT,
+                            );
+                            let _ = broadcaster_socket.send_to(&bytes, global_bcast).await;
+                        }
+                        for ip in unicast_targets {
                             if let Ok(parsed) = ip.parse::<IpAddr>() {
                                 let target = SocketAddr::new(parsed, DISCOVERY_PORT);
                                 let _ = broadcaster_socket.send_to(&bytes, target).await;
@@ -711,6 +753,55 @@ impl DiscoveryManager {
     }
 }
 
+fn broadcast_beacon_on_interface(
+    iface_name: &str,
+    local_ip_str: &str,
+    bcast_ip_str: &str,
+    port: u16,
+    bytes: &[u8],
+) {
+    let Ok(local_v4) = local_ip_str.parse::<Ipv4Addr>() else {
+        return;
+    };
+    let bind_addr = SocketAddr::new(IpAddr::V4(local_v4), 0);
+    let Ok(sock) = std::net::UdpSocket::bind(bind_addr) else {
+        return;
+    };
+    if sock.set_broadcast(true).is_err() {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+        if let Ok(c_name) = CString::new(iface_name) {
+            // SAFETY: c_name is NUL-terminated; if_nametoindex returns 0 if not found.
+            let if_idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+            if if_idx != 0 {
+                // SAFETY: valid open IPv4 socket fd and u32 interface index for IP_BOUND_IF.
+                unsafe {
+                    let idx_u32 = if_idx as u32;
+                    let _ = libc::setsockopt(
+                        sock.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_BOUND_IF,
+                        &idx_u32 as *const u32 as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = iface_name;
+
+    if let Ok(bcast_v4) = bcast_ip_str.parse::<Ipv4Addr>() {
+        let _ = sock.send_to(bytes, SocketAddr::new(IpAddr::V4(bcast_v4), port));
+    }
+    let _ = sock.send_to(bytes, SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
+}
+
 fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
     candidates
         .iter()
@@ -718,15 +809,17 @@ fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
             // 1. Trusted peers strictly first
             b.trusted
                 .cmp(&a.trusted)
-                // 2. Physical / wired / faster transport first
+                // 2. Directly on a matching local interface subnet (beats routed alias IPs)
+                .then_with(|| b.same_subnet.cmp(&a.same_subnet))
+                // 3. Physical / wired / faster transport first
                 .then_with(|| a.transport.cmp(&b.transport))
-                // 3. Lower measured RTT if available
+                // 4. Lower measured RTT if available
                 .then_with(|| {
                     let ar = a.rtt_ms.unwrap_or(9999.0);
                     let br = b.rtt_ms.unwrap_or(9999.0);
                     ar.partial_cmp(&br).unwrap_or(std::cmp::Ordering::Equal)
                 })
-                // 4. More recently seen
+                // 5. More recently seen
                 .then_with(|| b.last_seen.cmp(&a.last_seen))
         })
         .cloned()
@@ -860,5 +953,43 @@ mod tests {
         assert!(contains_unsafe_text_chars("evil\u{202E}name"));
         assert!(contains_unsafe_text_chars("bad\nline"));
         assert_eq!(sanitize_display_text("  Mac\u{202E}Book\x07Pro  ", 64), "MacBookPro");
+    }
+
+    #[test]
+    fn select_best_peer_prefers_trusted_same_subnet_and_wired_transports() {
+        let now = Instant::now();
+        let make = |ip: &str, transport: LinkTransport, same_subnet: bool, rtt: f64| PeerCandidate {
+            addr: SocketAddr::new(ip.parse().unwrap(), CONTROL_PORT),
+            last_seen: now,
+            os: "windows".into(),
+            device_id: "peer1".into(),
+            device_name: "PC".into(),
+            hardware_model: "Laptop".into(),
+            display_width: 1920,
+            display_height: 1200,
+            display_fps: 165,
+            share_name: None,
+            sunshine_name: None,
+            sunshine_port: 47989,
+            gpus: vec![],
+            transport,
+            link_speed_mbps: None,
+            link_description: transport.label().into(),
+            local_ip_used: None,
+            same_subnet,
+            rtt_ms: Some(rtt),
+            trusted: true,
+        };
+
+        let stale_alias = make("192.168.2.2", LinkTransport::DirectUsb, false, 0.5);
+        let wifi = make("192.168.137.1", LinkTransport::Wifi, true, 1.2);
+        let eth = make("169.254.20.5", LinkTransport::Ethernet, true, 0.6);
+        let tb = make("169.254.10.5", LinkTransport::Thunderbolt, true, 0.3);
+
+        let chosen_tb = select_best_peer(&[wifi.clone(), stale_alias.clone(), eth.clone(), tb.clone()]).unwrap();
+        assert_eq!(chosen_tb.addr.ip().to_string(), "169.254.10.5");
+
+        let chosen_eth = select_best_peer(&[wifi, stale_alias, eth]).unwrap();
+        assert_eq!(chosen_eth.addr.ip().to_string(), "169.254.20.5");
     }
 }

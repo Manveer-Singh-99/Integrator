@@ -20,7 +20,7 @@ fn main() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let deploy_target =
-            std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".to_string());
+            std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".to_string());
 
         let (swift_arch, clang_arch) = match target_arch.as_str() {
             "aarch64" => ("arm64", "arm64"),
@@ -75,11 +75,11 @@ fn main() {
         }
         if let Ok(s) = clip_cmd.status() {
             if s.success() {
-                // OUT_DIR is <target>/<profile>/build/<pkg>/out -> parent x3 is <target>/<profile>
+                // Copy helper binary into <target>/<profile>/ regardless of Cargo's build/<pkg>/<hash>/out vs build/<pkg>-<hash>/out layout
                 if let Some(profile_dir) = PathBuf::from(&out_dir)
                     .ancestors()
-                    .nth(3)
-                    .map(|p| p.to_path_buf())
+                    .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
+                    .and_then(|b| b.parent())
                 {
                     let _ = std::fs::copy(&clip_helper_out, profile_dir.join("macos_clip_files"));
                 }

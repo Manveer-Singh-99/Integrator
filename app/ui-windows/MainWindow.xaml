@@ -103,7 +103,7 @@
                                 <TextBlock x:Name="SidebarPeerName" Text="Searching for peer…"
                                            FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <TextBlock x:Name="SidebarLinkDesc" Text="Searching Ethernet / USB-C / LAN"
+                            <TextBlock x:Name="SidebarLinkDesc" Text="Searching Ethernet / TB / USB-C / Wi-Fi"
                                        FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                        TextTrimming="CharacterEllipsis" />
                             <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2,0,0">

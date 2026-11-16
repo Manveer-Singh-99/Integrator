@@ -3,11 +3,14 @@
 <div align="center">
   <img src="app/icons/icon.png" width="160" alt="Integrator App Icon" />
   <h1>Integrator</h1>
-  <p><strong>Direct USB-C Workstation Fusion Bridge between Apple Silicon Macs and Windows 11 PCs</strong></p>
+  <p><strong>Direct USB-C, Thunderbolt, Ethernet &amp; Wireless Workstation Fusion Bridge between Macs (Apple Silicon &amp; Post-2016 USB-C Intel) and Windows 11 PCs</strong></p>
   <p>$$\int_{\text{Windows 11}}^{\text{macOS}} (\text{Workstation Fusion})\, dt = \text{\textbf{Integrator}}$$</p>
 </div>
 
-**Direct USB-C to USB-C IP networking (`<1 ms` latency) between Apple Silicon Macs (M1/M2/M3/M4) and Windows 11 PCs — using any standard USB-C cable, with Secure Boot ON and zero reboots.**
+**Low-latency (`<1 ms` wired) workstation fusion between Macs and Windows PCs — over a plain USB-C cable (`<1 ms` CDC-NCM on Apple Silicon with Secure Boot ON and zero reboots), Thunderbolt 3/4 Bridge, Wired Ethernet, or the Windows PC's Wireless Hotspot.**
+
+> [!WARNING]
+> **Intel Mac Testing Status:** Support for post-2016 Intel Macs with USB-C ports (Universal `arm64` + `x86_64` macOS `12.0+` build, wired via Ethernet / USB-C Ethernet adapters / Thunderbolt 3–4 Bridge or wireless via Windows PC Mobile Hotspot / LAN) has been added cleanly to the app, **however Intel Macs have NOT been tested at all as of now or for the foreseeable future.** Only Apple Silicon (M1) + Windows 11 have been physically tested.
 
 Even though native Mac-to-Mac and Windows-to-Windows tools exist that can do this without any installation, this solution offers true zero latency and total flexibility. Furthermore, mobile devices (such as iPads, iPhones, and Android tablets) that can install Moonlight from their respective app stores can also act as high-performance extended displays. For now, only this cross-platform (Mac $\leftrightarrow$ Windows) implementation exists supporting USB 2.0 bidirectionally (meaning even standard USB-C charging cables work); other implementations for Mac-to-Mac and PC-to-PC will arrive when I get time.
 
@@ -94,7 +97,8 @@ This project was developed, tested, and benchmarked on the following physical ha
 
 | Device | Specifications | Role |
 | :--- | :--- | :--- |
-| **Apple Silicon Mac** | **MacBook Pro 13" (M1, 2020)**<br>• Chip: Apple M1 (8 cores)<br>• Memory: 8 GB Unified Memory<br>• Native Display: 2560 × 1600 Retina @ 60Hz<br>• OS: macOS Sequoia | Client / Second Screen Display |
+| **Apple Silicon Mac** *(Tested)* | **MacBook Pro 13" (M1, 2020)**<br>• Chip: Apple M1 (8 cores)<br>• Memory: 8 GB Unified Memory<br>• Native Display: 2560 × 1600 Retina @ 60Hz<br>• OS: macOS Sequoia | Client / Second Screen Display (supports plain USB-C CDC-NCM) |
+| **Post-2016 Intel USB-C Macs** *(Untested)* | **MacBook / MacBook Pro / MacBook Air (2016–2020 USB-C, macOS 12.0+)**<br>• Architecture: `x86_64` Universal build<br>• Transports: Wired Ethernet (USB-C adapter or RJ-45), Thunderbolt 3/4 Bridge, or PC Wireless Hotspot<br>• ⚠️ **Not tested at all as of now or for the foreseeable future** | Best-effort `x86_64` target (plain USB-C CDC-NCM not supported on Intel xHCI) |
 | **Windows 11 PC** | **HP OMEN Gaming Laptop (16")**<br>• CPU: Intel Core Ultra 9 285H (Arrow Lake)<br>• iGPU: Intel Arc 140T GPU (16GB shared, QuickSync Xe2)<br>• dGPU: NVIDIA GeForce RTX 5070 Laptop GPU (8GB GDDR6)<br>• Internal Display: 1920 × 1200 16:10 @ 165Hz<br>• OS: Windows 11 (Secure Boot ON, Test Signing OFF) | Host Workstation & Stream Server |
 | **Mobile Extended Display** | **iPad (A16 / 10.9" Liquid Retina)**<br>• Native Resolution: 2360 × 1640 @ 60Hz<br>• Software: Moonlight Game Streaming (iPadOS App Store)<br>• Link: USB-C wired (Personal Hotspot NCM) or 5GHz Wi-Fi | Auxiliary Extended Display (Slot 0) |
 | **Cables Tested** | Standard USB-C to USB-C charging cables (USB 2.0 480 Mbps lines) & full-spec USB4 / Thunderbolt cables | Point-to-point physical connection |
@@ -201,10 +205,13 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 
 The companion app is located in the [`app/`](app/) directory:
 
-#### On macOS:
+#### On macOS (Universal Apple Silicon + Intel, macOS 12.0+):
 ```bash
-cd app
-cargo build --release
+# Single-architecture build for this Mac:
+cd app && cargo build --release
+
+# Or build a Universal (arm64 + x86_64) .app bundle targeting macOS 12.0+ at app/target/bundle/Integrator.app:
+bash ./macos/build-universal-app.sh
 ```
 To run the packaged bundle or copy to your Applications folder:
 ```bash
@@ -214,6 +221,9 @@ To run the packaged bundle or copy to your Applications folder:
 # Packaged macOS Application bundle:
 open /Applications/Integrator.app
 ```
+
+> [!NOTE]
+> **Post-2016 Intel Macs (`x86_64`, USB-C):** Intel Macs cannot act as a plain USB-C CDC-NCM gadget (`USB\VID_05AC&PID_1902`), so skip `Install-AppleUsbNcm.ps1` and `install-macos.sh`. Instead, connect via **Thunderbolt 3/4 Bridge**, **Wired Ethernet** (USB-C Ethernet dongle / RJ-45, including routerless `169.254.x.x`), or the **Windows PC's Mobile Hotspot** (`192.168.137.x` — Integrator automatically opens scoped `LocalSubnet` Windows Firewall rules on startup and binds per-interface UDP broadcasts across both hosts). **Intel Macs have NOT been tested at all as of now or for the foreseeable future.**
 
 #### On Windows 11 (x64 or ARM64):
 ```powershell

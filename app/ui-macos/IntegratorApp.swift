@@ -933,7 +933,7 @@ struct MainDashboardView: View {
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                 }
-                Text(s?.link_description ?? "Awaiting USB-C / LAN beacon")
+                Text(s?.link_description ?? "Awaiting Ethernet / TB / USB-C / Wi-Fi beacon")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -1054,7 +1054,9 @@ struct MainDashboardView: View {
             } else {
                 Text(s?.gpu_controls_supported == true
                      ? "DirectX / NVENC / Moonlight hardware routing ready."
-                     : "Apple Silicon Unified Memory & VideoToolbox active.")
+                     : (s?.cpu_brand.localizedCaseInsensitiveContains("Apple") == true
+                        ? "Apple Silicon Unified Memory & VideoToolbox active."
+                        : "macOS VideoToolbox hardware encoding active."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

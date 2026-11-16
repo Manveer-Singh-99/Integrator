@@ -571,6 +571,97 @@ fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
     opts.open(path).ok()
 }
 
+#[cfg(target_os = "windows")]
+/// Ensures inbound Windows Defender Firewall rules allow Integrator discovery and encrypted
+/// services over direct Ethernet, Thunderbolt/USB4, Windows Mobile Hotspot, and USB-C NCM links
+/// even when Windows assigns those interfaces to the Public profile.
+fn ensure_windows_firewall_rules() {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const REMOTE_SCOPES: &str =
+        "LocalSubnet,10.99.99.0/24,192.168.2.0/24,192.168.137.0/24,169.254.0.0/16";
+
+    let Ok(exe_path) = std::env::current_exe() else {
+        return;
+    };
+    let exe_str = exe_path.to_string_lossy().trim().to_string();
+    if exe_str.is_empty()
+        || exe_str.contains('"')
+        || exe_str.chars().any(|c| c.is_control())
+    {
+        return;
+    }
+
+    let netsh = system_info::system32_exe("netsh.exe");
+    let rules = [
+        ("Integrator Core (TCP)", "TCP", "58281,58283,58285,58286"),
+        ("Integrator Core (UDP)", "UDP", "58280,58284"),
+    ];
+
+    for (rule_name, proto, ports) in rules {
+        let already_matches = Command::new(&netsh)
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={}", rule_name),
+                "verbose",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let txt = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+                txt.contains(&exe_str.to_ascii_lowercase()) && txt.contains("localsubnet")
+            })
+            .unwrap_or(false);
+
+        if already_matches {
+            continue;
+        }
+
+        let _ = Command::new(&netsh)
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={}", rule_name),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let _ = Command::new(&netsh)
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", rule_name),
+                "dir=in",
+                "action=allow",
+                &format!("program={}", exe_str),
+                &format!("protocol={}", proto),
+                &format!("localport={}", ports),
+                &format!("remoteip={}", REMOTE_SCOPES),
+                "profile=any",
+                "enable=yes",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 impl IntegratorCore {
     pub fn init_global() -> Result<Arc<Self>> {
         if let Some(existing) = GLOBAL_CORE.get() {
@@ -673,6 +764,14 @@ impl IntegratorCore {
             kvm,
         });
         let _ = GLOBAL_CORE.set(Arc::clone(&core));
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::thread::Builder::new()
+                .name("win-fw-init".into())
+                .spawn(ensure_windows_firewall_rules);
+        }
+
         Ok(core)
     }
 
