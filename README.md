@@ -105,6 +105,80 @@ This project was developed, tested, and benchmarked on the following physical ha
 
 ---
 
+## Port & Cable Guide (Plain-English Edition)
+
+Integrator connects a **Mac** and a **Windows PC** so they feel like one computer (shared mouse & keyboard, copy-paste, file drag-and-drop, and second screen).
+Which cable you should use depends on **what kind of Mac you have** and **which ports are on your computers**.
+
+### Step 1: Check Which Mac You Have
+Click the **Apple logo ()** in the top-left corner of your screen → **About This Mac**:
+
+* **Says "Chip: Apple M1 / M2 / M3 / M4..."** *(Late 2020 or newer)*
+  **Great news:** You can connect directly to a Windows PC using just a regular **USB-C cable**. *(You'll just run the quick Windows setup script once in [Quick Start](#quick-start) below.)*
+* **Says "Processor: Intel..."** *(2016–2020 Macs)*
+  **Important:** Intel Macs **cannot** connect directly with a plain USB-C cable. Instead, connect them using an **Ethernet cable/adapter**, a **Thunderbolt cable** (if your PC also has Thunderbolt), or **Wi-Fi / PC Hotspot**.
+  *(Note: Intel Macs are supported in software, but have **not been tested at all as of now or for the foreseeable future**.)*
+* **macOS Version:** Your Mac needs **macOS 12 (Monterey) or newer**.
+
+### Step 2: Know Your Ports (What They Look Like)
+
+| Port Shape | Name | What It Looks Like |
+| :--- | :--- | :--- |
+| **Small oval** | **USB-C** | Looks like a modern phone / MacBook charger port (plugs in either way up). |
+| **Small oval + ⚡ icon** | **Thunderbolt 3 / 4** | Same oval shape as USB-C, usually with a tiny **lightning bolt (⚡)** printed next to it. |
+| **Big rectangle** | **USB-A** | The classic rectangular USB port (often blue inside on faster ports). |
+| **Square clip-in port** | **Ethernet (LAN)** | Looks like an oversized phone jack where a network cable clicks in. |
+
+#### Which Mac port should you plug into?
+* **If you have a MacBook (Air or Pro):** Try the **USB-C port on the left side closest to the screen hinge** first. On some Macs, only that main port allows PC-to-Mac direct USB connections.
+* **If you have a Mac mini, Mac Studio, or iMac with BOTH oval and rectangular ports:** **Always plug into an oval USB-C port**, never the big rectangular USB-A port on the Mac. *(On Mac mini / Studio, use the USB-C port closest to the power cord or Ethernet port first.)*
+
+### Step 3: Pick the Right Cable or Connection
+
+#### Option A: USB-C to USB-C Cable *(Small oval plug on both ends — Apple Silicon Macs only)*
+This is the cleanest setup if you have an **M1 / M2 / M3 / M4 Mac** and your Windows PC has a **USB-C port**:
+* **Best cable to use:** A **USB-C Data Cable** (the thicker, shorter kind that comes with portable SSDs or monitors, labeled **5 Gbps / 10 Gbps / 20 Gbps / USB 3.2**). It gives `<1 ms` delay, smooth high-refresh display streaming, and fast multi-gigabyte file copies.
+* **MacBook charging cables (like Apple's white cord):** **Usually work!** Most MacBook charging cords are **USB 2.0 (480 Mbps)** — slower for giant files and extreme refresh rates, totally fine for mouse/keyboard, clipboard, and 60Hz screen extension.
+* **Cheap phone charger cables:** Some very cheap charging-only cords have **no data wires inside** — if your PC doesn't react at all when plugged in, swap to a different USB-C cable.
+* **Avoid active Thunderbolt cables for USB mode:** Some expensive Thunderbolt 3/4 cables (with a ⚡ and `3` or `4` on the plug) are wired only for Thunderbolt/video and skip standard USB wires. A regular USB-C data cable is much more reliable unless you specifically want Option C below.
+
+#### Option B: USB-A to USB-C Cable *(Big rectangle on PC → Small oval on Apple Silicon Mac)*
+Use this only if your **Windows PC has no USB-C port**, only rectangular USB-A ports:
+* Plug the **big rectangle (USB-A)** into the **Windows PC**, and the **small oval (USB-C)** into the **M-series Mac**.
+* Look inside the big USB-A plug: **blue (or teal/red) plastic inside** = faster 5–10 Gbps cable; **white or black plastic** = slower USB 2.0 cable. Make sure it's a **data cable**, not a power-only cord.
+* *(Heads up: USB-A to USB-C should work per USB standards, though only USB-C to USB-C has been physically tested so far.)*
+* **Never use a USB-A to USB-A cable** (big rectangle on both ends) — it will not work.
+
+#### Option C: Thunderbolt 3 / 4 Bridge *(Lightning bolt ⚡ port on BOTH Mac and PC)*
+* Only works if **both** your Mac and your Windows PC specifically have **⚡ Thunderbolt 3/4 or USB4 ports** (most Windows gaming/office laptops only have regular USB-C, not Thunderbolt networking).
+* Use a **Thunderbolt 3 or Thunderbolt 4 cable**. Gives ultra-fast 10–40 Gbps speeds with zero extra USB drivers — works on **both Apple Silicon and Intel Macs** *(Intel Macs untested)*.
+
+#### Option D: Wired Ethernet *(Universal fallback — works on EVERY Mac & PC)*
+* If your Mac doesn't have an Ethernet port, buy a basic **USB-C to Gigabit Ethernet adapter** (an inexpensive adapter, around 15 USD), plug it into the Mac, and run a standard Ethernet cable to your **Windows PC's Ethernet port** (or connect both to your Wi-Fi router).
+* Gives `<1 ms` wired speed and works on **Intel Macs, Apple Silicon Macs, and older USB-A Macs**.
+
+#### Option E: Windows PC Wireless Hotspot or Wi-Fi *(Zero cables)*
+* On your Windows PC, open **Settings → Network & internet → Mobile hotspot** and turn it on, then connect your Mac's Wi-Fi to that hotspot.
+* Great when traveling or on college/office Wi-Fi where normal Wi-Fi blocks laptops from talking to each other.
+
+### Step 4: Quick "Will My Setup Work?" Cheat Sheet
+
+| Your Mac | Your Windows PC | Best Way to Connect | Will It Work? |
+| :--- | :--- | :--- | :--- |
+| **Apple M1–M4** (USB-C) | **USB-C** port | USB-C to USB-C data cable | **Yes — tested & primary setup** |
+| **Apple M1–M4** (USB-C) | **Only USB-A** (rectangular) ports | USB-A (PC) → USB-C (Mac) data cable | **Should work** *(data cable only; not yet live-tested)* |
+| **Apple M1–M4** (USB-C) | **Ethernet** or **Wi-Fi** | USB-C Ethernet adapter or PC Hotspot | **Yes** |
+| **2016–2020 Intel Mac** (USB-C) | **USB-C** only (no Thunderbolt) | PC Wireless Hotspot, or USB-C Ethernet adapter | **Supported in app** *(Ethernet/Hotspot only — Intel Macs untested)* |
+| **2016–2020 Intel Mac** (USB-C / ⚡) | **⚡ Thunderbolt 3/4 / USB4** port | Thunderbolt 3 or 4 cable | **Supported in app** *(Intel Macs untested)* |
+| **Any Mac** using its **USB-A** port | Any **PC USB** port directly | Direct USB-A cable | **No** — use a **USB-A Ethernet adapter** or **Wi-Fi / Hotspot** instead |
+
+### Quick Troubleshooting If It Doesn't Connect Right Away
+1. **Try flipping or switching ports on the Mac:** Move the cable to the **left-side port closest to the screen** (MacBook) or **closest to the power plug** (Mac mini/Studio).
+2. **Swap the cable:** If nothing happens at all, your cable is probably **charging-only** (no data wires). Try a thicker USB-C data cable.
+3. **Check your Mac type:** If it's an **Intel Mac**, a plain USB-C cable won't create a network connection — switch to **Ethernet**, **Thunderbolt** (if supported by the PC), or **Windows Mobile Hotspot**.
+
+---
+
 ## Quick Start
 
 ### 1. Connect the USB-C Cable
