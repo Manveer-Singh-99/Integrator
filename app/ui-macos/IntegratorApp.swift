@@ -1765,7 +1765,7 @@ struct MainDashboardView: View {
             ))
             .toggleStyle(.switch)
 
-            Text("Roadmap Modules: Touch ID Biometric Gate • Multi-WAN Bonding")
+            Text("Roadmap Modules: Touch ID Biometric Gate • Mac → PC Camera • Multi-WAN Bonding")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

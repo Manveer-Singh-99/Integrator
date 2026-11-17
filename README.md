@@ -270,7 +270,7 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 | **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental UDP packet sink (`58284`) & local 24-bit/48kHz spatial test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
 | **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver (`input_kvm` feature toggle) |
-| **Universal Camera (Shared Webcam)** | macOS & Win 11 | ⏸️ **Cancelled** | Paused until further notice — macOS `CMIOExtension` requires a paid Apple Developer Program account for System Extension entitlements (`camera` disabled; mic/audio remains separate under `audio`) |
+| **Shared Camera (`Mac → Win 11` planned / `Win 11 → Mac` shelved)** | Mac → Win 11 | 📋 **Planned** *(Win→Mac ⏸️)* | **Mac → Win 11** (`AVFoundation` → `MFCreateVirtualCamera`, 0 USD Apple/MS fees); **Win 11 → Mac** (`CMIOExtension`) shelved unless explored via opt-in SIP/AMFI bypass (user's own risk) |
 | **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover (`multiwan` feature toggle) |
 
 ---
@@ -329,7 +329,7 @@ The unified app is designed around **two primary, mutually exclusive operating s
                ▼                                        ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │                     INDEPENDENT MODULAR TOGGLES                        │
-│  [✓] Universal Clipboard   [✓] Shared Folders   [🧪] Dynamic Audio     │
+│  [✓] Universal Clipboard   [✓] Shared Folders   [ ] Mac → PC Camera    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -397,8 +397,9 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * Reads ambient room lighting (CCT in Kelvin) from the Mac’s bezel ambient sensor.
   * Applies a **Bradford Chromatic Adaptation Transform (CAT)** with perceptual gamma compensation for matte vs. glossy panel differences.
   * Injects the resulting curves directly into the Windows GPU hardware Look-Up Table (`SetDeviceGammaRamp`) in `<0.1 ms`, ensuring both screens smoothly transition to the exact same paper-white warmth as ambient room lighting changes.
-* **🎥 Universal Camera (⏸️ Cancelled Until Further Notice):**
-  * Shared camera streaming (macOS `CMIOExtension` / Windows webcam) is paused indefinitely because macOS `CMIOExtension` System Extension entitlements and provisioning profiles require a paid Apple Developer Program account (`99 USD/yr`).
+* **🎥 Shared Camera (`Mac → Win 11` 📋 Planned / `Win 11 → Mac` ⏸️ Shelved):**
+  * **Mac → Windows 11 (📋 Planned):** Stream the MacBook’s FaceTime HD camera (`AVFoundation`) to Windows 11 as a native user-mode virtual webcam (`MFCreateVirtualCamera`, requires zero Apple Developer fee and zero Windows kernel driver signing).
+  * **Windows 11 → Mac (⏸️ Shelved):** Creating a virtual webcam inside macOS (`CMIOExtension`) requires a paid Apple Developer Program account (`99 USD/yr`) for System Extension provisioning/signing, so that direction is shelved for now *(if ever revisited without a paid account, it would strictly require users to opt into disabling macOS SIP/security protections at their own risk)*.
   * Cross-machine microphone / audio streaming remains separate under **Dynamic Audio Routing** (`audio`).
 * **🔊 Dynamic Audio Routing (System Tray Selector — 🧪 Experimental Preview):**
   * Currently implements an experimental UDP audio packet validator/sink (`58284`), topology state persistence, and a local 24-bit/48kHz spatial stereo test chime. Full cross-machine CoreAudio/WASAPI duplex playback is planned across three topologies:

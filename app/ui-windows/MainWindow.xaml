@@ -784,7 +784,7 @@
                                               Toggled="AutostartSwitch_Toggled"
                                               AutomationProperties.Name="Launch Integrator Automatically at Login" />
 
-                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Multi-WAN Bonding"
+                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Mac → PC Camera • Multi-WAN Bonding"
                                            Style="{StaticResource SubCaptionStyle}" />
                             </StackPanel>
                         </Border>

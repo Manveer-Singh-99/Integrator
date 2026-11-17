@@ -94,8 +94,6 @@ impl FeatureManager {
                             parsed.clipboard = false;
                             parsed.dragdrop = false;
                         }
-                        // Shared camera is cancelled until further notice; force fail-closed.
-                        parsed.camera = false;
                         parsed
                     }
                     Err(e) => {
@@ -162,8 +160,7 @@ impl FeatureManager {
             "storage" => f.storage,
             "touchid" => f.touchid,
             "truetone" => f.truetone,
-            // Cancelled until further notice (macOS CMIOExtension requires a paid Apple Developer account).
-            "camera" => false,
+            "camera" => f.camera,
             "audio" => f.audio,
             "touchbar" => f.touchbar,
             "multiwan" => f.multiwan,
@@ -213,15 +210,7 @@ impl FeatureManager {
             "storage" => candidate.storage = enabled,
             "touchid" => candidate.touchid = enabled,
             "truetone" => candidate.truetone = enabled,
-            "camera" => {
-                if enabled {
-                    return Err(
-                        "Universal Camera is cancelled until further notice (macOS CMIOExtension requires a paid Apple Developer account)."
-                            .to_string(),
-                    );
-                }
-                candidate.camera = false;
-            }
+            "camera" => candidate.camera = enabled,
             "audio" => candidate.audio = enabled,
             "touchbar" => candidate.touchbar = enabled,
             "multiwan" => candidate.multiwan = enabled,
@@ -343,15 +332,5 @@ mod tests {
         assert_eq!(parsed.dragdrop, defaults.dragdrop);
         assert_eq!(parsed.storage, defaults.storage);
         assert_eq!(parsed.benchmark, defaults.benchmark);
-    }
-
-    #[test]
-    fn cancelled_camera_feature_fails_closed() {
-        let mut flags = FeatureFlags::default();
-        flags.camera = true;
-        let mgr = FeatureManager::from_flags_for_test(flags);
-        assert!(!mgr.is_enabled("camera"));
-        assert!(mgr.set_flag_checked("camera", true).is_err());
-        assert!(mgr.set_flag_checked("camera", false).is_ok());
     }
 }
