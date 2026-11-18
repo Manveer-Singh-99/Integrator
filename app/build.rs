@@ -41,6 +41,7 @@ fn main() {
             "src/touchbar_hud.swift",
             "src/ambient_light.swift",
             "src/kvm_macos.swift",
+            "src/camera_macos.swift",
             "ui-macos/IntegratorApp.swift",
             "-o",
             &lib_path,
@@ -105,6 +106,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/touchbar_hud.swift");
         println!("cargo:rerun-if-changed=src/ambient_light.swift");
         println!("cargo:rerun-if-changed=src/kvm_macos.swift");
+        println!("cargo:rerun-if-changed=src/camera_macos.swift");
         println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
@@ -147,19 +149,74 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AppKit");
         println!("cargo:rustc-link-lib=framework=SwiftUI");
         println!("cargo:rustc-link-lib=framework=IOKit");
+        println!("cargo:rustc-link-lib=framework=AVFoundation");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
         println!("cargo:rerun-if-changed=src/virtual_display.m");
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let out_dir = std::env::var("OUT_DIR").unwrap();
         cc::Build::new()
             .cpp(true)
             .file("src/kvm_windows.cpp")
+            .file("src/camera_windows.cpp")
             .compile("kvm_windows");
         println!("cargo:rustc-link-lib=ole32");
         println!("cargo:rustc-link-lib=shell32");
         println!("cargo:rustc-link-lib=user32");
         println!("cargo:rustc-link-lib=gdi32");
         println!("cargo:rustc-link-lib=shlwapi");
+        println!("cargo:rustc-link-lib=advapi32");
+        println!("cargo:rustc-link-lib=mfplat");
+        println!("cargo:rustc-link-lib=mfuuid");
         println!("cargo:rerun-if-changed=src/kvm_windows.cpp");
+        println!("cargo:rerun-if-changed=src/camera_windows.cpp");
+        println!("cargo:rerun-if-changed=src/vcam_windows.cpp");
+
+        // Compile standalone FrameServer COM DLL (`integrator_vcam.dll`) with zero external runtime deps (/MT).
+        let vcam_dll_out = PathBuf::from(&out_dir).join("integrator_vcam.dll");
+        let vcam_obj_out = PathBuf::from(&out_dir).join("vcam_windows.obj");
+        let vcam_lib_out = PathBuf::from(&out_dir).join("integrator_vcam.lib");
+        let vcam_exp_out = PathBuf::from(&out_dir).join("integrator_vcam.exp");
+        let compiler = cc::Build::new().cpp(true).static_crt(true).get_compiler();
+        let mut vcam_cmd = compiler.to_command();
+        vcam_cmd.args([
+            "/nologo",
+            "/O2",
+            "/EHsc",
+            "/DUNICODE",
+            "/D_UNICODE",
+            &format!("/Fo{}", vcam_obj_out.display()),
+            "src/vcam_windows.cpp",
+            "/LD",
+            &format!("/Fe{}", vcam_dll_out.display()),
+            "/link",
+            &format!("/IMPLIB:{}", vcam_lib_out.display()),
+            "mfplat.lib",
+            "mfuuid.lib",
+            "mf.lib",
+            "mfsensorgroup.lib",
+            "propsys.lib",
+            "ole32.lib",
+            "advapi32.lib",
+            "/EXPORT:DllGetClassObject,PRIVATE",
+            "/EXPORT:DllCanUnloadNow,PRIVATE",
+        ]);
+        let vcam_status = vcam_cmd
+            .status()
+            .expect("Failed to invoke MSVC compiler for integrator_vcam.dll");
+        let _ = std::fs::remove_file(&vcam_lib_out);
+        let _ = std::fs::remove_file(&vcam_exp_out);
+        if !vcam_status.success() {
+            panic!("MSVC failed compiling src/vcam_windows.cpp into integrator_vcam.dll");
+        }
+        if let Some(profile_dir) = PathBuf::from(&out_dir)
+            .ancestors()
+            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
+            .and_then(|b| b.parent())
+        {
+            let _ = std::fs::copy(&vcam_dll_out, profile_dir.join("integrator_vcam.dll"));
+        }
     }
 }

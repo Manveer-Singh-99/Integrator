@@ -1,3 +1,63 @@
+//! # Central Application Engine & Subsystem Orchestrator (`core.rs`)
+//!
+//! ## 1. Module Purpose & Scope
+//! `core.rs` defines `IntegratorCore`, the central orchestrator and state machine supervisor for the
+//! entire Integrator workstation continuity platform.
+//!
+//! It brings together all operational subsystems into a cohesive engine:
+//! - **Asynchronous Runtime**: Owns and manages the dedicated Tokio multi-threaded runtime.
+//! - **Peer Discovery & Route Selection**: Runs the `DiscoveryManager` to maintain low-latency peer routes.
+//! - **Virtual Display Engine**: Coordinates `DisplayController` and `DisplayServer` for screen extension and mirroring.
+//! - **Cross-Platform KVM & Gestures**: Integrates `KvmService` for seamless pointer, keyboard, and drag-and-drop routing.
+//! - **Unified Clipboard**: Manages `ClipboardService` for bidirectional synchronization of text, images, and files.
+//! - **Shared Virtual Camera**: Operates `CameraService` forwarding video frames between macOS and Windows 11.
+//! - **Audio Bridging & Spatial Sound**: Controls WASAPI and CoreAudio streaming pipelines.
+//! - **Hardware Telemetry & TrueTone**: Gathers GPU metrics and synchronizes display white points across machines.
+//! - **Cryptographic Trust Store**: Manages SPAKE2+ PIN pairing, Ed25519 authorization, and peer blacklisting.
+//! - **Native UI Gateway & In-Memory Logging**: Dispatches JSON-RPC calls from native frontends (`dispatch_json`),
+//!   streams UI push events (`emit_ui_event`), and retains an in-memory ring buffer of diagnostic logs (`LOG_RING`).
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `main.rs`: Bootstraps the application via `IntegratorCore::init_global()`, checks for single-instance
+//!   activation via `try_focus_existing_instance()`, and handles CLI subcommands via `run_cli_if_requested()`.
+//! - `ffi.rs`: Delegates external C ABI requests (`integrator_core_invoke`, `integrator_core_tray_action`,
+//!   `integrator_core_shutdown`) to the global core singleton (`GLOBAL_CORE`).
+//!
+//! ### Downstream Callees:
+//! - Subsystems: `audio`, `autostart`, `benchmark`, `camera`, `clipboard`, `discovery`, `display`,
+//!   `features`, `kvm`, `storage`, `system_info`, `telemetry`, `truetone`, `trust`.
+//! - Logging Framework: Configures `tracing-subscriber` with stdout, rotating private log files (`~/.integrator.log`),
+//!   and an in-memory UI ring layer (`UiRingLogLayer`).
+//! - OS Firewall: Automates Windows Defender Firewall rules (`ensure_windows_firewall_rules`) on Windows hosts.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! High-level control actions (e.g., toggling screen extension, initiating pairing, syncing TrueTone calibration,
+//! mounting remote file shares) flow through `dispatch_json`. When interacting with a remote peer, `core.rs`
+//! serializes requests into `DisplayRpcRequest` packets and dispatches them across the authenticated control
+//! channel to the peer's `DisplayServer`. Status reports are aggregated into a unified `BridgeStatus` snapshot.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Tokio Multi-Threaded Executor**: `IntegratorCore::rt` powers all asynchronous I/O and tasks.
+//! - **Synchronous FFI Dispatch**: Native UI threads invoke `dispatch_json`, which blocks synchronously on the
+//!   internal Tokio runtime (`rt.block_on`) to return immediate responses.
+//! - **UI Callback Lifecycle Protection**: Native function pointers registered via `register_ui_callback`
+//!   are protected by an atomic in-flight counter (`IN_FLIGHT_UI_CALLBACKS`). When deregistering a callback,
+//!   the thread yields for up to 250ms until all in-flight callback executions complete, eliminating
+//!   native code execution after unmap.
+//! - **Offloading OS Blocking Calls**: Synchronous file system, process execution, and registry lookups
+//!   are dispatched via `tokio::task::spawn_blocking`.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Private Log File Permissions**: Log files on Unix systems are opened strictly with mode `0o600`.
+//!   Symlinks are detected and rejected to prevent symlink-poisoning attacks.
+//! - **Log Rotation**: Active log files exceeding 5 MiB (`MAX_LOG_FILE_BYTES`) are automatically rotated
+//!   to `.log.1` to prevent disk filling.
+//! - **Inbound Firewall Scoping**: Windows firewall rules are explicitly scoped to direct cable subnets
+//!   (`169.254.0.0/16`, `10.99.99.0/24`, `192.168.2.0/24`, `192.168.137.0/24`) and local subnets.
+//! - **Mandatory Cryptographic Pairing**: Operations requiring mutual trust strictly enforce SPAKE2+
+//!   PIN verification before granting access.
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -13,6 +73,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use crate::audio::{self, AudioRoutingStatus};
 use crate::autostart;
 use crate::benchmark;
+use crate::camera::{CameraService, CameraStatus};
 use crate::clipboard::ClipboardService;
 use crate::config;
 use crate::discovery::DiscoveryManager;
@@ -25,145 +86,256 @@ use crate::telemetry;
 use crate::truetone;
 use crate::trust;
 
+/// Function pointer type definition for native UI push event notifications.
+///
+/// Passes NUL-terminated UTF-8 C string pointers for `event_name` and `payload_json`.
 pub type UiEventCallback = extern "C" fn(event_name: *const c_char, payload_json: *const c_char);
 
+/// Global singleton container holding the active `IntegratorCore` engine instance.
 pub static GLOBAL_CORE: OnceLock<Arc<IntegratorCore>> = OnceLock::new();
+
+/// Global function pointer slot for native UI callback bridge.
 static UI_EVENT_CALLBACK: Mutex<Option<UiEventCallback>> = Mutex::new(None);
+
+/// Atomic counter tracking the number of active callback invocations currently executing inside native UI code.
 static IN_FLIGHT_UI_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// In-memory ring buffer storing the most recent 200 formatted log entries for UI diagnostics views.
 static LOG_RING: Mutex<Option<VecDeque<LogEntry>>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Native macOS Objective-C/Swift Touch Bar initialization entry point.
     fn init_touchbar_in_app(peer_ip: *const c_char);
+    /// Native macOS Touch Bar dismissal entry point.
     fn dismiss_touchbar_in_app();
+    /// Checks whether the macOS Touch Bar HUD is currently visible.
     fn is_touchbar_active_in_app() -> bool;
+    /// CLI loop driving the Touch Bar interface standalone.
     fn run_touchbar_cli_loop(peer_ip: *const c_char);
 }
 
+/// Structured record representing an individual log event stored in the UI ring buffer.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
+    /// POSIX timestamp in milliseconds when the event was recorded.
     pub ts_ms: u64,
+    /// Tracing severity level string (`"INFO"`, `"WARN"`, `"ERROR"`, `"DEBUG"`).
     pub level: String,
+    /// Formatted log message text, including appended tracing fields.
     pub message: String,
 }
 
+/// Physical pixel dimensions and refresh rate characterizing a display output.
 #[derive(Debug, Clone, Serialize)]
 pub struct DisplayGeometry {
+    /// Horizontal resolution in physical pixels.
     pub width: u32,
+    /// Vertical resolution in physical pixels.
     pub height: u32,
+    /// Frame refresh rate in Hertz (FPS).
     pub fps: u32,
 }
 
+/// Detailed metadata snapshot for a remote peer discovered on the local network.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredPeerInfo {
+    /// Unique 32-character hexadecimal identifier derived from the peer's Ed25519 public key.
     pub device_id: String,
+    /// Machine hostname.
     pub hostname: String,
+    /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
+    /// Hardware product model name.
     pub hardware_model: String,
+    /// Resolved IP address string.
     pub ip: String,
+    /// Local network interface IP used to reach this peer.
     pub local_ip_used: Option<String>,
+    /// Human-readable transport medium label (`"Thunderbolt"`, `"Direct USB-C"`, `"Ethernet"`, `"Wi-Fi"`).
     pub transport_label: String,
+    /// Indicates whether the physical connection is a direct point-to-point bridge cable.
     pub is_direct_cable: bool,
+    /// Estimated link physical throughput in Megabits per second.
     pub link_speed_mbps: Option<u32>,
+    /// Human-readable network route description.
     pub link_description: String,
+    /// Measured TCP round-trip latency in milliseconds.
     pub rtt_ms: Option<f64>,
+    /// Primary display resolution and refresh rate of remote machine.
     pub display: DisplayGeometry,
+    /// List of GPU adapter model names installed on remote machine.
     pub gpus: Vec<String>,
+    /// Optional SMB share name advertised by remote peer.
     pub share_name: Option<String>,
+    /// Cryptographic pairing status: `true` if peer's public key is in local trust store.
     pub trusted: bool,
+    /// Blacklist status: `true` if peer has been explicitly blocked.
     pub blocked: bool,
 }
 
+/// Complete snapshot of cryptographic pairing state and authorization policies.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrustSnapshotInfo {
+    /// Currently active 6-digit numeric pairing PIN.
     pub pairing_pin: String,
+    /// Policy flag: whether direct bridge cables are automatically trusted without PIN entry.
     pub auto_trust_direct_cable: bool,
+    /// Policy flag: whether LAN peers strictly require PIN pairing.
     pub require_pairing_on_lan: bool,
+    /// List of unconfirmed peer pairing connection requests awaiting user approval.
     pub pending_peers: Vec<trust::PendingPeerInfo>,
+    /// List of authorized paired peers stored in the keystore.
     pub trusted_peers: Vec<trust::TrustedPeerRecord>,
+    /// List of explicitly blocked remote device ID hex strings.
     pub blocked_device_ids: Vec<String>,
 }
 
+/// Top-level comprehensive health and connectivity state structure sent to native UI views.
 #[derive(Debug, Clone, Serialize)]
 pub struct BridgeStatus {
-    // Local machine profile
+    // Local Machine Identity & Hardware
+    /// Unique device ID hex string of the local machine.
     pub device_id: String,
+    /// Local machine hostname.
     pub hostname: String,
+    /// Local operating system platform string (`"macos"`, `"windows"`).
     pub os: String,
+    /// Local operating system identifier.
     pub local_os: String,
+    /// Local hardware model name (e.g. `"MacBookPro18,1"` or `"PC"`).
     pub hardware_model: String,
+    /// Local CPU processor brand string.
     pub cpu_brand: String,
+    /// Local primary display geometry and color depth.
     pub primary_display: system_info::PrimaryDisplayInfo,
+    /// Local GPU adapters detected.
     pub local_gpus: Vec<system_info::GpuDeviceInfo>,
+    /// Published SMB share names on local machine.
     pub local_share_names: Vec<String>,
+    /// Indicates whether physical Touch Bar hardware is present on this machine.
     pub has_touch_bar: bool,
 
-    // Active / best peer & route info
+    // Active Remote Peer & Link Route
+    /// `true` if an active peer candidate is currently elected.
     pub peer_connected: bool,
+    /// `true` if the active peer is cryptographically verified and trusted.
     pub peer_trusted: bool,
+    /// Unique device ID of active peer.
     pub peer_device_id: Option<String>,
+    /// Target IP address string of active peer.
     pub peer_ip: Option<String>,
+    /// Operating system of active peer.
     pub peer_os: Option<String>,
+    /// Computer hostname of active peer.
     pub peer_name: Option<String>,
+    /// Hardware product model of active peer.
     pub peer_hardware_model: Option<String>,
+    /// Display geometry of active peer.
     pub peer_display: Option<DisplayGeometry>,
+    /// GPU adapters of active peer.
     pub peer_gpus: Vec<String>,
+    /// Published SMB share name of active peer.
     pub peer_share_name: Option<String>,
+    /// Local interface IP communicating with active peer.
     pub peer_local_ip_used: Option<String>,
+    /// Label of active transport route (`"Thunderbolt"`, `"Ethernet"`, `"Wi-Fi"`).
     pub transport_label: String,
+    /// `true` if active link is a point-to-point direct cable.
     pub is_direct_cable: bool,
+    /// Link throughput speed in Mbps.
     pub link_speed_mbps: Option<u32>,
+    /// Route adapter description.
     pub link_description: String,
+    /// Measured round-trip connection latency in ms.
     pub rtt_ms: Option<f64>,
+    /// Formatted link speed string (e.g. `"20 Gbps"` or `"1000 Mbps"`).
     pub link_speed: String,
+    /// Transport medium type string.
     pub link_type: String,
 
-    // Display & GPU state
+    // Display Acceleration & Encoding
+    /// `true` if virtual display extension or mirroring is actively streaming.
     pub display_active: bool,
+    /// Active display streaming mode (`"mac_to_pc"`, `"pc_to_mac"`, or `None`).
     pub active_mode: Option<String>,
+    /// Platform indicator: `true` if local host is running Windows.
     pub is_windows_master: bool,
+    /// Selected hardware GPU encoder adapter on Windows (`"auto"`, `"nvidia"`, `"amd"`, `"intel"`).
     pub encode_gpu: String,
+    /// Selected hardware GPU decoder adapter on Windows.
     pub decode_gpu: String,
+    /// Indicates whether hardware GPU selection controls are supported.
     pub gpu_controls_supported: bool,
+    /// Indicates whether Touch Bar remote HUD is actively presented.
     pub touchbar_active: bool,
 
-    // True Tone / Ambient Light Sensor
+    // Ambient Lighting & TrueTone
+    /// `true` if ambient light sensor hardware is supported.
     pub ambient_supported: bool,
+    /// Measured ambient illuminance in Lux.
     pub ambient_lux: Option<f32>,
+    /// Correlated Color Temperature in Kelvin.
     pub ambient_cct: Option<u32>,
 
-    // Shared storage
+    // Shared Storage Status
+    /// `true` if remote SMB file share is mounted locally.
     pub storage_mounted: bool,
+    /// Storage mount path and connection status details.
     pub storage_status: StorageStatus,
+    /// User-preferred peer SMB share name.
     pub preferred_peer_share: Option<String>,
 
-    // Audio
+    // Audio Routing Status
+    /// Active audio sink/source capture and playback routing states.
     pub audio_status: AudioRoutingStatus,
 
-    // Features & Universal Input KVM + Drag-Drop
+    // Virtual Camera Status
+    /// Virtual webcam capture and forwarding status.
+    pub camera_status: CameraStatus,
+
+    // Capability Master Switches & KVM
+    /// Current feature toggle flags.
     pub feature_flags: FeatureFlags,
+    /// Low-latency keyboard, mouse, and gesture router status snapshot.
     pub kvm: KvmStatusSnapshot,
 
-    // Interfaces, discovery & trust
+    // Network Interfaces & Cryptographic Trust
+    /// All active physical and virtual local network interface endpoints.
     pub local_interfaces: Vec<system_info::LocalInterfaceInfo>,
+    /// User-configured manual peer unicast target IPs.
     pub manual_peer_ips: Vec<String>,
+    /// All discovered peers on the network.
     pub discovered_peers: Vec<DiscoveredPeerInfo>,
+    /// Keystore pairing PIN and trusted peer list.
     pub trust: TrustSnapshotInfo,
 
-    // Autostart & diagnostics
+    // Autostart & Diagnostic Logs
+    /// `true` if OS login autostart is registered.
     pub autostart_enabled: bool,
+    /// Recent diagnostic log lines from the in-memory ring buffer.
     pub recent_logs: Vec<LogEntry>,
 }
 
+/// Central application orchestrator managing lifecycle, state machines, and native UI dispatch.
 pub struct IntegratorCore {
+    /// Dedicated multi-threaded Tokio runtime driving all asynchronous tasks.
     pub rt: tokio::runtime::Runtime,
+    /// Zero-configuration peer beacon broadcaster and listener manager.
     pub discovery: DiscoveryManager,
+    /// Screen capture, stream encoding, and display RPC client controller.
     pub display_ctrl: DisplayController,
+    /// Bidirectional synchronized clipboard engine.
     pub clipboard: ClipboardService,
+    /// Master feature switches and capability persistence manager.
     pub features: Arc<FeatureManager>,
+    /// Low-latency universal input routing service.
     pub kvm: Arc<KvmService>,
+    /// Virtual webcam capture and frame forwarding service.
+    pub camera: Arc<CameraService>,
 }
 
+/// Helper visitor extracting message strings and key-value fields from `tracing::Event`.
 #[derive(Default)]
 struct LogVisitor {
     msg: String,
@@ -171,6 +343,7 @@ struct LogVisitor {
 }
 
 impl LogVisitor {
+    /// Formats extracted fields into a single human-readable log string.
     fn into_message(self) -> String {
         if self.fields.is_empty() {
             self.msg
@@ -204,6 +377,7 @@ impl tracing::field::Visit for LogVisitor {
     }
 }
 
+/// Tracing subscriber layer storing formatted events into `LOG_RING` and emitting UI events.
 struct UiRingLogLayer;
 
 impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
@@ -227,6 +401,8 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
             level: event.metadata().level().to_string(),
             message: formatted_msg,
         };
+
+        // Append to in-memory bounded ring buffer (capacity: 200)
         if let Ok(mut guard) = LOG_RING.lock() {
             let deque = guard.get_or_insert_with(|| VecDeque::with_capacity(200));
             if deque.len() >= 200 {
@@ -234,12 +410,15 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
             }
             deque.push_back(entry.clone());
         }
+
+        // Push real-time event to native UI callback
         if let Ok(json) = serde_json::to_string(&entry) {
             emit_ui_event("log_entry", &json);
         }
     }
 }
 
+/// RAII guard decrementing `IN_FLIGHT_UI_CALLBACKS` upon completion of a native UI callback execution.
 struct InFlightCallbackGuard;
 
 impl Drop for InFlightCallbackGuard {
@@ -248,6 +427,10 @@ impl Drop for InFlightCallbackGuard {
     }
 }
 
+/// Registers or deregisters the native UI event callback function pointer.
+///
+/// When passing `None` to deregister, blocks for up to 250ms until all currently executing
+/// in-flight native callback frames finish, preventing use-after-free in unloaded UI modules.
 pub fn register_ui_callback(cb: Option<UiEventCallback>) {
     if let Ok(mut guard) = UI_EVENT_CALLBACK.lock() {
         *guard = cb;
@@ -263,6 +446,9 @@ pub fn register_ui_callback(cb: Option<UiEventCallback>) {
     }
 }
 
+/// Pushes an asynchronous event notification across the FFI boundary to the native UI frontend.
+///
+/// Converts Rust string slices to C-style NUL-terminated strings and increments the in-flight guard.
 pub fn emit_ui_event(event_name: &str, payload_json: &str) {
     let Ok(ev) = CString::new(event_name) else { return };
     let Ok(pl) = CString::new(payload_json) else { return };
@@ -279,15 +465,22 @@ pub fn emit_ui_event(event_name: &str, payload_json: &str) {
     cb(ev.as_ptr(), pl.as_ptr());
 }
 
+/// Helper emitting an in-app banner toast notification to the native UI.
+///
+/// # Arguments
+/// * `kind` - Notification style (`"info"`, `"success"`, `"error"`, `"warning"`).
+/// * `message` - Banner text to display.
 pub fn emit_ui_toast(kind: &str, message: &str) {
     let payload = serde_json::json!({ "kind": kind, "message": message }).to_string();
     emit_ui_event("toast", &payload);
 }
 
+/// Signals the native UI layer to bring the main application window to the foreground.
 pub fn request_show_window() {
     emit_ui_event("show_window", "{}");
 }
 
+/// Returns a cloned snapshot of all log entries currently stored in `LOG_RING`.
 pub fn get_recent_logs() -> Vec<LogEntry> {
     if let Ok(guard) = LOG_RING.lock() {
         if let Some(deque) = guard.as_ref() {
@@ -297,6 +490,9 @@ pub fn get_recent_logs() -> Vec<LogEntry> {
     Vec::new()
 }
 
+/// Spawns an external operating system process and detaches a background thread to reap its exit status.
+///
+/// Prevents zombie process accumulation.
 fn spawn_and_reap(mut cmd: std::process::Command) {
     if let Ok(mut child) = cmd.spawn() {
         let _ = std::thread::Builder::new()
@@ -307,6 +503,7 @@ fn spawn_and_reap(mut cmd: std::process::Command) {
     }
 }
 
+/// Opens the user's persistent application data folder in the native file manager (Finder or Explorer).
 pub fn open_app_data_folder() {
     let cache_dir = system_info::app_data_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
@@ -331,6 +528,16 @@ pub fn open_app_data_folder() {
     }
 }
 
+/// Formats a measured benchmark bandwidth into human-readable Gbps or Mbps text.
+fn format_measured_speed(max_gbps: f64) -> String {
+    if max_gbps >= 1.0 {
+        format!("{:.2} Gbps", max_gbps)
+    } else {
+        format!("{:.0} Mbps", (max_gbps * 1000.0).round())
+    }
+}
+
+/// Formats physical interface link speed in Mbps into formatted Gbps/Mbps string.
 fn format_link_speed(speed_mbps: Option<u32>, connected: bool) -> String {
     match speed_mbps {
         Some(mbps) if mbps >= 1000 => {
@@ -346,6 +553,10 @@ fn format_link_speed(speed_mbps: Option<u32>, connected: bool) -> String {
     }
 }
 
+/// Detects whether an active Integrator instance is already running locally.
+///
+/// Probes `127.0.0.1:58281`. If connection succeeds, sends `ShowWindow` RPC to bring the
+/// active window forward and returns `true`.
 pub fn try_focus_existing_instance() -> bool {
     if let Ok(stream) = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], config::CONTROL_PORT)),
@@ -366,6 +577,10 @@ pub fn try_focus_existing_instance() -> bool {
     false
 }
 
+/// Parses and executes CLI subcommands passed into the process without launching the full GUI.
+///
+/// Supported subcommands: `paste-remote`, `benchmark <ip>`, `telemetry <ip>`, `touchbar <ip>`,
+/// `display [toggle|stop|status]`, `pin`, `pair <ip> <pin>`, `status`, `camera [toggle|start|stop|status]`.
 pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
     if args.len() <= 1 {
         return None;
@@ -532,13 +747,54 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                 Ok(())
             })
         })()),
+        "status" | "bridge-status" => Some((|| {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let resp = DisplayController::send_remote_rpc(
+                    "127.0.0.1",
+                    &DisplayRpcRequest::GetBridgeStatus,
+                )
+                .await?;
+                if let Some(s) = resp.bridge_status {
+                    println!("{}", serde_json::to_string_pretty(&s)?);
+                } else {
+                    println!("{}", resp.message);
+                }
+                Ok(())
+            })
+        })()),
+        "camera" => Some((|| {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+                let req = match subcmd {
+                    "toggle" => DisplayRpcRequest::ToggleCamera,
+                    "start" => DisplayRpcRequest::StartCamera,
+                    "stop" => DisplayRpcRequest::StopCamera,
+                    "status" => DisplayRpcRequest::GetCameraStatus,
+                    _ => anyhow::bail!("Unknown camera subcommand: {}. Use toggle, start, stop, or status.", subcmd),
+                };
+                let resp = DisplayController::send_remote_rpc("127.0.0.1", &req).await?;
+                println!("{}", resp.message);
+                if let Some(cs) = resp.camera_status {
+                    println!("{}", serde_json::to_string_pretty(&cs)?);
+                }
+                if !resp.success {
+                    anyhow::bail!("Camera command failed: {}", resp.message);
+                }
+                Ok(())
+            })
+        })()),
         _ => None,
     }
 }
 
+/// Maximum size allowed for `.integrator.log` before rotation (5 MiB).
 const MAX_LOG_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Opens the application log file with private permissions (`0o600`), symlink rejection, and rotation.
 fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
+    // Symlink inspection: reject symlinks to prevent arbitrary file truncation
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             eprintln!(
@@ -547,6 +803,8 @@ fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
             );
             return None;
         }
+
+        // Rotate file if size exceeds 5 MiB
         if meta.len() > MAX_LOG_FILE_BYTES {
             let backup = path.with_extension("log.1");
             let backup_is_symlink = std::fs::symlink_metadata(&backup)
@@ -571,10 +829,11 @@ fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
     opts.open(path).ok()
 }
 
+/// Automatically configures Windows Defender Firewall rules for Integrator on Windows hosts.
+///
+/// Ensures direct Thunderbolt/USB4, USB-C NCM, Ethernet, and Mobile Hotspot interfaces
+/// permit inbound traffic on Integrator TCP/UDP ports even if assigned to Public network profiles.
 #[cfg(target_os = "windows")]
-/// Ensures inbound Windows Defender Firewall rules allow Integrator discovery and encrypted
-/// services over direct Ethernet, Thunderbolt/USB4, Windows Mobile Hotspot, and USB-C NCM links
-/// even when Windows assigns those interfaces to the Public profile.
 fn ensure_windows_firewall_rules() {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -596,7 +855,7 @@ fn ensure_windows_firewall_rules() {
 
     let netsh = system_info::system32_exe("netsh.exe");
     let rules = [
-        ("Integrator Core (TCP)", "TCP", "58281,58283,58285,58286"),
+        ("Integrator Core (TCP)", "TCP", "58281,58283,58285,58286,58287"),
         ("Integrator Core (UDP)", "UDP", "58280,58284"),
     ];
 
@@ -618,7 +877,10 @@ fn ensure_windows_firewall_rules() {
             .filter(|o| o.status.success())
             .map(|o| {
                 let txt = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
-                txt.contains(&exe_str.to_ascii_lowercase()) && txt.contains("localsubnet")
+                let has_all_ports = proto != "TCP" || txt.contains("58287");
+                txt.contains(&exe_str.to_ascii_lowercase())
+                    && txt.contains("localsubnet")
+                    && has_all_ports
             })
             .unwrap_or(false);
 
@@ -626,6 +888,7 @@ fn ensure_windows_firewall_rules() {
             continue;
         }
 
+        // Delete obsolete rule
         let _ = Command::new(&netsh)
             .args([
                 "advfirewall",
@@ -639,6 +902,7 @@ fn ensure_windows_firewall_rules() {
             .stderr(Stdio::null())
             .status();
 
+        // Add scoped rule
         let _ = Command::new(&netsh)
             .args([
                 "advfirewall",
@@ -663,6 +927,17 @@ fn ensure_windows_firewall_rules() {
 }
 
 impl IntegratorCore {
+    /// Initializes the global `IntegratorCore` singleton runtime.
+    ///
+    /// # Startup Pipeline:
+    /// 1. Initializes private rotating logger and tracing subscriber.
+    /// 2. Spawns Tokio multi-threaded runtime.
+    /// 3. Initializes `FeatureManager` and loads `features.json`.
+    /// 4. Bootstraps `DiscoveryManager`, `ClipboardService`, `DisplayController`, `DisplayServer`,
+    ///    `BenchmarkServer`, `AudioManager`, `KvmService`, and `CameraService`.
+    /// 5. Configures native keyboard shortcut hooks on macOS.
+    /// 6. Spawns background Windows firewall rule verifier on Windows.
+    /// 7. Stores instance into `GLOBAL_CORE`.
     pub fn init_global() -> Result<Arc<Self>> {
         if let Some(existing) = GLOBAL_CORE.get() {
             return Ok(Arc::clone(existing));
@@ -696,11 +971,12 @@ impl IntegratorCore {
 
         let device_name = system_info::get_hostname();
         tracing::info!(
-            "🚀 Integrator v2.0 Native Core initializing on {} [{}]...",
+            "🚀 Integrator v1.0 Native Core initializing on {} [{}]...",
             std::env::consts::OS,
             device_name
         );
 
+        // 2. Spawn Tokio Multi-Thread Runtime
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -708,7 +984,8 @@ impl IntegratorCore {
 
         let feature_manager = Arc::new(FeatureManager::new());
 
-        let (discovery, display_ctrl, clipboard, kvm) = rt.block_on(async {
+        // 3. Initialize background services within runtime context
+        let (discovery, display_ctrl, clipboard, kvm, camera) = rt.block_on(async {
             let discovery = DiscoveryManager::new(&device_name);
             discovery
                 .start()
@@ -747,7 +1024,12 @@ impl IntegratorCore {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to start KVM engine: {e}"))?;
 
-            Ok::<_, anyhow::Error>((discovery, display_ctrl, clipboard, kvm))
+            let camera = CameraService::new(discovery.clone(), Arc::clone(&feature_manager));
+            if let Err(e) = camera.start_server().await {
+                tracing::warn!("Failed to start shared camera listener: {}", e);
+            }
+
+            Ok::<_, anyhow::Error>((discovery, display_ctrl, clipboard, kvm, camera))
         })?;
 
         #[cfg(target_os = "macos")]
@@ -762,6 +1044,7 @@ impl IntegratorCore {
             clipboard,
             features: feature_manager,
             kvm,
+            camera,
         });
         let _ = GLOBAL_CORE.set(Arc::clone(&core));
 
@@ -775,6 +1058,10 @@ impl IntegratorCore {
         Ok(core)
     }
 
+    /// Assembles a complete, unified `BridgeStatus` diagnostic structure.
+    ///
+    /// Aggregates hardware profiles, active peer candidates, link latency, audio/camera routing,
+    /// display streaming states, TrueTone ambient sensor readings, and trust snapshot.
     pub async fn build_bridge_status(&self) -> BridgeStatus {
         let local_prof = tokio::task::spawn_blocking(system_info::collect_local_profile)
             .await
@@ -904,10 +1191,20 @@ impl IntegratorCore {
         #[cfg(not(target_os = "macos"))]
         let touchbar_active = false;
 
-        let link_speed = best
+        let measured_bench = best_ip
+            .as_deref()
+            .and_then(benchmark::latest_measurement_for_peer);
+        let effective_speed_mbps = measured_bench
             .as_ref()
-            .map(|p| format_link_speed(p.link_speed_mbps, true))
-            .unwrap_or_else(|| "--".to_string());
+            .map(|m| (m.max_gbps * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32)
+            .or_else(|| best.as_ref().and_then(|p| p.link_speed_mbps));
+        let link_speed = if let Some(ref m) = measured_bench {
+            format_measured_speed(m.max_gbps)
+        } else {
+            best.as_ref()
+                .map(|p| format_link_speed(p.link_speed_mbps, true))
+                .unwrap_or_else(|| "--".to_string())
+        };
         let link_type = best
             .as_ref()
             .map(|p| p.transport.label().to_string())
@@ -948,7 +1245,7 @@ impl IntegratorCore {
                 .as_ref()
                 .map(|p| p.transport.is_direct_cable())
                 .unwrap_or(false),
-            link_speed_mbps: best.as_ref().and_then(|p| p.link_speed_mbps),
+            link_speed_mbps: effective_speed_mbps,
             link_description: best
                 .as_ref()
                 .map(|p| p.link_description.clone())
@@ -978,6 +1275,7 @@ impl IntegratorCore {
             preferred_peer_share,
 
             audio_status: audio::AudioManager::status(),
+            camera_status: self.camera.status(),
             feature_flags,
             kvm: self.kvm.get_status_snapshot(),
 
@@ -998,6 +1296,14 @@ impl IntegratorCore {
         }
     }
 
+    /// Primary JSON-RPC dispatcher processing incoming method calls from native GUI frontends.
+    ///
+    /// # Arguments
+    /// * `method` - Method name string (e.g. `"get_bridge_status"`, `"pair_with_peer"`).
+    /// * `params_json` - JSON string containing parameter dictionary.
+    ///
+    /// # Return Value
+    /// Returns a serialized JSON string containing either `{"ok": true, "data": ...}` or `{"ok": false, "error": "..."}`.
     pub fn dispatch_json(&self, method: &str, params_json: &str) -> String {
         let params_val: serde_json::Value = if params_json.trim().is_empty() {
             serde_json::json!({})
@@ -1010,7 +1316,7 @@ impl IntegratorCore {
 
         let res: Result<serde_json::Value, String> = self.rt.block_on(async {
             match method {
-                "get_status" => Ok(serde_json::json!("Integrator v2.0 Native Active")),
+                "get_status" => Ok(serde_json::json!("Integrator v1.0 Native Active")),
                 "get_bridge_status" => {
                     let s = self.build_bridge_status().await;
                     Ok(serde_json::to_value(s).map_err(|e| e.to_string())?)
@@ -1340,7 +1646,9 @@ impl IntegratorCore {
                     let args: FlagArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
                     let feat = args.feature.trim();
                     let flags = self.features.set_flag_checked(feat, args.enabled)?;
-                    if !args.enabled {
+                    if feat == "camera" {
+                        self.camera.sync_with_feature_flag(args.enabled).await;
+                    } else if !args.enabled {
                         match feat {
                             "display" => {
                                 if self.display_ctrl.is_active().await
@@ -1376,6 +1684,18 @@ impl IntegratorCore {
                         }
                     }
                     Ok(serde_json::to_value(flags).map_err(|e| e.to_string())?)
+                }
+                "toggle_camera" => {
+                    let msg = self.camera.toggle().await?;
+                    Ok(serde_json::json!(msg))
+                }
+                "start_camera" => {
+                    let msg = self.camera.start().await?;
+                    Ok(serde_json::json!(msg))
+                }
+                "stop_camera" => {
+                    self.camera.stop().await;
+                    Ok(serde_json::json!("Shared Camera stopped"))
                 }
                 "get_kvm_status" => {
                     Ok(serde_json::to_value(self.kvm.get_status_snapshot()).map_err(|e| e.to_string())?)
@@ -1500,7 +1820,7 @@ impl IntegratorCore {
                         return Err(format!("Invalid peer IPv4 address: {}", args.ip));
                     }
                     if !trust::is_device_trusted(cid) {
-                        return Err("Integrator v2.0 requires cryptographic PIN pairing (SPAKE2 + Ed25519) before trusting a peer.".into());
+                        return Err("Integrator v1.0 requires cryptographic PIN pairing (SPAKE2 + Ed25519) before trusting a peer.".into());
                     }
                     Ok(serde_json::json!(format!("Verified paired peer {} ({})", args.hostname.trim(), cip)))
                 }
@@ -1537,7 +1857,7 @@ impl IntegratorCore {
                     }
                     let args: PolicyArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
                     trust::set_trust_policy(args.auto_trust_cable, args.require_lan_pairing);
-                    Ok(serde_json::json!("Integrator v2.0 enforces mandatory cryptographic pairing on all interfaces"))
+                    Ok(serde_json::json!("Integrator v1.0 enforces mandatory cryptographic pairing on all interfaces"))
                 }
                 "pair_with_peer" => {
                     #[derive(Deserialize)]
@@ -1571,11 +1891,20 @@ impl IntegratorCore {
         }
     }
 
+    /// Shuts down all active services, releasing system hooks and closing sockets.
     pub fn shutdown(&self) {
+        self.camera.shutdown_sync();
         self.kvm.shutdown();
         register_ui_callback(None);
     }
 
+    /// Triggers a system menu bar / tray action.
+    ///
+    /// # Supported Actions:
+    /// - `"paste_remote"`: Initiates remote clipboard paste operation.
+    /// - `"toggle_display"`: Starts or stops screen extension streaming.
+    /// - `"open_cache"`: Reveals application data folder in file manager.
+    /// - `"quit"`: Releases input locks and emits application exit event.
     pub fn trigger_tray_action(&self, action: &str) {
         match action {
             "paste_remote" => {
@@ -1615,13 +1944,18 @@ impl IntegratorCore {
     }
 }
 
+/// Formats an error string into a standard JSON error envelope `{"ok": false, "error": ...}`.
 fn wrap_err(msg: String) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }
 
+/// Converts a raw C-string pointer (`*const c_char`) into an owned Rust `String`.
+///
+/// Returns an empty string if `ptr` is null, or lossy UTF-8 if invalid sequences are encountered.
 pub fn c_str_to_rust(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
+    // SAFETY: Pointer is non-null and assumed to point to a NUL-terminated C string.
     unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
 }

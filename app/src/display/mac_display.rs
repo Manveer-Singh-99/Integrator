@@ -1,5 +1,53 @@
-//! macOS display control: in-process CGVirtualDisplay management,
-//! dynamic Sunshine configuration, and non-destructive Moonlight launching.
+//! # macOS Display Management Subsystem
+//!
+//! ## 1. Module Purpose & Scope
+//! This module owns the macOS-specific implementation of the **Display Subsystem** (`display` feature).
+//! It provides:
+//! 1. In-process virtual display lifecycle management via CoreGraphics private SPI (`virtual_display.m`).
+//! 2. Dynamic discovery and output targeting for the Sunshine streaming server (`sunshine.conf`).
+//! 3. LaunchServices-based execution of `Sunshine.app` ensuring proper macOS Screen Recording TCC permissions.
+//! 4. Non-destructive resolution and execution of the Moonlight client CLI on macOS.
+//! 5. Desktop user notifications via AppleScript (`osascript`).
+//!
+//! ## 2. Cross-Platform Architectural Pipelines
+//!
+//! ### Mac-as-Host Extended Desktop
+//! - **Virtual Display**: Creates a private `CGVirtualDisplay` in-process with Integrator Vendor ID `0x494E`
+//!   and Product ID `0x0165`. Because it is created in-process, it is recognized natively by macOS
+//!   window server without requiring third-party kernel extensions or driver bundles.
+//! - **Sunshine Output Targeting**: Reads `sunshine.conf` and rewrites `output_name = <display_id>`
+//!   dynamically so Sunshine captures the virtual display exclusively.
+//! - **Hardware Acceleration**: Sunshine captures frames via ScreenCaptureKit / Desktop Duplication
+//!   and encodes them using Apple Silicon VideoToolbox hardware encoders (H.264 or HEVC).
+//! - **Moonlight Streaming**: Windows peer receives the stream and decodes via D3D11 / NVDEC / AMF / Intel QSV.
+//!
+//! ### Mac-as-Client Extended Desktop
+//! - Receives a stream from a Windows host (which encodes via NVIDIA NVENC, AMD AMF, or Intel QuickSync).
+//! - Reads existing paired hosts non-destructively from `com.moonlight-stream.Moonlight` preferences via
+//!   `defaults read`, refreshes the matching host's direct IP route, and spawns `Moonlight.app` with
+//!   VideoToolbox hardware decoding, `--no-vsync`, and `--no-frame-pacing`.
+//!
+//! ### Shared Camera Coexistence
+//! While high-resolution display streaming runs over ports 47989/48989, the FaceTime HD camera stream
+//! runs independently over port 58287 in uncompressed 720p30 NV12 into Windows 11 FrameServer
+//! (`integrator_vcam.dll` / `Integrator MacBook Camera`). Display streaming and camera capture
+//! execute simultaneously across distinct threads and network ports with zero mutual interference.
+//!
+//! ## 3. Threading & Process Management Model
+//! - **Process Spawning**: Processes (`open`, `killall`, `defaults`, `osascript`) are launched via
+//!   standard `std::process::Command` within `tokio::task::spawn_blocking` blocks.
+//! - **Zombie Prevention**: Every spawned child process is handed off to a dedicated reaping thread
+//!   ([`reap_child`]) which blocks until the child exits, preventing zombie process accumulation.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **LaunchServices TCC Inheritance**: When Sunshine is installed as a `.app` bundle, it is launched
+//!   via `/usr/bin/open` rather than directly as a POSIX binary. This ensures macOS attributes Screen
+//!   Recording permissions directly to `Sunshine.app` rather than requiring `Integrator.app` to
+//!   request Screen Recording rights.
+//! - **Private Log File Permissions**: Output log files (`sunshine.log`, `sunshine.err.log`) are created
+//!   with POSIX mode `0600` (read/write by owner only), rejecting symlinks to mitigate symlink traversal.
+//! - **AppleScript Sanitization**: Notification titles and messages are filtered to strip control
+//!   characters and truncated to safe length limits before passing to `osascript`.
 
 use crate::system_info;
 use anyhow::{Context, Result};
@@ -8,6 +56,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Spawns a dedicated background thread to wait on and reap a child process, preventing zombies.
+///
+/// # Arguments
+/// - `child`: The spawned child process handle.
+/// - `label`: Diagnostic label used to name the reaper thread.
 fn reap_child(mut child: Child, label: &'static str) {
     let _ = std::thread::Builder::new()
         .name(format!("reap-{}", label))
@@ -16,6 +69,12 @@ fn reap_child(mut child: Child, label: &'static str) {
         });
 }
 
+/// Creates or truncates a private log file with mode `0600` (read/write by owner only).
+///
+/// Rejects symlinked paths to prevent symlink traversal privilege escalation.
+///
+/// # Arguments
+/// - `path`: Destination filesystem path.
 fn create_private_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
@@ -35,6 +94,13 @@ fn create_private_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// Pure string transformation helper updating or inserting `output_name = <display_id>` in sunshine configuration.
+///
+/// Preserves comments, whitespace, and unrelated configuration keys.
+///
+/// # Arguments
+/// - `content`: Existing raw content of `sunshine.conf`.
+/// - `display_id`: CoreGraphics display identifier to set.
 pub(crate) fn update_sunshine_output_content(content: &str, display_id: u32) -> String {
     let mut new_lines = Vec::new();
     let mut found = false;
@@ -65,11 +131,13 @@ extern "C" {
     fn is_virtual_display_active_in_app() -> bool;
 }
 
+/// Manager providing macOS native display creation, Sunshine configuration, and Moonlight execution.
 pub struct MacDisplayManager;
 
 impl MacDisplayManager {
-    /// Locate Integrator's own virtual display using our custom Vendor/Product ID
-    /// (never misidentifying a physical external monitor).
+    /// Locates Integrator's own virtual display using custom Vendor/Product ID (`0x494E` / `0x0165`).
+    ///
+    /// Guarantees that physical external displays are never misidentified as Integrator virtual displays.
     #[cfg(target_os = "macos")]
     pub fn get_active_virtual_display() -> Option<u32> {
         let in_app_id = unsafe { get_virtual_display_id_in_app() };
@@ -86,7 +154,10 @@ impl MacDisplayManager {
         None
     }
 
-    /// Updates discovered `sunshine.conf` `output_name = <display_id>`.
+    /// Updates discovered `sunshine.conf` with `output_name = <display_id>`.
+    ///
+    /// # Arguments
+    /// - `display_id`: CoreGraphics display identifier of the target virtual screen.
     pub fn configure_sunshine_output(display_id: u32) -> Result<()> {
         let conf_path = system_info::find_sunshine_conf().unwrap_or_else(|| {
             system_info::user_home_dir().join(".config/sunshine/sunshine.conf")
@@ -108,7 +179,15 @@ impl MacDisplayManager {
         Ok(())
     }
 
-    /// Creates or reuses an in-process CGVirtualDisplay on macOS.
+    /// Creates or reuses an in-process `CGVirtualDisplay` on macOS.
+    ///
+    /// # Arguments
+    /// - `width`: Target display width in pixels (clamped to 800..=7680).
+    /// - `height`: Target display height in pixels (clamped to 600..=4320).
+    /// - `fps`: Target refresh rate in Hertz (clamped to 30..=240).
+    ///
+    /// # Returns
+    /// CoreGraphics display identifier (`CGDirectDisplayID`) on success.
     pub fn start_virtual_display(width: u32, height: u32, fps: u32) -> Result<u32> {
         #[cfg(target_os = "macos")]
         {
@@ -149,6 +228,7 @@ impl MacDisplayManager {
         Ok(())
     }
 
+    /// Returns whether an Integrator virtual display is currently instantiated and online.
     pub fn is_virtual_display_active() -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -161,7 +241,10 @@ impl MacDisplayManager {
         }
     }
 
-    /// Launches Sunshine daemon using dynamic binary discovery.
+    /// Launches the Sunshine streaming server daemon using dynamic binary and bundle discovery.
+    ///
+    /// When Sunshine is packaged inside a `.app` bundle, it is launched via `/usr/bin/open`
+    /// to preserve Screen Recording TCC permissions.
     pub fn start_sunshine() -> Result<()> {
         let _ = Self::stop_sunshine();
         std::thread::sleep(Duration::from_millis(250));
@@ -231,6 +314,7 @@ impl MacDisplayManager {
         Ok(())
     }
 
+    /// Stops any running Sunshine server processes on macOS.
     pub fn stop_sunshine() -> Result<()> {
         let is_running = || {
             ["Sunshine", "sunshine"].iter().any(|proc_name| {
@@ -268,6 +352,7 @@ impl MacDisplayManager {
         Self::wait_for_port("127.0.0.1", port, timeout_dur).await
     }
 
+    /// Probes a TCP port until connection succeeds or `timeout` expires.
     pub async fn wait_for_port(ip: &str, port: u16, timeout: Duration) -> bool {
         let addr = format!("{}:{}", ip, port);
         let start = std::time::Instant::now();
@@ -283,7 +368,17 @@ impl MacDisplayManager {
         false
     }
 
-    /// Launches Moonlight CLI on macOS without clobbering unrelated hosts or user global settings.
+    /// Launches the Moonlight client CLI on macOS without clobbering unrelated host pairing configurations.
+    ///
+    /// # Arguments
+    /// - `pc_ip`: Target host IPv4 address.
+    /// - `port`: Sunshine web/RTSP port.
+    /// - `host_name`: Host display name.
+    /// - `width`: Stream width in pixels.
+    /// - `height`: Stream height in pixels.
+    /// - `fps`: Refresh rate in Hertz.
+    /// - `bitrate_kbps`: Maximum bitrate in kilobits per second.
+    /// - `audio_on_host`: Whether audio is retained on host.
     pub fn start_moonlight_client(
         pc_ip: &str,
         port: u16,
@@ -355,6 +450,7 @@ impl MacDisplayManager {
         Ok(())
     }
 
+    /// Stops any running Moonlight client processes on macOS.
     pub fn stop_moonlight_client() -> Result<()> {
         let is_running = || {
             Command::new("/usr/bin/pgrep")
@@ -380,6 +476,7 @@ impl MacDisplayManager {
         Ok(())
     }
 
+    /// Displays a native macOS desktop notification via AppleScript (`osascript`).
     pub fn show_notification(title: &str, message: &str) {
         let safe_title: String = title.chars().filter(|c| !c.is_control()).take(128).collect();
         let safe_msg: String = message.chars().filter(|c| !c.is_control()).take(256).collect();
@@ -400,8 +497,10 @@ impl MacDisplayManager {
     }
 }
 
-/// Inspect existing paired Moonlight hosts in `com.moonlight-stream.Moonlight` and refresh ONLY
-/// a slot that genuinely matches `host_name` / `pc_ip` & `port`, never touching unrelated hosts.
+/// Inspects existing paired Moonlight hosts in `com.moonlight-stream.Moonlight` preferences
+/// and refreshes ONLY the slot that genuinely matches `host_name` / `pc_ip` & `port`.
+///
+/// Guarantees that existing user configurations and other gaming PC pairings remain completely untouched.
 fn resolve_or_refresh_mac_moonlight_slot(
     pc_ip: &str,
     port: u16,

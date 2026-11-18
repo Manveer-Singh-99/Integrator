@@ -1,3 +1,71 @@
+//
+//  kvm_windows.cpp
+//  Integrator Universal Input KVM - Windows Win32 Low-Level Driver & OLE D&D Bridge
+//
+//  ========================================================================================
+//  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+//  ========================================================================================
+//  This file implements the native Win32/C++ backend for the Integrator Universal Input KVM
+//  subsystem on Windows 10 and Windows 11.
+//
+//  Key Subsystem Capabilities:
+//  - Low-Level OS Input Interception: Installs `WH_MOUSE_LL` and `WH_KEYBOARD_LL` hooks via
+//    `SetWindowsHookExW` on a dedicated message-pump thread to capture raw mouse movements,
+//    clicks, wheel deltas, and keyboard transitions before desktop windows receive them.
+//  - Edge Probe & Corner Guard Windows: Creates 1-pixel layered, transparent, topmost windows
+//    (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW`) positioned along active display
+//    boundaries to monitor edge dwell, corner exclusion zones, and incoming OLE drag sessions.
+//  - Synthetic Input Injection: Synthesizes remote pointer movement, clicks, smooth scrolling,
+//    and keyboard keystrokes using Win32 `SendInput` with virtual-key codes (`VK_*`), hardware
+//    scancodes, and `KEYEVENTF_EXTENDEDKEY` flags.
+//  - Fluent Drag Ghost HUD: Renders a translucent layered GDI window (`WS_EX_LAYERED`) displaying
+//    live file drag badges and titles under the cursor during active cross-screen transfers.
+//  - OLE COM Drag-and-Drop Bridging: Implements `IDropTarget` (`EdgeDropTarget`) to catch outgoing
+//    Windows Explorer file drags at the screen boundary, and `IDropSource` / `IDataObject`
+//    (`RemoteDropSource`) to execute native `DoDragDrop` calls onto Windows target applications.
+//
+//  ========================================================================================
+//  2. ARCHITECTURAL LINKAGES & CALL FLOW
+//  ========================================================================================
+//  Upstream Callers:
+//  - `src/kvm/windows_backend.rs`: Rust FFI bridge that invokes `extern "C"` functions:
+//    - `integrator_kvm_win_start_hooks`: Starts hook and OLE worker threads.
+//    - `integrator_kvm_win_stop_hooks`: Unhooks and terminates worker threads.
+//    - `integrator_kvm_win_set_controlling`: Hides and parks the local Windows cursor.
+//    - `integrator_kvm_win_set_controlled`: Warps and reveals cursor upon remote entry.
+//    - `integrator_kvm_win_inject_*`: Synthesizes inputs into the Windows input queue.
+//    - `integrator_kvm_win_show_drag_ghost` / `hide_drag_ghost`: Controls GDI HUD.
+//    - `integrator_kvm_win_begin_native_drag`: Initiates `DoDragDrop` on OLE worker thread.
+//
+//  Downstream Callees:
+//  - Win32 User32 (`SetWindowsHookExW`, `SendInput`, `CreateWindowExW`, `SetCursorPos`).
+//  - Win32 GDI32 (`CreateSolidBrush`, `CreateFontW`, `FillRect`, `DrawTextW`).
+//  - Win32 OLE32 / Shell32 (`OleInitialize`, `RegisterDragDrop`, `DoDragDrop`, `SHCreateDataObject`).
+//  - Rust C FFI Callbacks: `KvmWinEventCallback` (`on_win_event`) and `KvmWinDragEndedCallback`.
+//
+//  ========================================================================================
+//  3. THREADING & CONCURRENCY MODEL
+//  ========================================================================================
+//  - Input Hook Thread (`g_hook_thread`): Dedicated Win32 thread running a standard `GetMessage`
+//    pump. Hosts `WH_MOUSE_LL` / `WH_KEYBOARD_LL` hooks, guard window, edge probe window, and
+//    the GDI ghost HUD window.
+//  - OLE STA Worker Thread (`g_ole_thread`): Dedicated COM STA thread hosting the message-only
+//    window for executing blocking `DoDragDrop` loops without impeding the input hook pump.
+//  - Fast-Path Lock-Free Synchronization: Atomic flags (`g_controlling_peer`, `g_physical_left_down`,
+//    `g_swallowed_mod_keys`) provide sub-microsecond state checks inside the hook procedures.
+//
+//  ========================================================================================
+//  4. SECURITY & SAFETY INVARIANTS
+//  ========================================================================================
+//  - Anti-Feedback Loop Tagging (`kIntegratorEventTag = 0x494E5447`): Synthetic events generated
+//    by `SendInput` set `dwExtraInfo = 0x494E5447`. Hook procedures verify this tag and immediately
+//    forward the event via `CallNextHookEx`, preventing infinite self-reinforcing input loops.
+//  - UNC Path Traversal & Coercion Mitigation: `is_valid_local_drag_path` rejects remote UNC
+//    network paths (`\\server\share`) to protect against NTLM reflection/relay exploits during
+//    drag-and-drop operations.
+//  - Exception Boundaries: No C++ exceptions cross the `extern "C"` ABI boundary into Rust.
+//
+
 #ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -253,6 +321,13 @@ static void position_edge_window(HWND hwnd) {
 
 // MARK: - OLE IDropTarget for Edge Catcher (captures active Explorer CF_HDROP drag at screen border)
 
+/// OLE IDropTarget implementation attached to the invisible screen boundary edge window.
+///
+/// When the user drags files from Windows Explorer toward the configured screen boundary,
+/// this target receives `DragEnter`, extracts the list of dragged files via the `CF_HDROP`
+/// clipboard format, validates the paths against network UNC exploits, and caches them in
+/// `g_captured_paths`. When the mouse subsequent crosses the screen border, `KvmService`
+/// packages these paths into a `DragOffer` and hands off the drag session to the remote Mac.
 class EdgeDropTarget final : public IDropTarget {
 public:
     EdgeDropTarget() : ref_count_(1) {}
@@ -354,6 +429,14 @@ private:
 
 // MARK: - OLE IDropSource for Remote -> Windows `DoDragDrop`
 
+/// OLE IDropSource implementation driving synthetic file drag sessions on Windows.
+///
+/// When a file drag initiated on macOS enters the Windows desktop, the payload files are
+/// staged to disk, and `DoDragDrop` is executed on the dedicated OLE STA thread using this source.
+/// `QueryContinueDrag` continuously monitors `g_remote_drag_left_down` (updated by incoming
+/// network mouse button messages from the Mac). When the user releases the physical mouse button
+/// on the Mac, `g_remote_drag_left_down` becomes false, prompting `QueryContinueDrag` to return
+/// `DRAGDROP_S_DROP` and completing the native drop into whatever Windows application is under the cursor.
 class RemoteDropSource final : public IDropSource {
 public:
     RemoteDropSource() : ref_count_(1) {}

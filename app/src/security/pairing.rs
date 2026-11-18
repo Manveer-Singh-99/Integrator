@@ -1,23 +1,80 @@
-//! Staged RFC 9382 SPAKE2 + Ed25519 Pairing Protocol (`IPR2`, v2) & Anti-DoS Coordinator.
+//! # Staged RFC 9382 SPAKE2 + Ed25519 Pairing Protocol (`IPR2`, v2) & Anti-DoS Coordinator (`app/src/security/pairing.rs`)
 //!
-//! Security properties:
-//! 1. **4-Message Staged Mutual Confirmation (`PairInit` -> `PairServerShare` -> `PairClientConfirm` -> `PairServerComplete`)**:
-//!    - Neither side commits trust or transitions to the negotiated `K_root` until the peer's
-//!      SPAKE2 confirmation MAC (`F_A` / `F_B`) and `Ed25519` transcript signature (`sig_A` / `sig_B`)
-//!      are cryptographically verified.
-//!    - The responder (Server `B`) verifies `F_A` and `sig_A` *before* revealing `F_B`, `sig_B`,
-//!      or `F_ack`, preventing unauthenticated attackers from using the server as a signing oracle.
-//! 2. **Anti-DoS PIN Lifecycle (Zero Forced PIN Rotation on Failed Guesses)**:
-//!    - Failed confirmation attempts from an attacker **never** rotate or invalidate the host's active PIN.
-//!    - Per-IP rate limiting enforces at most 3 failed attempts per 60s window per IP, followed by
-//!      exponential per-IP lockout (`60s`, `120s`, `240s`, `480s`, `960s`), while other IPs remain
-//!      able to pair with the active PIN until its 10-minute TTL expires or a valid pairing completes.
-//! 3. **Bounded Concurrency & Replay Resistance**:
-//!    - Max 4 concurrent in-flight pairing sessions globally (`MAX_CONCURRENT_SESSIONS = 4`),
-//!      max 1 active session per IP, 15-second session TTL, and 32-byte fresh CSPRNG nonces on both sides.
-//! 4. **Identity-Key Pinning**:
-//!    - Verifies `device_id == SHA256("integrator-device-id-v2" || ed25519_pubkey)[0..16]` and blocks
-//!      unexpected key changes for any already-pinned peer until explicitly unpaired.
+//! ## 1. Module Purpose & Architectural Scope
+//! This module implements the mutual cryptographic pairing handshake (`IPR2`) that transitions two Integrator
+//! devices (e.g. macOS MacBook and Windows 11 Desktop) from an unauthenticated discovery state to a mutually
+//! trusted, cryptographically pinned state.
+//!
+//! Pairing accomplishes three foundational objectives:
+//! 1. Authenticates both machines using a transient 6-digit numeric PIN without exposing the PIN to offline dictionary attacks.
+//! 2. Mutually verifies each machine's long-term Ed25519 identity key and records device identifiers in `KeystoreV2`.
+//! 3. Derives a high-entropy 256-bit pre-shared root key ($K_{\text{root}}$) used to secure all future TCP/UDP sessions.
+//!
+//! In addition to the protocol state machine, this module contains the host-side [`PairingCoordinatorV2`], which
+//! enforces strict anti-DoS protections to prevent unauthorized PIN rotation, brute-force enumeration, or resource exhaustion.
+//!
+//! ## 2. Protocol State Machine (4-Message Staged Mutual Confirmation)
+//! ```text
+//!    Initiator (Client A)                                 Responder (Server B)
+//!    ====================                                 ====================
+//!    1. Initiate:
+//!       Sample client_nonce (32B)
+//!       Assemble PairInitMsg
+//!                 ---------------- PairInit (0x01) -------------->
+//!                                                      2. Receive PairInit:
+//!                                                         Verify rate limits & window open
+//!                                                         Verify client Ed25519 key against pinned records
+//!                                                         Sample server_nonce (32B), session_id (16B)
+//!                                                         Start SPAKE2 B: compute pB = y*B + w*N
+//!                 <------------ PairServerShare (0x02) -----------
+//!    3. Process Server Share:
+//!       Verify server Ed25519 key against pinned records
+//!       Start SPAKE2 A: compute pA = x*B + w*M
+//!       Finish SPAKE2 A: compute K, Ke, Ka, KcA, KcB, F_A, F_B
+//!       Sign transcript: sig_A = Ed25519_Sign(tt_sha256 || F_A)
+//!                 ----------- PairClientConfirm (0x03) ---------->
+//!                                                      4. Process Client Confirm:
+//!                                                         Finish SPAKE2 B: compute K, Ke, Ka, KcA, KcB
+//!                                                         Verify F_A == expected in constant-time
+//!                                                         Verify sig_A with client_ed25519_pk
+//!                                                         (Client is now fully authenticated!)
+//!                                                         Sign transcript: sig_B = Ed25519_Sign(tt_sha256 || F_B || sig_A)
+//!                                                         Derive K_root, K_ack, F_ack, SAS
+//!                                                         Commit Client A to KeystoreV2
+//!                                                         Consume PIN & close pairing window
+//!                 <----------- PairServerComplete (0x04) ---------
+//!    5. Finalize:
+//!       Verify F_B == expected in constant-time
+//!       Verify sig_B with server_ed25519_pk
+//!       Derive K_root, K_ack, F_ack, SAS
+//!       Verify F_ack == expected, key_id == expected
+//!       Commit Server B to KeystoreV2
+//! ```
+//!
+//! ## 3. Security Properties & Threat Model
+//! - **Oracle Attack Mitigation**: Server B verifies Client A's SPAKE2 confirmation tag $F_A$ and Ed25519 signature
+//!   $sig_A$ *before* generating $sig_B$ or revealing $F_B$ or $F_{\text{ack}}$. An unauthenticated attacker cannot use
+//!   Server B as a signing oracle.
+//! - **Anti-DoS PIN Lifecycle (Zero Forced PIN Rotation on Failed Guesses)**:
+//!   - Attackers submitting incorrect PINs or corrupt handshake frames **never** cause the host's active PIN to rotate,
+//!     expire, or close.
+//!   - Per-IP rate limiting allows at most 3 failed guesses per 60-second window per IP. Exceeding this triggers
+//!     exponential per-IP lockout ($60s \cdot 2^k$, capped at $960s$), while legitimate peers on other IPs remain
+//!     able to pair using the active PIN until its 10-minute TTL expires.
+//! - **Bounded Concurrency & Memory Isolation**:
+//!   - At most 4 concurrent pairing sessions globally (`MAX_CONCURRENT_PAIRING_SESSIONS = 4`).
+//!   - At most 1 active session per source IP.
+//!   - In-flight sessions expire after 15 seconds (`INFLIGHT_SESSION_TTL_SECS = 15`).
+//! - **Identity-Key Pinning**:
+//!   - Enforces `device_id == SHA256("integrator-device-id-v2" || ed25519_pubkey)[0..16]`.
+//!   - Automatically blocks conflicting keys for previously paired device IDs or hostnames.
+//! - **Unbiased Random PIN Generation**:
+//!   - Generates 6-digit numeric PINs via CSPRNG rejection sampling over $[0, 4294000000)$ modulo $900,000 + 100,000$.
+//!
+//! ## 4. Threading & Concurrency Model
+//! Handshake runner functions operate asynchronously over Tokio `AsyncRead + AsyncWrite` streams. Shared state
+//! (`PairingCoordinatorV2`, `KeystoreV2`) is wrapped in `std::sync::Mutex`. Locks are acquired briefly in synchronous
+//! scopes and dropped before `.await` points to ensure futures are `Send` across multi-threaded Tokio runtimes.
 
 use crate::security::{
     constant_time_eq, csprng_array, hex_decode_array, hex_encode,
@@ -33,34 +90,69 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
+/// 4-byte ASCII wire magic identifying Integrator Pairing v2 frames (`"IPR2"`).
 pub const PAIRING_WIRE_MAGIC: [u8; 4] = *b"IPR2";
+
+/// Pairing protocol version (`2`).
 pub const PAIRING_PROTOCOL_VERSION: u16 = 2;
+
+/// Header version byte (`0x02`).
 pub const PAIRING_HEADER_VERSION_BYTE: u8 = 0x02;
+
+/// Maximum permitted serialized pairing frame payload length (4096 bytes).
 pub const MAX_PAIRING_FRAME_BYTES: usize = 4096;
 
-pub const PIN_TTL_SECS: u64 = 600; // 10 minutes
-pub const INFLIGHT_SESSION_TTL_SECS: u64 = 15; // 15 seconds per handshake
+/// Time-to-live for an active pairing PIN (10 minutes = 600 seconds).
+pub const PIN_TTL_SECS: u64 = 600;
+
+/// Maximum duration an in-flight pairing handshake may remain pending before expiration (15 seconds).
+pub const INFLIGHT_SESSION_TTL_SECS: u64 = 15;
+
+/// Maximum concurrent in-flight pairing handshakes across all remote IPs (4 sessions).
 pub const MAX_CONCURRENT_PAIRING_SESSIONS: usize = 4;
+
+/// Maximum failed confirmation attempts permitted per IP before triggering exponential lockout (3 attempts).
 pub const MAX_FAILED_ATTEMPTS_PER_IP: u32 = 3;
+
+/// Maximum `PairInit` handshakes an IP may initiate per 60-second window (12 attempts).
 pub const MAX_PAIR_INIT_PER_IP_PER_WINDOW: u32 = 12;
+
+/// Rolling rate-limiting window duration (60 seconds).
 pub const IP_ATTEMPT_WINDOW_SECS: u64 = 60;
+
+/// Base lockout duration on rate limit violation (60 seconds).
 pub const BASE_IP_LOCKOUT_SECS: u64 = 60;
+
+/// Maximum tracked remote IPs in the rate limit table (1024 entries).
 pub const MAX_IP_RATE_LIMIT_ENTRIES: usize = 1024;
+
+/// Network I/O timeout for sending or receiving individual pairing frames (10 seconds).
 pub const PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum length of sanitized device name strings (64 characters).
 pub const MAX_NAME_LEN: usize = 64;
+
+/// Maximum length of sanitized platform identifier strings (16 characters).
 pub const MAX_PLATFORM_LEN: usize = 16;
 
+/// Wire message type discriminator byte for `IPR2` frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PairingMsgType {
+    /// Client initiates pairing handshake (`0x01`).
     PairInit = 0x01,
+    /// Server responds with ephemeral share and session ID (`0x02`).
     PairServerShare = 0x02,
+    /// Client sends SPAKE2 MAC and Ed25519 identity signature (`0x03`).
     PairClientConfirm = 0x03,
+    /// Server sends completion acknowledgment MAC and signature (`0x04`).
     PairServerComplete = 0x04,
+    /// Handshake error notice (`0xFF`).
     PairError = 0xFF,
 }
 
 impl PairingMsgType {
+    /// Maps a raw `u8` wire byte to a [`PairingMsgType`] variant.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x01 => Some(PairingMsgType::PairInit),
@@ -73,52 +165,84 @@ impl PairingMsgType {
     }
 }
 
+/// Message 1: Sent from Initiator (Client A) to Responder (Server B) to start pairing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairInitMsg {
+    /// Pairing protocol version (must be 2).
     pub version: u16,
+    /// 32-character lowercase hex canonical device ID of Client A.
     pub client_device_id_hex: String,
+    /// 64-character lowercase hex compressed Ed25519 public key of Client A.
     pub client_ed25519_pk_hex: String,
+    /// 64-character lowercase hex CSPRNG random nonce from Client A (32 bytes).
     pub client_nonce_hex: String,
+    /// Friendly device name of Client A (sanitized, max 64 chars).
     pub device_name: String,
+    /// Operating system platform of Client A (e.g. `"macOS"`, max 16 chars).
     pub platform: String,
 }
 
+/// Message 2: Sent from Responder (Server B) to Initiator (Client A) containing Server's share.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairServerShareMsg {
+    /// Pairing protocol version (must be 2).
     pub version: u16,
+    /// 32-character lowercase hex random session identifier (16 bytes).
     pub pairing_session_id_hex: String,
+    /// 32-character lowercase hex canonical device ID of Server B.
     pub server_device_id_hex: String,
+    /// 64-character lowercase hex compressed Ed25519 public key of Server B.
     pub server_ed25519_pk_hex: String,
+    /// 64-character lowercase hex CSPRNG random nonce from Server B (32 bytes).
     pub server_nonce_hex: String,
+    /// 64-character lowercase hex SPAKE2 blinded share $pB$ (32 bytes).
     pub spake2_share_b_hex: String,
+    /// Friendly device name of Server B (sanitized, max 64 chars).
     pub device_name: String,
+    /// Operating system platform of Server B (e.g. `"Windows"`, max 16 chars).
     pub platform: String,
 }
 
+/// Message 3: Sent from Initiator (Client A) to Responder (Server B) containing confirmation authenticators.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairClientConfirmMsg {
+    /// 32-character lowercase hex matching session identifier.
     pub pairing_session_id_hex: String,
+    /// 64-character lowercase hex SPAKE2 blinded share $pA$ (32 bytes).
     pub spake2_share_a_hex: String,
+    /// 64-character lowercase hex confirmation MAC $F_A = \text{HMAC-SHA256}(K_{cA}, TT)$ (32 bytes).
     pub confirm_mac_a_hex: String,
+    /// 128-character lowercase hex Ed25519 signature $sig_A$ over $tt\_sha256 \,\|\, F_A$ (64 bytes).
     pub identity_sig_a_hex: String,
 }
 
+/// Message 4: Sent from Responder (Server B) to Initiator (Client A) confirming pairing completion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairServerCompleteMsg {
+    /// 32-character lowercase hex matching session identifier.
     pub pairing_session_id_hex: String,
+    /// 64-character lowercase hex confirmation MAC $F_B = \text{HMAC-SHA256}(K_{cB}, TT)$ (32 bytes).
     pub confirm_mac_b_hex: String,
+    /// 128-character lowercase hex Ed25519 signature $sig_B$ over $tt\_sha256 \,\|\, F_B \,\|\, sig_A$ (64 bytes).
     pub identity_sig_b_hex: String,
+    /// 64-character lowercase hex completion acknowledgment MAC $F_{\text{ack}}$ (32 bytes).
     pub ack_mac_hex: String,
+    /// 32-character lowercase hex derived key identifier for $K_{\text{root}}$ (16 bytes).
     pub key_id_hex: String,
 }
 
+/// Wire error message transmitted when a handshake is rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairErrorWireMsg {
+    /// Numeric error code category.
     pub code: u8,
+    /// Seconds the remote peer must wait before retrying (for rate limiting).
     pub retry_after_secs: u32,
+    /// Human-readable error description (clamped to 120 chars).
     pub message: String,
 }
 
+/// Error scenarios occurring during pairing handshake execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
     UnsupportedVersion(u16),
@@ -205,6 +329,7 @@ impl std::fmt::Display for PairingError {
 impl std::error::Error for PairingError {}
 
 impl PairingError {
+    /// Maps internal error variant to a structured wire error message for transmission.
     pub fn to_wire_error(&self) -> PairErrorWireMsg {
         let (code, retry) = match self {
             PairingError::UnsupportedVersion(_) => (1, 0),
@@ -225,6 +350,7 @@ impl PairingError {
     }
 }
 
+/// Rate-limiting record tracking authentication failures and init attempts for a single IP address.
 #[derive(Debug, Clone)]
 struct IpRateLimitRecord {
     failures: u32,
@@ -236,6 +362,7 @@ struct IpRateLimitRecord {
     last_touched: u64,
 }
 
+/// In-flight handshake state retained by Server B between `PairInit` and `PairClientConfirm`.
 struct InFlightServerSession {
     pairing_session_id: [u8; 16],
     source_ip: IpAddr,
@@ -248,7 +375,7 @@ struct InFlightServerSession {
     aad_hash: [u8; 32],
 }
 
-/// Manages the host's active pairing PIN, per-IP rate limiting, and in-flight SPAKE2 sessions.
+/// Host-side pairing coordinator managing the active PIN, in-flight handshakes, and anti-DoS rate limiting.
 pub struct PairingCoordinatorV2 {
     active_pin: Option<Zeroizing<String>>,
     pin_created_at_secs: u64,
@@ -260,6 +387,7 @@ pub struct PairingCoordinatorV2 {
 }
 
 impl PairingCoordinatorV2 {
+    /// Constructs a fresh coordinator with specified local device name and platform.
     pub fn new(local_device_name: String, local_platform: String) -> Self {
         Self {
             active_pin: None,
@@ -272,8 +400,7 @@ impl PairingCoordinatorV2 {
         }
     }
 
-    /// Generates an unbiased 6-digit PIN (`100000`..=`999999`) via rejection sampling and opens
-    /// the pairing window for `PIN_TTL_SECS` (10 minutes).
+    /// Generates an unbiased 6-digit numeric PIN (`100000`..=`999999`) and opens the 10-minute pairing window.
     pub fn open_pairing_window(&mut self, now_secs: u64) -> String {
         let pin = generate_unbiased_6digit_pin();
         self.active_pin = Some(Zeroizing::new(pin.clone()));
@@ -283,7 +410,7 @@ impl PairingCoordinatorV2 {
         pin
     }
 
-    /// Opens the pairing window with an explicit 6-digit PIN (used for deterministic testing or user-regenerated PIN).
+    /// Opens the pairing window with an explicit 6-digit PIN (for testing or user specification).
     pub fn open_pairing_window_with_pin(
         &mut self,
         pin: &str,
@@ -299,20 +426,24 @@ impl PairingCoordinatorV2 {
         Ok(())
     }
 
+    /// Closes the pairing window, clearing the active PIN and aborting all in-flight handshakes.
     pub fn close_pairing_window(&mut self) {
         self.pairing_window_open = false;
         self.active_pin = None;
         self.inflight_sessions.clear();
     }
 
+    /// Returns the Unix epoch timestamp (seconds) when the current PIN was generated.
     pub fn pin_created_at_secs(&self) -> u64 {
         self.pin_created_at_secs
     }
 
+    /// Aborts any in-flight pairing session originating from `ip`.
     pub fn cancel_inflight_for_ip(&mut self, ip: IpAddr) {
         self.inflight_sessions.retain(|_, s| s.source_ip != ip);
     }
 
+    /// Returns the active PIN string if the pairing window is open and within its 10-minute TTL.
     pub fn active_pin(&self, now_secs: u64) -> Option<&str> {
         if !self.pairing_window_open {
             return None;
@@ -323,9 +454,9 @@ impl PairingCoordinatorV2 {
         self.active_pin.as_deref().map(|z| z.as_str())
     }
 
+    /// Evicts an unlocked, oldest-touched rate-limit entry when the table exceeds `MAX_IP_RATE_LIMIT_ENTRIES`.
     fn evict_one_rate_limit_entry(&mut self, now_secs: u64) {
-        // Prefer evicting unlocked entries (oldest last_touched first) so flooding IPs cannot
-        // push an actively locked-out attacker out of the table.
+        // Prefer evicting unlocked entries so attacking IPs currently in lockout cannot be purged
         if let Some(&evict_ip) = self
             .ip_rate_limits
             .iter()
@@ -343,6 +474,7 @@ impl PairingCoordinatorV2 {
         }
     }
 
+    /// Retrieves or inserts the rate-limiting record for `ip`.
     fn ensure_rate_limit_entry_mut(
         &mut self,
         ip: IpAddr,
@@ -366,6 +498,7 @@ impl PairingCoordinatorV2 {
             })
     }
 
+    /// Checks whether `ip` is currently locked out due to excessive failed attempts.
     fn check_ip_rate_limit(&mut self, ip: IpAddr, now_secs: u64) -> Result<(), PairingError> {
         if let Some(rec) = self.ip_rate_limits.get_mut(&ip) {
             rec.last_touched = now_secs;
@@ -386,6 +519,7 @@ impl PairingCoordinatorV2 {
         Ok(())
     }
 
+    /// Enforces the sliding window limit on `PairInit` frequency for a given IP.
     fn check_and_record_pair_init(&mut self, ip: IpAddr, now_secs: u64) -> Result<(), PairingError> {
         let entry = self.ensure_rate_limit_entry_mut(ip, now_secs);
         entry.last_touched = now_secs;
@@ -407,7 +541,7 @@ impl PairingCoordinatorV2 {
         Ok(())
     }
 
-    /// Records a failed authentication attempt for `ip` WITHOUT rotating or invalidating the host's active PIN.
+    /// Records an authentication failure for `ip` WITHOUT invalidating or rotating the active PIN.
     fn record_ip_failure(&mut self, ip: IpAddr, now_secs: u64) {
         let entry = self.ensure_rate_limit_entry_mut(ip, now_secs);
         entry.last_touched = now_secs;
@@ -426,17 +560,19 @@ impl PairingCoordinatorV2 {
         }
     }
 
+    /// Clears rate-limiting failure tracking for `ip` after successful authenticated pairing.
     fn clear_ip_failures(&mut self, ip: IpAddr) {
         self.ip_rate_limits.remove(&ip);
     }
 
+    /// Prunes in-flight handshake sessions exceeding `INFLIGHT_SESSION_TTL_SECS` (15s).
     fn prune_expired_sessions(&mut self, now_secs: u64) {
         self.inflight_sessions.retain(|_, s| {
             now_secs.saturating_sub(s.created_at_secs) <= INFLIGHT_SESSION_TTL_SECS
         });
     }
 
-    /// Step 1 (Server `B`): Processes `PairInit` from `source_ip` and returns `PairServerShareMsg`.
+    /// Step 1 (Server B): Processes incoming `PairInitMsg` and responds with `PairServerShareMsg`.
     pub fn handle_pair_init(
         &mut self,
         keystore: &KeystoreV2,
@@ -547,9 +683,7 @@ impl PairingCoordinatorV2 {
         Ok(share_msg)
     }
 
-    /// Step 2 (Server `B`): Processes `PairClientConfirm`, verifies `F_A` and `sig_A` BEFORE
-    /// committing trust or revealing `F_B`, `sig_B`, and `F_ack`.
-    /// On failure, records a per-IP failure without rotating the active PIN.
+    /// Step 2 (Server B): Processes `PairClientConfirmMsg`, verifying $F_A$ and $sig_A$ before revealing $F_B$ or $F_{\text{ack}}$.
     pub fn handle_pair_client_confirm(
         &mut self,
         keystore: &mut KeystoreV2,
@@ -686,7 +820,7 @@ impl PairingCoordinatorV2 {
     }
 }
 
-/// Client-side (`Initiator A`) state machine for a single pairing handshake.
+/// Client-side (Initiator A) state machine managing an active pairing handshake.
 pub struct ClientPairingHandshakeV2 {
     pin: Zeroizing<String>,
     init_msg: PairInitMsg,
@@ -695,6 +829,7 @@ pub struct ClientPairingHandshakeV2 {
     client_nonce: [u8; 32],
 }
 
+/// Intermediate client state awaiting final `PairServerCompleteMsg`.
 pub struct ClientAwaitingServerComplete {
     pairing_session_id: [u8; 16],
     server_device_id: [u8; 16],
@@ -706,7 +841,7 @@ pub struct ClientAwaitingServerComplete {
 }
 
 impl ClientPairingHandshakeV2 {
-    /// Step 1 (Client `A`): Creates `PairInitMsg` to send to the host.
+    /// Step 1 (Client A): Creates `PairInitMsg` to transmit to Server B.
     pub fn initiate(
         keystore: &KeystoreV2,
         pin: &str,
@@ -743,8 +878,7 @@ impl ClientPairingHandshakeV2 {
         ))
     }
 
-    /// Step 2 (Client `A`): Processes `PairServerShareMsg`, validates server identity & pinning,
-    /// computes SPAKE2 share `pA`, `F_A`, and `sig_A`, and returns `PairClientConfirmMsg`.
+    /// Step 2 (Client A): Processes `PairServerShareMsg`, computes $pA$, $F_A$, and $sig_A$, and returns `PairClientConfirmMsg`.
     pub fn process_server_share(
         self,
         keystore: &KeystoreV2,
@@ -838,8 +972,7 @@ impl ClientPairingHandshakeV2 {
 }
 
 impl ClientAwaitingServerComplete {
-    /// Step 3 (Client `A`): Verifies `PairServerCompleteMsg` (`F_B`, `sig_B`, `F_ack`, and `key_id`)
-    /// BEFORE committing the server's `K_root` to the local keystore.
+    /// Step 3 (Client A): Verifies `PairServerCompleteMsg` and commits Server B to local keystore.
     pub fn finalize_and_commit(
         self,
         keystore: &mut KeystoreV2,
@@ -910,7 +1043,7 @@ impl ClientAwaitingServerComplete {
 // Wire Framing & Async Stream Handshake Runners
 // ============================================================================
 
-/// Writes a bounded `IPR2` frame (`[magic: 4B][ver: 1B][msg_type: 1B][len: u16 BE][payload]`).
+/// Writes a bounded `IPR2` frame: `[magic: 4B][ver: 1B][msg_type: 1B][len: u16 BE][payload]`.
 pub async fn send_pairing_frame<W, T>(
     writer: &mut W,
     msg_type: PairingMsgType,
@@ -954,7 +1087,7 @@ where
     recv_pairing_frame_with_prefixed_magic(reader, None).await
 }
 
-/// Reads a bounded `IPR2` frame when the 4-byte magic has optionally already been read from `reader`.
+/// Reads a bounded `IPR2` frame when the 4-byte magic has optionally already been read.
 pub async fn recv_pairing_frame_with_prefixed_magic<R>(
     reader: &mut R,
     already_read_magic: Option<[u8; 4]>,
@@ -1056,8 +1189,7 @@ where
     awaiting.finalize_and_commit(keystore, &complete_msg, server_ip, via_direct_cable)
 }
 
-/// Executes the 4-message Client (`Initiator A`) pairing flow using a shared `&std::sync::Mutex<KeystoreV2>`,
-/// never holding the mutex across `.await` points so the returned future is `Send`.
+/// Executes the 4-message Client pairing flow using a shared `Mutex<KeystoreV2>` without holding locks across `.await`.
 pub async fn run_client_pairing_with_shared_keystore<S>(
     stream: &mut S,
     keystore_mutex: &std::sync::Mutex<KeystoreV2>,
@@ -1116,8 +1248,7 @@ where
     awaiting.finalize_and_commit(&mut ks, &complete_msg, server_ip, via_direct_cable)
 }
 
-/// Executes the 4-message Server (`Responder B`) pairing flow using shared `&std::sync::Mutex` references,
-/// never holding any mutex guard across `.await` points so the returned future is `Send`.
+/// Executes the 4-message Server pairing flow using shared `Mutex` references without holding locks across `.await`.
 pub async fn handle_server_pairing_with_shared_locks<S>(
     stream: &mut S,
     already_read_magic: Option<[u8; 4]>,
@@ -1356,6 +1487,8 @@ where
 // Transcript & Helper Functions
 // ============================================================================
 
+/// Assembles the Client A identity byte string for SPAKE2 transcript:
+/// `"integrator-pair-v2-A" || u16_be(ver) || client_device_id || client_ed25519_pk || client_nonce`.
 fn build_spake2_identity_a(
     client_device_id: &[u8; 16],
     client_ed25519_pk: &[u8; 32],
@@ -1370,6 +1503,8 @@ fn build_spake2_identity_a(
     out
 }
 
+/// Assembles the Server B identity byte string for SPAKE2 transcript:
+/// `"integrator-pair-v2-B" || u16_be(ver) || server_device_id || server_ed25519_pk || server_nonce || session_id`.
 fn build_spake2_identity_b(
     server_device_id: &[u8; 16],
     server_ed25519_pk: &[u8; 32],
@@ -1386,6 +1521,7 @@ fn build_spake2_identity_b(
     out
 }
 
+/// Computes SHA-256 hash of `PairInitMsg` and `PairServerShareMsg` fields bound as AAD into confirmation keys.
 fn compute_pairing_header_aad(init_msg: &PairInitMsg, share_msg: &PairServerShareMsg) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"integrator-pair-header-aad-v2");
@@ -1405,6 +1541,8 @@ fn compute_pairing_header_aad(init_msg: &PairInitMsg, share_msg: &PairServerShar
     out
 }
 
+/// Assembles the payload signed by Client A:
+/// `"integrator-pair-sig-A-v2" || tt_sha256 || confirm_mac_a`.
 fn build_client_signature_payload(tt_sha256: &[u8; 32], confirm_mac_a: &[u8; 32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(26 + 32 + 32);
     buf.extend_from_slice(b"integrator-pair-sig-A-v2");
@@ -1413,6 +1551,8 @@ fn build_client_signature_payload(tt_sha256: &[u8; 32], confirm_mac_a: &[u8; 32]
     buf
 }
 
+/// Assembles the payload signed by Server B:
+/// `"integrator-pair-sig-B-v2" || tt_sha256 || confirm_mac_b || sig_a`.
 fn build_server_signature_payload(
     tt_sha256: &[u8; 32],
     confirm_mac_b: &[u8; 32],
@@ -1426,6 +1566,11 @@ fn build_server_signature_payload(
     buf
 }
 
+/// Generates an unbiased 6-digit numeric PIN (`100000`..=`999999`) using CSPRNG rejection sampling.
+///
+/// Modulo reduction of uniform `u32` integers over a range that is not a power of 2 introduces slight bias.
+/// Rejection sampling discards values $\ge 2^{32} - (2^{32} \bmod 900,000)$, guaranteeing mathematical
+/// uniformity across all 900,000 valid PINs.
 pub fn generate_unbiased_6digit_pin() -> String {
     const RANGE: u32 = 900_000;
     const MAX_UNBIASED: u32 = u32::MAX - (u32::MAX % RANGE);
@@ -1439,10 +1584,12 @@ pub fn generate_unbiased_6digit_pin() -> String {
     }
 }
 
+/// Checks whether `pin` is exactly 6 ASCII digits (`0`..=`9`).
 pub fn is_valid_6digit_pin(pin: &str) -> bool {
     pin.len() == 6 && pin.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Identifies Unicode bidirectional control characters used in visual spoofing attacks.
 fn is_bidi_format_char(c: char) -> bool {
     matches!(
         c,
@@ -1455,6 +1602,7 @@ fn is_bidi_format_char(c: char) -> bool {
     )
 }
 
+/// Sanitizes friendly device and platform strings, stripping control characters, bidi overrides, and clamping length.
 fn sanitize_label(input: &str, max_len: usize) -> String {
     let filtered: String = input
         .chars()
@@ -1880,4 +2028,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_s);
     }
 }
-

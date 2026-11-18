@@ -1,9 +1,67 @@
-//! Dynamic UDP Peer Discovery over any active interface (USB-C CDC-NCM,
-//! Thunderbolt Bridge, Wired Ethernet, Wi-Fi, or user-configured peer IP).
+//! # Dynamic Zero-Configuration Peer Discovery & Route Selection (`discovery.rs`)
 //!
-//! Validates incoming beacons for protocol version, timestamp freshness (±60s),
-//! HMAC integrity, port bounds, and field lengths, and runs synchronous OS queries
-//! on the blocking thread pool so Tokio async worker threads are never stalled.
+//! ## 1. Module Purpose & Scope
+//! `discovery.rs` implements zero-configuration peer discovery, link qualification, and dynamic route
+//! selection for Integrator. It enables paired or newly introduced macOS and Windows 11 machines to
+//! find each other automatically across physical and virtual network interfaces without manual IP entry.
+//!
+//! Supported network link media include:
+//! - Direct Thunderbolt 3/4 and USB4 bridge cables (sub-millisecond latency, multi-gigabit throughput).
+//! - USB-C CDC-NCM virtual Ethernet connections.
+//! - High-speed wired Local Area Networks (1GbE / 2.5GbE / 10GbE).
+//! - 5GHz / 6GHz Wi-Fi infrastructure networks.
+//! - User-configured static unicast peer IP addresses (for routed multi-subnet environments).
+//!
+//! ### Core Responsibilities:
+//! 1. **Signed Beacon Broadcast**: Periodically broadcasts Ed25519-signed discovery beacons over local interface
+//!    broadcast addresses (`bcast_str`), global broadcast (`255.255.255.255`), and unicast addresses.
+//! 2. **Multi-Stage Beacon Verification**: Validates protocol versions, timestamp freshness (±60s),
+//!    cryptographic Ed25519 signatures, port safety bounds, and Unicode character safety.
+//! 3. **Anti-Replay Protection (`BeaconReplayCache`)**: Rejects duplicate or replayed discovery frames
+//!    across single or multiple network interfaces while allowing valid multi-interface bursts.
+//! 4. **Route Characterization & Metric Ranking**: Probes candidate link latency (TCP RTT) and evaluates
+//!    transport hierarchy (Thunderbolt > Direct USB > Ethernet > Wi-Fi) to elect the lowest-latency,
+//!    highest-bandwidth communication route.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `core::IntegratorCore`: Instantiates `DiscoveryManager`, spawns the discovery daemon (`start()`),
+//!   and continuously queries `get_peer_ip()` and `get_best_peer()` to initiate transport sessions.
+//! - Native UI Frontends (via `ffi.rs`): Call `get_all_peers()`, `add_manual_peer_ip()`, and
+//!   `remove_manual_peer_ip()` to display live discovery candidate lists and manage manual IP overrides.
+//!
+//! ### Downstream Callees:
+//! - `system_info`: Queries host profile (`collect_local_profile`), enumerates physical interface endpoints
+//!   (`discovery_interface_endpoints`), and resolves OS routing tables (`describe_route_to_peer`).
+//! - `trust`: Cryptographically signs outgoing beacons (`sign_discovery_beacon_v2_full`) and verifies
+//!   incoming beacon authenticity and authorization states (`verify_discovery_beacon_v2_full`, `observe_discovered_peer`).
+//! - `config`: Reads well-known port definitions (`DISCOVERY_PORT`, `CONTROL_PORT`, `CLIPBOARD_PORT`).
+//! - Native OS Sockets: Utilizes `tokio::net::UdpSocket` and native C sockets (`setsockopt` with `IP_BOUND_IF`
+//!   on macOS) to bind outgoing broadcast packets to specific physical network adapters.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! The broadcaster daemon compiles host display geometry, GPU models, OS version, and service ports into a JSON
+//! beacon, signs it with the local device's Ed25519 private key, and transmits it via UDP port 58280.
+//! The counterpart device's receiver verifies the signature against its trusted peer keystore, measures
+//! round-trip connection latency to the sender's control port, and updates its active peer candidate table.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Asynchronous Tokio Green Threads**: Hosts independent broadcaster and listener tasks.
+//! - **Blocking Offloading**: Synchronous OS routing queries and disk persistence operations are offloaded
+//!   to `tokio::task::spawn_blocking` to prevent stalling the async executor worker threads.
+//! - **Concurrent RTT Probe Limiting**: Background TCP RTT probes are governed by a `Semaphore`
+//!   (`MAX_CONCURRENT_RTT_PROBES = 8`) to avoid socket starvation during network bursts.
+//! - **Locking Hierarchy**: Shared state (`candidates`, `rtt_cache`, `manual_ips`) is guarded by `tokio::sync::RwLock`
+//!   for concurrent reader throughput.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Cryptographic Authenticity**: Unsigned or invalidly signed beacons are dropped before route inspection.
+//! - **Replay Attack Resistance**: Monotonic timestamp tracking rejects delayed, re-routed, or captured beacons.
+//! - **Text Sanitization & Anti-Spoofing**: Hostnames, OS descriptions, and GPU strings containing control
+//!   characters or Unicode bidirectional formatting markers (e.g. `\u{202E}` right-to-left override) are rejected.
+//! - **Privileged Port Protection**: Beacons specifying service ports below 1024 are rejected to prevent
+//!   traffic redirection attacks against root-owned system daemons.
+//! - **History Poisoning Defense**: Only verified, cryptographically trusted peer IPs are persisted to disk.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -18,42 +76,92 @@ use crate::config::{CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT};
 use crate::system_info::{self, LinkTransport};
 use crate::trust;
 
+/// Protocol version number for discovery beacon format negotiation.
 pub const DISCOVERY_PROTOCOL_VERSION: u16 = 2;
+
+/// Time-To-Live for peer candidates. Candidates not refreshed within 10 seconds are evicted.
 const PEER_CANDIDATE_TTL: Duration = Duration::from_secs(10);
+
+/// Maximum number of distinct peer candidate routes retained in memory.
 const MAX_PEER_CANDIDATES: usize = 64;
+
+/// Maximum entries cached in the RTT measurement map.
 const MAX_RTT_CACHE_ENTRIES: usize = 128;
+
+/// In-memory cache lifetime for TCP RTT probe measurements.
 const RTT_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum tracked remote devices in the anti-replay cache.
 const MAX_REPLAY_DEVICES: usize = 128;
+
+/// Maximum simultaneous IP paths tracked per remote device in the anti-replay cache.
 const MAX_REPLAY_IPS_PER_DEVICE: usize = 8;
+
+/// Expiration lifetime for anti-replay cache entries.
 const REPLAY_WINDOW_TTL: Duration = Duration::from_secs(130);
+
+/// Maximum permissible clock skew (in milliseconds) across multi-homed interface bursts.
 const MAX_REPLAY_CROSS_IP_SKEW_MS: u64 = 3_000;
+
+/// Maximum user-configured manual peer IP addresses allowed in persistent storage.
 const MAX_MANUAL_IPS: usize = 32;
+
+/// Ring buffer capacity for deduplicating recent peer IP history writes.
 const MAX_RECENT_SEEN: usize = 64;
+
+/// Upper limit on concurrent background TCP RTT probe tasks.
 const MAX_CONCURRENT_RTT_PROBES: usize = 8;
 
+/// Global file lock ensuring serialized access to `peer_history.json`.
 static HISTORY_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Monotonic atomic counter for generating unique temporary history filenames.
 static HISTORY_TMP_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+/// Returns the static mutex guarding peer history file writes.
 fn history_file_lock() -> &'static Mutex<()> {
     HISTORY_FILE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Tracks replay detection state for a single remote device identity.
 #[derive(Debug)]
 struct DeviceReplayState {
+    /// Highest timestamp seen across all network interfaces for this device.
     max_ts_ms: u64,
+    /// Local monotonic instant when this device record was last refreshed.
     last_updated: Instant,
+    /// Per-source-IP timestamp history: maps IP address to `(last_timestamp_ms, recorded_instant)`.
     per_ip: HashMap<IpAddr, (u64, Instant)>,
 }
 
+/// In-memory sliding window cache mitigating discovery beacon replay attacks.
 #[derive(Debug, Default)]
 struct BeaconReplayCache {
+    /// Maps remote device ID hex strings to their replay tracking states.
     devices: HashMap<String, DeviceReplayState>,
 }
 
 impl BeaconReplayCache {
+    /// Evaluates whether an incoming beacon should be accepted or rejected as a replay.
+    ///
+    /// # Replay Rules:
+    /// 1. Prunes records older than `REPLAY_WINDOW_TTL` (130 seconds).
+    /// 2. Enforces LRU eviction if device capacity (`MAX_REPLAY_DEVICES`) is exceeded.
+    /// 3. Rejects beacons whose timestamp is older than `max_ts_ms - 3000ms`, preventing
+    ///    attackers from re-broadcasting older beacons captured on another interface.
+    /// 4. Rejects non-strictly-increasing timestamps arriving from the same source IP.
+    ///
+    /// # Arguments
+    /// * `device_id` - Identifier of the transmitting device.
+    /// * `ip` - Source IP address where the packet arrived.
+    /// * `timestamp_ms` - POSIX timestamp in milliseconds from the beacon payload.
+    /// * `now` - Monotonic instant of receipt.
+    ///
+    /// # Return Value
+    /// Returns `true` if the beacon is fresh and valid; `false` if replayed or stale.
     fn accept(&mut self, device_id: &str, ip: IpAddr, timestamp_ms: u64, now: Instant) -> bool {
-        // Prune expired IP entries and stale devices first.
+        // Prune expired IP entries and stale devices first
         self.devices.retain(|_, state| {
             state
                 .per_ip
@@ -62,6 +170,7 @@ impl BeaconReplayCache {
                 && now.saturating_duration_since(state.last_updated) <= REPLAY_WINDOW_TTL
         });
 
+        // Enforce maximum device capacity via LRU eviction
         if !self.devices.contains_key(device_id) && self.devices.len() >= MAX_REPLAY_DEVICES {
             if let Some(oldest_key) = self
                 .devices
@@ -82,17 +191,18 @@ impl BeaconReplayCache {
                 per_ip: HashMap::new(),
             });
 
-        // Reject replayed older beacons routed through a spoofed source IP.
+        // Reject replayed older beacons routed through a spoofed source IP
         if state.max_ts_ms > timestamp_ms.saturating_add(MAX_REPLAY_CROSS_IP_SKEW_MS) {
             return false;
         }
 
-        // Reject duplicate or backwards timestamps arriving on the same source IP.
+        // Reject duplicate or backwards timestamps arriving on the same source IP
         if let Some((last_ip_ts, _)) = state.per_ip.get(&ip) {
             if timestamp_ms <= *last_ip_ts {
                 return false;
             }
         } else if state.per_ip.len() >= MAX_REPLAY_IPS_PER_DEVICE {
+            // Evict oldest IP if device has too many simultaneous active interfaces
             if let Some(oldest_ip) = state
                 .per_ip
                 .iter()
@@ -103,6 +213,7 @@ impl BeaconReplayCache {
             }
         }
 
+        // Record fresh timestamp and advance state
         state.per_ip.insert(ip, (timestamp_ms, now));
         state.max_ts_ms = state.max_ts_ms.max(timestamp_ms);
         state.last_updated = now;
@@ -110,6 +221,10 @@ impl BeaconReplayCache {
     }
 }
 
+/// Identifies whether a Unicode character represents a bidirectional formatting override.
+///
+/// Detects characters like Left-to-Right Embedding, Right-to-Left Override, and directional isolates
+/// used in visual spoofing / Trojan Source attacks.
 fn is_bidi_format_char(c: char) -> bool {
     matches!(
         c,
@@ -117,10 +232,13 @@ fn is_bidi_format_char(c: char) -> bool {
     )
 }
 
+/// Returns `true` if the input text contains control characters or bidirectional format overrides.
 fn contains_unsafe_text_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control() || is_bidi_format_char(c))
 }
 
+/// Sanitizes display strings received over the wire by stripping control characters and BiDi overrides,
+/// trimming whitespace, and bounding maximum character length.
 fn sanitize_display_text(raw: &str, max_chars: usize) -> String {
     raw.chars()
         .filter(|&c| !c.is_control() && !is_bidi_format_char(c))
@@ -131,84 +249,135 @@ fn sanitize_display_text(raw: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// Wire schema for UDP discovery beacon packets broadcast across network interfaces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryBeacon {
+    /// Wire protocol version number (negotiated at `DISCOVERY_PROTOCOL_VERSION = 2`).
     #[serde(default = "default_protocol_version")]
     pub protocol_version: u16,
+    /// Unique 32-character hexadecimal identifier derived from the sender's Ed25519 public key.
     #[serde(default)]
     pub device_id: String,
+    /// Hex-encoded 32-byte Ed25519 public key of the transmitting device.
     #[serde(default)]
     pub ed25519_pubkey: String,
+    /// User-friendly hostname or machine name of the transmitting device.
     pub sender_name: String,
+    /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
+    /// Hardware product model name (e.g. `"MacBookPro18,1"` or `"Dell XPS 15 9520"`).
     #[serde(default)]
     pub hardware_model: String,
+    /// TCP service port for control handshakes and SPAKE2+ key exchange.
     pub control_port: u16,
+    /// TCP service port for clipboard synchronization streams.
     pub clipboard_port: u16,
+    /// Width of primary display in physical pixels.
     #[serde(default)]
     pub display_width: u32,
+    /// Height of primary display in physical pixels.
     #[serde(default)]
     pub display_height: u32,
+    /// Primary display refresh rate in frames per second (FPS).
     #[serde(default)]
     pub display_fps: u32,
+    /// Optional default SMB file share name published by this device.
     #[serde(default)]
     pub share_name: Option<String>,
+    /// Optional Sunshine game-streaming service host name.
     #[serde(default)]
     pub sunshine_name: Option<String>,
+    /// Optional Sunshine Web UI / RTSP control port.
     #[serde(default)]
     pub sunshine_port: u16,
+    /// List of detected GPU adapter model names.
     #[serde(default)]
     pub gpus: Vec<String>,
+    /// POSIX timestamp in milliseconds when the beacon was generated and signed.
     pub timestamp_ms: u64,
+    /// Hex-encoded 64-byte Ed25519 cryptographic signature over the canonical beacon metadata.
     #[serde(default)]
     pub beacon_sig: String,
 }
 
+/// Serde default helper providing the default protocol version constant.
 fn default_protocol_version() -> u16 {
     DISCOVERY_PROTOCOL_VERSION
 }
 
+/// Discovered peer candidate route representing an active reachability path to a remote machine.
 #[derive(Debug, Clone)]
 pub struct PeerCandidate {
+    /// Resolved socket address (IP and control port) of the peer service.
     pub addr: SocketAddr,
+    /// Local monotonic instant when the most recent beacon was received from this candidate.
     pub last_seen: Instant,
+    /// Remote operating system name.
     pub os: String,
+    /// Remote device ID hex string.
     pub device_id: String,
+    /// Remote user-friendly computer name.
     pub device_name: String,
+    /// Remote hardware model identifier.
     pub hardware_model: String,
+    /// Width of remote display in physical pixels.
     pub display_width: u32,
+    /// Height of remote display in physical pixels.
     pub display_height: u32,
+    /// Remote display refresh rate in Hz/FPS.
     pub display_fps: u32,
+    /// Remote SMB share name, if available.
     pub share_name: Option<String>,
+    /// Remote Sunshine streamer service name, if active.
     pub sunshine_name: Option<String>,
+    /// Remote Sunshine service port.
     pub sunshine_port: u16,
+    /// Remote GPU adapter descriptions.
     pub gpus: Vec<String>,
+    /// Physical link classification (Thunderbolt, USB CDC-NCM, Ethernet, Wi-Fi).
     pub transport: LinkTransport,
+    /// Link physical speed in Megabits per second (e.g. 40000 for Thunderbolt 4).
     pub link_speed_mbps: Option<u32>,
+    /// Human-readable description of physical route interface.
     pub link_description: String,
+    /// Local IPv4 interface address used to reach this peer.
     pub local_ip_used: Option<String>,
+    /// Indicates whether the peer resides on the exact same CIDR subnet as the local interface.
     pub same_subnet: bool,
+    /// Measured round-trip connection latency in milliseconds.
     pub rtt_ms: Option<f64>,
+    /// Cryptographic trust status: `true` if peer's Ed25519 key is paired in local keystore.
     pub trusted: bool,
 }
 
+/// Persistent schema stored in `peer_history.json` tracking known peer IPs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PeerHistoryFile {
+    /// Recently observed verified peer IP addresses.
     recent_ips: Vec<String>,
+    /// User-configured manual unicast peer IP addresses.
     manual_ips: Vec<String>,
 }
 
+/// Central peer discovery manager coordinating broadcast tasks, listener sockets, and route selection.
 #[derive(Clone)]
 pub struct DiscoveryManager {
+    /// Local device ID derived from Ed25519 public key.
     local_device_id: String,
+    /// Local user-friendly device hostname.
     local_name: String,
+    /// In-memory table of active peer candidate routes.
     candidates: Arc<RwLock<Vec<PeerCandidate>>>,
+    /// Currently elected active peer IP address string.
     active_peer_ip: Arc<RwLock<Option<String>>>,
+    /// Cache of measured TCP round-trip times per destination IP.
     rtt_cache: Arc<RwLock<HashMap<String, (Instant, f64)>>>,
+    /// User-defined manual peer IP addresses.
     manual_ips: Arc<RwLock<Vec<String>>>,
 }
 
 impl DiscoveryManager {
+    /// Initializes a new `DiscoveryManager` instance and loads stored peer IP history.
     pub fn new(my_device_name: &str) -> Self {
         let history = load_peer_history();
         Self {
@@ -221,23 +390,31 @@ impl DiscoveryManager {
         }
     }
 
+    /// Returns the IP address string of the highest-ranking active peer candidate.
     pub async fn get_peer_ip(&self) -> Option<String> {
         self.best_candidate_inner()
             .await
             .map(|c| c.addr.ip().to_string())
     }
 
+    /// Returns the complete `PeerCandidate` record for the highest-ranking candidate.
     pub async fn get_best_peer(&self) -> Option<PeerCandidate> {
         self.best_candidate_inner().await
     }
 
+    /// Returns a list of all active peer candidate routes observed within `PEER_CANDIDATE_TTL`.
     pub async fn get_all_peers(&self) -> Vec<PeerCandidate> {
         let mut guard = self.candidates.write().await;
         let now = Instant::now();
+        // Prune expired candidate entries
         guard.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
         guard.clone()
     }
 
+    /// Adds a user-specified manual IPv4 address to the unicast discovery list and persists it to disk.
+    ///
+    /// # Errors
+    /// Returns an error if `ip` is not a valid IPv4 address or if `MAX_MANUAL_IPS` is exceeded.
     pub async fn add_manual_peer_ip(&self, ip: &str) -> Result<()> {
         let trimmed = ip.trim().to_string();
         if !system_info::is_valid_ipv4(&trimmed) {
@@ -265,6 +442,7 @@ impl DiscoveryManager {
         Ok(())
     }
 
+    /// Removes a user-specified manual IP address from the unicast list and persists the update.
     pub async fn remove_manual_peer_ip(&self, ip: &str) {
         let trimmed = ip.trim().to_string();
         {
@@ -280,10 +458,12 @@ impl DiscoveryManager {
         .await;
     }
 
+    /// Returns a list of currently registered manual peer IP strings.
     pub async fn get_manual_peer_ips(&self) -> Vec<String> {
         self.manual_ips.read().await.clone()
     }
 
+    /// Internal helper evaluating candidate list, pruning stale candidates, and ranking the best candidate.
     async fn best_candidate_inner(&self) -> Option<PeerCandidate> {
         let mut guard = self.candidates.write().await;
         let now = Instant::now();
@@ -295,13 +475,22 @@ impl DiscoveryManager {
         selected
     }
 
+    /// Starts the background UDP discovery listener and beacon broadcaster tasks.
+    ///
+    /// # Tasks Spawned:
+    /// 1. **UDP Listener**: Listens on `0.0.0.0:58280`, receives datagrams, verifies signatures,
+    ///    runs anti-replay checks, resolves routes, measures latency, and maintains candidate table.
+    /// 2. **UDP Broadcaster**: Every 2 seconds, collects host profile, signs beacon with local Ed25519
+    ///    key, and transmits across all active network interfaces and unicast targets.
     pub async fn start(&self) -> Result<()> {
         let bind_addr = format!("0.0.0.0:{}", DISCOVERY_PORT);
         let socket = UdpSocket::bind(&bind_addr).await?;
         socket.set_broadcast(true)?;
         let socket = Arc::new(socket);
 
-        // Task 1: UDP listener
+        // --------------------------------------------------------------------
+        // Task 1: UDP Discovery Listener Task
+        // --------------------------------------------------------------------
         let listener_socket = Arc::clone(&socket);
         let candidates = Arc::clone(&self.candidates);
         let active_peer_ip = Arc::clone(&self.active_peer_ip);
@@ -317,7 +506,9 @@ impl DiscoveryManager {
             loop {
                 match listener_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
+                        // Deserialize JSON beacon payload
                         if let Ok(beacon) = serde_json::from_slice::<DiscoveryBeacon>(&buf[..len]) {
+                            // Verify protocol version
                             if beacon.protocol_version != DISCOVERY_PROTOCOL_VERSION {
                                 continue;
                             }
@@ -328,6 +519,7 @@ impl DiscoveryManager {
                                 beacon.device_id.trim().to_ascii_lowercase()
                             };
 
+                            // Ignore loopback reflections and own device beacons
                             if dev_id == my_device_id
                                 || dev_id == my_trust_device_id
                                 || addr.ip().is_loopback()
@@ -335,6 +527,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
+                            // Reject privileged/invalid port numbers (< 1024)
                             if beacon.control_port < 1024 || beacon.clipboard_port < 1024 {
                                 tracing::debug!(
                                     "Dropped discovery beacon with privileged/invalid ports from {}",
@@ -343,6 +536,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
+                            // Reject beacons containing control characters or Unicode BiDi formatting markers
                             if contains_unsafe_text_chars(&beacon.sender_name)
                                 || contains_unsafe_text_chars(&beacon.os)
                                 || contains_unsafe_text_chars(&beacon.hardware_model)
@@ -363,6 +557,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
+                            // Construct canonical metadata structure for Ed25519 signature verification
                             let signed_meta = trust::DiscoveryBeaconSignedMeta {
                                 protocol_version: beacon.protocol_version,
                                 sender_name: &beacon.sender_name,
@@ -377,6 +572,7 @@ impl DiscoveryManager {
                                 gpus: &beacon.gpus,
                             };
 
+                            // Verify Ed25519 signature and timestamp freshness (±60 seconds)
                             if !trust::verify_discovery_beacon_v2_full(
                                 &dev_id,
                                 &beacon.ed25519_pubkey,
@@ -394,6 +590,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
+                            // Enforce anti-replay sliding window checks
                             let replay_ok = {
                                 let mut rc = replay_cache
                                     .lock()
@@ -420,6 +617,7 @@ impl DiscoveryManager {
                             let sender_name_clone = sender_name_clean.clone();
                             let dev_id_clone = dev_id.clone();
 
+                            // Offload blocking OS routing table query to blocking pool
                             let Ok((
                                 is_self_ip,
                                 transport,
@@ -454,7 +652,7 @@ impl DiscoveryManager {
                                     &peer_ip_for_route,
                                     transport.is_direct_cable(),
                                 );
-                                // Persist verified paired peer IPs only, preventing spoofed LAN history pollution.
+                                // Persist verified paired peer IPs only, preventing spoofed LAN history pollution
                                 if trusted {
                                     record_recent_peer_ip(&peer_ip_for_route);
                                 }
@@ -477,7 +675,7 @@ impl DiscoveryManager {
                                 continue;
                             }
 
-                            // Refresh real TCP RTT in background at most once every 4s per IP (bounded probes & cache)
+                            // Refresh TCP RTT in background at most once every 4 seconds per IP
                             let cached_rtt = {
                                 let cache_guard = rtt_cache.read().await;
                                 cache_guard.get(&peer_ip).map(|(t, r)| (t.elapsed(), *r))
@@ -573,12 +771,14 @@ impl DiscoveryManager {
                                 trusted,
                             };
 
+                            // Update existing candidate or insert new one with capacity bounds
                             if let Some(existing) =
                                 list.iter_mut().find(|c| c.addr.ip() == addr.ip())
                             {
                                 *existing = candidate;
                             } else {
                                 if list.len() >= MAX_PEER_CANDIDATES {
+                                    // Evict oldest untrusted candidate, or oldest candidate overall
                                     if let Some(evict_idx) = list
                                         .iter()
                                         .enumerate()
@@ -595,6 +795,7 @@ impl DiscoveryManager {
                                 list.push(candidate);
                             }
 
+                            // Re-evaluate best candidate route
                             let best = select_best_peer(&list).map(|c| c.addr.ip().to_string());
                             let mut active = active_peer_ip.write().await;
                             if *active != best {
@@ -617,7 +818,9 @@ impl DiscoveryManager {
             }
         });
 
-        // Task 2: UDP beacon broadcaster across dynamic OS interface broadcasts & unicast hints
+        // --------------------------------------------------------------------
+        // Task 2: UDP Beacon Broadcaster Task
+        // --------------------------------------------------------------------
         let broadcaster_socket = Arc::clone(&socket);
         let manual_ips_ref = Arc::clone(&self.manual_ips);
         let fallback_name = self.local_name.clone();
@@ -627,6 +830,7 @@ impl DiscoveryManager {
                 let manual_snapshot = manual_ips_ref.read().await.clone();
                 let fallback_clone = fallback_name.clone();
 
+                // Offload profile collection, beacon signing, and interface broadcast to blocking pool
                 if let Ok((bytes, no_endpoints, unicast_targets)) =
                     tokio::task::spawn_blocking(move || {
                     let profile = system_info::collect_local_profile();
@@ -634,6 +838,7 @@ impl DiscoveryManager {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+
                     let sender_name = sanitize_display_text(
                         if profile.hostname.is_empty() {
                             &fallback_clone
@@ -675,6 +880,7 @@ impl DiscoveryManager {
                         gpus: &gpus,
                     };
 
+                    // Cryptographically sign discovery beacon with local Ed25519 identity key
                     let (signed_dev_id, ed25519_pubkey, sig) =
                         trust::sign_discovery_beacon_v2_full(
                             ts,
@@ -708,11 +914,15 @@ impl DiscoveryManager {
                     let mut unicast_targets: Vec<String> = Vec::new();
                     let mut seen: HashSet<String> = HashSet::new();
                     let hist = load_peer_history();
+
+                    // Accumulate manual IP overrides and recent peer history for unicast delivery
                     for ip in manual_snapshot.iter().chain(hist.recent_ips.iter()) {
                         if seen.insert(ip.clone()) {
                             unicast_targets.push(ip.clone());
                         }
                     }
+
+                    // Transmit beacon onto each physical interface broadcast endpoint
                     if !bytes.is_empty() {
                         for (iface_name, ip_str, bcast_str, _transport) in &endpoints {
                             broadcast_beacon_on_interface(
@@ -729,6 +939,7 @@ impl DiscoveryManager {
                 .await
                 {
                     if !bytes.is_empty() {
+                        // Fallback to global broadcast if no discrete interface endpoints were enumerated
                         if no_endpoints {
                             let global_bcast = SocketAddr::new(
                                 IpAddr::V4(Ipv4Addr::BROADCAST),
@@ -736,6 +947,7 @@ impl DiscoveryManager {
                             );
                             let _ = broadcaster_socket.send_to(&bytes, global_bcast).await;
                         }
+                        // Send direct unicast datagrams to manual and recent peer endpoints
                         for ip in unicast_targets {
                             if let Ok(parsed) = ip.parse::<IpAddr>() {
                                 let target = SocketAddr::new(parsed, DISCOVERY_PORT);
@@ -745,6 +957,7 @@ impl DiscoveryManager {
                     }
                 }
 
+                // Sleep for 2 seconds between discovery broadcast cycles
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
@@ -753,6 +966,14 @@ impl DiscoveryManager {
     }
 }
 
+/// Transmits a UDP discovery beacon packet out of a specific physical network interface.
+///
+/// # Platform Behavior:
+/// - On macOS: Uses `setsockopt(..., IPPROTO_IP, IP_BOUND_IF, ...)` to strictly bind the socket
+///   to the interface index corresponding to `iface_name`. This ensures that packets meant for a
+///   direct Thunderbolt or USB4 bridge do not leak across Wi-Fi or primary Ethernet.
+/// - Transmits to both the subnet-directed broadcast address (`bcast_ip_str`) and the global
+///   broadcast address (`255.255.255.255`).
 fn broadcast_beacon_on_interface(
     iface_name: &str,
     local_ip_str: &str,
@@ -796,12 +1017,22 @@ fn broadcast_beacon_on_interface(
     #[cfg(not(target_os = "macos"))]
     let _ = iface_name;
 
+    // Transmit to directed subnet broadcast
     if let Ok(bcast_v4) = bcast_ip_str.parse::<Ipv4Addr>() {
         let _ = sock.send_to(bytes, SocketAddr::new(IpAddr::V4(bcast_v4), port));
     }
+    // Transmit to global subnet broadcast
     let _ = sock.send_to(bytes, SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
 }
 
+/// Evaluates a collection of active peer candidates and selects the single best candidate route.
+///
+/// # Priority Hierarchy:
+/// 1. **Trust Status**: Trusted (cryptographically paired) peers strictly take precedence over untrusted peers.
+/// 2. **Subnet Alignment**: Direct matching interface subnet beats routed or alien alias IPs.
+/// 3. **Physical Transport Medium**: Thunderbolt 4 / USB4 (`DirectUsb` / `Thunderbolt`) > Wired Ethernet > Wi-Fi.
+/// 4. **Measured Latency**: Lower measured round-trip time (RTT in ms).
+/// 5. **Recency**: Most recently observed beacon timestamp.
 fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
     candidates
         .iter()
@@ -825,12 +1056,16 @@ fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
         .cloned()
 }
 
+/// Checks whether the given IP address matches one of the local machine's network interface addresses.
 fn is_own_local_ip(ip: &str) -> bool {
     system_info::list_local_ipv4_interfaces()
         .iter()
         .any(|iface| iface.ip == ip)
 }
 
+/// Measures TCP connection round-trip latency to `ip:port` with a 450ms timeout.
+///
+/// Drops the TCP stream immediately upon completing the 3-way handshake.
 async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
     let Ok(parsed) = ip.parse::<IpAddr>() else {
         return None;
@@ -847,10 +1082,12 @@ async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
     None
 }
 
+/// Resolves the filesystem path to `peer_history.json` in the user's application data directory.
 fn history_path() -> std::path::PathBuf {
     system_info::app_data_dir().join("peer_history.json")
 }
 
+/// Loads peer IP history from `peer_history.json` with file locking and schema sanitization.
 fn load_peer_history() -> PeerHistoryFile {
     let _guard = history_file_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut parsed: PeerHistoryFile = std::fs::read_to_string(history_path())
@@ -868,6 +1105,7 @@ fn load_peer_history() -> PeerHistoryFile {
     parsed
 }
 
+/// Persists peer IP history atomically to disk using a unique temporary file and atomic rename.
 fn save_peer_history(hist: &PeerHistoryFile) {
     let _guard = history_file_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Ok(json) = serde_json::to_string_pretty(hist) else {
@@ -898,6 +1136,9 @@ fn save_peer_history(hist: &PeerHistoryFile) {
     }
 }
 
+/// Adds a verified, authenticated peer IP address to the recent peers list.
+///
+/// Uses an in-memory ring buffer (`RECENT_SEEN`) to debounce duplicate writes.
 fn record_recent_peer_ip(ip: &str) {
     static RECENT_SEEN: OnceLock<Mutex<(VecDeque<String>, HashSet<String>)>> = OnceLock::new();
     let seen = RECENT_SEEN.get_or_init(|| Mutex::new((VecDeque::new(), HashSet::new())));

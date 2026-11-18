@@ -1,3 +1,38 @@
+// ==============================================================================================
+// Integrator Windows Native System Tray Manager (`ui-windows/TrayIconManager.cs`)
+//
+// 1. Module Purpose & System Scope:
+//    - Manages the native Win32 notification icon in the Windows taskbar system tray (Notification Area)
+//      via `Shell_NotifyIconW` and `NOTIFYICON_VERSION_4`.
+//    - Implemented with zero dependencies on System.Windows.Forms or legacy WebView components to maintain
+//      minimal memory footprint and clean unmanaged resource management.
+//    - Replicates the exact functional menu layout of the macOS `NSStatusItem` menu for cross-platform parity:
+//      Show Dashboard, Paste Remote Item, Toggle Extended Screen, Open Clipboard Cache, and Quit Integrator.
+//
+// 2. Architectural Linkages & Native Core Bridge:
+//    - Upstream Caller: `IntegratorUI.App` instantiates `TrayIconManager` during `OnLaunched` and disposes it on exit.
+//    - Downstream APIs:
+//        * Shell32: `Shell_NotifyIconW` (NIM_ADD, NIM_DELETE, NIM_SETVERSION).
+//        * User32: Window registration (`RegisterClassExW`), message pump window (`CreateWindowExW`),
+//          context menu generation (`CreatePopupMenu`, `AppendMenuW`, `TrackPopupMenuEx`), cursor tracking (`GetCursorPos`).
+//        * CoreBridge: Asynchronous invocation of `CoreBridge.TrayAction` on the CLR thread pool.
+//
+// 3. Threading & Concurrency Model:
+//    - Dedicated Message Window: Creates a zero-size, top-level unmanaged window on the STA UI thread to
+//      receive `WM_TRAYICON` notification callbacks from the Windows shell.
+//    - Non-Blocking Menu Handlers: Context menu actions (such as `paste_remote` or `toggle_display`) are
+//      dispatched onto background `ThreadPool` threads via `ThreadPool.QueueUserWorkItem` to prevent
+//      blocking the Win32 message loop or causing UI stalls.
+//
+// 4. Security & Safety Invariants:
+//    - Shell Crash Resilience: Registers for the `"TaskbarCreated"` broadcast message via `RegisterWindowMessageW`.
+//      If `explorer.exe` crashes or restarts, the tray icon is automatically re-created without user intervention.
+//    - Exception Boundary Protection: The unmanaged `WndProc` trampoline wraps all managed code in a catch-all block,
+//      preventing CLR exceptions from unwinding across unmanaged Win32 callback boundaries.
+//    - Resource Hygiene: Complete `IDisposable` implementation explicitly frees `_hIcon`, destroys `_hwnd`,
+//      deletes the notification icon via `NIM_DELETE`, and unregisters the window class with `UnregisterClassW`.
+// ==============================================================================================
+
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -60,8 +95,14 @@ namespace IntegratorUI
         private bool _added;
         private bool _disposed;
 
+        /// <summary>
+        /// Native window procedure delegate matching Win32 WNDPROC signature.
+        /// </summary>
         private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+        /// <summary>
+        /// Win32 WNDCLASSEXW structure for registering the hidden tray message window class.
+        /// </summary>
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct WNDCLASSEXW
         {
@@ -79,6 +120,9 @@ namespace IntegratorUI
             public IntPtr hIconSm;
         }
 
+        /// <summary>
+        /// Win32 NOTIFYICONDATAW structure for communicating with Shell_NotifyIconW.
+        /// </summary>
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct NOTIFYICONDATAW
         {
@@ -102,6 +146,9 @@ namespace IntegratorUI
             public IntPtr hBalloonIcon;
         }
 
+        /// <summary>
+        /// Win32 POINT structure for cursor coordinate capture.
+        /// </summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT
         {
@@ -168,6 +215,11 @@ namespace IntegratorUI
         [DllImport("user32.dll")]
         private static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+        /// <summary>
+        /// Initializes the system tray notification icon and its underlying Win32 message window.
+        /// </summary>
+        /// <param name="onShowWindow">Callback action invoked to restore and activate the dashboard window.</param>
+        /// <param name="onQuit">Callback action invoked when the user selects Quit from the context menu.</param>
         public TrayIconManager(Action onShowWindow, Action onQuit)
         {
             _onShowWindow = onShowWindow;
@@ -175,6 +227,9 @@ namespace IntegratorUI
             InitTray();
         }
 
+        /// <summary>
+        /// Registers the window class, creates the hidden helper window, loads the icon, and adds the tray item.
+        /// </summary>
         private void InitTray()
         {
             _wndProcDelegate = WndProc;
@@ -215,6 +270,9 @@ namespace IntegratorUI
             AddTrayIcon();
         }
 
+        /// <summary>
+        /// Calls Shell_NotifyIconW to add the icon and configure NOTIFYICON_VERSION_4 behavior.
+        /// </summary>
         private void AddTrayIcon()
         {
             if (_disposed || _hwnd == IntPtr.Zero) return;
@@ -240,10 +298,14 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Unmanaged window procedure dispatching tray interactions, double clicks, and shell messages.
+        /// </summary>
         private IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
             try
             {
+                // Automatically re-register tray icon if explorer.exe crashed and restarted
                 if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
                 {
                     AddTrayIcon();
@@ -270,6 +332,9 @@ namespace IntegratorUI
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
 
+        /// <summary>
+        /// Displays the native Win32 context popup menu matching the macOS NSStatusItem menu items.
+        /// </summary>
         private void ShowContextMenu()
         {
             IntPtr menu = CreatePopupMenu();
@@ -286,6 +351,7 @@ namespace IntegratorUI
                 AppendMenuW(menu, MF_STRING, (UIntPtr)ID_QUIT, "Quit Integrator");
 
                 GetCursorPos(out POINT pt);
+                // Required by Win32 to ensure popup menu dismisses properly when clicking outside
                 SetForegroundWindow(_hwnd);
                 cmd = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD, pt.X, pt.Y, _hwnd, IntPtr.Zero);
                 PostMessageW(_hwnd, 0, IntPtr.Zero, IntPtr.Zero);
@@ -295,6 +361,7 @@ namespace IntegratorUI
                 DestroyMenu(menu);
             }
 
+            // Execute context menu commands without blocking the message loop
             switch ((int)cmd)
             {
                 case ID_SHOW:
@@ -315,6 +382,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Explicit cleanup of unmanaged Win32 window, icon, and shell notification resources.
+        /// </summary>
         public void Dispose()
         {
             if (_disposed) return;

@@ -1,7 +1,67 @@
-//! Dynamic hardware, display, network, GPU, and application-path discovery.
+//! # Dynamic Hardware, Display, Network, GPU, & System Path Discovery (`system_info.rs`)
 //!
-//! Replaces all setup-specific assumptions (IPs, hostnames, GPUs, monitors,
-//! share names, install paths) with live runtime enumeration across macOS and Windows.
+//! ## 1. Module Purpose & Scope
+//! `system_info.rs` provides comprehensive, live runtime operating system and hardware discovery
+//! across macOS (Apple Silicon and Intel) and Windows 11 (x86_64 and ARM64).
+//!
+//! Rather than relying on static configuration or hardcoded network parameters, this module dynamically
+//! discovers:
+//! - **Network Topology & Routing**: Enumerates physical and virtual IPv4 interfaces (MAC addresses,
+//!   netmasks, broadcast addresses, CIDR prefixes), classifies physical transport media (Thunderbolt,
+//!   USB-C CDC-NCM, Ethernet, Wi-Fi), and inspects the OS routing table to determine exact egress interfaces.
+//! - **Display Geometry & Scaling**: Reads primary display resolution, refresh rate (60Hz–240Hz ProMotion/FreeSync),
+//!   and HiDPI scale factors using CoreGraphics (macOS) and Win32 `EnumDisplaySettingsW` (Windows).
+//! - **Graphics Processing Units (GPUs)**: Enumerates all active discrete, integrated, and unified memory
+//!   graphics hardware across NVIDIA, AMD, Intel, and Apple architectures, extracting VRAM capacities and
+//!   identifying dedicated streaming encoders.
+//! - **Hardware Product Identity & Sensors**: Resolves machine product model, CPU brand string, Touch Bar
+//!   hardware presence, and unique cryptographic device identifiers.
+//! - **File Sharing & Companion Tools**: Automatically locates local SMB file shares, user desktop/download
+//!   directories, and companion installations (Sunshine streaming server, Moonlight client).
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `core::IntegratorCore`: Queries host profile (`collect_local_profile`), builds comprehensive diagnostic
+//!   snapshots (`build_bridge_status`), and resolves persistent application cache directories (`app_data_dir`).
+//! - `discovery::DiscoveryManager`: Uses `discovery_interface_endpoints` to bind UDP broadcast sockets to
+//!   individual physical interfaces and calls `describe_route_to_peer` and `is_same_subnet_as_peer` to rank candidates.
+//! - `bridge::LinkMonitor`: Invokes `describe_route_to_peer` to classify whether latency transitions involve
+//!   Thunderbolt or Wi-Fi links.
+//! - `telemetry::query_gpu_telemetry`: Reads GPU enumeration lists and active Sunshine adapter preferences.
+//!
+//! ### Downstream Callees:
+//! - **macOS Frameworks & APIs**: CoreGraphics (`CGMainDisplayID`, `CGDisplayPixelsWide`, `CGDisplayCopyDisplayMode`),
+//!   Darwin Libc (`getifaddrs`, `freeifaddrs`), and system utilities (`/usr/sbin/networksetup`, `/sbin/ifconfig`,
+//!   `/usr/sbin/ioreg`, `/usr/bin/sharing`, `/usr/sbin/scutil`, `/usr/sbin/sysctl`, `/usr/sbin/system_profiler`).
+//! - **Windows System APIs & Registry**: Win32 `user32.dll` (`EnumDisplaySettingsW`, `GetDpiForSystem`),
+//!   `iphlpapi.dll` (`GetIpAddrTable`), registry inspection via `reg.exe`, PowerShell `Get-NetAdapter`, and `net.exe`.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! The metrics gathered by this file form the foundational payload of Integrator's discovery beacons and
+//! capability negotiations. Display resolutions enable asymmetric mouse coordinate mapping in `kvm/`, GPU
+//! architectures govern hardware video encoder selection in `display/`, and interface speeds dictate adaptive
+//! bitrate limits.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Thread-Safe In-Memory Caches**: Hardware queries that incur process spawning overhead (e.g. `networksetup`,
+//!   `system_profiler`, PowerShell) are cached with monotonic Time-To-Live expiration:
+//!   - `GPU_CACHE`: 30-second TTL.
+//!   - `PORT_CACHE` (macOS): 15-second TTL.
+//!   - `META_CACHE` (Windows): 20-second TTL.
+//! - **Locking**: `APP_CONFIG_LOCK` ensures serialized access to `app_config.json`.
+//! - **Offloading**: Upstream callers dispatch methods in this file via `tokio::task::spawn_blocking` to prevent
+//!   blocking the Tokio asynchronous worker pool.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Symlink Attack Prevention**: `atomic_write_private` explicitly checks `symlink_metadata` and refuses
+//!   to overwrite symlinks, mitigating privilege escalation attacks.
+//! - **Hardened Permissions**: Directories are created with POSIX mode `0o700` and files with `0o600`.
+//! - **No Insecure Temp Fallback**: `app_data_dir()` and `save_path_preferences()` strictly reject falling back
+//!   to world-writable `/tmp` or unverified temp locations if user home environment variables are unset.
+//! - **Path & Name Sanitization**: Text arguments for Sunshine adapter names and paths are checked for control
+//!   characters and bounded in length.
+//! - **Synthetic Speed Rejection**: `sanitize_adapter_link_speed` filters out bogus virtual driver speeds
+//!   (e.g. Windows USB NCM drivers reporting `100 Gbps` or macOS reporting `100baseTX`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -12,13 +72,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+/// Global mutex serializing concurrent disk operations on `app_config.json`.
 static APP_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Monotonic atomic counter for generating unique temporary filenames safely across threads.
 static SYSTEM_INFO_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Returns the static mutex guarding application configuration file access.
 fn app_config_lock() -> &'static Mutex<()> {
     APP_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Resolves an executable path in `%SystemRoot%\System32` on Windows, falling back to `C:\Windows\System32`.
 #[cfg(target_os = "windows")]
 pub(crate) fn system32_exe(name: &str) -> PathBuf {
     if let Ok(root) = std::env::var("SystemRoot") {
@@ -30,9 +95,17 @@ pub(crate) fn system32_exe(name: &str) -> PathBuf {
     PathBuf::from(r"C:\Windows\System32").join(name)
 }
 
+/// Atomically writes a private file to disk with strict permissions, symlink rejection, and atomic replacement.
+///
+/// # Security Guarantees:
+/// 1. Rejects symlinked target paths to prevent symlink traversal attacks.
+/// 2. Sets directory permissions to `0o700` (Unix).
+/// 3. Writes content to a hidden temporary file with mode `0o600` (Unix).
+/// 4. Atomically renames temporary file over the target destination via `std::fs::rename`.
 pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
+    // Check if target path exists and is a symlink
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -49,6 +122,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Restrict parent directory access to owner only (rwx------)
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
 
@@ -65,6 +139,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            // Restrict file permissions to owner read/write only (rw-------)
             opts.mode(0o600);
         }
         let mut file = opts.open(&tmp)?;
@@ -78,6 +153,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result
         return Err(e);
     }
 
+    // Atomically replace target path
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -85,6 +161,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result
     Ok(())
 }
 
+/// Locates `nvidia-smi.exe` in trusted Windows system directories.
 #[cfg(target_os = "windows")]
 fn find_nvidia_smi_path() -> Option<PathBuf> {
     let sys = system32_exe("nvidia-smi.exe");
@@ -103,50 +180,81 @@ fn find_nvidia_smi_path() -> Option<PathBuf> {
     None
 }
 
+/// Physical pixel dimensions, refresh rate, and scaling factor of the primary display.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PrimaryDisplayInfo {
+    /// Horizontal resolution in physical pixels.
     pub width: u32,
+    /// Vertical resolution in physical pixels.
     pub height: u32,
+    /// Refresh rate in Hertz (FPS).
     pub fps: u32,
+    /// Display scale factor (e.g. 2.0 for Retina / 200% Windows DPI scaling).
     pub scale_factor: f64,
 }
 
+/// Hardware description and capabilities of a detected graphics processing unit.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GpuDeviceInfo {
+    /// Zero-based adapter enumeration index.
     pub index: u32,
+    /// Human-readable marketing model name (e.g. `"NVIDIA GeForce RTX 4080"`).
     pub name: String,
+    /// Hardware vendor brand string (`"NVIDIA"`, `"AMD"`, `"Intel"`, `"Apple"`, `"Unknown"`).
     pub vendor: String,
+    /// `true` if adapter is a discrete PCIe card; `false` if integrated or unified memory SoC.
     pub is_discrete: bool,
+    /// Total dedicated video memory in Megabytes (MB), if reportable.
     pub vram_mb: Option<u64>,
 }
 
+/// Complete hardware and system configuration profile of the local workstation.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LocalHardwareProfile {
+    /// Unique 32-character hexadecimal device identifier derived from local Ed25519 public key.
     pub device_id: String,
+    /// Workstation computer hostname.
     pub hostname: String,
+    /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
+    /// Hardware model identifier (e.g. `"MacBookPro18,1"` or motherboard product name).
     pub hardware_model: String,
+    /// CPU brand string (e.g. `"Apple M1 Max"` or `"13th Gen Intel(R) Core(TM) i9-13900K"`).
     pub cpu_brand: String,
+    /// `true` if MacBook Touch Bar hardware is present.
     pub has_touch_bar: bool,
+    /// Primary display resolution, refresh rate, and HiDPI scale factor.
     pub primary_display: PrimaryDisplayInfo,
+    /// Enumerated graphics adapters.
     pub gpus: Vec<GpuDeviceInfo>,
+    /// Preferred GPU name for hardware display encoding/decoding.
     pub preferred_gpu_name: Option<String>,
+    /// Sunshine game-streaming service name, if installed.
     pub sunshine_name: Option<String>,
+    /// Sunshine web service port (defaults to 47989).
     pub sunshine_port: u16,
+    /// Published SMB share names discovered on local machine.
     pub default_share_names: Vec<String>,
 }
 
+/// Physical transport medium classification for a network communication route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkTransport {
+    /// Direct point-to-point USB-C CDC-NCM virtual Ethernet link.
     DirectUsb,
+    /// Direct point-to-point Thunderbolt 3/4 or USB4 networking bridge.
     Thunderbolt,
+    /// Standard wired Local Area Network (1GbE / 2.5GbE / 10GbE RJ45).
     Ethernet,
+    /// 802.11 Wi-Fi wireless infrastructure network or PC Mobile Hotspot.
     Wifi,
+    /// Unclassified or routed network transport.
     Unknown,
 }
 
 impl LinkTransport {
+    /// Returns a human-friendly label describing the transport medium.
     pub fn label(self) -> &'static str {
         match self {
             LinkTransport::DirectUsb => "USB-C Direct",
@@ -157,29 +265,45 @@ impl LinkTransport {
         }
     }
 
+    /// Returns `true` if the transport is a direct high-bandwidth cable (Thunderbolt or Direct USB-C).
     pub fn is_direct_cable(self) -> bool {
         matches!(self, LinkTransport::DirectUsb | LinkTransport::Thunderbolt)
     }
 }
 
+/// Configuration snapshot of an active local IPv4 network interface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalInterfaceInfo {
+    /// OS interface device name (e.g. `"en0"` on macOS, `"Ethernet 2"` on Windows).
     pub name: String,
+    /// User-friendly hardware port description (e.g. `"Thunderbolt Bridge"` or `"Wi-Fi"`).
     pub friendly_name: String,
+    /// Assigned IPv4 address string (e.g. `"192.168.1.10"`).
     pub ip: String,
+    /// IPv4 subnet mask string (e.g. `"255.255.255.0"`).
     pub netmask: String,
+    /// Subnet directed broadcast address string (e.g. `"192.168.1.255"`).
     pub broadcast: String,
+    /// CIDR subnet prefix length (e.g. 24 for `/24`).
     pub cidr_prefix: u8,
+    /// Physical transport medium classification.
     pub transport: LinkTransport,
+    /// Reported link speed in Megabits per second.
     pub link_speed_mbps: Option<u32>,
+    /// Formatted route and speed description string.
     pub description: String,
 }
 
+/// User path overrides stored in `app_config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppPathPreferences {
+    /// Preferred local SMB share name.
     pub smb_share_name: Option<String>,
+    /// Preferred remote peer SMB share name.
     pub peer_smb_share_name: Option<String>,
+    /// Custom path to `sunshine.conf`.
     pub sunshine_conf_path: Option<String>,
+    /// Custom path to `Moonlight` executable.
     pub moonlight_path: Option<String>,
 }
 
@@ -238,6 +362,9 @@ extern "C" {
     fn freeifaddrs(ifa: *mut DarwinIfAddrs);
 }
 
+/// Safely inspects environment variables to locate the user's home directory.
+///
+/// Verifies that paths are non-empty, contain no NUL bytes, and represent absolute paths.
 pub fn try_user_home_dir() -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -276,6 +403,7 @@ pub fn try_user_home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Returns the user's home directory, or an unmapped sentinel directory if environment variables are missing.
 pub fn user_home_dir() -> PathBuf {
     try_user_home_dir().unwrap_or_else(|| {
         #[cfg(not(target_os = "windows"))]
@@ -289,7 +417,9 @@ pub fn user_home_dir() -> PathBuf {
     })
 }
 
-/// Persistent app state directory (`~/.usbc_clipboard_cache`), never falling back to `/tmp`.
+/// Returns the persistent application data directory (`~/.usbc_clipboard_cache`).
+///
+/// Explicitly rejects symlinks to prevent directory traversal and sets Unix permissions to `0o700`.
 pub fn app_data_dir() -> PathBuf {
     let dir = user_home_dir().join(".usbc_clipboard_cache");
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
@@ -307,6 +437,7 @@ pub fn app_data_dir() -> PathBuf {
     dir
 }
 
+/// Loads user application path preferences from `app_config.json`.
 pub fn load_path_preferences() -> AppPathPreferences {
     let _guard = app_config_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = app_data_dir().join("app_config.json");
@@ -316,6 +447,7 @@ pub fn load_path_preferences() -> AppPathPreferences {
         .unwrap_or_default()
 }
 
+/// Persists user application path preferences to `app_config.json` atomically.
 pub fn save_path_preferences(prefs: &AppPathPreferences) -> std::io::Result<()> {
     let _guard = app_config_lock().lock().unwrap_or_else(|e| e.into_inner());
     let dir = app_data_dir();
@@ -336,7 +468,7 @@ pub fn save_path_preferences(prefs: &AppPathPreferences) -> std::io::Result<()> 
     atomic_write_private(&path, json.as_bytes())
 }
 
-/// Resolve the active user's Desktop (falling back to Downloads or home dir) dynamically.
+/// Resolves the user's Desktop directory dynamically, falling back to Downloads or Home.
 pub fn user_desktop_or_downloads_dir() -> PathBuf {
     #[cfg(not(target_os = "windows"))]
     {
@@ -378,6 +510,7 @@ pub fn user_desktop_or_downloads_dir() -> PathBuf {
     }
 }
 
+/// Helper building a windowless `std::process::Command` on Windows.
 #[cfg(target_os = "windows")]
 fn win_cmd(program: &Path) -> Command {
     use std::os::windows::process::CommandExt;
@@ -387,6 +520,7 @@ fn win_cmd(program: &Path) -> Command {
     cmd
 }
 
+/// Queries Windows Shell Folders in the registry to locate special user directories (e.g. Desktop, Downloads).
 #[cfg(target_os = "windows")]
 fn query_windows_shell_folder(value_name: &str) -> Option<String> {
     let out = win_cmd(&system32_exe("reg.exe"))
@@ -420,6 +554,7 @@ fn query_windows_shell_folder(value_name: &str) -> Option<String> {
     None
 }
 
+/// Expands `%USERPROFILE%`, `%APPDATA%`, and `%OneDrive%` placeholders in registry strings.
 #[cfg(target_os = "windows")]
 fn expand_windows_env_vars(input: &str) -> String {
     let mut out = input.to_string();
@@ -427,7 +562,6 @@ fn expand_windows_env_vars(input: &str) -> String {
         if let Ok(val) = std::env::var(var) {
             let token = format!("%{}%", var);
             if out.to_ascii_lowercase().contains(&token.to_ascii_lowercase()) {
-                // Case-insensitive single-pass replace
                 let lower = out.to_ascii_lowercase();
                 let tok_lower = token.to_ascii_lowercase();
                 if let Some(idx) = lower.find(&tok_lower) {
@@ -439,8 +573,7 @@ fn expand_windows_env_vars(input: &str) -> String {
     out
 }
 
-/// Returns the canonical v2 device identifier (`HEX(SHA256("integrator-device-id-v2" || local_ed25519_pubkey)[0..16])`)
-/// bound to the installation's persistent Ed25519 identity key in `KeystoreV2`.
+/// Returns the persistent canonical v2 device identifier hex string bound to `KeystoreV2`.
 pub fn get_or_create_device_id() -> String {
     static DEVICE_ID: OnceLock<String> = OnceLock::new();
     DEVICE_ID
@@ -453,6 +586,7 @@ pub fn get_or_create_device_id() -> String {
         .clone()
 }
 
+/// Queries the local operating system hostname.
 pub fn get_hostname() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -500,6 +634,7 @@ pub fn get_hostname() -> String {
     }
 }
 
+/// Resolves hardware product model name and CPU processor brand.
 pub fn get_hardware_model_and_cpu() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
@@ -557,6 +692,7 @@ pub fn get_hardware_model_and_cpu() -> (String, String) {
     }
 }
 
+/// Reads a string value from the Windows registry.
 #[cfg(target_os = "windows")]
 fn reg_query_sz(key: &str, value: &str) -> Option<String> {
     let out = win_cmd(&system32_exe("reg.exe"))
@@ -584,7 +720,7 @@ fn reg_query_sz(key: &str, value: &str) -> Option<String> {
     None
 }
 
-/// Detect whether this Mac actually has Touch Bar hardware / daemon active.
+/// Detects whether this Mac has physical Touch Bar hardware or its daemon active.
 pub fn has_touch_bar_hardware() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -611,6 +747,7 @@ pub fn has_touch_bar_hardware() -> bool {
     }
 }
 
+/// Queries the primary display physical resolution, refresh rate, and scale factor.
 pub fn get_primary_display_info() -> PrimaryDisplayInfo {
     #[cfg(target_os = "macos")]
     {
@@ -665,6 +802,7 @@ pub fn get_primary_display_info() -> PrimaryDisplayInfo {
     }
 }
 
+/// Windows implementation querying primary display metrics via `EnumDisplaySettingsW` and `GetDpiForSystem`.
 #[cfg(target_os = "windows")]
 fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     #[repr(C)]
@@ -736,7 +874,7 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     }
 }
 
-/// Enumerate GPUs on the local machine dynamically without assuming vendor or model.
+/// Enumerates graphics adapters with a 30-second in-memory cache to prevent frequent OS subprocess calls.
 pub fn enumerate_gpus() -> Vec<GpuDeviceInfo> {
     static GPU_CACHE: OnceLock<Mutex<(Instant, Vec<GpuDeviceInfo>)>> = OnceLock::new();
     let cache = GPU_CACHE.get_or_init(|| Mutex::new((Instant::now() - std::time::Duration::from_secs(120), Vec::new())));
@@ -753,6 +891,7 @@ pub fn enumerate_gpus() -> Vec<GpuDeviceInfo> {
     gpus
 }
 
+/// Executes un-cached GPU enumeration across macOS `system_profiler` or Windows registry + `nvidia-smi`.
 fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
     let mut out = Vec::new();
 
@@ -812,7 +951,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
 
     #[cfg(target_os = "windows")]
     {
-        // First collect any NVIDIA GPUs via nvidia-smi for exact model + VRAM.
+        // First collect any NVIDIA GPUs via nvidia-smi for exact model + VRAM
         if let Some(nvidia_smi_path) = find_nvidia_smi_path() {
             if let Ok(cmd) = win_cmd(&nvidia_smi_path)
                 .args(["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"])
@@ -838,7 +977,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
             }
         }
 
-        // Also inspect Windows Display class registry keys for all adapters (Intel, AMD, NVIDIA, etc.).
+        // Also inspect Windows Display class registry keys for all adapters (Intel, AMD, NVIDIA, etc.)
         if let Ok(cmd) = win_cmd(&system32_exe("reg.exe"))
             .args([
                 "query",
@@ -901,6 +1040,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
     out
 }
 
+/// Infers GPU vendor from adapter model name string.
 fn infer_vendor(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
     if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") || lower.contains("quadro") {
@@ -916,6 +1056,7 @@ fn infer_vendor(name: &str) -> &'static str {
     }
 }
 
+/// Parses video memory size string in MB or GB into integer Megabytes.
 #[allow(dead_code)]
 fn parse_vram_mb(s: &str) -> Option<u64> {
     let mut digits = String::new();
@@ -934,7 +1075,7 @@ fn parse_vram_mb(s: &str) -> Option<u64> {
     }
 }
 
-/// Locate a helper executable or script relative to the running binary, bundle, repo, or PATH.
+/// Locates a helper executable or script relative to the running binary, bundle, repository, or PATH.
 pub fn find_app_helper(name: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -969,6 +1110,7 @@ pub fn find_app_helper(name: &str) -> Option<PathBuf> {
     find_in_path(name)
 }
 
+/// Searches the system PATH environment variable for a given binary name.
 pub fn find_in_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -987,6 +1129,7 @@ pub fn find_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+/// Locates the `sunshine.conf` configuration file in standard installation locations or user preferences.
 pub fn find_sunshine_conf() -> Option<PathBuf> {
     let prefs = load_path_preferences();
     if let Some(custom) = prefs.sunshine_conf_path {
@@ -1027,6 +1170,7 @@ pub fn find_sunshine_conf() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// Locates the `sunshine` streaming server executable binary.
 pub fn find_sunshine_binary() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -1062,6 +1206,7 @@ pub fn find_sunshine_binary() -> Option<PathBuf> {
     }
 }
 
+/// Locates the `Moonlight` game streaming client binary.
 pub fn find_moonlight_binary() -> Option<PathBuf> {
     let prefs = load_path_preferences();
     if let Some(custom) = prefs.moonlight_path {
@@ -1081,7 +1226,7 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
                 return Some(p);
             }
         }
-        // Spotlight bundle ID fallback if installed anywhere else on disk.
+        // Spotlight bundle ID fallback if installed anywhere else on disk
         if let Ok(out) = Command::new("/usr/bin/mdfind")
             .arg("kMDItemCFBundleIdentifier == 'com.moonlight-stream.Moonlight'")
             .output()
@@ -1117,6 +1262,7 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
     }
 }
 
+/// Parses Sunshine server name, port, and configured adapter name from `sunshine.conf`.
 pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
     let Some(conf_path) = find_sunshine_conf() else {
         return (None, 47989, None);
@@ -1150,6 +1296,7 @@ pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
     (name, port, adapter)
 }
 
+/// Validates that a Sunshine GPU adapter name contains no control characters and is under 256 chars.
 fn validate_sunshine_adapter_name(raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 256 || trimmed.chars().any(|c| c.is_control()) {
@@ -1158,7 +1305,7 @@ fn validate_sunshine_adapter_name(raw: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
-/// Update `adapter_name` inside `sunshine.conf` safely; returns `Ok(true)` if changed.
+/// Modifies `adapter_name` inside `sunshine.conf` atomically.
 #[allow(dead_code)]
 pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     let clean_name = validate_sunshine_adapter_name(adapter_name)?;
@@ -1195,7 +1342,7 @@ pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     Ok(changed)
 }
 
-/// Discover local SMB shares dynamically. First entry is user-preferred or highest priority non-admin share.
+/// Discovers published local SMB shares dynamically using native tools (`sharing -l` on macOS, `net share` on Windows).
 pub fn list_local_smb_shares() -> Vec<String> {
     let mut shares = Vec::new();
     let prefs = load_path_preferences();
@@ -1248,7 +1395,6 @@ pub fn list_local_smb_shares() -> Vec<String> {
                 }
             }
         }
-        // Check legacy common share name if user shared their home folder
         if shares.is_empty() {
             shares.push(get_hostname());
         }
@@ -1269,8 +1415,8 @@ pub fn list_local_smb_shares() -> Vec<String> {
                     if !in_rows || t.is_empty() || t.starts_with("The command completed") {
                         continue;
                     }
-                    // Columns: Share name | Resource | Remark
                     if let Some(share_name) = t.split_whitespace().next() {
+                        // Skip administrative shares (C$, IPC$, ADMIN$)
                         if share_name.ends_with('$')
                             || share_name.eq_ignore_ascii_case("IPC$")
                             || share_name.eq_ignore_ascii_case("ADMIN$")
@@ -1293,6 +1439,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
     shares
 }
 
+/// Gathers a full snapshot of the local machine's identity, display, GPU, and sharing configuration.
 pub fn collect_local_profile() -> LocalHardwareProfile {
     let device_id = get_or_create_device_id();
     let hostname = get_hostname();
@@ -1325,7 +1472,7 @@ pub fn collect_local_profile() -> LocalHardwareProfile {
     }
 }
 
-/// Ask the OS routing table which local IPv4 address will be used to reach `peer_ip`.
+/// Asks the OS routing table which local IPv4 interface will be used to route packets to `peer_ip`.
 pub fn local_ip_for_peer(peer_ip: &str) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect((peer_ip, 58281)).ok()?;
@@ -1333,6 +1480,7 @@ pub fn local_ip_for_peer(peer_ip: &str) -> Option<String> {
     Some(addr.ip().to_string())
 }
 
+/// Bitwise subnet membership check: returns `true` if `iface_ip` and `target_ip` match under `netmask`.
 #[inline]
 pub(crate) fn ipv4_in_subnet(iface_ip: Ipv4Addr, netmask: Ipv4Addr, target_ip: Ipv4Addr) -> bool {
     let mask_u = u32::from(netmask);
@@ -1342,10 +1490,10 @@ pub(crate) fn ipv4_in_subnet(iface_ip: Ipv4Addr, netmask: Ipv4Addr, target_ip: I
     (u32::from(iface_ip) & mask_u) == (u32::from(target_ip) & mask_u)
 }
 
-/// Returns true if `peer_ip` shares an on-link subnet with `local_ip` (or any active local IPv4 interface
-/// when `local_ip` is `None`), distinguishing directly attached links (e.g., USB-C `10.99.99.x`,
-/// Thunderbolt `169.254.x.x`, Direct Ethernet, or PC Mobile Hotspot `192.168.137.x`) from unconfigured
-/// alias IPs routed out an unrelated default gateway.
+/// Checks whether `peer_ip` resides on the exact same on-link CIDR subnet as `local_ip`.
+///
+/// Distinguishes directly connected links (Thunderbolt `169.254.x.x`, USB-C `10.99.99.x`,
+/// Mobile Hotspot `192.168.137.x`) from unconfigured alias IPs routed via a default gateway.
 pub fn is_same_subnet_as_peer(local_ip: Option<&str>, peer_ip: &str) -> bool {
     let Ok(peer_v4) = peer_ip.trim().parse::<Ipv4Addr>() else {
         return false;
@@ -1368,14 +1516,14 @@ pub fn is_same_subnet_as_peer(local_ip: Option<&str>, peer_ip: &str) -> bool {
     false
 }
 
-/// Look up which local interface owns `local_ip`.
+/// Looks up which local network interface owns the specified `local_ip`.
 pub fn interface_for_local_ip(local_ip: &str) -> Option<LocalInterfaceInfo> {
     list_local_ipv4_interfaces()
         .into_iter()
         .find(|iface| iface.ip == local_ip)
 }
 
-/// Determine transport class + friendly description + link speed for a route to `peer_ip`.
+/// Resolves physical transport medium, link speed, description, and local egress IP for a route to `peer_ip`.
 pub fn describe_route_to_peer(peer_ip: &str) -> (LinkTransport, Option<u32>, String, Option<String>) {
     let local_ip = local_ip_for_peer(peer_ip);
     if let Some(ref lip) = local_ip {
@@ -1396,6 +1544,7 @@ pub fn describe_route_to_peer(peer_ip: &str) -> (LinkTransport, Option<u32>, Str
     )
 }
 
+/// Returns `true` if the route to `peer_ip` is a direct physical bridge cable (Thunderbolt or USB-C).
 pub fn is_direct_cable_route(peer_ip: &str) -> bool {
     if peer_ip == "127.0.0.1" {
         return true;
@@ -1404,7 +1553,7 @@ pub fn is_direct_cable_route(peer_ip: &str) -> bool {
     transport.is_direct_cable()
 }
 
-/// Directed broadcast targets across all active local IPv4 interfaces plus `255.255.255.255`.
+/// Returns a deduplicated list of directed broadcast target addresses across all active interfaces plus `255.255.255.255`.
 #[allow(dead_code)]
 pub fn discovery_broadcast_targets() -> Vec<String> {
     let mut targets = Vec::new();
@@ -1421,9 +1570,10 @@ pub fn discovery_broadcast_targets() -> Vec<String> {
     targets
 }
 
-/// Enumerates `(iface_name, local_ip, broadcast_ip, transport)` across all active IPv4 interfaces
-/// so UDP discovery can bind per-interface sockets (vital for Thunderbolt Bridge, Direct Ethernet
-/// `169.254.x.x`, and Windows Mobile Hotspot `192.168.137.x` when Wi-Fi is also active).
+/// Enumerates `(iface_name, local_ip, broadcast_ip, transport)` tuples across all active physical and virtual interfaces.
+///
+/// Enables per-interface UDP discovery socket binding so direct Thunderbolt, USB-C, and Wi-Fi links
+/// transmit their beacons onto their respective physical media.
 pub fn discovery_interface_endpoints() -> Vec<(String, String, String, LinkTransport)> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
@@ -1439,7 +1589,7 @@ pub fn discovery_interface_endpoints() -> Vec<(String, String, String, LinkTrans
     endpoints
 }
 
-/// Enumerate all active non-loopback IPv4 interfaces with mask, broadcast, transport type, and link speed.
+/// Enumerates all active non-loopback IPv4 network interfaces on the local operating system.
 pub fn list_local_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     #[cfg(target_os = "macos")]
     {
@@ -1455,16 +1605,19 @@ pub fn list_local_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     }
 }
 
+/// Converts an IPv4 subnet mask into its CIDR prefix count (e.g. 255.255.255.0 -> 24).
 fn mask_to_prefix(mask: Ipv4Addr) -> u8 {
     u32::from(mask).count_ones() as u8
 }
 
+/// Calculates the subnet-directed broadcast address for a given IP and subnet mask.
 fn compute_broadcast(ip: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
     let ip_u = u32::from(ip);
     let mask_u = u32::from(mask);
     Ipv4Addr::from((ip_u & mask_u) | !mask_u)
 }
 
+/// RAII cleanup guard invoking `freeifaddrs` on a linked list returned by `getifaddrs`.
 #[cfg(target_os = "macos")]
 struct IfAddrsGuard(*mut DarwinIfAddrs);
 
@@ -1477,6 +1630,7 @@ impl Drop for IfAddrsGuard {
     }
 }
 
+/// macOS network interface enumerator using `getifaddrs` and hardware port mapping.
 #[cfg(target_os = "macos")]
 fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     let port_map = cached_mac_hardware_ports();
@@ -1497,6 +1651,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         let entry = unsafe { &*cur };
         cur = entry.ifa_next;
 
+        // Skip down or loopback interfaces
         if (entry.ifa_flags & IFF_UP) == 0 || (entry.ifa_flags & IFF_LOOPBACK) != 0 {
             continue;
         }
@@ -1541,7 +1696,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             .to_string_lossy()
             .into_owned();
 
-        // Skip virtual utun / awdl / llw / point-to-point tunnel interfaces unless no real interfaces exist
+        // Skip virtual point-to-point tunnel interfaces
         if name.starts_with("utun")
             || name.starts_with("awdl")
             || name.starts_with("llw")
@@ -1578,12 +1733,11 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         });
     }
 
-    // IfAddrsGuard frees `ifap` on drop.
-    // Sort best wired / direct links before Wi-Fi
     out.sort_by_key(|i| i.transport);
     out
 }
 
+/// Caches macOS network hardware port mappings (`networksetup -listallhardwareports`) with a 15-second TTL.
 #[cfg(target_os = "macos")]
 fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
     static PORT_CACHE: OnceLock<Mutex<(Instant, std::collections::HashMap<String, String>)>> =
@@ -1627,6 +1781,7 @@ fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Classifies macOS network interface friendly names into `LinkTransport` categories.
 #[cfg(any(target_os = "macos", test))]
 fn classify_mac_friendly_name(friendly: &str) -> LinkTransport {
     let lower_friendly = friendly.to_ascii_lowercase();
@@ -1665,6 +1820,7 @@ fn classify_mac_friendly_name(friendly: &str) -> LinkTransport {
     }
 }
 
+/// Parses speed and media type flags from `ifconfig` output lines on macOS.
 #[cfg(any(target_os = "macos", test))]
 fn parse_mac_ifconfig_media(txt: &str) -> (Option<u32>, bool, bool) {
     let mut speed_mbps = None;
@@ -1703,19 +1859,13 @@ fn parse_mac_ifconfig_media(txt: &str) -> (Option<u32>, bool, bool) {
     (speed_mbps, is_ncm_media, is_wired_media)
 }
 
+/// Classifies physical transport and link speed for macOS network adapters.
 #[cfg(target_os = "macos")]
 fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option<u32>) {
     let lower_friendly = friendly.to_ascii_lowercase();
-
-    // Only classify as Thunderbolt if `networksetup` explicitly maps this device to Thunderbolt.
-    // Never classify arbitrary `bridge*` (e.g., Internet Sharing `bridge100` or VM bridges) as Thunderbolt.
-    // Likewise, only classify as DirectUsb for genuine point-to-point USB CDC/NCM/RNDIS/Apple bridges,
-    // not generic USB-C-to-RJ45 Ethernet LAN adapters used on Intel & Apple Silicon Macs.
     let mut transport = classify_mac_friendly_name(friendly);
 
-    // macOS presents Apple Silicon host-to-host USB-C NCM links (`AppleUSBDeviceNCM11Data`) as generic
-    // "Ethernet Adapter (enN)" with `100baseTX` media. Confirm NCM backing via IORegistry so
-    // Apple Silicon USB-C links get DirectUsb prioritization and full streaming bitrates.
+    // Confirm Apple Silicon host-to-host USB-C NCM backing via IORegistry
     if !lower_friendly.contains("wi-fi")
         && !lower_friendly.contains("airport")
         && !lower_friendly.contains("thunderbolt")
@@ -1733,15 +1883,15 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
             if is_ncm_media && transport == LinkTransport::Unknown {
                 transport = LinkTransport::DirectUsb;
             } else if transport == LinkTransport::Unknown && is_wired_media {
-                // Ensure USB-C Ethernet adapters missing from cached `networksetup` never rank behind Wi-Fi
                 transport = LinkTransport::Ethernet;
             }
         }
     }
 
-    (transport, speed_mbps)
+    (transport, sanitize_adapter_link_speed(transport, speed_mbps))
 }
 
+/// Inspects IOKit registry to determine if `iface` represents an Apple Silicon USB-C NCM virtual adapter.
 #[cfg(target_os = "macos")]
 fn mac_is_usb_ncm_interface(iface: &str) -> bool {
     use std::collections::HashSet;
@@ -1772,6 +1922,7 @@ fn mac_is_usb_ncm_interface(iface: &str) -> bool {
     matched
 }
 
+/// Parses BSD interface names from `ioreg -r -c AppleUSBDeviceNCMData -l` output.
 #[cfg(any(target_os = "macos", test))]
 fn parse_ioreg_usb_ncm_bsd_names(ioreg_output: &str) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
@@ -1797,6 +1948,7 @@ fn parse_ioreg_usb_ncm_bsd_names(ioreg_output: &str) -> std::collections::HashSe
     names
 }
 
+/// Windows network interface enumerator using `GetIpAddrTable` and PowerShell metadata cache.
 #[cfg(target_os = "windows")]
 fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     #[repr(C)]
@@ -1851,7 +2003,6 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             break;
         }
         let row = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const MibIpAddrRow) };
-        // Skip disconnected (0x0008) or being-deleted (0x0040) IPv4 rows
         if (row.w_type & (0x0008 | 0x0040)) != 0 {
             continue;
         }
@@ -1904,6 +2055,7 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     out
 }
 
+/// Classifies Windows network adapters, filtering VPN tunnels and recognizing USB4/Thunderbolt/Hotspots.
 #[cfg(any(target_os = "windows", test))]
 fn classify_windows_adapter(name: &str, desc: &str, medium: &str) -> (bool, LinkTransport, bool) {
     let combined = format!("{} {} {}", name, desc, medium).to_ascii_lowercase();
@@ -1948,6 +2100,7 @@ fn classify_windows_adapter(name: &str, desc: &str, medium: &str) -> (bool, Link
     (is_vpn, transport, is_hotspot)
 }
 
+/// Caches Windows PowerShell `Get-NetAdapter` results with a 20-second TTL.
 #[cfg(target_os = "windows")]
 fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, String, LinkTransport, Option<u32>)> {
     static META_CACHE: OnceLock<
@@ -1994,6 +2147,7 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
                 let speed = parse_windows_link_speed(parts[3].trim());
                 let medium = parts.get(4).map(|s| s.trim()).unwrap_or("");
                 let (_is_vpn, transport, is_hotspot) = classify_windows_adapter(&name, &raw_desc, medium);
+                let speed = sanitize_adapter_link_speed(transport, speed);
                 let desc = if is_hotspot && !raw_desc.to_ascii_lowercase().contains("hotspot") {
                     format!("PC Wireless Hotspot - {}", raw_desc)
                 } else {
@@ -2010,6 +2164,15 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
     map
 }
 
+/// Discards synthetic placeholder link speeds reported by virtual USB-C NCM drivers.
+fn sanitize_adapter_link_speed(transport: LinkTransport, speed_mbps: Option<u32>) -> Option<u32> {
+    match (transport, speed_mbps) {
+        (LinkTransport::DirectUsb, Some(mbps)) if mbps >= 40_000 || mbps == 100 => None,
+        (_, other) => other,
+    }
+}
+
+/// Parses Windows link speed strings (e.g. `"1,000 Mbps"`, `"2.5 Gbps"`).
 #[cfg(any(target_os = "windows", test))]
 fn parse_windows_link_speed(raw: &str) -> Option<u32> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -2027,8 +2190,6 @@ fn parse_windows_link_speed(raw: &str) -> Option<u32> {
         return None;
     }
 
-    // Distinguish English thousands separators ("1,000 Mbps", "10,000 Mbps")
-    // from locale decimal commas ("2,5 Gbps").
     let normalized = if num_token.contains('.') {
         num_token.replace(',', "")
     } else if num_token.contains(',') {
@@ -2055,11 +2216,12 @@ fn parse_windows_link_speed(raw: &str) -> Option<u32> {
     }
 }
 
-/// Normalize a user-supplied display or host path safely without hardcoding any machine names.
+/// Validates whether the given string is a valid IPv4 address.
 pub fn is_valid_ipv4(ip: &str) -> bool {
     ip.trim().parse::<Ipv4Addr>().is_ok()
 }
 
+/// Checks whether a given path exists on the local filesystem.
 #[allow(dead_code)]
 pub fn is_local_file_path(path: &Path) -> bool {
     path.exists()
@@ -2068,8 +2230,17 @@ pub fn is_local_file_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_ioreg_usb_ncm_bsd_names, parse_windows_link_speed, validate_sunshine_adapter_name,
+        parse_ioreg_usb_ncm_bsd_names, parse_windows_link_speed, sanitize_adapter_link_speed,
+        validate_sunshine_adapter_name, LinkTransport,
     };
+
+    #[test]
+    fn test_sanitize_synthetic_usb_ncm_speed() {
+        assert_eq!(sanitize_adapter_link_speed(LinkTransport::DirectUsb, Some(100_000)), None);
+        assert_eq!(sanitize_adapter_link_speed(LinkTransport::DirectUsb, Some(100)), None);
+        assert_eq!(sanitize_adapter_link_speed(LinkTransport::DirectUsb, Some(5_000)), Some(5_000));
+        assert_eq!(sanitize_adapter_link_speed(LinkTransport::Ethernet, Some(100)), Some(100));
+    }
 
     #[test]
     fn test_parse_ioreg_usb_ncm_bsd_names() {

@@ -1,6 +1,99 @@
-//! Universal Clipboard Service with Mutually Authenticated `TransportSessionV2` (`ITR2`),
-//! Strict Quotas, Path Traversal & Symlink Protections, Per-File + Manifest SHA-256 Verification,
-//! and Isolated Staging with Atomic Commits.
+//! # Universal Clipboard Service & Zero-RAM Streaming Engine
+//!
+//! ## 1. Module Purpose & Scope
+//! The `ClipboardService` provides secure, full-duplex, mutually authenticated clipboard
+//! synchronization across macOS and Windows 10/11 workstations.
+//!
+//! Operating over `TransportSessionV2` (`ServiceId::ClipboardSync` on TCP port `CLIPBOARD_PORT = 58285`),
+//! the service synchronizes UTF-8 plain text, uncompressed RGBA bitmaps, and entire directory
+//! trees with zero memory-buffering overhead.
+//!
+//! ### Core Subsystem Responsibilities:
+//! 1. **Lightweight Change Polling**: Continuously polls `os_seq::get_clipboard_sequence()` every
+//!    250ms. Expensive OS clipboard reads and SHA-256 hashing occur only when the native sequence
+//!    number increments.
+//! 2. **Multi-Format Ingestion & Negotiation**:
+//!    - Text strings up to 10 MiB are hashed and synchronized instantly upon copy.
+//!    - Bitmaps up to 64 MiB (max 8192x8192 px) are transmitted inline (icons) or streamed as binary
+//!      RGBA chunks without base64 overhead.
+//!    - Multi-gigabyte file hierarchies (up to 32 GiB total) are advertised via lightweight
+//!      `LazyAnnouncement` metadata, deferring actual data transmission until the user explicitly
+//!      triggers Paste (`Cmd+V` / `Ctrl+V`) or finishes an edge drag-and-drop.
+//! 3. **Isolated Staging & Atomic Commits**:
+//!    - Incoming files are streamed into private, isolated temporary directories (`0o700` on Unix).
+//!    - Each file is verified against its individual SHA-256 digest (`FRAME_FILE_HASH`) during transfer.
+//!    - Once the entire session completes (`FRAME_END`), the staging directory is atomically promoted
+//!      into the local clipboard cache and registered with the native OS clipboard (`NSPasteboard` / `CF_HDROP`).
+//! 4. **Hardware & TouchBar Telemetry**:
+//!    - Drives the TouchBar HUD on MacBook Pro models (`touchbar_hud.swift`), displaying live
+//!      transfer progress percentages and MB/s throughput during multi-gigabyte transfers.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                          ClipboardService Architecture & Call Flow                     │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!              ┌─────────────────────────────────────────────────────────┐
+//!              │                 Integrator Core Engine                  │
+//!              │             (src/core.rs / src/main.rs)                 │
+//!              └────────────────────────────┬────────────────────────────┘
+//!                                           │ Instantiates & Supervises
+//!                                           ▼
+//!              ┌─────────────────────────────────────────────────────────┐
+//!              │                    ClipboardService                     │
+//!              │  - Sequence Watcher Loop (250ms interval)               │
+//!              │  - Format Negotiator (Text, Image, LazyAnnouncement)   │
+//!              │  - Staging Pipeline & Atomic Cache Promotion            │
+//!              └───────┬─────────────────┬───────────────────┬───────────┘
+//!                      │                 │                   │
+//!           Outbound   │     Inbound     │                   │ Progress Telemetry
+//!           Streams    │     Streams     │                   │
+//!                      ▼                 ▼                   ▼
+//!       ┌───────────────────────────────┐     ┌──────────────────────────────┐
+//!       │      TransportSessionV2       │     │     touchbar_hud.swift       │
+//!       │  (ServiceId::ClipboardSync)   │     │  - Live Transfer Progress %  │
+//!       │   ChaCha20-Poly1305 over TCP  │     │  - MB/s Streaming Velocity   │
+//!       └──────────────┬────────────────┘     └──────────────────────────────┘
+//!                      │ Port 58285
+//!                      ▼
+//!             Remote Peer Workstation
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/core.rs`: Instantiates `ClipboardService::new`, assigns `CLIPBOARD_INSTANCE`, spawns the
+//!   sequence watcher task, and calls `shutdown()`.
+//! - Native Keyboard Shortcut Interceptors: Invoke `trigger_rust_remote_paste()` when the user
+//!   presses `Cmd+V` / `Ctrl+V` while a remote lazy file transfer is pending.
+//! - KVM Engine (`src/kvm/service.rs`): Reuses `ClipboardService` staging and streaming helpers
+//!   for drag-and-drop operations.
+//!
+//! ### Downstream Callees:
+//! - `super::protocol`: Wire message formats and frame markers.
+//! - `super::os_seq`: OS sequence counter queries.
+//! - `super::file_helper::FileClipboardHelper`: Native OS file clipboard access (`NSPasteboard` / `CF_HDROP`).
+//! - `arboard::Clipboard`: Cross-platform plain text and bitmap read/write operations.
+//! - `crate::trust`: Mutually authenticated transport session establishment.
+//! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58285.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Tokio Multi-Thread Runtime**: Manages TCP connection acceptance, handshake timeouts,
+//!   and asynchronous file streaming loops.
+//! - **Connection Limits & Semaphores**:
+//!   - `MAX_PRE_AUTH_CLIP_CONNS = 16`: Throttles unauthenticated TCP connection bursts.
+//!   - `MAX_POST_AUTH_CLIP_CONNS = 8`: Bounds active concurrent transfer sessions.
+//! - **Blocking I/O Offloading**: Heavy disk reads and OS clipboard operations are dispatched to
+//!   `tokio::task::spawn_blocking` to prevent starving async network worker threads.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Strict Mutual Authentication**: Operates exclusively over `TransportSessionV2` validated
+//!   against pinned Ed25519 identity keys. Zero IP-based bypass or cleartext transmission is permitted.
+//! - **Path Traversal & Symlink Immunity**: Rejects absolute paths, Windows drive letters (`C:\`),
+//!   and `..` components. Refuses to follow or create symlinks in staging directories.
+//! - **Digest Verification**: Incoming files undergo two-layer verification: per-file SHA-256 validation
+//!   (`FRAME_FILE_HASH`) and session-wide content verification. Missing or mismatched hashes cause
+//!   immediate abort and deletion of the temporary staging directory.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -2817,7 +2910,7 @@ mod tests {
 
         let f1_path = src_dir.join("bundle/hello.txt");
         let f2_path = src_dir.join("bundle/sub/data.bin");
-        let f1_bytes = b"Integrator v2.0 authenticated file stream test";
+        let f1_bytes = b"Integrator v1.0 authenticated file stream test";
         let f2_bytes = vec![0x3Cu8; 300_000];
         std::fs::write(&f1_path, f1_bytes).unwrap();
         std::fs::write(&f2_path, &f2_bytes).unwrap();

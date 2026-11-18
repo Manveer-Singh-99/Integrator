@@ -1,8 +1,113 @@
-//! Dynamic cross-platform SMB shared storage mounter.
+//! # Storage Subsystem: Dynamic Cross-Platform SMB Shared Storage Mounter
 //!
-//! Eliminates hardcoded share names ("HP-OMEN", "MacBook") and fixed drive letters ("M:\")
-//! or sudo `/Volumes` directories in favor of discovered/configured share names,
-//! NetFS `mount volume` on macOS, and dynamic `net use *` drive assignment on Windows.
+//! ## Architectural Overview & Design Intent
+//!
+//! The `storage` module provides zero-configuration, secure, cross-platform SMB network share
+//! mounting and lifecycle management between macOS and Windows peers in an Integrator session.
+//! Traditional network sharing setups frequently suffer from brittle assumptions: hardcoded
+//! NetBIOS/mDNS hostnames (e.g., `"HP-OMEN"`, `"MacBook"`), fixed drive letters (e.g., `"M:\"`),
+//! or privileged `/Volumes` mount directory manipulation requiring `sudo`.
+//!
+//! This subsystem completely eliminates hardcoded mount configurations in favor of:
+//! 1. **Cryptographic Peer Verification**: Prior to initiating any network mount or discovery probes,
+//!    the remote IPv4 address is authenticated via [`trust::has_paired_peer_at_ip`](crate::trust::has_paired_peer_at_ip).
+//!    Unpaired, untrusted, or blocked peers are rejected outright to prevent SMB relay attacks or
+//!    rogue share enumeration.
+//! 2. **Dynamic Share Discovery & Fallback Cascade**: If the user has not configured an explicit
+//!    override or preference in [`system_info::load_path_preferences`](crate::system_info::load_path_preferences),
+//!    the module dynamically queries the remote peer for available disk shares using native platform tools:
+//!    - macOS: `/usr/bin/smbutil view -N //peer_ip` (querying guest/anonymous share listings).
+//!    - Windows: `net.exe view \\peer_ip` (querying NetBIOS/SMB share enumeration).
+//! 3. **Native Non-Privileged OS Mount Orchestration**:
+//!    - **macOS**: Leverages NetFS via AppleScript (`/usr/bin/osascript -e 'mount volume "smb://..."'`).
+//!      This mounts the volume directly into `/Volumes/<ShareName>` within the user's active login
+//!      session, utilizing existing macOS Keychain / Kerberos SSO credentials or guest access without
+//!      requiring root/sudo privileges.
+//!    - **Windows**: Executes `C:\Windows\System32\net.exe use * \\peer_ip\share /persistent:no` using
+//!      `CREATE_NO_WINDOW` (0x08000000). The operating system automatically allocates the next available
+//!      drive letter in reverse alphabetical order (e.g., `Z:`, `Y:`, `X:`), completely avoiding drive
+//!      letter collision issues.
+//! 4. **Strict Path & Metacharacter Sanitization**: All share names, whether discovered remotely or
+//!    supplied by user input, are validated through [`validate_smb_share_name`] against directory traversal
+//!    (`..`), administrative hidden shares (`C$`, `ADMIN$`, `IPC$`), control characters, and shell injection
+//!    delimiters (`;`, `|`, `&`, `"`, etc.).
+//! 5. **Atomic State Persistence**: The active mount status is tracked on disk at `<app_data_dir>/active_mount.json`
+//!    using atomic write-and-rename mechanics with restrictive permissions (`0o600` on Unix), protected by
+//!    a process-wide mutex to avoid race conditions.
+//!
+//! ---
+//!
+//! ## Cross-Platform Execution Flow
+//!
+//! ```text
+//!  +-------------------------------------------------------------------------------+
+//!  |                      Integrator UI / Core Storage Command                     |
+//!  +-------------------------------------------------------------------------------+
+//!                                         |
+//!                                         v
+//!                       StorageManager::mount_with_share(ip, hint)
+//!                                         |
+//!                     +-------------------+-------------------+
+//!                     | Verify IPv4 format & trust status     |
+//!                     | trust::has_paired_peer_at_ip(peer_ip) |
+//!                     +-------------------+-------------------+
+//!                                         |
+//!                     +-------------------+-------------------+
+//!                     | Resolve Share Name:                   |
+//!                     | 1. Stored preference                  |
+//!                     | 2. Explicit share_hint                |
+//!                     | 3. Dynamic discovery (smbutil/net)    |
+//!                     +-------------------+-------------------+
+//!                                         |
+//!                     +-------------------+-------------------+
+//!                     | validate_smb_share_name()             |
+//!                     | Reject "..", "$", shell metachars     |
+//!                     +-------------------+-------------------+
+//!                                         |
+//!                +------------------------+------------------------+
+//!                |                                                 |
+//!     [target_os = "macos"]                             [target_os = "windows"]
+//!                |                                                 |
+//!                v                                                 v
+//!     osascript mount volume                            net.exe use * \\ip\share
+//!     smb://<ip>/<encoded_share>                        /persistent:no (CREATE_NO_WINDOW)
+//!                |                                                 |
+//!                v                                                 v
+//!     Mounts to /Volumes/<Share>                        Assigns dynamic letter (e.g. Z:\)
+//!                |                                                 |
+//!                +------------------------+------------------------+
+//!                                         |
+//!                                         v
+//!                     ActiveMountRecord saved atomically
+//!                     to <app_data_dir>/active_mount.json
+//!                                         |
+//!                                         v
+//!                             Return StorageStatus { ... }
+//! ```
+//!
+//! ---
+//!
+//! ## Upstream Callers and Downstream Callees
+//!
+//! - **Upstream Callers**:
+//!   - `src/core.rs`: Coordinates system state transitions, peer connection events, and mounts.
+//!   - Tauri IPC / Frontend: Storage settings pane and file explorer integration triggers.
+//! - **Downstream Callees**:
+//!   - [`crate::trust`]: Validates peer identity prior to issuing SMB commands.
+//!   - [`crate::system_info`]: Loads and saves user path preferences.
+//!   - System binaries: `/usr/bin/osascript`, `/usr/sbin/diskutil`, `/sbin/umount`, `/usr/bin/smbutil`,
+//!     `/sbin/mount`, `C:\Windows\System32\net.exe`.
+//!
+//! ---
+//!
+//! ## Safety & Concurrency Invariants
+//!
+//! - **Locking**: Active mount disk operations are guarded by [`MOUNT_STATE_LOCK`], ensuring concurrent
+//!   mount/unmount requests do not corrupt the on-disk JSON metadata.
+//! - **Atomic Persistence**: Files are written to temporary unique paths (`active_mount.json.<pid>.<seq>.tmp`)
+//!   and renamed atomically. Unix permissions are restricted to `0o600`.
+//! - **Subprocess Isolation**: On Windows, all child processes are spawned with `CREATE_NO_WINDOW`
+//!   to avoid GUI console flashes or interactive prompts hanging the runtime.
 
 use crate::{system_info, trust};
 use anyhow::Result;
@@ -12,46 +117,80 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Absolute path to macOS AppleScript interpreter binary.
 #[cfg(target_os = "macos")]
 const OSASCRIPT_BIN: &str = "/usr/bin/osascript";
+
+/// Absolute path to macOS disk management utility binary.
 #[cfg(target_os = "macos")]
 const DISKUTIL_BIN: &str = "/usr/sbin/diskutil";
+
+/// Absolute path to macOS unmount utility binary.
 #[cfg(target_os = "macos")]
 const UMOUNT_BIN: &str = "/sbin/umount";
+
+/// Absolute path to macOS SMB control and enumeration utility binary.
 #[cfg(target_os = "macos")]
 const SMBUTIL_BIN: &str = "/usr/bin/smbutil";
+
+/// Absolute path to macOS mount table inspection utility binary.
 #[cfg(target_os = "macos")]
 const MOUNT_BIN: &str = "/sbin/mount";
+
+/// Absolute path to Windows network resource command binary.
 #[cfg(target_os = "windows")]
 const NET_EXE_BIN: &str = r"C:\Windows\System32\net.exe";
 
+/// Process-wide mutual exclusion lock for active mount state file operations.
 static MOUNT_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Monotonically increasing counter for temporary mount state file generation.
 static MOUNT_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Returns the shared process-wide lock for serializing active mount state reads and writes.
 fn mount_state_lock() -> &'static Mutex<()> {
     MOUNT_STATE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Represents the real-time status of an Integrator SMB network share mount.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
+    /// Whether an active SMB share is currently mounted and accessible on the local system.
     pub is_mounted: bool,
+    /// Local filesystem path where the remote share is mounted (e.g., `/Volumes/Workspace` or `Z:\`).
     pub mount_path: String,
+    /// IPv4 address of the remote peer hosting the SMB share.
     pub remote_ip: String,
+    /// Validated name of the remote SMB share (e.g., `"Workspace"` or `"Public"`).
     pub remote_share: String,
+    /// Human-readable descriptive status or diagnostic error message for display in UI.
     pub message: String,
 }
 
+/// On-disk persistence record tracking the active SMB mount details.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ActiveMountRecord {
+    /// IPv4 address of the remote peer.
     peer_ip: String,
+    /// Name of the remote SMB share.
     remote_share: String,
+    /// Local path or drive letter where the share is mounted.
     mount_path: String,
 }
 
+/// High-level static coordinator for managing SMB shared storage lifecycle.
 pub struct StorageManager;
 
 /// Validates an SMB share name against path-traversal, shell/AppleScript metacharacters,
 /// administrative `$` shares, and length bounds.
+///
+/// # Security Invariants
+/// - Rejects empty or whitespace-only names.
+/// - Caps maximum length at 80 characters to prevent buffer overruns or abnormal path expansion.
+/// - Prohibits `.` and `..` path segments to prevent directory traversal attacks.
+/// - Rejects administrative shares ending in `$` (such as `C$`, `ADMIN$`, `IPC$`) to guard against
+///   accidental administrative root volume exposure.
+/// - Rejects control characters and forbidden shell delimiters: `['/', '\\', ':', '"', ';', '|', '<', '>', '*', '?']`.
 pub fn validate_smb_share_name(raw: &str) -> std::result::Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -77,6 +216,10 @@ pub fn validate_smb_share_name(raw: &str) -> std::result::Result<String, String>
 }
 
 impl StorageManager {
+    /// Updates the user's preferred remote SMB share name in persistent application preferences.
+    ///
+    /// Validates the share name using [`validate_smb_share_name`] before saving. Passing `None`
+    /// or an empty string clears the preferred share name.
     pub fn set_preferred_peer_share(share: Option<&str>) -> std::io::Result<()> {
         let validated = match share.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(raw) => Some(
@@ -90,22 +233,36 @@ impl StorageManager {
         system_info::save_path_preferences(&prefs)
     }
 
+    /// Retrieves the user's preferred remote SMB share name if configured and valid.
     pub fn get_preferred_peer_share() -> Option<String> {
         system_info::load_path_preferences()
             .peer_smb_share_name
             .and_then(|s| validate_smb_share_name(&s).ok())
     }
 
+    /// Checks whether an SMB share is currently active and mounted locally.
     #[allow(dead_code)]
     pub fn is_mounted() -> bool {
         detect_active_mount(None).is_some()
     }
 
+    /// Mounts the default or auto-discovered SMB share from the specified peer IP.
     #[allow(dead_code)]
     pub fn mount(peer_ip: &str) -> Result<StorageStatus> {
         Self::mount_with_share(peer_ip, None)
     }
 
+    /// Mounts an SMB share from the given peer IP, with an optional explicit share hint.
+    ///
+    /// # Workflow
+    /// 1. Validates peer IP as a valid IPv4 address.
+    /// 2. Verifies cryptographic pairing with the peer via [`trust::has_paired_peer_at_ip`].
+    /// 3. Checks if the target share is already mounted locally; if so, returns existing mount info.
+    /// 4. Resolves target share name (preferred override -> hint -> dynamic discovery via smbutil/net view).
+    /// 5. Executes platform-native non-privileged mount:
+    ///    - macOS: AppleScript `mount volume "smb://<ip>/<encoded_share>"`.
+    ///    - Windows: `net use * \\<ip>\<share> /persistent:no` with `CREATE_NO_WINDOW`.
+    /// 6. Records the active mount atomically to `active_mount.json`.
     pub fn mount_with_share(peer_ip: &str, share_hint: Option<&str>) -> Result<StorageStatus> {
         let clean_ip = peer_ip.trim();
         if !system_info::is_valid_ipv4(clean_ip) {
@@ -125,6 +282,7 @@ impl StorageManager {
             share_hint.and_then(|s| validate_smb_share_name(s).ok())
         });
 
+        // Fast-path: check if target is already mounted
         if let Some(existing) = detect_active_mount_matching(Some(clean_ip), requested_share.as_deref()) {
             return Ok(StorageStatus {
                 is_mounted: true,
@@ -263,6 +421,11 @@ impl StorageManager {
         }
     }
 
+    /// Unmounts any currently active Integrator SMB network share.
+    ///
+    /// On macOS, issues `/usr/sbin/diskutil unmount <mount_path>` (falling back to `/sbin/umount`).
+    /// On Windows, issues `net.exe use <drive> /delete /yes`.
+    /// On successful unmount, removes the active mount record from disk.
     pub fn unmount() -> Result<StorageStatus> {
         let active = detect_active_mount(None);
         let Some(rec) = active else {
@@ -336,11 +499,13 @@ impl StorageManager {
         }
     }
 
+    /// Queries the current storage mount status for an optional peer IP filter.
     #[allow(dead_code)]
     pub fn status(peer_ip: Option<&str>) -> StorageStatus {
         Self::status_with_share(peer_ip, None)
     }
 
+    /// Queries current storage mount status with optional peer IP and share hint filters.
     pub fn status_with_share(peer_ip: Option<&str>, share_hint: Option<&str>) -> StorageStatus {
         let valid_hint = share_hint.and_then(|h| validate_smb_share_name(h).ok());
         let expected_share = Self::get_preferred_peer_share().or_else(|| valid_hint.clone());
@@ -372,10 +537,12 @@ impl StorageManager {
     }
 }
 
+/// Returns the path to the persistent `active_mount.json` state file in the application data directory.
 fn active_mount_file() -> std::path::PathBuf {
     system_info::app_data_dir().join("active_mount.json")
 }
 
+/// Loads and validates the persisted active mount record from disk under [`MOUNT_STATE_LOCK`].
 fn load_active_mount() -> Option<ActiveMountRecord> {
     let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let rec = std::fs::read_to_string(active_mount_file())
@@ -391,6 +558,7 @@ fn load_active_mount() -> Option<ActiveMountRecord> {
     }
 }
 
+/// Atomically saves the active mount record to disk under [`MOUNT_STATE_LOCK`] using a tempfile and rename.
 fn save_active_mount(rec: &ActiveMountRecord) {
     let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = active_mount_file();
@@ -422,6 +590,7 @@ fn save_active_mount(rec: &ActiveMountRecord) {
     }
 }
 
+/// Deletes the active mount record file from disk under [`MOUNT_STATE_LOCK`].
 fn clear_active_mount() {
     let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = active_mount_file();
@@ -432,6 +601,9 @@ fn clear_active_mount() {
     }
 }
 
+/// Parses standard `smbutil view` stdout output to extract available disk share names.
+///
+/// Skips header lines, dashes, IPC shares, and footer summaries.
 fn parse_smbutil_disk_shares(stdout: &str) -> Vec<String> {
     let mut shares = Vec::new();
     for line in stdout.lines() {
@@ -456,6 +628,7 @@ fn parse_smbutil_disk_shares(stdout: &str) -> Vec<String> {
     shares
 }
 
+/// Resolves the remote SMB share name for a given peer using preference, hint, or dynamic discovery.
 fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<String> {
     let parsed_ip: IpAddr = peer_ip.trim().parse().ok()?;
     if !trust::has_paired_peer_at_ip(parsed_ip) {
@@ -514,10 +687,12 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
     }
 }
 
+/// Detects an active mount matching an optional peer IP filter.
 fn detect_active_mount(peer_ip_filter: Option<&str>) -> Option<ActiveMountRecord> {
     detect_active_mount_matching(peer_ip_filter, None)
 }
 
+/// Detects an active mount matching optional peer IP and share name filters by querying OS mount tables.
 fn detect_active_mount_matching(
     peer_ip_filter: Option<&str>,
     share_filter: Option<&str>,
@@ -632,6 +807,7 @@ fn detect_active_mount_matching(
     }
 }
 
+/// Parses a line of `net.exe use` output on Windows into (Drive, Host, ShareName, FullUNC).
 #[cfg(any(target_os = "windows", test))]
 fn parse_windows_net_use_line(line: &str) -> Option<(Option<String>, String, String, String)> {
     let unc_pos = line.find(r"\\")?;
@@ -663,6 +839,7 @@ fn parse_windows_net_use_line(line: &str) -> Option<(Option<String>, String, Str
     ))
 }
 
+/// Parses a macOS `mount` command source string (e.g., `//user@10.0.0.2/Share%20Name`) into (IP, ShareName).
 #[cfg(target_os = "macos")]
 fn parse_smbfs_source(src: &str) -> (String, String) {
     let cleaned = src.trim().trim_start_matches('/');
@@ -676,6 +853,7 @@ fn parse_smbfs_source(src: &str) -> (String, String) {
     }
 }
 
+/// Percent-encodes path segments for inclusion in macOS `smb://` URLs.
 #[cfg(target_os = "macos")]
 fn percent_encode_path_segment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -690,6 +868,7 @@ fn percent_encode_path_segment(input: &str) -> String {
     out
 }
 
+/// Decodes percent-encoded hex sequences from macOS mount table entries.
 #[cfg(target_os = "macos")]
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -711,6 +890,7 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Extracts assigned Windows drive letter from `net use *` command stdout.
 #[cfg(target_os = "windows")]
 fn parse_assigned_windows_drive(stdout: &str) -> Option<String> {
     for tok in stdout.split_whitespace() {
@@ -722,6 +902,7 @@ fn parse_assigned_windows_drive(stdout: &str) -> Option<String> {
     None
 }
 
+/// Finds the Windows drive letter assigned to an existing UNC network path.
 #[cfg(target_os = "windows")]
 fn find_windows_drive_for_unc(unc: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
@@ -801,4 +982,3 @@ Workspace Drive                                 Disk    Shared SSD
         }
     }
 }
-

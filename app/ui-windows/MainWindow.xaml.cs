@@ -1,3 +1,58 @@
+// ==============================================================================================
+// Integrator Windows Native Client & WinUI 3 Dashboard Shell (`ui-windows/MainWindow.xaml.cs`)
+//
+// 1. Module Purpose & System Scope:
+//    - Serves as the primary user-facing desktop interface for Integrator on Windows 11 and Windows 10.
+//    - Hosts the thirteen subsystem cards in an adaptive, responsive two-column grid matching the macOS
+//      SwiftUI client layout and design hierarchy.
+//    - Provides zero-latency hardware telemetry, 2D interactive desk monitor arrangement, SPAKE2 pairing
+//      and trust verification, discrete GPU selection, SMB storage mounting, live logs, and audio/video streaming.
+//
+// 2. Architectural Linkages & Native Core Bridge:
+//    - Upstream Caller: `IntegratorUI.App` instantiates and activates `MainWindow` during `OnLaunched`.
+//    - Downstream Core: Invokes RPC endpoints on `integrator_core.dll` via `CoreBridge.Invoke<T>`
+//      wrapped in background `Task.Run` operations to prevent blocking the Windows STA UI thread.
+//    - Downstream APIs & Windows App SDK:
+//        * Windows App SDK: `AppWindow`, `AppWindowTitleBar`, `DisplayArea`, `OverlappedPresenter`.
+//        * Composition & Backdrops: `MicaController` on Windows 11; automatic runtime fallback to
+//          `DesktopAcrylicController` / `DesktopAcrylicBackdrop` on Windows 10 where Mica is unsupported.
+//        * Win32 User32: `GetDpiForWindow` for high-DPI monitor coordinate and dimension scaling.
+//
+// 3. Card Subsystems & Visual Architecture:
+//    - Card 1: Extended Screen & GPU Acceleration (NVENC / DirectX / Moonlight vs VideoToolbox routing).
+//    - Card 2: Universal Input KVM & Desk Layout (2D desk monitor schematic, edge hop delays, modifier translation).
+//    - Card 3: Cross-Screen Drag & Drop (Zero-RAM file streaming, ghost thumbnail badge, QoS clamp, drop directory).
+//    - Card 4: Universal Clipboard (ChaCha20 encrypted sync, SHA-256 verification, atomic staging cache).
+//    - Card 5: Peer Discovery & v1.0 Trust (mDNS / UDP beacon discovery, SPAKE2 6-digit PIN pairing, manual IP targets).
+//    - Card 6: Route Telemetry & Link Speed (Active network interface discovery, RTT ping, live speed test).
+//    - Card 7: Auto-Mounted Shared Storage (Automated SMB volume negotiation, preferred share mount overrides).
+//    - Card 8: True Tone & Chromatic Sync (Ambient light sensor readings, manual CCT/gamma calibration).
+//    - Card 9: Touch Bar Hardware HUD (Touch Bar telemetry strip status and toggle invocation).
+//    - Card 10: Dynamic Audio Routing (ChaCha20-Poly1305 encrypted spatial UDP sink, test chime invocation).
+//    - Card 10B: Mac -> PC Shared Camera (Windows Virtual Camera driver receiving 720p30 video over TCP :58287).
+//    - Card 11: System & Autostart (Windows Task Scheduler logon autostart, dynamic glass intensity slider).
+//    - Card 12: Live Telemetry & Security Logs (Monospaced tailing log console with ANSI/log-level visual highlighting).
+//
+// 4. Mica & Windows 10 Desktop Acrylic Fallback + Dynamic Glass Intensity:
+//    - Detects backdrop support dynamically at startup: if `MicaController.IsSupported()` is false, falls back
+//      seamlessly to `DesktopAcrylicBackdrop` on Windows 10 build 19041+.
+//    - The dynamic glass intensity slider modulates card background alpha and border stroke opacities
+//      in real-time across all 13 card borders without requiring a window restart.
+//
+// 5. Threading & Concurrency Model:
+//    - All UI elements execute on the Windows Single-Threaded Apartment (STA) UI thread.
+//    - Asynchronous RPC dispatches: All `CoreBridge.Invoke<T>` calls are executed inside `Task.Run(() => ...)`
+//      workers and resumed on the UI thread via `await` or `DispatcherQueue.TryEnqueue`.
+//    - Polling: Repeating 2.0-second `DispatcherTimer` queries `get_bridge_status` on schedule. Polling is
+//      automatically suspended when the window is minimized or hidden to the taskbar system tray.
+//
+// 6. Security & Safety Invariants:
+//    - Form State Preservation: Dirty flags (`_kvmLayoutDirty`, `_encodeGpuDirty`, `_decodeGpuDirty`, `_preferredShareDirty`)
+//      prevent periodic status polling updates from overwriting user inputs in-flight.
+//    - Input Validation: IP address inputs are strictly validated with `IPAddress.TryParse` prior to dispatch.
+//    - Failure Containment: Network and RPC failures are surfaced via non-blocking toast banners.
+// ==============================================================================================
+
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -20,34 +75,68 @@ using WinRT.Interop;
 
 namespace IntegratorUI
 {
+    /// <summary>
+    /// Primary application window for Integrator on Windows, hosting the thirteen subsystem cards,
+    /// navigation sidebar, top status bar, ephemeral toast notifications, and backdrop rendering.
+    /// </summary>
     public sealed partial class MainWindow : Window
     {
+        /// <summary>Reference to the parent WinUI application instance.</summary>
         private readonly App _app;
+        /// <summary>Repeating 2.0-second timer polling the Rust core bridge status.</summary>
         private readonly DispatcherTimer _pollTimer;
+        /// <summary>Timer for auto-dismissing ephemeral toast notifications.</summary>
         private readonly DispatcherTimer _toastTimer;
+        /// <summary>Array of all thirteen card container borders for responsive layout and styling.</summary>
         private readonly Border[] _allCards;
+        /// <summary>Array of category navigation buttons.</summary>
         private readonly Button[] _navButtons;
+        /// <summary>Dictionary caching in-progress pairing PIN inputs keyed by peer IP address.</summary>
         private readonly Dictionary<string, string> _pinInputs = new();
 
+        /// <summary>Currently selected card navigation filter category ("all", "display", "input", "network", "system").</summary>
         private string _selectedCategory = "all";
+        /// <summary>Latest bridge status snapshot returned by the core backend.</summary>
         private BridgeStatusModel? _status;
+        /// <summary>Live draft of KVM monitor layout configuration.</summary>
         private KvmLayoutConfigModel _kvmLayout = new();
+        /// <summary>True if user has modified KVM layout controls without saving to the core.</summary>
         private bool _kvmLayoutDirty;
+        /// <summary>True if user has modified the encode GPU selection dropdown.</summary>
         private bool _encodeGpuDirty;
+        /// <summary>True if user has modified the decode GPU selection dropdown.</summary>
         private bool _decodeGpuDirty;
+        /// <summary>True if user has modified the preferred share name input field.</summary>
         private bool _preferredShareDirty;
+        /// <summary>Reentrancy guard preventing overlapping asynchronous status refresh calls.</summary>
         private bool _refreshInFlight;
+        /// <summary>True while a live speed benchmark is executing.</summary>
         private bool _speedTestRunning;
+        /// <summary>True if the window is currently hidden to the system tray.</summary>
         private bool _isHiddenToTray;
+        /// <summary>True if application exit sequence has commenced.</summary>
         private bool _disposedForExit;
+        /// <summary>Guard flag preventing UI change event handlers from triggering during programmatic status binding.</summary>
         private bool _applyingStatus;
+        /// <summary>Cached column count of the responsive cards grid to prevent redundant relayouts.</summary>
         private int _currentGridColumns = -1;
+        /// <summary>Cached composite key of the discovered peers list to skip redundant DOM rebuilds.</summary>
         private string? _lastPeerKey;
+        /// <summary>Cached composite key of manual peer IPs to skip redundant DOM rebuilds.</summary>
         private string? _lastManualIpKey;
+        /// <summary>Cached composite key of GPU adapters to skip redundant ComboBox rebuilds.</summary>
         private string? _lastGpuListKey;
+        /// <summary>Cached composite key of recent logs to skip redundant TextBlock allocations.</summary>
         private string? _lastRenderedLogsKey;
+        /// <summary>Cached theme mode to detect dark/light theme transitions for log text brushes.</summary>
         private ElementTheme _lastRenderedTheme = ElementTheme.Default;
 
+        /// <summary>
+        /// Initializes the main dashboard window, configures high-DPI sizing and titlebar chrome,
+        /// registers system backdrop (Mica or Windows 10 Acrylic fallback), and starts the status polling timer.
+        /// </summary>
+        /// <param name="app">Reference to the parent application instance.</param>
+        /// <param name="startHidden">True to initialize the window in hidden state (minimized to system tray).</param>
         public MainWindow(App app, bool startHidden = false)
         {
             _app = app;
@@ -58,7 +147,7 @@ namespace IntegratorUI
             {
                 CardDisplay, CardKvm, CardDragDrop, CardClipboard,
                 CardDiscovery, CardSpeed, CardStorage, CardTrueTone,
-                CardTouchBar, CardAudio, CardSystem, CardLogs
+                CardTouchBar, CardAudio, CardCamera, CardSystem, CardLogs
             };
             _navButtons = new[]
             {
@@ -93,9 +182,18 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Win32 User32 function querying the dots per inch (DPI) of the specified window.
+        /// </summary>
+        /// <param name="hwnd">Window handle.</param>
+        /// <returns>DPI value (e.g., 96 for 100%, 144 for 150%).</returns>
         [DllImport("user32.dll")]
         private static extern uint GetDpiForWindow(IntPtr hwnd);
 
+        /// <summary>
+        /// Configures custom XAML title bar extension, high-DPI responsive window sizing,
+        /// taskbar icon, Mica or Desktop Acrylic system backdrops, and close-to-tray window behaviors.
+        /// </summary>
         private void ConfigureWindowChrome()
         {
             ExtendsContentIntoTitleBar = true;
@@ -126,6 +224,13 @@ namespace IntegratorUI
                 tb.ButtonInactiveBackgroundColor = Colors.Transparent;
             }
 
+            // Windows 10 frosted glass fallback if Mica is unsupported
+            if (!Microsoft.UI.Composition.SystemBackdrops.MicaController.IsSupported() &&
+                Microsoft.UI.Composition.SystemBackdrops.DesktopAcrylicController.IsSupported())
+            {
+                this.SystemBackdrop = new DesktopAcrylicBackdrop();
+            }
+
             // Hide to system tray instead of killing background KVM/clipboard/display daemons.
             AppWindow.Closing += (_, args) =>
             {
@@ -142,6 +247,10 @@ namespace IntegratorUI
             };
         }
 
+        /// <summary>
+        /// Evaluates window visibility and minimize states to start or stop the periodic 2-second status polling timer.
+        /// Conserves CPU cycles and network polling when the window is hidden to tray or minimized.
+        /// </summary>
         private void UpdatePollingState()
         {
             if (_disposedForExit) return;
@@ -162,6 +271,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Restores the window from minimized or hidden tray state, brings it to the foreground, and resumes polling.
+        /// </summary>
         public void RestoreAndActivate()
         {
             try
@@ -178,6 +290,9 @@ namespace IntegratorUI
             catch { }
         }
 
+        /// <summary>
+        /// Hides the window to the taskbar system tray and pauses periodic status polling.
+        /// </summary>
         public void HideToTray()
         {
             try
@@ -189,6 +304,9 @@ namespace IntegratorUI
             catch { }
         }
 
+        /// <summary>
+        /// Stops timers and marks the window as disposed during application shutdown.
+        /// </summary>
         internal void CleanupForExit()
         {
             _disposedForExit = true;
@@ -196,6 +314,11 @@ namespace IntegratorUI
             _toastTimer.Stop();
         }
 
+        /// <summary>
+        /// Processes reverse asynchronous notifications dispatched from integrator_core.dll.
+        /// </summary>
+        /// <param name="evt">Event identifier string.</param>
+        /// <param name="payload">JSON event payload string.</param>
         public void HandleCoreEvent(string evt, string payload)
         {
             if (evt == "toast" || evt == "ui-toast")
@@ -216,6 +339,11 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Asynchronously queries get_bridge_status from integrator_core.dll on a background worker thread
+        /// and applies the snapshot to the UI controls on the STA thread.
+        /// </summary>
+        /// <returns>Task tracking asynchronous execution.</returns>
         private async Task RefreshStatusAsync()
         {
             if (_refreshInFlight || _disposedForExit) return;
@@ -241,6 +369,11 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Programmatically updates all UI controls, status pills, and toggle switches from the bridge status snapshot.
+        /// Sets _applyingStatus to true during update to prevent UI feedback loops.
+        /// </summary>
+        /// <param name="s">Latest bridge status snapshot from the core.</param>
         private void ApplyStatusToUi(BridgeStatusModel s)
         {
             _applyingStatus = true;
@@ -273,7 +406,7 @@ namespace IntegratorUI
                 SidebarPeerName.Text = s.PeerName ?? "Searching for peer…";
                 SidebarLinkDesc.Text = s.LinkDescription;
                 SidebarSpeedText.Text = string.IsNullOrWhiteSpace(s.LinkSpeed) ? "--" : s.LinkSpeed;
-                SidebarTrustText.Text = s.PeerTrusted ? "Verified v2.0" : "Pair Required";
+                SidebarTrustText.Text = s.PeerTrusted ? "Verified v1.0" : "Pair Required";
                 SidebarPeerDot.Fill = new SolidColorBrush(s.PeerConnected
                     ? Color.FromArgb(255, 32, 184, 90)
                     : Color.FromArgb(255, 232, 158, 27));
@@ -459,6 +592,30 @@ namespace IntegratorUI
                     : s.AudioStatus.Topology;
                 BtnPlayChime.IsEnabled = f.Audio;
 
+                // Card 10B: Mac -> PC Shared Camera
+                SwitchCamera.IsOn = f.Camera;
+                var cam = s.CameraStatus;
+                CameraPillText.Text = string.IsNullOrWhiteSpace(cam.State) ? (cam.Active ? "Active" : "Disabled") : cam.State;
+                SetPillStyle(CameraPill, CameraPillDot, cam.Active
+                    ? Color.FromArgb(255, 32, 184, 90)
+                    : (f.Camera ? Color.FromArgb(255, 24, 180, 212) : Color.FromArgb(255, 136, 136, 136)));
+                if (!string.IsNullOrWhiteSpace(cam.LastError))
+                {
+                    CameraSummaryText.Text = cam.LastError;
+                }
+                else if (cam.Active)
+                {
+                    CameraSummaryText.Text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0} • {1}x{2}@{3}fps • {4} frames received (TCP :58287)",
+                        cam.Role, cam.Width, cam.Height, cam.Fps, cam.FramesTransferred);
+                }
+                else
+                {
+                    CameraSummaryText.Text = "Exposes 'Integrator MacBook Camera' (720p30) via encrypted TCP :58287 when enabled on Mac and PC.";
+                }
+                BtnToggleCamera.Content = cam.Active ? "Stop Virtual Camera" : "Enable Virtual Camera";
+
                 // Card 11: Autostart
                 SwitchAutostart.IsOn = s.AutostartEnabled;
                 AutostartPillText.Text = s.AutostartEnabled ? "Launch at Login" : "Manual Launch";
@@ -475,6 +632,11 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Maps GPU name and vendor strings into canonical lowercase tags ("nvidia", "amd", "intel", "discrete").
+        /// </summary>
+        /// <param name="g">GPU metadata model.</param>
+        /// <returns>Canonical vendor tag.</returns>
         private static string GpuVendorTag(GpuDeviceInfo g)
         {
             string combined = (g.Vendor + " " + g.Name).ToLowerInvariant();
@@ -487,6 +649,11 @@ namespace IntegratorUI
             return g.IsDiscrete ? "discrete" : "integrated";
         }
 
+        /// <summary>
+        /// Populates encode and decode GPU ComboBox dropdowns from detected local graphics adapters.
+        /// Preserves user selections if dirty flags are set.
+        /// </summary>
+        /// <param name="s">Bridge status model containing detected GPUs.</param>
         private void PopulateGpuCombos(BridgeStatusModel s)
         {
             string gpuKey = string.Join("|", s.LocalGpus.Select(g => $"{g.Index}:{g.Name}:{g.Vendor}:{g.IsDiscrete}"));
@@ -522,6 +689,12 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Selects the ComboBox item matching the specified GPU preference tag or vendor name.
+        /// </summary>
+        /// <param name="combo">Target ComboBox control.</param>
+        /// <param name="preference">Desired preference string.</param>
+        /// <param name="gpus">List of detected GPUs.</param>
         private static void SelectGpuComboByPreference(ComboBox combo, string preference, List<GpuDeviceInfo> gpus)
         {
             string pref = preference.Trim();
@@ -568,6 +741,9 @@ namespace IntegratorUI
             if (combo.Items.Count > 0) combo.SelectedIndex = 0;
         }
 
+        /// <summary>
+        /// Helper selecting a ComboBoxItem whose Tag matches the specified string.
+        /// </summary>
         private static void SelectComboByTag(ComboBox combo, string tag)
         {
             for (int i = 0; i < combo.Items.Count; i++)
@@ -581,6 +757,9 @@ namespace IntegratorUI
             if (combo.Items.Count > 0) combo.SelectedIndex = 0;
         }
 
+        /// <summary>
+        /// Binds KVM layout controls (alignment slider, hop delay, checkboxes) and updates schematic tiles.
+        /// </summary>
         private void ApplyKvmLayoutControls(BridgeStatusModel s)
         {
             AlignmentSlider.Value = Math.Clamp(_kvmLayout.AlignmentOffset, -0.5f, 0.5f);
@@ -614,6 +793,9 @@ namespace IntegratorUI
             ApplyEdgeStylesAndSchematic(s);
         }
 
+        /// <summary>
+        /// Highlights the active peer edge transition button and rebuilds the 2D desk layout schematic.
+        /// </summary>
         private void ApplyEdgeStylesAndSchematic(BridgeStatusModel s)
         {
             var accent = (Style)Application.Current.Resources["AccentButtonStyle"];
@@ -630,6 +812,9 @@ namespace IntegratorUI
             RebuildDeskSchematic(s);
         }
 
+        /// <summary>
+        /// Rebuilds the visual 2D desk monitor placement schematic representing local and peer displays.
+        /// </summary>
         private void RebuildDeskSchematic(BridgeStatusModel s)
         {
             DeskSchematicHost.Children.Clear();
@@ -659,6 +844,9 @@ namespace IntegratorUI
             DeskSchematicHost.Children.Add(panel);
         }
 
+        /// <summary>
+        /// Creates a styled monitor tile Border for the desk placement schematic.
+        /// </summary>
         private Border CreateMonitorTile(string label, bool accent)
         {
             return new Border
@@ -690,6 +878,9 @@ namespace IntegratorUI
             };
         }
 
+        /// <summary>
+        /// Rebuilds the manual peer IP badges panel, displaying remove buttons for user-added IP targets.
+        /// </summary>
         private void RebuildManualIpsPanel(BridgeStatusModel s)
         {
             var ips = s.ManualPeerIps ?? new List<string>();
@@ -731,6 +922,10 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Rebuilds the discovered and trusted peers list, presenting pairing PIN input fields, trust badges,
+        /// and block/unblock action buttons while preserving user input text during refresh cycles.
+        /// </summary>
         private void RebuildPeersList(BridgeStatusModel s)
         {
             // Preserve user's in-progress PIN text while updating peer statuses cleanly.
@@ -816,7 +1011,7 @@ namespace IntegratorUI
                 {
                     var badge = new TextBlock
                     {
-                        Text = "Trusted v2.0",
+                        Text = "Trusted v1.0",
                         FontSize = 11,
                         FontWeight = FontWeights.SemiBold,
                         Foreground = new SolidColorBrush(Color.FromArgb(255, 32, 184, 90)),
@@ -854,7 +1049,7 @@ namespace IntegratorUI
                     var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
                     var pairBtn = new Button
                     {
-                        Content = "Pair v2.0",
+                        Content = "Pair v1.0",
                         Style = (Style)Application.Current.Resources["AccentButtonStyle"],
                         Padding = new Thickness(10, 4, 10, 4),
                         FontSize = 11
@@ -908,6 +1103,10 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Populates the live log console panel with recent log records from the Rust core.
+        /// Preserves scroll position and autoscrolls to the latest entry when pinned to bottom.
+        /// </summary>
         private void RebuildLogsPanel(List<LogEntryModel> logs)
         {
             var safeLogs = logs ?? new List<LogEntryModel>();
@@ -966,6 +1165,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Applies consistent colored indicator dot and semi-transparent background fill to a status pill.
+        /// </summary>
         private static void SetPillStyle(Border pill, Ellipse dot, Color color)
         {
             dot.Fill = new SolidColorBrush(color);
@@ -975,6 +1177,9 @@ namespace IntegratorUI
 
         // MARK: - Responsive Grid & Navigation
 
+        /// <summary>
+        /// Handles category navigation button clicks, filtering the visible cards on the dashboard.
+        /// </summary>
         private void NavButton_Click(object sender, RoutedEventArgs e)
         {
             if (sender is Button btn && btn.Tag is string cat)
@@ -985,6 +1190,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Updates the accent highlight styling of the category navigation buttons.
+        /// </summary>
         private void UpdateNavStyles()
         {
             var accentBrush = (Brush)Application.Current.Resources["AccentFillColorDefaultBrush"];
@@ -1001,11 +1209,17 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Responds to window resize events, adjusting the cards grid layout between 1 and 2 columns.
+        /// </summary>
         private void CardsGrid_SizeChanged(object sender, SizeChangedEventArgs e)
         {
             RebuildCardsGrid(force: false);
         }
 
+        /// <summary>
+        /// Reconfigures grid column and row definitions and redistributes visible cards dynamically.
+        /// </summary>
         private void RebuildCardsGrid(bool force)
         {
             int cols = CardsGrid.ActualWidth >= 740 ? 2 : 1;
@@ -1042,6 +1256,10 @@ namespace IntegratorUI
 
         // MARK: - RPC Actions & UI Event Handlers
 
+        /// <summary>
+        /// Dispatches an asynchronous JSON-RPC call to integrator_core.dll on a background worker thread,
+        /// presents toast feedback, and triggers a UI status refresh.
+        /// </summary>
         private async void RunInvoke(
             string method,
             object? parameters = null,
@@ -1087,10 +1305,22 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Handles click on the Refresh button in the top bar to query latest bridge status.
+        /// </summary>
         private void RefreshBtn_Click(object sender, RoutedEventArgs e) => _ = RefreshStatusAsync();
+        /// <summary>
+        /// Opens the local clipboard file staging and cache folder in Windows File Explorer.
+        /// </summary>
         private void OpenCacheBtn_Click(object sender, RoutedEventArgs e) => RunInvoke("open_cache_folder", refreshAfter: false);
+        /// <summary>
+        /// Hides the main dashboard window to the Windows notification tray.
+        /// </summary>
         private void HideWindowBtn_Click(object sender, RoutedEventArgs e) => HideToTray();
 
+        /// <summary>
+        /// Handles toggle switches for subsystem feature flags and dispatches set_feature_flag RPCs.
+        /// </summary>
         private void FeatureSwitch_Toggled(object sender, RoutedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1109,6 +1339,7 @@ namespace IntegratorUI
                     "storage" => f.Storage,
                     "audio" => f.Audio,
                     "benchmark" => f.Benchmark,
+                    "camera" => f.Camera,
                     _ => enabled
                 };
                 if (current == enabled) return;
@@ -1116,9 +1347,19 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Initiates or toggles extended screen display streaming from Mac to Windows PC.
+        /// </summary>
         private void ExtendMacToPc_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_mac_to_pc");
+
+        /// <summary>
+        /// Initiates or toggles extended screen display streaming from Windows PC to Mac.
+        /// </summary>
         private void ExtendPcToMac_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_pc_to_mac");
 
+        /// <summary>
+        /// Marks encode or decode GPU selection as dirty when changed by the user in the dropdowns.
+        /// </summary>
         private void GpuCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1126,6 +1367,9 @@ namespace IntegratorUI
             else if (ReferenceEquals(sender, DecodeGpuCombo)) _decodeGpuDirty = true;
         }
 
+        /// <summary>
+        /// Dispatches user-selected video encode and decode GPU preferences to the native core.
+        /// </summary>
         private void ApplyGpu_Click(object sender, RoutedEventArgs e)
         {
             string enc = (EncodeGpuCombo.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
@@ -1140,6 +1384,9 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>
+        /// Queries real-time discrete GPU metrics (temperature, VRAM, clock, load) from the peer.
+        /// </summary>
         private async void QueryGpu_Click(object sender, RoutedEventArgs e)
         {
             var res = await Task.Run(() => CoreBridge.Invoke<GpuTelemetryModel>("get_gpu_telemetry"));
@@ -1159,6 +1406,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Updates the peer edge placement ("left", "right", "top", "bottom") in the KVM layout draft.
+        /// </summary>
         private void EdgeBtn_Click(object sender, RoutedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1171,6 +1421,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Handles changes to KVM alignment offset and edge hop delay sliders, updating layout draft and text labels.
+        /// </summary>
         private void KvmSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
         {
             if (_applyingStatus || _status == null || AlignmentValueText == null || HopDelayValueText == null) return;
@@ -1181,6 +1434,9 @@ namespace IntegratorUI
             HopDelayValueText.Text = _kvmLayout.HopDelayMs + " ms";
         }
 
+        /// <summary>
+        /// Updates boolean KVM preferences (dead corners, modifier translation, trackpad, ghost thumbnails, QoS clamping).
+        /// </summary>
         private void KvmCheck_Changed(object sender, RoutedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1192,6 +1448,9 @@ namespace IntegratorUI
             _kvmLayoutDirty = true;
         }
 
+        /// <summary>
+        /// Handles selection of the fallback target folder for dropped files ("downloads", "desktop", "cache").
+        /// </summary>
         private void DropFolderCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1202,8 +1461,14 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Handles click on the Save & Sync Layout button.
+        /// </summary>
         private void SaveKvmLayout_Click(object sender, RoutedEventArgs e) => SaveKvmLayoutInternal();
 
+        /// <summary>
+        /// Synchronizes the locally modified KVM desk layout configuration with the native core.
+        /// </summary>
         private void SaveKvmLayoutInternal()
         {
             _kvmLayout.UpdatedAtMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -1217,10 +1482,24 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>
+        /// Releases any active input capture locks held by the local or peer machine.
+        /// </summary>
         private void ReleaseKvm_Click(object sender, RoutedEventArgs e) => RunInvoke("release_kvm_control");
+
+        /// <summary>
+        /// Requests remote clipboard item to be staged and pasted onto the local workstation.
+        /// </summary>
         private void PasteRemote_Click(object sender, RoutedEventArgs e) => RunInvoke("paste_remote");
+
+        /// <summary>
+        /// Regenerates and rotates the local workstation's 6-digit SPAKE2 pairing PIN code.
+        /// </summary>
         private void RegenPin_Click(object sender, RoutedEventArgs e) => RunInvoke("regenerate_pairing_pin");
 
+        /// <summary>
+        /// Validates and adds a manual peer IP address target for unadvertised or direct-cable peer connections.
+        /// </summary>
         private void AddManualIp_Click(object sender, RoutedEventArgs e)
         {
             string ip = ManualIpInput.Text.Trim();
@@ -1235,6 +1514,9 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>
+        /// Triggers an active live throughput benchmark against the connected peer.
+        /// </summary>
         private async void RunSpeedTest_Click(object sender, RoutedEventArgs e)
         {
             if (_status != null && !_status.FeatureFlags.Benchmark)
@@ -1257,6 +1539,7 @@ namespace IntegratorUI
                         res.Data.Summary, res.Data.MaxGbps, res.Data.LatencyMs);
                     SpeedBenchmarkText.Visibility = Visibility.Visible;
                     ShowToast("Live speed test finished", "success");
+                    await RefreshStatusAsync();
                 }
                 else
                 {
@@ -1274,12 +1557,18 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Flags the preferred storage share name input field as dirty when edited by the user.
+        /// </summary>
         private void PreferredShareInput_TextChanged(object sender, TextChangedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
             _preferredShareDirty = true;
         }
 
+        /// <summary>
+        /// Dispatches the user-specified preferred remote SMB share name override to the native core.
+        /// </summary>
         private void SetShare_Click(object sender, RoutedEventArgs e)
         {
             string trimmed = PreferredShareInput.Text.Trim();
@@ -1293,12 +1582,18 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>
+        /// Toggles mounting or unmounting of the peer's shared storage volume.
+        /// </summary>
         private void ToggleMount_Click(object sender, RoutedEventArgs e)
         {
             bool mounted = _status?.StorageMounted == true;
             RunInvoke(mounted ? "unmount_shared_storage" : "mount_shared_storage");
         }
 
+        /// <summary>
+        /// Updates preview labels for True Tone CCT (Kelvin) and gamma compensation factor sliders.
+        /// </summary>
         private void TrueToneSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
         {
             if (CctValueText == null || GammaValueText == null) return;
@@ -1306,6 +1601,9 @@ namespace IntegratorUI
             GammaValueText.Text = string.Format(CultureInfo.InvariantCulture, "{0:0.00}x", GammaSlider.Value);
         }
 
+        /// <summary>
+        /// Dispatches True Tone manual calibration values (CCT and gamma) to the core.
+        /// </summary>
         private void SyncCalibration_Click(object sender, RoutedEventArgs e)
         {
             RunInvoke("apply_truetone_calibration", new
@@ -1315,9 +1613,24 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>
+        /// Toggles the Apple Touch Bar telemetry HUD strip.
+        /// </summary>
         private void ToggleTouchBar_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_touchbar_hud");
+
+        /// <summary>
+        /// Plays an authenticated spatial test chime over the low-latency UDP audio channel.
+        /// </summary>
         private void PlayChime_Click(object sender, RoutedEventArgs e) => RunInvoke("play_spatial_chime");
 
+        /// <summary>
+        /// Toggles the Mac -> PC shared virtual camera streaming session.
+        /// </summary>
+        private void ToggleCamera_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_camera");
+
+        /// <summary>
+        /// Configures Integrator to launch automatically at Windows user logon via Task Scheduler.
+        /// </summary>
         private void AutostartSwitch_Toggled(object sender, RoutedEventArgs e)
         {
             if (_applyingStatus || _status == null) return;
@@ -1325,6 +1638,11 @@ namespace IntegratorUI
             RunInvoke("set_autostart", new { enabled = SwitchAutostart.IsOn });
         }
 
+        /// <summary>
+        /// Displays an ephemeral toast banner notification with colored indicator dot for 4 seconds.
+        /// </summary>
+        /// <param name="message">Notification body text.</param>
+        /// <param name="level">Notification level ("info", "success", "warn", "error").</param>
         private void ShowToast(string message, string level)
         {
             ToastMessage.Text = message;
@@ -1340,6 +1658,38 @@ namespace IntegratorUI
 
             _toastTimer.Stop();
             _toastTimer.Start();
+        }
+
+        /// <summary>
+        /// Handles changes to the dynamic glass intensity slider, updating percentage text and card alphas.
+        /// </summary>
+        private void SliderGlassIntensity_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+        {
+            if (GlassIntensityLabel != null)
+            {
+                GlassIntensityLabel.Text = $"{(int)e.NewValue}%";
+            }
+            ApplyGlassIntensity(e.NewValue / 100.0);
+        }
+
+        /// <summary>
+        /// Modulates the alpha channel of background fills and border strokes across all 13 card containers.
+        /// </summary>
+        /// <param name="intensity">Fractional intensity value (0.10 to 1.00).</param>
+        private void ApplyGlassIntensity(double intensity)
+        {
+            byte alpha = (byte)Math.Clamp((int)(intensity * 255 * 0.12), 8, 70);
+            byte borderAlpha = (byte)Math.Clamp((int)(intensity * 255 * 0.22), 15, 90);
+            var cardBg = new SolidColorBrush(Windows.UI.Color.FromArgb(alpha, 128, 128, 128));
+            var cardBorder = new SolidColorBrush(Windows.UI.Color.FromArgb(borderAlpha, 160, 160, 160));
+            if (_allCards != null)
+            {
+                foreach (var card in _allCards)
+                {
+                    card.Background = cardBg;
+                    card.BorderBrush = cardBorder;
+                }
+            }
         }
     }
 }

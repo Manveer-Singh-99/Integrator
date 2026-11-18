@@ -74,15 +74,19 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.0.0</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>2.0.0</string>
+	<string>1.0.0</string>
 	<key>CSResourcesFileMapped</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>${DEPLOY_TARGET}</string>
 	<key>CFBundleIconFile</key>
 	<string>icon.icns</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Integrator captures your MacBook camera when Shared Camera (Mac to Windows 11) is turned on.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Integrator uses your local and USB-C network to discover and connect securely with your paired Windows workstation.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>
@@ -92,6 +96,11 @@ EOF
 codesign --force --deep --sign - "$OUT_BUNDLE"
 echo "Built Universal app bundle: $OUT_BUNDLE"
 file "$OUT_BUNDLE/Contents/MacOS/integrator"
+
+mkdir -p "$SCRIPT_DIR/build"
+rm -rf "$SCRIPT_DIR/build/Integrator.app"
+ditto "$OUT_BUNDLE" "$SCRIPT_DIR/build/Integrator.app"
+echo "Mirrored to: $SCRIPT_DIR/build/Integrator.app"
 
 if [ "$INSTALL_TO_APPS" -eq 1 ]; then
     echo "Installing to /Applications/Integrator.app (note: ad-hoc re-sign may require re-enabling Accessibility permission)..."

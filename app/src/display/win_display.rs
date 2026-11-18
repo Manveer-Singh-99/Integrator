@@ -1,6 +1,59 @@
-//! Windows Native Display Controller.
-//! Manages dynamic Virtual Display Driver discovery/control, Sunshine services,
-//! non-destructive Moonlight host resolution, GPU routing, and Moonlight client execution.
+//! # Windows Native Display & Virtual Display Driver Subsystem
+//!
+//! ## 1. Module Purpose & Scope
+//! This module owns the Windows 11-specific implementation of the **Display Subsystem** (`display` feature).
+//! It provides:
+//! 1. Dynamic discovery and PnP control of Windows Virtual Display Driver (VDD) adapters
+//!    (IddSampleDriver, Apollo, MTT VDD, Parsec, Amyuni, Spacedesk).
+//! 2. Display slot attachment and detachment via `VddCtl.exe join 1` and `VddCtl.exe leave 1`.
+//! 3. Windows Service and Scheduled Task supervision for the Sunshine streaming host
+//!    (`SunshineService`, `SunshineSecondary`).
+//! 4. Non-destructive resolution and IP updating of existing Moonlight host pairing slots in
+//!    `HKCU\Software\Moonlight Game Streaming Project\Moonlight\hosts`.
+//! 5. Windows DirectX GPU routing via `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`, directing
+//!    discrete GPUs for hardware video encoding (NVENC / AMF) and decoding (D3D11 / NVDEC).
+//!
+//! ## 2. Cross-Platform Architectural Pipelines
+//!
+//! ### Windows-as-Host Extended Desktop
+//! - **VDD PnP Activation**: Discovers the display adapter under `ROOT\DISPLAY` and enables it via
+//!   `Enable-PnpDevice`. Attaches display slot 1 via `VddCtl.exe join 1` (verified in `Program Files` to
+//!   prevent privilege escalation).
+//! - **Sunshine Desktop Duplication**: Sunshine captures the newly attached virtual screen via DXGI
+//!   Desktop Duplication API, encodes video with discrete GPU hardware (NVIDIA NVENC, AMD AMF, or
+//!   Intel QuickSync), and listens on port 47989 (or secondary 48989).
+//! - **Moonlight Streaming**: The macOS client receives the stream and renders with VideoToolbox hardware decoding.
+//!
+//! ### Windows-as-Client Extended Desktop
+//! - Receives a stream from a macOS host (which encodes via Apple Silicon VideoToolbox).
+//! - Queries `HKCU\Software\Moonlight Game Streaming Project\Moonlight\hosts` via `reg.exe query /s`,
+//!   locates the matched slot non-destructively, updates its `localaddress` / `manualaddress` without
+//!   wiping existing paired games or settings, and launches `Moonlight.exe` in fullscreen.
+//!
+//! ### Shared Camera Coexistence
+//! While Windows display streaming captures the desktop imagery with high frame rates (60 to 240 Hz),
+//! the Shared Camera subsystem operates simultaneously over port 58287:
+//! - macOS captures FaceTime HD camera at 720p30 NV12 (`camera_macos.swift`).
+//! - Frames stream directly across `TransportSessionV2` into `camera_windows.cpp` and `vcam_windows.cpp`.
+//! - Windows 11 Media Foundation FrameServer (`integrator_vcam.dll`) exposes "Integrator MacBook Camera"
+//!   system-wide to Teams, Zoom, OBS, and browsers without requiring third-party drivers or physical camera
+//!   source wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
+//! The display and camera subsystems run concurrently without port conflicts or GPU encoder resource starvation.
+//!
+//! ## 3. Threading & Process Management Model
+//! - **Hidden Process Spawning**: All Windows process executions (`reg.exe`, `sc.exe`, `schtasks.exe`,
+//!   `powershell.exe`, `taskkill.exe`) use `CREATE_NO_WINDOW` (0x08000000) to avoid flashing command prompts.
+//! - **Zombie Reaping**: Background worker threads ([`reap_child`]) wait for spawned child processes.
+//! - **Registry Synchronization**: Registry updates are executed before launching `Moonlight.exe` to
+//!   prevent races with Qt `QSettings` flushes.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **LPE Mitigation**: `find_vdd_ctl` strictly restricts binary discovery to authenticated system directories
+//!   (`Program Files`, `ProgramW6432`), rejecting user-writable directories to prevent local privilege escalation.
+//! - **PowerShell Escaping**: Dynamic parameters passed to PowerShell commands are sanitized using
+//!   [`ps_single_quote`], doubling embedded single quotes.
+//! - **Non-Destructive Registry Updates**: Existing user preferences (`AutoHDREnable`, `SwapEffectUpgradeEnable`)
+//!   in `UserGpuPreferences` are preserved during GPU routing updates.
 
 use crate::system_info;
 use anyhow::{Context, Result};
@@ -11,6 +64,11 @@ use std::time::Duration;
 #[allow(unused_imports)]
 use tracing::{info, warn};
 
+/// Spawns a dedicated thread to wait on and reap an exiting child process, preventing zombies.
+///
+/// # Arguments
+/// - `child`: Spawned child process handle.
+/// - `label`: Diagnostic label naming the reaper thread.
 fn reap_child(mut child: Child, label: &'static str) {
     let _ = std::thread::Builder::new()
         .name(format!("reap-{}", label))
@@ -19,20 +77,24 @@ fn reap_child(mut child: Child, label: &'static str) {
         });
 }
 
+/// Windows process creation flag suppressing visible console window creation.
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Windows Registry path for Moonlight host pairing slots.
 #[cfg(target_os = "windows")]
 const MOONLIGHT_HOSTS_REG_KEY: &str =
     r"HKCU\Software\Moonlight Game Streaming Project\Moonlight\hosts";
 
+/// Windows Registry path for per-application DirectX GPU preferences.
 #[cfg(target_os = "windows")]
 const DIRECTX_GPU_PREFS_KEY: &str = r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences";
 
+/// Manager providing Windows native display creation, VDD PnP control, and Moonlight client execution.
 pub struct WinDisplayManager;
 
 impl WinDisplayManager {
-    /// Finds the Moonlight executable via `system_info::find_moonlight_binary()`.
+    /// Discovers the Moonlight executable via `system_info::find_moonlight_binary()` or standard installation directories.
     pub fn find_moonlight_exe() -> Option<PathBuf> {
         system_info::find_moonlight_binary().or_else(|| {
             #[cfg(target_os = "windows")]
@@ -47,6 +109,16 @@ impl WinDisplayManager {
     }
 
     /// Resolves an existing Moonlight host slot non-destructively and launches `Moonlight.exe`.
+    ///
+    /// # Arguments
+    /// - `mac_ip`: Target host IPv4 address.
+    /// - `port`: Sunshine web/RTSP port.
+    /// - `host_name`: Target host display name.
+    /// - `width`: Stream width in pixels.
+    /// - `height`: Stream height in pixels.
+    /// - `fps`: Refresh rate in Hertz.
+    /// - `bitrate_kbps`: Maximum bitrate in kilobits per second.
+    /// - `audio_on_host`: Whether audio is retained on host.
     pub fn start_moonlight_client(
         mac_ip: &str,
         port: u16,
@@ -122,7 +194,7 @@ impl WinDisplayManager {
         Ok(())
     }
 
-    /// Stops Moonlight.exe on Windows.
+    /// Stops any running `Moonlight.exe` processes on Windows via `taskkill.exe`.
     pub fn stop_moonlight_client() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
@@ -465,6 +537,7 @@ impl WinDisplayManager {
     }
 }
 
+/// Helper function creating a `Command` configured with `CREATE_NO_WINDOW` on Windows.
 #[cfg(target_os = "windows")]
 fn hidden_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     use std::os::windows::process::CommandExt;
@@ -473,6 +546,7 @@ fn hidden_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// Scans standard Program Files and Local AppData paths for legacy Moonlight installations.
 #[cfg(target_os = "windows")]
 fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
     for env_key in [
@@ -497,6 +571,7 @@ fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
     None
 }
 
+/// Discovers `VddCtl.exe` strictly inside protected Program Files locations to prevent standard user LPE.
 #[cfg(target_os = "windows")]
 fn find_vdd_ctl() -> Option<PathBuf> {
     // Only trust protected Program Files locations for VddCtl.exe to prevent standard-user LPE.
@@ -517,6 +592,7 @@ fn find_vdd_ctl() -> Option<PathBuf> {
     None
 }
 
+/// Verifies whether a named Windows Scheduled Task is registered.
 #[cfg(target_os = "windows")]
 fn scheduled_task_exists(task_name: &str) -> bool {
     hidden_cmd(&system_info::system32_exe("schtasks.exe"))
@@ -528,6 +604,7 @@ fn scheduled_task_exists(task_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Checks whether `SunshineService` is running via `sc.exe query`.
 #[cfg(target_os = "windows")]
 fn is_sunshine_service_active() -> bool {
     if let Ok(out) = hidden_cmd(&system_info::system32_exe("sc.exe"))
@@ -542,6 +619,7 @@ fn is_sunshine_service_active() -> bool {
     false
 }
 
+/// Checks whether a process with `image_name` is running via `tasklist.exe`.
 #[cfg(target_os = "windows")]
 fn is_image_running(image_name: &str) -> bool {
     let filter = format!("IMAGENAME eq {}", image_name);
@@ -557,11 +635,13 @@ fn is_image_running(image_name: &str) -> bool {
     false
 }
 
+/// Checks whether `sunshine.exe` process is active.
 #[cfg(target_os = "windows")]
 fn is_sunshine_process_running() -> bool {
     is_image_running("sunshine.exe")
 }
 
+/// Ensures that Sunshine is active by checking service status, scheduled task, or starting the binary.
 #[cfg(target_os = "windows")]
 fn ensure_sunshine_running() -> Result<()> {
     let sc_exe = system_info::system32_exe("sc.exe");
@@ -611,6 +691,7 @@ fn ensure_sunshine_running() -> Result<()> {
     anyhow::bail!("Neither SunshineSecondary task, SunshineService, nor sunshine.exe binary found")
 }
 
+/// Enumerates display adapters using PowerShell `Get-PnpDevice -Class Display` and parses virtual adapters.
 #[cfg(target_os = "windows")]
 fn discover_vdd_pnp_devices() -> Vec<VddPnpDevice> {
     let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
@@ -634,6 +715,7 @@ fn discover_vdd_pnp_devices() -> Vec<VddPnpDevice> {
     parse_vdd_pnp_devices(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Non-destructively locates or updates the Moonlight host registry entry on Windows.
 #[cfg(target_os = "windows")]
 fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &str) -> String {
     let reg_exe = system_info::system32_exe("reg.exe");
@@ -724,6 +806,7 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, _port: u16, _host_name: &
     mac_ip.to_string()
 }
 
+/// Reads the raw `REG_SZ` preference string for an executable path from `UserGpuPreferences`.
 #[cfg(target_os = "windows")]
 fn query_user_gpu_preference_raw(exe_path: &std::path::Path) -> Option<String> {
     let exe_str = exe_path.to_string_lossy();
@@ -739,12 +822,14 @@ fn query_user_gpu_preference_raw(exe_path: &std::path::Path) -> Option<String> {
     extract_reg_sz_value_data(&text)
 }
 
+/// Extracts the numeric GPU preference code (1: Integrated, 2/4: Discrete) from a raw preference string.
 #[cfg(target_os = "windows")]
 fn query_user_gpu_preference(exe_path: &std::path::Path) -> Option<u8> {
     let text = query_user_gpu_preference_raw(exe_path)?;
     parse_user_gpu_preference_value(&text)
 }
 
+/// Sets or updates the GPU preference token in `UserGpuPreferences`, preserving other existing settings.
 #[cfg(target_os = "windows")]
 fn set_user_gpu_preference(exe_path: &std::path::Path, pref_val: &str) -> Result<()> {
     let existing = query_user_gpu_preference_raw(exe_path);
@@ -773,6 +858,7 @@ fn set_user_gpu_preference(exe_path: &std::path::Path, pref_val: &str) -> Result
     Ok(())
 }
 
+/// Updates the `encoder` setting and optionally removes `adapter_name` in `sunshine.conf`.
 #[cfg(target_os = "windows")]
 fn update_sunshine_conf_encoder(
     conf_path: &std::path::Path,
@@ -790,18 +876,27 @@ fn update_sunshine_conf_encoder(
 // Pure cross-platform parsing & resolution helpers (unit-tested on all OSes)
 // ============================================================================
 
+/// Parsed representation of an existing Moonlight host pairing slot in Windows Registry.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct MoonlightHostSlot {
+    /// Full registry key path (e.g. `HKCU\Software\...\hosts\10`).
     reg_key: String,
+    /// Configured hostname.
     hostname: String,
+    /// Host unique identifier UUID.
     uuid: String,
+    /// Local network IP address.
     localaddress: String,
+    /// Manual override IP address.
     manualaddress: String,
+    /// Remote external IP address.
     remoteaddress: String,
+    /// List of configured TCP/UDP ports associated with this host.
     ports: Vec<u16>,
 }
 
+/// Splits a single line of `reg.exe query` output into value name and value data.
 #[cfg(any(target_os = "windows", test))]
 fn split_reg_query_value_line(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim();
@@ -825,6 +920,7 @@ fn split_reg_query_value_line(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Extracts the data string from a single-line `REG_SZ` registry query output.
 #[cfg(any(target_os = "windows", test))]
 fn extract_reg_sz_value_data(reg_output: &str) -> Option<String> {
     for line in reg_output.lines() {
@@ -835,6 +931,7 @@ fn extract_reg_sz_value_data(reg_output: &str) -> Option<String> {
     None
 }
 
+/// Parses the numeric preference code from `GpuPreference=<n>;` in a semicolon-delimited string.
 #[cfg(any(target_os = "windows", test))]
 fn parse_user_gpu_preference_value(raw: &str) -> Option<u8> {
     for part in raw.split([';', ' ', '\t', '\r', '\n']) {
@@ -848,6 +945,7 @@ fn parse_user_gpu_preference_value(raw: &str) -> Option<u8> {
     None
 }
 
+/// Merges a new `GpuPreference=<n>;` token into an existing semicolon-delimited DirectX preference string.
 #[cfg(any(target_os = "windows", test))]
 fn merge_user_gpu_preference_value(existing_raw: Option<&str>, new_pref: &str) -> String {
     let new_token = new_pref.trim().trim_end_matches(';');
@@ -878,6 +976,7 @@ fn merge_user_gpu_preference_value(existing_raw: Option<&str>, new_pref: &str) -
     parts.join(";") + ";"
 }
 
+/// Parses a 16-bit integer from a decimal or hex (`0x...`) string representation.
 #[cfg(any(target_os = "windows", test))]
 fn parse_reg_u16(raw: &str) -> Option<u16> {
     let t = raw.trim();
@@ -888,6 +987,7 @@ fn parse_reg_u16(raw: &str) -> Option<u16> {
     }
 }
 
+/// Parses the multi-key output of `reg query ...\Moonlight\hosts /s` into a list of [`MoonlightHostSlot`] structs.
 #[cfg(any(target_os = "windows", test))]
 fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
     let mut slots: Vec<MoonlightHostSlot> = Vec::new();
@@ -953,6 +1053,7 @@ fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
     slots
 }
 
+/// Non-destructively selects the best matching Moonlight host slot based on IP, port, and hostname scoring.
 #[cfg(any(target_os = "windows", test))]
 fn select_moonlight_host_slot<'a>(
     slots: &'a [MoonlightHostSlot],
@@ -1007,19 +1108,25 @@ fn select_moonlight_host_slot<'a>(
     best
 }
 
+/// Escapes a string for safe inclusion inside PowerShell single-quoted string literals.
 #[cfg(any(target_os = "windows", test))]
 fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Parsed PnP device descriptor for a Virtual Display Driver adapter.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VddPnpDevice {
+    /// Device instance ID (e.g. `ROOT\DISPLAY\0002`).
     instance_id: String,
+    /// Friendly device name (e.g. `Virtual Display Driver`).
     friendly_name: String,
+    /// Current PnP operational status (`OK`, `Disabled`, etc.).
     status: String,
 }
 
+/// Determines whether a PnP display device matches known virtual display driver signatures.
 #[cfg(any(target_os = "windows", test))]
 fn is_virtual_display_adapter(instance_id: &str, friendly_name: &str, name: &str) -> bool {
     let combined = format!("{} {}", friendly_name, name).to_ascii_lowercase();
@@ -1048,6 +1155,7 @@ fn is_virtual_display_adapter(instance_id: &str, friendly_name: &str, name: &str
         && (combined.contains("virtual") || combined.contains("vdd") || combined.trim().is_empty())
 }
 
+/// Parses the output of `Get-PnpDevice -Class Display` into a list of matching virtual display adapters.
 #[cfg(any(target_os = "windows", test))]
 fn parse_vdd_pnp_devices(output: &str) -> Vec<VddPnpDevice> {
     let mut devices = Vec::new();
@@ -1081,15 +1189,21 @@ fn parse_vdd_pnp_devices(output: &str) -> Vec<VddPnpDevice> {
     devices
 }
 
+/// Target GPU parameters resolved for video encoding or decoding.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedGpuTarget {
+    /// Whether automatic selection is enabled.
     is_auto: bool,
+    /// Adapter name matching Sunshine's `adapter_name` config parameter.
     adapter_name: Option<String>,
+    /// Encoder keyword (e.g. `"nvenc"`, `"amdvce"`, `"quicksync"`).
     encoder: Option<&'static str>,
+    /// DirectX registry preference string (e.g. `"GpuPreference=2;"`).
     reg_pref: &'static str,
 }
 
+/// Identifies GPU vendor ("nvidia", "amd", "intel") from vendor and device name strings.
 #[cfg(any(target_os = "windows", test))]
 fn vendor_key(vendor: &str, name: &str) -> Option<String> {
     let combined = format!("{} {}", vendor, name).to_ascii_lowercase();
@@ -1113,6 +1227,7 @@ fn vendor_key(vendor: &str, name: &str) -> Option<String> {
     }
 }
 
+/// Resolves the hardware encoder identifier for a given GPU vendor/name.
 #[cfg(any(target_os = "windows", test))]
 fn encoder_for_gpu(vendor: &str, name: &str) -> Option<&'static str> {
     match vendor_key(vendor, name).as_deref() {
@@ -1123,6 +1238,7 @@ fn encoder_for_gpu(vendor: &str, name: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns the vendor or discrete/integrated label matching a numeric DirectX preference code.
 #[cfg(any(target_os = "windows", test))]
 fn gpu_label_for_preference(pref_code: u8, gpus: &[system_info::GpuDeviceInfo]) -> String {
     let real_gpus: Vec<&system_info::GpuDeviceInfo> = gpus
@@ -1147,6 +1263,7 @@ fn gpu_label_for_preference(pref_code: u8, gpus: &[system_info::GpuDeviceInfo]) 
     }
 }
 
+/// Resolves a vendor label from an adapter name string and GPU device list.
 #[cfg(any(target_os = "windows", test))]
 fn resolve_label_from_adapter(adapter: &str, gpus: &[system_info::GpuDeviceInfo]) -> String {
     let adapter_lower = adapter.to_ascii_lowercase();
@@ -1167,6 +1284,7 @@ fn resolve_label_from_adapter(adapter: &str, gpus: &[system_info::GpuDeviceInfo]
     vendor_key("", adapter).unwrap_or_else(|| adapter.to_string())
 }
 
+/// Resolves target encoder, adapter name, and registry preference from a user selection string.
 #[cfg(any(target_os = "windows", test))]
 fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> ResolvedGpuTarget {
     let trimmed = selection.trim();
@@ -1308,6 +1426,7 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
     }
 }
 
+/// Parses the `encoder` setting from `sunshine.conf` contents.
 #[cfg(any(target_os = "windows", test))]
 fn parse_sunshine_encoder(content: &str) -> Option<String> {
     for raw in content.lines() {
@@ -1327,6 +1446,7 @@ fn parse_sunshine_encoder(content: &str) -> Option<String> {
     None
 }
 
+/// Pure string transformation helper updating or inserting the `encoder` setting in `sunshine.conf`.
 #[cfg(any(target_os = "windows", test))]
 fn update_sunshine_encoder_content(
     content: &str,

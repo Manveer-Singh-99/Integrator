@@ -1,7 +1,64 @@
+//
+//  ambient_light.swift
+//  Integrator Cross-Screen TrueTone - macOS Hardware Ambient Light Sensor Driver
+//
+//  ========================================================================================
+//  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+//  ========================================================================================
+//  This file implements the low-level macOS hardware Ambient Light Sensor (ALS) driver for
+//  Integrator's Cross-Screen TrueTone and Chromatic Adaptation subsystem.
+//
+//  Key Subsystem Capabilities:
+//  - Dynamic IOKit HID Event System Client: Dynamically binds IOKit framework symbols at runtime
+//    via `dlopen`/`dlsym` (`IOHIDEventSystemClientCreateWithType`, `IOHIDServiceClientCopyEvent`),
+//    avoiding hard private framework link dependencies while maintaining ABI compatibility
+//    across macOS Monterey through macOS Sequoia.
+//  - Apple Silicon SPU & Intel LMU HID Ingestion: Queries the HID Event System matching
+//    `PrimaryUsagePage = 0xff00` (Apple Vendor Specific) and `PrimaryUsage = 4` (Ambient Light Sensor).
+//  - Photometric Extraction: Interrogates HID event type 12 (`kIOHIDEventTypeAmbientLightSensor`)
+//    to extract:
+//    - Raw Illuminance in Lux (`luxField = 12 << 16`)
+//    - Red / Warm channel value (`ch0Field = (12 << 16) | 1`)
+//    - Blue / Cool channel value (`ch2Field = (12 << 16) | 3`)
+//  - Correlated Color Temperature (CCT) Estimation: Solves the channel ratio `ch2 / ch0` to compute
+//    ambient color temperature in Kelvin `[2500K, 9000K]` relative to standard D65 (6500K).
+//
+//  ========================================================================================
+//  2. ARCHITECTURAL LINKAGES & CALL FLOW
+//  ========================================================================================
+//  Upstream Caller:
+//  - `src/truetone/mod.rs`: Rust TrueTone engine invokes the C-ABI function:
+//    `read_mac_ambient_sensor(outLux, outCct)`
+//    during periodic display calibration cycles.
+//
+//  Downstream Callees:
+//  - `/System/Library/Frameworks/IOKit.framework/IOKit`: Dynamic symbol invocation.
+//  - CoreFoundation: `CFArray`, `CFTypeRef` memory lifecycle management.
+//
+//  ========================================================================================
+//  3. THREADING & CONCURRENCY MODEL
+//  ========================================================================================
+//  - Synchronous FFI Invocation: `read_mac_ambient_sensor` executes re-entrantly on the caller's
+//    thread (typically a background Tokio worker thread).
+//  - Transient Resource Management: All IOKit client handles and CFArray references are created,
+//    inspected, and released within the scope of a single function invocation, preventing memory
+//    leaks or resource lock contention.
+//
+//  ========================================================================================
+//  4. SECURITY & SAFETY INVARIANTS
+//  ========================================================================================
+//  - Non-MacBook / Desktop Machine Containment: Devices lacking ambient hardware sensors
+//    (Mac mini, Mac Studio, Mac Pro, Hackintosh) or clamshell closed MacBooks safely return `false`
+//    with sentinel values `outLux = -1.0` and `outCct = 0` without crashing.
+//  - Finite Arithmetic Sanitization: All floating-point readings are tested with `.isFinite` and
+//    `lux >= 0.0` before propagating into the Bradford CAT matrix.
+//
+
 import Foundation
 import IOKit
 
 // MARK: - Dynamic IOKit HID Function Bindings (Strict C Pointer ABI)
+
 private let ioKitHandle: UnsafeMutableRawPointer? = dlopen(
     "/System/Library/Frameworks/IOKit.framework/IOKit",
     RTLD_NOW | RTLD_LOCAL
@@ -54,6 +111,7 @@ private let iohidEventGetFloatValue: FnIOHIDEventGetFloatValue? = {
 }()
 
 // MARK: - Ambient Light Sensor Reader FFI
+
 /// Reads the macOS hardware Ambient Light Sensor via IOKit HID.
 ///
 /// FFI Return Contract (consumed by `src/truetone/mod.rs`):
@@ -64,6 +122,11 @@ private let iohidEventGetFloatValue: FnIOHIDEventGetFloatValue? = {
 ///   (e.g., Mac Studio, Mac mini, desktop Mac, or unavailable sensor) or when the
 ///   sensor reading is non-finite/negative, explicitly writing sentinel
 ///   `outLux = -1.0` and `outCct = 0` instead of fabricating positive lux.
+///
+/// - Parameters:
+///   - outLux: Pointer receiving the ambient illumination in Lux.
+///   - outCct: Pointer receiving the estimated Correlated Color Temperature in Kelvin.
+/// - Returns: `true` if a hardware sensor was read successfully, `false` otherwise.
 @_cdecl("read_mac_ambient_sensor")
 public func read_mac_ambient_sensor(
     outLux: UnsafeMutablePointer<Float>?,

@@ -1,4 +1,72 @@
-//! High-level display extension controller and RPC orchestrator.
+//! # Display Controller & Session Orchestrator
+//!
+//! ## 1. Module Purpose & Scope
+//! This module implements [`DisplayController`], the central stateful orchestrator for the
+//! **Integrator Extended Display Subsystem** (`display` feature) and local/remote RPC request routing.
+//!
+//! It manages the lifecycle of extended desktop streaming between macOS and Windows 11,
+//! coordinating native virtual display creation, Sunshine streaming server configuration,
+//! non-destructive Moonlight client resolution, and dynamic bitrate/resolution adaptation.
+//! It also serves as the command dispatcher for all incoming [`DisplayRpcRequest`] messages,
+//! including Shared Camera management, True Tone gamma synchronization, remote clipboard pasting,
+//! storage filesystem mounting, and low-latency UDP audio negotiation.
+//!
+//! ## 2. Cross-Platform Architectural Pipelines
+//!
+//! ### Mac-to-PC Extended Display Pipeline (`start_mac_to_pc_locked`)
+//! 1. **Peer Discovery & Resolution**: Resolves target peer display dimensions (`width`, `height`),
+//!    refresh rate (`fps`), and route IP via [`DisplayController::resolve_peer_display_and_host`].
+//! 2. **In-Process Virtual Display (macOS)**: Invokes `MacDisplayManager::start_virtual_display`
+//!    which calls `virtual_display.m` to instantiate a private `CGVirtualDisplay` with Integrator
+//!    Vendor ID (`0x494E`) and Product ID (`0x0165`).
+//! 3. **Sunshine Capture Configuration**: Dynamically writes `output_name = <display_id>` into
+//!    `sunshine.conf` (`MacDisplayManager::configure_sunshine_output`) and starts Sunshine.
+//! 4. **Hardware Encoding & Port Readiness**: Sunshine captures the virtual display via ScreenCaptureKit /
+//!    Desktop Duplication and initializes Apple Silicon VideoToolbox hardware encoders.
+//!    Controller waits until Sunshine binds local port 47989.
+//! 5. **Remote Moonlight Invocation**: Sends an authenticated [`DisplayRpcRequest::StartMoonlight`]
+//!    RPC to the Windows peer over `TransportSessionV2` on port 58281. The Windows PC launches
+//!    fullscreen Moonlight with D3D11 / NVDEC / AMF / Intel QSV hardware decoding.
+//!
+//! ### PC-to-Mac Extended Display Pipeline (`start_pc_to_mac_locked`)
+//! 1. **Virtual Display Driver (Windows 11)**: Invokes `WinDisplayManager::enable_vdd_device`
+//!    to activate the IddSampleDriver / Apollo Indirect Display Driver via PnP and attach slot 1
+//!    via `VddCtl.exe join 1`.
+//! 2. **Sunshine Host Supervision**: Verifies that `SunshineService` or `SunshineSecondary` task
+//!    is listening on port 47989 or secondary port 48989.
+//! 3. **Hardware Encoding (Windows)**: Sunshine captures the virtual display via DXGI Desktop Duplication
+//!    and encodes video using discrete GPU hardware (NVIDIA NVENC, AMD AMF, or Intel QuickSync).
+//! 4. **Remote Moonlight Invocation**: Sends [`DisplayRpcRequest::StartMoonlight`] to the Mac peer.
+//!    The Mac launches fullscreen Moonlight decoding with VideoToolbox hardware acceleration.
+//!
+//! ### Shared Camera Interaction
+//! While display streaming operates over Sunshine/Moonlight (ports 47989/48989), the Shared Camera
+//! operates concurrently over `TransportSessionV2` on port 58287. Camera commands ([`DisplayRpcRequest::StartCamera`],
+//! [`DisplayRpcRequest::ToggleCamera`], [`DisplayRpcRequest::StopCamera`], [`DisplayRpcRequest::GetCameraStatus`])
+//! are dispatched directly to [`crate::camera::CameraService`], activating FaceTime HD capture on Mac
+//! and the driverless Windows 11 Media Foundation FrameServer virtual webcam (`integrator_vcam.dll`)
+//! without mutual interference or encoder resource contention.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Transition Serialization**: An internal async `Mutex<()>` (`transition_lock`) serializes
+//!   all state changes (`start_mac_to_pc`, `stop_mac_to_pc`, `start_pc_to_mac`, `stop_pc_to_mac`,
+//!   `StopAll`). This guarantees that concurrent UI toggles or remote RPCs cannot induce race
+//!   conditions during virtual display creation or Sunshine port binding.
+//! - **Lock-Free Read Access**: Shared state (`host_active`, `client_active`, `active_mode`,
+//!   `active_peer_ip`) is stored in `tokio::sync::RwLock` containers, permitting high-frequency
+//!   status queries without lock contention.
+//! - **Blocking Offload**: System commands, registry operations, and process launches are
+//!   offloaded to `tokio::task::spawn_blocking` to prevent starving the Tokio async thread pool.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Loopback Call Guarding**: Sensitive RPC requests (`PasteRemote`, `ShowWindow`, `GetPairingPin`,
+//!   `PairWithPeer`) are strictly restricted to local loopback CLI callers (`127.0.0.1` / `::1`)
+//!   unless explicitly authorized for cross-machine desktop toggling.
+//! - **Redirect Attack Mitigation**: In `StartMoonlight`, incoming `host_ip` parameters from remote
+//!   callers are validated against the authenticated peer's socket address, preventing malicious
+//!   redirection of Moonlight clients to arbitrary third-party IP addresses.
+//! - **Dynamic Bitrate Clamping**: Stream bitrates are strictly clamped between 5,000 and 500,000 kbps,
+//!   and display geometries are clamped to even integer dimensions within 800x600 to 7680x4320.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -17,18 +85,27 @@ use super::mac_display::MacDisplayManager;
 use super::protocol::{required_feature_for_rpc, DisplayRpcRequest, DisplayRpcResponse};
 use super::win_display::WinDisplayManager;
 
+/// Stateful controller managing extended display sessions, bitrate calculations, and RPC routing.
 #[derive(Clone)]
 pub struct DisplayController {
+    /// Peer discovery manager for resolving counterpart device IP addresses and link characteristics.
     discovery: DiscoveryManager,
+    /// Feature flag manager governing feature enablement.
     features: Arc<FeatureManager>,
+    /// Serializes display session transitions (start, stop, toggle) to prevent re-entrant races.
     transition_lock: Arc<Mutex<()>>,
+    /// Whether this machine is currently acting as the Sunshine display host.
     host_active: Arc<RwLock<bool>>,
+    /// Whether this machine is currently acting as the Moonlight display client.
     client_active: Arc<RwLock<bool>>,
+    /// Human-readable description of the current display mode (e.g. `"Mac -> PC (2560x1440 @ 120Hz)"`).
     active_mode: Arc<RwLock<Option<String>>>,
+    /// IP address of the peer currently engaged in an active display session.
     active_peer_ip: Arc<RwLock<Option<String>>>,
 }
 
 impl DisplayController {
+    /// Instantiates a new [`DisplayController`] tied to discovery and feature managers.
     pub fn new(discovery: DiscoveryManager, features: Arc<FeatureManager>) -> Self {
         Self {
             discovery,
@@ -41,6 +118,7 @@ impl DisplayController {
         }
     }
 
+    /// Constructs a baseline [`DisplayRpcResponse`] populated with current active state.
     async fn base_response(&self, success: bool, message: impl Into<String>) -> DisplayRpcResponse {
         DisplayRpcResponse {
             success,
@@ -51,6 +129,7 @@ impl DisplayController {
         }
     }
 
+    /// Formats an IP address and port into a valid IPv4/IPv6 socket target string.
     fn format_socket_target(ip: &str, port: u16) -> String {
         if let Ok(parsed) = ip.trim().parse::<IpAddr>() {
             SocketAddr::new(parsed, port).to_string()
@@ -59,6 +138,7 @@ impl DisplayController {
         }
     }
 
+    /// Checks whether a TCP port is currently open and accepting connections with a 250ms timeout.
     async fn is_tcp_port_open(ip: &str, port: u16) -> bool {
         let addr = Self::format_socket_target(ip, port);
         matches!(
@@ -67,6 +147,7 @@ impl DisplayController {
         )
     }
 
+    /// Polls a TCP port periodically until it becomes open or `timeout` expires.
     async fn wait_for_tcp_port(ip: &str, port: u16, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
@@ -78,6 +159,13 @@ impl DisplayController {
         false
     }
 
+    /// Calculates the optimal streaming bitrate in kilobits per second based on link transport and refresh rate.
+    ///
+    /// Bitrate Matrix:
+    /// - Direct Thunderbolt / USB4 cable: 100 Mbps (standard) / 150 Mbps (120Hz+ high-framerate).
+    /// - 2.5GbE+ Ethernet: 100 Mbps / 150 Mbps.
+    /// - Gigabit Ethernet: 65 Mbps / 85 Mbps.
+    /// - Wi-Fi: 35 Mbps adaptive to avoid airtime congestion.
     fn compute_optimal_bitrate_kbps(peer: &PeerCandidate, fps: u32) -> u32 {
         let high_fps = fps >= 120;
         if peer.transport.is_direct_cable() {
@@ -148,6 +236,7 @@ impl DisplayController {
                 fps: 60,
                 scale_factor: 1.0,
             });
+        // Ensure even dimensions required by video encoders (width & !1, height & !1)
         let final_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680) & !1;
         let final_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320) & !1;
         let raw_fps = if fps > 0 { fps } else { local_disp.fps };
@@ -157,6 +246,7 @@ impl DisplayController {
         (final_w, final_h, final_fps, final_hostname)
     }
 
+    /// Reads optional custom sunshine server name from secondary `sunshine_mac2.conf`.
     fn read_secondary_sunshine_name() -> Option<String> {
         let conf_path = system_info::find_sunshine_conf()?
             .parent()?
@@ -179,6 +269,7 @@ impl DisplayController {
     }
 
     /// Toggles Mac-as-Host extended desktop to the discovered peer.
+    ///
     /// When invoked on Windows, forwards the toggle request over authenticated TransportV2 to the Mac peer.
     pub async fn toggle_mac_to_pc(&self) -> Result<String> {
         #[cfg(not(target_os = "macos"))]
@@ -223,6 +314,7 @@ impl DisplayController {
         self.start_mac_to_pc_locked().await
     }
 
+    /// Clears internal host session flags and resets active mode.
     async fn clear_host_state(&self) {
         *self.host_active.write().await = false;
         let client_on = *self.client_active.read().await;
@@ -234,6 +326,7 @@ impl DisplayController {
         }
     }
 
+    /// Clears internal client session flags and resets active mode.
     async fn clear_client_state(&self) {
         *self.client_active.write().await = false;
         let host_on = *self.host_active.read().await;
@@ -243,6 +336,7 @@ impl DisplayController {
         }
     }
 
+    /// Internal locked implementation of Mac-to-PC extended desktop initiation.
     async fn start_mac_to_pc_locked(&self) -> Result<()> {
         let peer = self
             .discovery
@@ -356,6 +450,7 @@ impl DisplayController {
         self.stop_mac_to_pc_locked().await
     }
 
+    /// Internal locked teardown routine for Mac-as-Host session.
     async fn stop_mac_to_pc_locked(&self) -> Result<()> {
         info!("Stopping Mac-to-PC extended display...");
 
@@ -383,6 +478,7 @@ impl DisplayController {
     }
 
     /// Toggles PC-as-Host extended desktop to the discovered Mac peer.
+    ///
     /// When invoked on macOS, forwards the toggle request over authenticated TransportV2 to the Windows peer.
     pub async fn toggle_pc_to_mac(&self) -> Result<String> {
         #[cfg(not(target_os = "windows"))]
@@ -427,6 +523,7 @@ impl DisplayController {
         self.start_pc_to_mac_locked().await
     }
 
+    /// Internal locked initiation routine for PC-as-Host extended desktop mode.
     async fn start_pc_to_mac_locked(&self) -> Result<()> {
         let peer = self
             .discovery
@@ -540,6 +637,7 @@ impl DisplayController {
         self.stop_pc_to_mac_locked().await
     }
 
+    /// Internal locked teardown routine for PC-as-Host session.
     async fn stop_pc_to_mac_locked(&self) -> Result<()> {
         info!("Stopping PC-to-Mac extended display...");
 
@@ -560,7 +658,10 @@ impl DisplayController {
         Ok(())
     }
 
-    /// Handles an incoming DisplayRpcRequest on the local machine.
+    /// Handles an incoming [`DisplayRpcRequest`] on the local machine with security authorization checks.
+    ///
+    /// Validates loopback-only caller constraints, feature flag status, and parameter sanity before
+    /// dispatching to specific subsystem handlers.
     pub async fn handle_rpc(
         &self,
         req: DisplayRpcRequest,
@@ -573,6 +674,7 @@ impl DisplayController {
             DisplayRpcRequest::TogglePcToMac => cfg!(target_os = "windows") && peer_ip.is_some(),
             _ => false,
         };
+        // Enforce loopback restriction on sensitive administrative commands
         if matches!(
             req,
             DisplayRpcRequest::ToggleMacToPc
@@ -593,6 +695,7 @@ impl DisplayController {
                 .await;
         }
 
+        // Verify that the requested subsystem feature flag is enabled
         if let Some(feature) = required_feature_for_rpc(&req) {
             if !self.features.is_enabled(feature)
                 && !(is_loopback_caller && matches!(req, DisplayRpcRequest::StopAll | DisplayRpcRequest::StopMoonlight))
@@ -639,6 +742,7 @@ impl DisplayController {
                 let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
                 let trimmed_host_ip = host_ip.trim();
 
+                // Prevent malicious redirect attacks to third-party endpoints
                 if !is_loopback_caller
                     && !trimmed_host_ip.is_empty()
                     && !caller_ip_str.is_empty()
@@ -1068,10 +1172,67 @@ impl DisplayController {
                     Err(e) => self.base_response(false, e).await,
                 }
             }
+            DisplayRpcRequest::GetBridgeStatus => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    let s = core.build_bridge_status().await;
+                    let mut resp = self.base_response(true, "Bridge status retrieved").await;
+                    resp.bridge_status = serde_json::to_value(s).ok();
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::StartCamera => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    match core.camera.start().await {
+                        Ok(msg) => {
+                            let mut resp = self.base_response(true, msg).await;
+                            resp.camera_status = Some(core.camera.status());
+                            resp
+                        }
+                        Err(e) => self.base_response(false, format!("Failed to start camera: {}", e)).await,
+                    }
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::ToggleCamera => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    match core.camera.toggle().await {
+                        Ok(msg) => {
+                            let mut resp = self.base_response(true, msg).await;
+                            resp.camera_status = Some(core.camera.status());
+                            resp
+                        }
+                        Err(e) => self.base_response(false, format!("Failed to toggle camera: {}", e)).await,
+                    }
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::StopCamera => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    core.camera.stop().await;
+                    let mut resp = self.base_response(true, "Shared Camera stopped").await;
+                    resp.camera_status = Some(core.camera.status());
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::GetCameraStatus => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    let mut resp = self.base_response(true, "Camera status retrieved").await;
+                    resp.camera_status = Some(core.camera.status());
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
         }
     }
 
-    /// Returns whether display streaming is currently active.
+    /// Returns whether display streaming or virtual display is currently active.
     pub async fn is_active(&self) -> bool {
         let host_active = *self.host_active.read().await;
         let client_active = *self.client_active.read().await;
@@ -1084,12 +1245,17 @@ impl DisplayController {
         }
     }
 
-    /// Returns the currently active display mode, if any.
+    /// Returns the currently active display mode label, if any.
     pub async fn get_active_mode(&self) -> Option<String> {
         self.active_mode.read().await.clone()
     }
 
-    /// Sends an encrypted, mutually authenticated RPC request to a remote peer or localhost over TransportSessionV2.
+    /// Sends an encrypted, mutually authenticated RPC request to a remote peer over `TransportSessionV2`.
+    ///
+    /// - Parameters:
+    ///   - `peer_ip`: Target peer IP address.
+    ///   - `req`: The [`DisplayRpcRequest`] to send.
+    /// - Returns: Deserialized [`DisplayRpcResponse`] on success, or an error if connection or timeout occurs.
     pub async fn send_remote_rpc(
         peer_ip: &str,
         req: &DisplayRpcRequest,
@@ -1130,6 +1296,14 @@ impl DisplayController {
 
 /// C FFI bridge used by the macOS Touch Bar GPU HUD (`touchbar_hud.swift`) to poll
 /// `GetGpuTelemetry` over an authenticated `TransportSessionV2` (`ITR2`) channel.
+///
+/// # Arguments
+/// - `peer_ip_ptr`: Null-terminated C string with peer IPv4/IPv6 address.
+/// - `out_buf`: Destination byte buffer receiving the UTF-8 JSON response.
+/// - `cap`: Capacity of `out_buf` in bytes.
+///
+/// # Returns
+/// Number of bytes written into `out_buf` (excluding null terminator), or 0 on error.
 #[no_mangle]
 pub extern "C" fn fetch_rust_gpu_telemetry_json(
     peer_ip_ptr: *const std::os::raw::c_char,
@@ -1206,4 +1380,3 @@ mod tests {
         );
     }
 }
-

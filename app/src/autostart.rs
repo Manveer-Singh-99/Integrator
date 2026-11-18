@@ -1,3 +1,59 @@
+//! # Native Operating System Autostart & Login Persistence Manager (`autostart.rs`)
+//!
+//! ## 1. Module Purpose & Scope
+//! `autostart.rs` manages the automatic startup configuration of Integrator across operating system
+//! reboots and user login sessions on macOS and Windows 11.
+//!
+//! Because Integrator functions as an omnipresent workstation continuity layer (providing seamless
+//! display mirroring, KVM input forwarding, audio bridging, and clipboard sync), background availability
+//! from the moment the user logs into their desktop is essential.
+//!
+//! This module provides a unified abstraction (`AutostartManager`) that manages the divergent,
+//! platform-specific mechanisms required for silent, elevated background startup:
+//! - **macOS**: Manages a per-user `LaunchAgent` property list (`com.manveersingh.integrator.plist`)
+//!   located in `~/Library/LaunchAgents/`, registered with macOS `launchd` via `launchctl bootstrap`
+//!   and `launchctl bootout` targeting the user's active GUI domain (`gui/<UID>`).
+//! - **Windows 11**: Uses Windows Task Scheduler (`schtasks.exe`) to configure an elevated scheduled task
+//!   (`"IntegratorAutostart"`) with `<RunLevel>HighestAvailable</RunLevel>`. This ensures the application
+//!   runs with necessary administrator privileges to hook low-level keyboard/mouse events (`WH_KEYBOARD_LL`)
+//!   and communicate with virtual camera drivers without triggering disruptive User Account Control (UAC) prompts
+//!   at every login. It also removes legacy, non-elevated registry entries (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `core::IntegratorCore`: Handles UI JSON-RPC requests (`"get_autostart"`, `"set_autostart"`)
+//!   dispatched across the FFI boundary from settings preference panels.
+//! - Native GUI View Models (Swift `SettingsView` on macOS, WinUI 3 `SettingsPage` on Windows).
+//!
+//! ### Downstream Callees:
+//! - macOS System Binaries: `/bin/launchctl` for dynamic service lifecycle management;
+//!   `/usr/bin/id -u` to determine numeric POSIX user ID.
+//! - Windows System Binaries: `%SystemRoot%\System32\schtasks.exe` for task manipulation;
+//!   `whoami.exe /USER` to obtain user Security Identifier (SID); `reg.exe` for legacy registry cleanup.
+//! - `system_info::atomic_write_private`: Writes LaunchAgent plists and Task XMLs with restricted permissions.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! Autostart operates strictly on the local machine. Once enabled, the application launches with `--hidden`
+//! (macOS) or `--minimized` (Windows), initializes background UDP discovery listeners and transport servers,
+//! and automatically re-establishes connections to paired peers across the network.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - Methods in `AutostartManager` execute synchronous process invocations (`std::process::Command`).
+//! - When invoked from the Tokio asynchronous runtime in `core.rs`, calls are wrapped in
+//!   `tokio::task::spawn_blocking` to avoid blocking executor worker threads during OS process execution.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **XML Injection Prevention**: All dynamic file paths, arguments, and user identity tokens inserted
+//!   into plist and XML templates are strictly sanitized via `xml_escape` and validated to reject ASCII
+//!   control characters (`\0`, `\n`, `\r`, `\t`).
+//! - **Hardened Process Spawning**:
+//!   - On Windows, all processes are executed with `CREATE_NO_WINDOW (0x08000000)` to prevent console flashing.
+//!   - Executables are resolved using fully qualified paths (e.g. `system32_exe("schtasks.exe")`),
+//!     mitigating path-hijacking attacks.
+//! - **UTF-16LE Encoding with BOM**: Windows Task Scheduler XML imports require strict UTF-16LE with BOM
+//!   (`0xFF 0xFE`), generated via `encode_utf16_le_with_bom`.
+//! - **Private File Permissions**: Plist and temporary XML files are created with mode `0o600` on Unix.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -5,19 +61,32 @@ use std::path::PathBuf;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
+/// Canonical LaunchAgent bundle identifier for macOS launchd registration.
 #[cfg(target_os = "macos")]
 const MAC_LAUNCH_LABEL: &str = "com.manveersingh.integrator";
 
+/// Task Scheduler task name for elevated startup on Windows.
 #[cfg(target_os = "windows")]
 const WIN_TASK_NAME: &str = "IntegratorAutostart";
+
+/// Legacy registry run key path used in older versions, cleaned up upon activation.
 #[cfg(target_os = "windows")]
 const WIN_LEGACY_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Windows process creation flag to prevent terminal window popup.
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Platform-agnostic manager for inspecting and toggling system login autostart.
 pub struct AutostartManager;
 
 impl AutostartManager {
+    /// Queries the operating system to determine whether autostart is currently enabled.
+    ///
+    /// # Platform Mechanics:
+    /// - **macOS**: Checks whether `~/Library/LaunchAgents/com.manveersingh.integrator.plist` exists on disk.
+    /// - **Windows**: Queries `schtasks.exe /Query /TN IntegratorAutostart` and checks for exit code 0.
+    /// - **Other**: Returns `false`.
     pub fn is_enabled() -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -42,6 +111,13 @@ impl AutostartManager {
         }
     }
 
+    /// Configures the operating system autostart state.
+    ///
+    /// # Arguments
+    /// * `enabled` - `true` to register autostart on user login; `false` to deregister and remove configuration.
+    ///
+    /// # Return Value
+    /// Returns `Ok(bool)` reflecting the new verified state of `is_enabled()`, or `Err` if OS commands failed.
     pub fn set_enabled(enabled: bool) -> Result<bool> {
         #[cfg(target_os = "macos")]
         {
@@ -63,6 +139,9 @@ impl AutostartManager {
     }
 }
 
+/// Escapes reserved XML characters in a string to prevent XML injection attacks.
+///
+/// Converts `&`, `<`, `>`, `"`, and `'` to their corresponding XML entities (`&amp;`, `&lt;`, etc.).
 pub(crate) fn xml_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -78,6 +157,9 @@ pub(crate) fn xml_escape(input: &str) -> String {
     out
 }
 
+/// Validates that a filesystem path is valid UTF-8 and contains no control characters.
+///
+/// Rejects paths containing NUL bytes, newlines, carriage returns, or other non-printable characters.
 fn validate_path_for_xml(path: &Path) -> Result<String> {
     let s = path
         .to_str()
@@ -91,6 +173,10 @@ fn validate_path_for_xml(path: &Path) -> Result<String> {
     Ok(s.to_string())
 }
 
+/// Constructs a valid macOS `LaunchAgent` XML plist for the specified executable path.
+///
+/// Configures `RunAtLoad = true`, `KeepAlive = false`, and `ProcessType = Interactive`
+/// passing `--hidden` to launch the application into the background status bar.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
     let exe_str = validate_path_for_xml(exe_path)?;
@@ -119,6 +205,10 @@ pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
     ))
 }
 
+/// Constructs a valid Windows Task Scheduler Task definition XML.
+///
+/// Configures `<LogonTrigger>`, `<RunLevel>HighestAvailable</RunLevel>`,
+/// and passes `--minimized` to suppress the main window on startup.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> Result<String> {
     let exe_str = validate_path_for_xml(exe_path)?;
@@ -182,9 +272,13 @@ pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> 
     ))
 }
 
+/// Encodes a UTF-8 text string into UTF-16 Little-Endian bytes prefixed with a Byte Order Mark (BOM).
+///
+/// Windows `schtasks.exe /Create /XML` requires a UTF-16LE BOM (`0xFF 0xFE`) when parsing task XML definitions.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn encode_utf16_le_with_bom(text: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+    // Write UTF-16 Little-Endian Byte Order Mark (BOM)
     bytes.push(0xFF);
     bytes.push(0xFE);
     for unit in text.encode_utf16() {
@@ -193,6 +287,7 @@ pub(crate) fn encode_utf16_le_with_bom(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// Resolves the current user's home directory from the `HOME` environment variable on macOS.
 #[cfg(target_os = "macos")]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -200,6 +295,7 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Resolves the absolute path to the user's LaunchAgent plist file.
 #[cfg(target_os = "macos")]
 fn mac_plist_path() -> Result<PathBuf> {
     let home = home_dir().context("Could not resolve HOME directory")?;
@@ -209,8 +305,13 @@ fn mac_plist_path() -> Result<PathBuf> {
         .join(format!("{MAC_LAUNCH_LABEL}.plist")))
 }
 
+/// Discovers the absolute path to the executable inside the `.app` bundle on macOS.
+///
+/// Searches `std::env::current_exe()`, standard `/Applications/Integrator.app`,
+/// and user `~/Applications/Integrator.app` locations.
 #[cfg(target_os = "macos")]
 fn resolve_mac_app_executable() -> Result<PathBuf> {
+    // Check if the current running executable is already inside an .app bundle
     if let Ok(exe) = std::env::current_exe() {
         let canonical = exe.canonicalize().unwrap_or(exe);
         let s = canonical.to_string_lossy();
@@ -219,6 +320,7 @@ fn resolve_mac_app_executable() -> Result<PathBuf> {
         }
     }
 
+    // Inspect known installation paths
     let mut candidates = vec![
         PathBuf::from("/Applications/Integrator.app/Contents/MacOS/Integrator"),
         PathBuf::from("/Applications/Integrator.app/Contents/MacOS/integrator"),
@@ -233,6 +335,7 @@ fn resolve_mac_app_executable() -> Result<PathBuf> {
         }
     }
 
+    // Fall back to current executable
     let exe = std::env::current_exe().context("Could not resolve current executable path")?;
     if exe.is_file() {
         return Ok(exe);
@@ -240,6 +343,7 @@ fn resolve_mac_app_executable() -> Result<PathBuf> {
     anyhow::bail!("Could not locate Integrator executable for LaunchAgent")
 }
 
+/// Retrieves the current POSIX numeric user ID by executing `/usr/bin/id -u`.
 #[cfg(target_os = "macos")]
 fn current_uid() -> Result<String> {
     let out = Command::new("/usr/bin/id")
@@ -256,6 +360,7 @@ fn current_uid() -> Result<String> {
     Ok(uid)
 }
 
+/// Unloads any active LaunchAgent service registration via `/bin/launchctl bootout`.
 #[cfg(target_os = "macos")]
 fn launchctl_bootout(uid: &str) {
     let service_target = format!("gui/{uid}/{MAC_LAUNCH_LABEL}");
@@ -264,6 +369,7 @@ fn launchctl_bootout(uid: &str) {
         .output();
 }
 
+/// Enables or disables macOS autostart by creating/deleting the LaunchAgent plist and bootstrapping launchd.
 #[cfg(target_os = "macos")]
 fn set_enabled_macos(enabled: bool) -> Result<()> {
     let plist_path = mac_plist_path()?;
@@ -279,10 +385,12 @@ fn set_enabled_macos(enabled: bool) -> Result<()> {
         let exe_path = resolve_mac_app_executable()?;
         let plist_xml = build_macos_plist_xml(&exe_path)?;
 
+        // Boot out any existing registration prior to writing updated plist
         launchctl_bootout(&uid);
         crate::system_info::atomic_write_private(&plist_path, plist_xml.as_bytes())
             .with_context(|| format!("Failed to write LaunchAgent plist {}", plist_path.display()))?;
 
+        // Register the new LaunchAgent with launchd for the user's GUI session
         let domain = format!("gui/{uid}");
         let plist_str = plist_path
             .to_str()
@@ -312,6 +420,7 @@ fn set_enabled_macos(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Parses the output of `whoami.exe /USER /FO CSV /NH` to extract the user's Security Identifier (SID).
 #[cfg(target_os = "windows")]
 fn parse_whoami_sid_csv(csv: &str) -> Option<String> {
     let line = csv.lines().next()?.trim();
@@ -326,6 +435,7 @@ fn parse_whoami_sid_csv(csv: &str) -> Option<String> {
     }
 }
 
+/// Retrieves the current Windows user's SID or DOMAIN\Username.
 #[cfg(target_os = "windows")]
 fn current_windows_user_id() -> Option<String> {
     use std::os::windows::process::CommandExt;
@@ -353,6 +463,7 @@ fn current_windows_user_id() -> Option<String> {
     }
 }
 
+/// Removes legacy non-elevated Run registry values from `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 #[cfg(target_os = "windows")]
 fn cleanup_legacy_run_key() {
     use std::os::windows::process::CommandExt;
@@ -363,9 +474,11 @@ fn cleanup_legacy_run_key() {
         .output();
 }
 
+/// Enables or disables Windows autostart via elevated Scheduled Task manipulation.
 #[cfg(target_os = "windows")]
 fn set_enabled_windows(enabled: bool) -> Result<()> {
     use std::os::windows::process::CommandExt;
+    // Remove obsolete registry key
     cleanup_legacy_run_key();
 
     let schtasks = crate::system_info::system32_exe("schtasks.exe");

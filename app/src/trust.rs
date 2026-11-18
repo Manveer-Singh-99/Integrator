@@ -1,15 +1,79 @@
-//! Peer trust, Ed25519 identity, RFC 9382 SPAKE2 pairing coordination, and
-//! unified `TransportV2` session management (`~/.integrator/security/trusted_peers_v2.json`).
+//! ============================================================================
+//! Peer Trust, Ed25519 Identity, SPAKE2 Pairing & TransportV2 Orchestrator
+//! ============================================================================
 //!
-//! Security model (v2.0):
-//! - Zero static keys: all legacy v1 public transport and beacon secrets have been eliminated.
-//! - Zero IP/interface auto-trust: Discovery (`58280/udp`) is strictly an untrusted hint and never
-//!   grants trust or mutates `KeystoreV2` credentials.
-//! - Pairing uses the 4-message RFC 9382 SPAKE2 (`edwards25519`) + `Ed25519` handshake (`IPR2`).
-//!   Failed PIN attempts from an unauthenticated IP never rotate or invalidate the host's active PIN.
-//! - All post-pairing TCP services (Display RPC `58281`, Clipboard/File Transfer `58283`,
-//!   Benchmark `58285`) use `TransportSessionV2` (`ITR2`) with ephemeral `X25519` + `K_root` +
-//!   mutual pinned `Ed25519` signatures + `ChaCha20-Poly1305`.
+//! # 1. Architectural Overview & Purpose
+//!
+//! `trust.rs` serves as the high-level security orchestrator for the Integrator
+//! ecosystem. It provides the centralized boundary where peer identity pinning,
+//! discovery advertisement observation, RFC 9382 SPAKE2 pairing coordination,
+//! and authenticated `TransportV2` TCP session establishment intersect.
+//!
+//! # 2. Cryptographic Security Model & Threat Model
+//!
+//! ## 2.1 Core Security Principles
+//! - **Zero Static Keys**: All legacy v1 static transport secrets and beacon keys have been
+//!   eliminated. Every session uses ephemeral keys derived via CSPRNG and authenticated via
+//!   pinned Ed25519 identity keys and SPAKE2 root keys.
+//! - **Zero IP/Interface Auto-Trust**: Discovery advertisements broadcast on UDP port `58280`
+//!   are treated as strictly untrusted hints. Connections arriving over direct physical cables
+//!   (Thunderbolt 4 / USB4 / USB-C) NEVER auto-grant trust or bypass pairing. Trust is established
+//!   exclusively via the 4-message mutual confirmation RFC 9382 SPAKE2 protocol (`IPR2`).
+//! - **Anti-DoS PIN Protection**: Failed pairing attempts from unauthenticated IP addresses
+//!   never rotate or invalidate the host's active pairing PIN. Only explicit user action or
+//!   pairing window expiration can rotate the PIN. Attackers attempting brute-force PIN guesses
+//!   face exponential per-IP lockout.
+//! - **Mutual Authentication & Forward Secrecy**: All operational TCP services (Display RPC `58281`,
+//!   Clipboard/File Transfer `58283`, Link Benchmark `58285`, Input KVM `58286`, Camera `58287`)
+//!   enforce `TransportSessionV2` (`ITR2`) with ephemeral X25519 Diffie-Hellman key agreement,
+//!   pre-shared root key $K_{\text{root}}$ injection, mutual Ed25519 transcript signatures,
+//!   and directional ChaCha20-Poly1305 record encryption.
+//! - **Discovery Beacon Integrity**: UDP discovery beacons are signed with the host's private
+//!   Ed25519 identity key. Receivers verify signature authenticity, derive and validate the 16-byte
+//!   `device_id`, enforce a $\pm 60$ second timestamp freshness window, and verify that the public
+//!   key matches the pinned record in `KeystoreV2` if the peer is paired.
+//!
+//! ## 2.2 Threading & Concurrency Model
+//! - Runtime state is encapsulated in the `RuntimeTrustState` singleton, managed via `OnceLock`.
+//! - Internal sub-components (`pairing_coordinator`, `active_pin_cached`, `pending_peers`,
+//!   `ip_to_device_hint`) are protected by individual standard `Mutex` guards.
+//! - **Crucial Invariant**: Mutex guards are never held across async `.await` suspension points.
+//!   All locks are acquired, read/updated, and dropped synchronously before invoking network I/O,
+//!   ensuring all async futures implement `Send` and remain fully Tokio-compatible.
+//!
+//! ## 2.3 Subsystem Linkages
+//! ```text
+//!       +-----------------------+
+//!       |      Discovery        | (Port 58280 UDP - Untrusted hints)
+//!       +-----------+-----------+
+//!                   | observe_discovered_peer()
+//!                   v
+//!       +-----------------------+       +-------------------------+
+//!       |     trust.rs          |<----->| KeystoreV2 (Storage)    |
+//!       | (Trust Orchestrator)  |       | (~/.integrator/security)|
+//!       +-----+-----------+-----+       +-------------------------+
+//!             |           |
+//!  pair_v2()  |           | connect_transport()
+//!             v           v
+//!       +-----------+   +-------------------+
+//!       | PairingV2 |   | TransportSessionV2|
+//!       | (SPAKE2)  |   | (ITR2 ChaCha20)   |
+//!       +-----------+   +-------------------+
+//! ```
+//!
+//! # 3. Callers & Callees
+//! - **Callers**:
+//!   - `crate::discovery`: Periodically broadcasts signed v2 beacons and feeds observed advertisements into `observe_discovered_peer`.
+//!   - `crate::rpc::server`: Invokes `handle_incoming_pairing_stream_v2` and `accept_transport_from_stream` on TCP port 58281.
+//!   - `crate::clipboard::sync`: Calls `connect_transport_to_ip` on TCP port 58283 for encrypted clipboard data.
+//!   - `crate::benchmark::runner`: Calls `connect_transport_to_ip` on TCP port 58285 for link benchmarking.
+//!   - UI Handlers / IPC: Calls `open_or_get_pairing_pin`, `regenerate_pin`, `untrust_or_block_device`, `get_trust_snapshot`.
+//! - **Callees**:
+//!   - `crate::security::keystore::KeystoreV2`: Device identity key, peer trust store, root keys.
+//!   - `crate::security::pairing::PairingCoordinatorV2`: SPAKE2 protocol execution and PIN window tracking.
+//!   - `crate::security::transport::TransportSessionV2`: Authenticated, encrypted record layer.
+//!   - `crate::system_info`: Hostname, OS platform, and direct cable route detection.
+//! ============================================================================
 
 use crate::security::{
     self,
@@ -29,47 +93,77 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
+/// Bounded capacity for the unauthenticated in-memory discovered peer UI cache (64 entries).
 const MAX_DISCOVERED_PENDING_PEERS: usize = 64;
 
+/// Serialized representation of a trusted peer record stored in the trust configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPeerRecord {
+    /// 16-byte peer device UUID formatted as a 32-character lowercase hex string.
     pub device_id: String,
+    /// Hostname advertised by the peer during pairing.
     pub hostname: String,
+    /// Most recent observed IP address of the peer.
     pub last_ip: String,
+    /// UTC timestamp in seconds when cryptographic pairing was completed.
     pub paired_at_epoch: u64,
+    /// True if the peer was paired over a direct physical cable connection.
     pub via_direct_cable: bool,
+    /// 32-byte Ed25519 identity public key formatted as a 64-character lowercase hex string.
     pub ed25519_pubkey_hex: String,
+    /// 16-byte key identifier identifying the pinned root key $K_{\text{root}}$ in hex.
     pub key_id_hex: String,
 }
 
+/// Snapshot structure representing the trust configuration state exposed to UI and IPC queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustConfigFile {
+    /// Legacy configuration flag; strictly false in v1.0 (pairing required on all interfaces).
     pub auto_trust_direct_cable: bool,
+    /// Legacy configuration flag; strictly true in v1.0 (pairing required on LAN).
     pub require_pairing_on_lan: bool,
+    /// Currently active 6-digit pairing PIN, or empty string if pairing window is closed.
     pub pairing_pin: String,
+    /// UTC timestamp in seconds when the current pairing PIN was generated.
     pub pin_created_at_epoch: u64,
+    /// List of all currently trusted and pinned peer devices.
     pub trusted_peers: Vec<TrustedPeerRecord>,
+    /// List of blocked peer device UUIDs in hex.
     pub blocked_device_ids: Vec<String>,
+    /// List of blocked IP addresses.
     pub blocked_ips: Vec<String>,
 }
 
+/// In-memory metadata representation of an observed network peer (trusted or untrusted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPeerInfo {
+    /// 16-byte peer device UUID formatted as a 32-character lowercase hex string.
     pub device_id: String,
+    /// Hostname advertised by the peer.
     pub hostname: String,
+    /// IP address from which the advertisement or connection originated.
     pub ip: String,
+    /// True if the connection route is over a direct physical cable.
     pub is_direct_cable: bool,
+    /// True if the peer is cryptographically paired and not blocked.
     pub trusted: bool,
+    /// True if the peer device UUID or IP address is currently blocked.
     pub blocked: bool,
 }
 
+/// Thread-safe in-memory runtime trust coordinator state.
 struct RuntimeTrustState {
+    /// Active SPAKE2 pairing coordinator managing PIN generation and anti-DoS rate limiting.
     pairing_coordinator: Mutex<PairingCoordinatorV2>,
+    /// In-memory cache of the active pairing PIN `(pin, created_at_epoch)`.
     active_pin_cached: Mutex<(String, u64)>,
+    /// Bounded UI cache of recently observed network peers.
     pending_peers: Mutex<HashMap<String, PendingPeerInfo>>,
+    /// Fast-lookup hint mapping IP addresses to advertised device IDs.
     ip_to_device_hint: Mutex<HashMap<String, String>>,
 }
 
+/// Returns a reference to the global `RuntimeTrustState` singleton.
 fn runtime_state() -> &'static RuntimeTrustState {
     static STATE: OnceLock<RuntimeTrustState> = OnceLock::new();
     STATE.get_or_init(|| {
@@ -85,17 +179,20 @@ fn runtime_state() -> &'static RuntimeTrustState {
     })
 }
 
+/// Fills a buffer with cryptographically secure random bytes from the OS CSPRNG.
 #[allow(dead_code)]
 pub fn csprng_fill(buf: &mut [u8]) {
     security::csprng_fill(buf);
 }
 
+/// Generates a cryptographically secure random hex-encoded token of `byte_len` bytes.
 pub fn generate_random_token_hex(byte_len: usize) -> String {
     let mut bytes = vec![0u8; byte_len];
     security::csprng_fill(&mut bytes);
     security::hex_encode(&bytes)
 }
 
+/// Compares two byte slices in constant time, mitigating timing side-channel attacks.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     security::constant_time_eq(a, b)
 }
@@ -289,12 +386,13 @@ pub fn untrust_or_block_device(device_id: &str, block: bool) {
     }
 }
 
-/// Policy setter retained for UI compatibility; in v2.0, cryptographic pairing is strictly mandatory
+/// Policy setter retained for UI compatibility; in v1.0, cryptographic pairing is strictly mandatory
 /// on all interfaces (including direct USB-C / Thunderbolt cables).
 pub fn set_trust_policy(_auto_trust_direct_cable: bool, _require_pairing_on_lan: bool) {
-    info!("Integrator v2.0 security policy enforces mandatory cryptographic pairing on all interfaces");
+    info!("Integrator v1.0 security policy enforces mandatory cryptographic pairing on all interfaces");
 }
 
+/// Checks whether a peer device ID is currently paired and trusted in the global keystore.
 pub fn is_device_trusted(device_id: &str) -> bool {
     let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
     ks.get_peer(device_id).is_some()
@@ -379,6 +477,7 @@ pub fn lookup_verified_peer_by_id_at_ip(
     ks.get_peer(&clean_id).cloned()
 }
 
+/// Returns a complete snapshot tuple `(TrustConfigFile, Vec<PendingPeerInfo>)` representing current trust state.
 pub fn get_trust_snapshot() -> (TrustConfigFile, Vec<PendingPeerInfo>) {
     let (pairing_pin, pin_created_at_epoch) = current_active_pin();
     let (trusted_peers, blocked_device_ids, blocked_ips) = {
@@ -424,6 +523,8 @@ pub fn get_trust_snapshot() -> (TrustConfigFile, Vec<PendingPeerInfo>) {
 // ============================================================================
 
 /// Initiates the 4-message RFC 9382 SPAKE2 + Ed25519 pairing handshake (`IPR2`) with `peer_ip:port`.
+///
+/// Returns the pinned `VerifiedPeerCredentials` and human-readable confirmation SAS string on success.
 pub async fn pair_with_remote_peer_v2(
     peer_ip: &str,
     port: u16,
@@ -579,6 +680,7 @@ pub async fn accept_transport_from_stream(
 // Discovery Beacon v2 Ed25519 Signing & Verification (No Static Keys)
 // ============================================================================
 
+/// Constructs the canonical ASCII signing payload for minimal v2 discovery beacons.
 fn build_beacon_v2_signing_payload(
     device_id_hex: &str,
     ed25519_pubkey_hex: &str,
@@ -703,12 +805,14 @@ pub struct DiscoveryBeaconSignedMeta<'a> {
     pub gpus: &'a [String],
 }
 
+/// Appends length-prefixed bytes to a serialization buffer (4-byte big-endian length + raw bytes).
 fn append_lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&data[..(len as usize)]);
 }
 
+/// Appends an optional length-prefixed string: 0x00 if None; 0x01 followed by length-prefixed bytes if Some.
 fn append_opt_lp_str(buf: &mut Vec<u8>, value: Option<&str>) {
     match value {
         Some(v) => {
@@ -719,6 +823,7 @@ fn append_opt_lp_str(buf: &mut Vec<u8>, value: Option<&str>) {
     }
 }
 
+/// Constructs the unambiguous length-prefixed binary signing payload for full v2 discovery beacons.
 fn build_beacon_v2_full_signing_payload(
     device_id_hex: &str,
     ed25519_pubkey_hex: &str,

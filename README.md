@@ -237,7 +237,7 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 
 ---
 
-## ⚡ Integrator: The Unified Desktop Companion App (`v2.0` - Current Progress)
+## ⚡ Integrator: The Unified Desktop Companion App (`v1.0` - Current Progress)
 
 > [!IMPORTANT]
 > **Project Status: Companion App Built & Operational!**

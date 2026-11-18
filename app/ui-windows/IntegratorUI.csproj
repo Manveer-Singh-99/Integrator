@@ -80,4 +80,47 @@
       </ItemGroup>
     </When>
   </Choose>
+
+  <Choose>
+    <When Condition="'$(Platform)' == 'ARM64' And Exists('..\target\aarch64-pc-windows-msvc\release\integrator_vcam.dll')">
+      <ItemGroup>
+        <Content Include="..\target\aarch64-pc-windows-msvc\release\integrator_vcam.dll">
+          <Link>integrator_vcam.dll</Link>
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+      </ItemGroup>
+    </When>
+    <When Condition="'$(Platform)' != 'ARM64' And Exists('..\target\x86_64-pc-windows-msvc\release\integrator_vcam.dll')">
+      <ItemGroup>
+        <Content Include="..\target\x86_64-pc-windows-msvc\release\integrator_vcam.dll">
+          <Link>integrator_vcam.dll</Link>
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+      </ItemGroup>
+    </When>
+    <When Condition="Exists('..\target\release\integrator_vcam.dll')">
+      <ItemGroup>
+        <Content Include="..\target\release\integrator_vcam.dll">
+          <Link>integrator_vcam.dll</Link>
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+      </ItemGroup>
+    </When>
+    <When Condition="Exists('..\target\x86_64-pc-windows-msvc\debug\integrator_vcam.dll')">
+      <ItemGroup>
+        <Content Include="..\target\x86_64-pc-windows-msvc\debug\integrator_vcam.dll">
+          <Link>integrator_vcam.dll</Link>
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+      </ItemGroup>
+    </When>
+    <When Condition="Exists('..\target\debug\integrator_vcam.dll')">
+      <ItemGroup>
+        <Content Include="..\target\debug\integrator_vcam.dll">
+          <Link>integrator_vcam.dll</Link>
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+      </ItemGroup>
+    </When>
+  </Choose>
 </Project>

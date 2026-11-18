@@ -1,7 +1,75 @@
-//! Cross-Screen True Tone & Chromatic Adaptation Sync.
+//! # Cross-Screen TrueTone & Bradford Chromatic Adaptation Engine
 //!
-//! Matches remote peer display white point to the Mac ambient light environment
-//! in real-time using ambient light sensor telemetry and Bradford CAT.
+//! ## 1. Module Purpose & Scope
+//! This module provides real-time ambient color temperature synchronization and chromatic adaptation
+//! between a macOS host equipped with an Apple Ambient Light Sensor (ALS) and a paired Windows 10/11
+//! workstation.
+//!
+//! When a MacBook Pro is positioned alongside an external Windows monitor, differences in panel
+//! native white points and room lighting can cause significant visual fatigue and jarring color
+//! mismatch. This module:
+//! 1. Telemeters ambient illumination (lux) and Correlated Color Temperature (CCT in Kelvin) from
+//!    the Mac hardware sensor (`ambient_light.swift`).
+//! 2. Solves the CIE daylight / Planckian locus chromaticity equations to derive destination XYZ
+//!    tristimulus white points.
+//! 3. Applies the Bradford Chromatic Adaptation Transform (CAT) in cone response space to calculate
+//!    per-channel linear sRGB multipliers `(k_r, k_g, k_b)`.
+//! 4. Injects calibrated 256-entry hardware gamma lookup tables (LUT) directly into the Windows GPU
+//!    using the Win32 GDI `SetDeviceGammaRamp` API.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                          TrueTone & Chromatic Adaptation Flow                          │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!                 MacBook (Host)                               Windows 11 (Client)
+//!     ┌──────────────────────────────────┐             ┌──────────────────────────────────┐
+//!     │ Apple Ambient Light Sensor (ALS) │             │ Windows Display Controller       │
+//!     │ IOKit HID (ambient_light.swift)  │             │ (src/display/win_display.rs)     │
+//!     └────────────────┬─────────────────┘             └────────────────▲─────────────────┘
+//!                      │                                                │
+//!                      │ lux, CCT (2500K..9000K)                        │ apply_hardware_
+//!                      ▼                                                │ gamma_ramp()
+//!     ┌──────────────────────────────────┐                              │
+//!     │   read_ambient_light()           │                              │
+//!     │   (src/truetone/mod.rs)          │                              │
+//!     └────────────────┬─────────────────┘                              │
+//!                      │ Telemetry Broadcast (UDP / RPC)                │
+//!                      ├────────────────────────────────────────────────┘
+//!                      │
+//!                      ▼
+//!     ┌──────────────────────────────────┐
+//!     │ Bradford CAT Matrix Transform    │
+//!     │ - CIE D-Illuminant / Planckian   │
+//!     │ - Cone Response Scaling (M_BFD)  │
+//!     │ - SetDeviceGammaRamp GDI API     │
+//!     └──────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/core.rs`: Periodically samples ambient light and synchronizes display white points.
+//! - Settings UI: Allows users to toggle Cross-Screen TrueTone and calibrate intensity.
+//!
+//! ### Downstream Callees:
+//! - `src/ambient_light.swift`: FFI bridge to Apple IOKit HID ambient light sensor.
+//! - Win32 GDI32: `SetDeviceGammaRamp`, `GetDC`, and `ReleaseDC` on Windows.
+//!
+//! ## 3. Mathematical Foundations: Bradford CAT
+//! - **Reference White Point**: Standard CIE D65 (`x = 0.3127, y = 0.3290`, `X = 0.95047, Y = 1.00000, Z = 1.08883`).
+//! - **Target White Point**: Computed using CIE Daylight equations (for CCT >= 4000K) or the Kang 2002
+//!   Planckian approximation (for CCT < 4000K).
+//! - **Cone Transformation**: XYZ values are projected into Bradford cone response space via matrix $M_{BFD}$:
+//!   $$\begin{bmatrix} \rho \\ \gamma \\ \beta \end{bmatrix} = \begin{bmatrix} 0.8951 & 0.2664 & -0.1614 \\ -0.7502 & 1.7135 & 0.0367 \\ 0.0389 & -0.0685 & 1.0296 \end{bmatrix} \begin{bmatrix} X \\ Y \\ Z \end{bmatrix}$$
+//! - Scaling ratios $s_\rho = \rho_d / \rho_s$, $s_\gamma = \gamma_d / \gamma_s$, $s_\beta = \beta_d / \beta_s$
+//!   are applied and mapped back through $M_{BFD}^{-1}$ into linear sRGB space.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Finite Number Guarantee**: All multipliers and gamma values are verified for finite validity
+//!   (`is_finite()`). Any `NaN` or `Inf` value safely falls back to neutral 1.0.
+//! - **LUT Ramp Clamping**: Color temperature is clamped to `[2500, 9000] K` and multipliers are
+//!   clamped to `[0.4, 1.5]`, preventing display blackout or severe tinting.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

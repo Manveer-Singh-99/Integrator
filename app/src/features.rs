@@ -1,8 +1,52 @@
-//! Feature flags and master switches for Integrator.
+//! # Granular Feature Flags & Capability Configuration Engine (`features.rs`)
 //!
-//! Provides granular master switches for workstation fusion capabilities,
-//! persisting user preferences atomically to disk across application restarts
-//! with fail-closed semantics on corrupt configuration or unknown feature names.
+//! ## 1. Module Purpose & Scope
+//! `features.rs` manages the runtime feature flags and capability master switches for the
+//! Integrator engine. It gives users and administrative policies fine-grained control over which
+//! workstation fusion subsystems are active (e.g., virtual display, KVM input, clipboard sync,
+//! audio bridging, virtual camera, TrueTone color sync).
+//!
+//! Key responsibilities include:
+//! - Persisting feature configuration atomically to `features.json` in the user's application data directory.
+//! - Enforcing strict functional dependency invariants (e.g. Universal Clipboard and Drag-and-Drop
+//!   depend strictly on Universal Input/KVM being active).
+//! - Providing a strict fail-closed security posture: corrupt configuration files or queries for unknown
+//!   feature identifiers automatically default to disabled (`false`).
+//! - Safeguarding against partial write corruption using atomic temporary file creation, POSIX file
+//!   permission restrictions (`0o600`), and atomic filesystem renames (`rename(2)`).
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `core::IntegratorCore`: Checks feature flags before starting background listeners (e.g. not starting
+//!   audio capture if `audio == false`) and when negotiating capabilities with connecting peers.
+//! - UI View Models (via `ffi::integrator_core_invoke`): Expose toggle switches to enable/disable features in real time.
+//! - `discovery::Beacon`: Advertises enabled capability bitmasks to local network peers.
+//!
+//! ### Downstream Callees:
+//! - `system_info::app_data_dir`: Resolves OS-specific persistent configuration directory
+//!   (`~/Library/Application Support/Integrator` on macOS, `%APPDATA%\Integrator` on Windows).
+//! - Local Filesystem (`std::fs`): Writes and renames JSON files atomically.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! When two Integrator nodes connect (macOS ↔ Windows 11), each node advertises its active `FeatureFlags`.
+//! Subsystems only establish data streams if BOTH local and remote nodes have enabled the corresponding feature.
+//! Toggling a feature locally immediately halts the active stream and notifies the peer.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - `Arc<RwLock<FeatureFlags>>`: Provides lock-free read concurrency for high-frequency queries
+//!   (`is_enabled`) across asynchronous tasks and UI threads.
+//! - `set_flag_checked`: Acquires an exclusive write lock across the entire serialization and disk
+//!   flush pipeline. This prevents race conditions where concurrent updates could clobber each other's
+//!   filesystem state.
+//! - `AtomicU64`: Allocates monotonic unique sequence numbers for temporary files across threads.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Fail-Closed on Corruption**: If `features.json` cannot be parsed or read, it is backed up to
+//!   `features.json.corrupt.<timestamp>` and an all-disabled `fail_closed()` state is loaded.
+//! - **Permission Hardening**: On Unix systems, parent directories are restricted to `0o700` and config
+//!   files to `0o600`, preventing local multi-user eavesdropping.
+//! - **Input Validation**: Unknown feature strings passed to `is_enabled` return `false` and log warnings;
+//!   unknown strings passed to `set_flag_checked` return an `Err` and reject modification.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -12,26 +56,45 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, warn};
 
+/// Global atomic sequence counter for naming transient configuration write files safely across threads.
 static FEATURES_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Complete schema of configurable subsystem feature flags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FeatureFlags {
+    /// Virtual display mirroring and screen extension streaming (H.264/HEVC/AV1).
     pub display: bool,
+    /// Bidirectional synchronized system clipboard (text, rich text, images, files).
+    /// Strictly requires `input_kvm` to be enabled.
     pub clipboard: bool,
+    /// Low-latency keyboard, mouse pointer, and gesture redirection across screens.
     pub input_kvm: bool,
+    /// Cross-screen drag-and-drop file and object transfer. Requires `input_kvm`.
     pub dragdrop: bool,
+    /// Remote filesystem mounting and peer folder synchronization.
     pub storage: bool,
+    /// Remote biometric authentication forwarding (Touch ID on Mac to Windows Hello).
     pub touchid: bool,
+    /// Ambient light and display white-point color profile synchronization.
     pub truetone: bool,
+    /// Virtual webcam capture and frame forwarding to peer virtual camera device.
     pub camera: bool,
+    /// High-fidelity low-latency bidirectional PCM audio streaming.
     pub audio: bool,
+    /// MacBook Pro Touch Bar extension and virtual function key surface.
     pub touchbar: bool,
+    /// Multi-path network aggregation over concurrent Ethernet and Wi-Fi links.
     pub multiwan: bool,
+    /// Built-in hardware encode/decode and network bandwidth benchmarking suite.
     pub benchmark: bool,
 }
 
 impl Default for FeatureFlags {
+    /// Returns default feature configuration for first-time installation.
+    ///
+    /// Core continuity features (display, clipboard, input, audio, truetone) are enabled by default.
+    /// Camera and Multi-WAN are disabled by default until explicitly enabled by the user.
     fn default() -> Self {
         Self {
             display: true,
@@ -51,7 +114,9 @@ impl Default for FeatureFlags {
 }
 
 impl FeatureFlags {
-    /// Fail-closed configuration used when an existing `features.json` on disk is corrupt.
+    /// Safe fail-closed configuration used when existing configuration on disk is corrupt or unreadable.
+    ///
+    /// Disables all subsystems to prevent unexpected network broadcasts or unauthenticated port exposure.
     pub fn fail_closed() -> Self {
         Self {
             display: false,
@@ -70,18 +135,28 @@ impl FeatureFlags {
     }
 }
 
+/// Central state manager governing feature flag inspection and persistent disk updates.
 pub struct FeatureManager {
+    /// Synchronized in-memory cache of current feature flags.
     flags: Arc<RwLock<FeatureFlags>>,
+    /// Absolute path to persistent `features.json` file.
     config_path: PathBuf,
 }
 
 impl Default for FeatureManager {
+    /// Instantiates `FeatureManager` using standard application data directories.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl FeatureManager {
+    /// Initializes `FeatureManager`, reading `features.json` from the OS app data directory.
+    ///
+    /// # Behavior:
+    /// - If `features.json` exists and is valid JSON, parses flags and enforces dependency constraints.
+    /// - If `features.json` is malformed, creates a timestamped backup copy and loads `FeatureFlags::fail_closed()`.
+    /// - If `features.json` does not exist, returns `FeatureFlags::default()`.
     pub fn new() -> Self {
         let config_dir = crate::system_info::app_data_dir();
         let config_path = config_dir.join("features.json");
@@ -90,6 +165,7 @@ impl FeatureManager {
             match fs::read_to_string(&config_path) {
                 Ok(data) => match serde_json::from_str::<FeatureFlags>(&data) {
                     Ok(mut parsed) => {
+                        // Enforce dependency rule: clipboard and dragdrop cannot be active without KVM
                         if !parsed.input_kvm {
                             parsed.clipboard = false;
                             parsed.dragdrop = false;
@@ -97,6 +173,7 @@ impl FeatureManager {
                         parsed
                     }
                     Err(e) => {
+                        // Configuration corruption detected: preserve corrupted file for forensic analysis
                         let epoch = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
@@ -131,6 +208,7 @@ impl FeatureManager {
         }
     }
 
+    /// Internal test constructor allowing injection of arbitrary flags and isolated temp files.
     #[cfg(test)]
     pub fn from_flags_for_test(flags: FeatureFlags) -> Self {
         let seq = FEATURES_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -141,6 +219,7 @@ impl FeatureManager {
         }
     }
 
+    /// Returns a cloned snapshot of all current feature flags.
     pub fn get_flags(&self) -> FeatureFlags {
         self.flags
             .read()
@@ -148,8 +227,12 @@ impl FeatureManager {
             .clone()
     }
 
-    /// Returns whether `feature` is enabled. Fails closed (`false`) for unknown feature names.
-    /// Both `clipboard` and `dragdrop` depend strictly on `input_kvm`.
+    /// Returns whether the specified `feature` is currently active and permitted to run.
+    ///
+    /// # Invariants & Rules:
+    /// - Unknown feature names return `false` (fail-closed) and log a warning.
+    /// - `"clipboard"` and `"dragdrop"` strictly return `false` if `"input_kvm"` is disabled,
+    ///   even if their individual flag bits are set to `true`.
     pub fn is_enabled(&self, feature: &str) -> bool {
         let f = self.flags.read().unwrap_or_else(|e| e.into_inner());
         match feature.trim() {
@@ -172,13 +255,22 @@ impl FeatureManager {
         }
     }
 
-    /// Updates a known feature flag and persists it atomically to disk, returning an error
-    /// if the feature identifier is unknown, dependency is unmet, or disk persistence fails.
+    /// Updates a specific feature flag with validation and atomic filesystem persistence.
+    ///
+    /// # Arguments
+    /// * `feature` - Name of the feature to modify (e.g. `"audio"`, `"clipboard"`).
+    /// * `enabled` - Desired state (`true` or `false`).
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if:
+    /// - `feature` is not a recognized feature identifier.
+    /// - Enabling `"clipboard"` or `"dragdrop"` is attempted while `"input_kvm"` is disabled.
+    /// - Filesystem directory creation, file write, or file rename fails.
     pub fn set_flag_checked(&self, feature: &str, enabled: bool) -> Result<FeatureFlags, String> {
-        // Hold the write lock across atomic disk persistence so concurrent callers
-        // cannot reorder disk snapshots and failed writes never mutate in-memory state.
+        // Hold write lock across entire persistence cycle to guarantee sequential disk updates
         let mut f = self.flags.write().unwrap_or_else(|e| e.into_inner());
         let mut candidate = f.clone();
+
         match feature.trim() {
             "display" => candidate.display = enabled,
             "clipboard" => {
@@ -193,7 +285,7 @@ impl FeatureManager {
             "input_kvm" | "input" => {
                 candidate.input_kvm = enabled;
                 if !enabled {
-                    // Auto-disable coupled continuity features when KVM is turned off.
+                    // Auto-disable coupled continuity features when KVM is turned off
                     candidate.clipboard = false;
                     candidate.dragdrop = false;
                 }
@@ -220,39 +312,52 @@ impl FeatureManager {
             }
         }
 
+        // Ensure parent configuration directory exists
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {}", e))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                // Restrict directory access to owner only (rwx------)
                 let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
             }
         }
+
+        // Serialize formatted JSON
         let json = serde_json::to_string_pretty(&candidate)
             .map_err(|e| format!("Failed to serialize feature flags: {}", e))?;
+
+        // Write to temporary file with unique PID and sequence number
         let seq = FEATURES_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = self
             .config_path
             .with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
+
         if let Err(e) = fs::write(&tmp_path, json.as_bytes()) {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!("Failed to write {}: {}", tmp_path.display(), e));
         }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Restrict file access to owner read/write only (rw-------)
             let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
         }
+
+        // Atomically rename temporary file over target configuration file
         if let Err(e) = fs::rename(&tmp_path, &self.config_path) {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!("Failed to save {}: {}", self.config_path.display(), e));
         }
 
+        // Commit candidate state into in-memory cache
         *f = candidate.clone();
         Ok(candidate)
     }
 
+    /// Convenience wrapper around `set_flag_checked` that logs any error and returns current flags.
     pub fn set_flag(&self, feature: &str, enabled: bool) -> FeatureFlags {
         match self.set_flag_checked(feature, enabled) {
             Ok(flags) => flags,

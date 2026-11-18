@@ -1,3 +1,75 @@
+//! # macOS Quartz & IOKit KVM Input Backend
+//!
+//! ## 1. Module Purpose & Scope
+//! This module provides the macOS-specific hardware input capture, cursor warping, synthetic
+//! event injection, and native drag-and-drop integration for the Integrator Universal Input KVM.
+//!
+//! ### Core Subsystem Responsibilities:
+//! - **Low-Level Event Interception**: Establishes a passive/active Quartz event tap (`CGEventTap`)
+//!   via Mach port callbacks in `kvm_macos.swift` to intercept raw mouse moves, clicks, scroll wheel
+//!   deltas, and keyboard transitions before they reach AppKit or windowed applications.
+//! - **Event Swallowing & Cursor Parking**: When the cursor hops past a configured display edge into
+//!   the `ControllingPeer` state, local input events are swallowed (`kCGEventNull`) and the local cursor
+//!   is parked or warped to prevent it from wandering off-screen or interacting with local windows.
+//! - **Synthetic Quartz Injection**: Replays remote mouse and keyboard events originating from the
+//!   paired Windows workstation using `CGEventCreateMouseEvent`, `CGEventCreateKeyboardEvent`,
+//!   `CGEventCreateScrollWheelEvent2`, and `CGEventPost(kCGHIDEventTap, ...)`.
+//! - **Active Drag Session Bridging**: Detects when a boundary crossing occurs while holding a file
+//!   selection, extracting file paths from the active `NSPasteboard` drag pasteboard and displaying
+//!   translucent floating ghost HUDs.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                           macOS KVM Backend Architecture                               │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!                     ┌────────────────────────────────────────┐
+//!                     │         KvmService (service.rs)        │
+//!                     └───────────────▲────────┬───────────────┘
+//!                                     │        │
+//!      on_cg_event / on_drag_ended    │        │ inject_mouse_move / inject_key
+//!                                     │        │
+//!                     ┌───────────────┴────────▼───────────────┐
+//!                     │      macos_backend.rs (Rust FFI)       │
+//!                     └───────────────▲────────┬───────────────┘
+//!                                     │        │
+//!         C FFI Event Callbacks       │        │ C FFI Injection Calls
+//!                                     │        │
+//!                     ┌───────────────┴────────▼───────────────┐
+//!                     │       kvm_macos.swift (Swift/ObjC)     │
+//!                     │  - CGEventTap on Mach Port RunLoop     │
+//!                     │  - CGSSetConnectionProperty (Bg Cursor)│
+//!                     │  - IOKit HID (Caps Lock State Sync)    │
+//!                     │  - NSDraggingSession & Drag Ghost HUD  │
+//!                     └────────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/kvm/service.rs`: Invokes `start`, `stop`, `set_controlling_mode`, `set_controlled_mode`,
+//!   `inject_mouse_move`, `inject_mouse_button`, `inject_scroll`, `inject_key`, and drag ghost controls.
+//!
+//! ### Downstream Callees:
+//! - `src/kvm_macos.swift`: Interacts directly with macOS system APIs via C-ABI functions:
+//!   - `integrator_kvm_macos_start_tap` / `integrator_kvm_macos_stop_tap`: Manages `CFMachPort` lifecycle.
+//!   - `integrator_kvm_macos_inject_*`: Synthesizes Quartz input events tagged with `0x494E5447` ("INTG").
+//!   - `integrator_kvm_macos_show_drag_ghost` / `integrator_kvm_macos_hide_drag_ghost`: Controls AppKit HUD.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - The macOS `CGEventTap` runs inside a dedicated OS thread hosting a `CFRunLoop`.
+//! - Input events invoke the `on_cg_event` C callback synchronously on the run-loop thread.
+//! - `TAP_ACTIVE` is an `AtomicBool` providing instantaneous status queries without locking.
+//! - `START_TAP_LOCK` ensures serial execution during tap setup, teardown, and retry attempts.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Accessibility Privileges**: Requires Accessibility permissions (`AXIsProcessTrusted`). If permissions
+//!   are missing, a non-blocking retry thread is spawned and prompts the user without crashing.
+//! - **Anti-Feedback Tagging**: All synthetic events are tagged with `kIntegratorEventTag = 0x494E5447`.
+//!   The event tap ignores tagged events to prevent infinite feedback loops.
+//! - **Null-Pointer & Memory Safety**: All C strings returned from Swift are freed using
+//!   `integrator_kvm_macos_free_str`, preventing heap leaks across the FFI boundary.
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
@@ -8,11 +80,19 @@ use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton};
 use crate::kvm::service::{HookDecision, KvmService};
 
+/// Global handle to the active `KvmService` instance for event routing.
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
+
+/// Atomic indicator showing whether the macOS `CGEventTap` is currently installed and healthy.
 static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mutual exclusion lock guarding event tap initialization and teardown routines.
 static START_TAP_LOCK: Mutex<()> = Mutex::new(());
 
+/// C-compatible function pointer for raw event ingestion from Swift.
 type KvmEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
+
+/// C-compatible function pointer for drag-and-drop termination callbacks from Swift.
 type KvmDragEndedCallback = extern "C" fn(bool, *const c_char);
 
 extern "C" {
@@ -69,6 +149,14 @@ extern "C" {
     );
 }
 
+/// Initializes the macOS KVM input backend, registering callbacks and installing the `CGEventTap`.
+///
+/// If Accessibility permissions have not yet been granted by macOS System Settings,
+/// a background retry daemon is spawned to automatically attach the tap as soon as
+/// the user enables the permission, requiring no application restart.
+///
+/// # Arguments
+/// * `service` - Reference to the core `KvmService` coordinator.
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
     let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -108,6 +196,7 @@ pub fn start(service: Arc<KvmService>) {
     }
 }
 
+/// Disables and removes the macOS `CGEventTap`, restoring standard OS input dispatch.
 pub fn stop() {
     let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     TAP_ACTIVE.store(false, Ordering::Release);
@@ -116,12 +205,17 @@ pub fn stop() {
     }
 }
 
+/// Returns whether the macOS `CGEventTap` is currently installed and actively capturing events.
 pub fn is_hook_active() -> bool {
     let active = unsafe { integrator_kvm_macos_is_tap_active() };
     TAP_ACTIVE.store(active, Ordering::Release);
     active
 }
 
+/// Triggers macOS system prompt requesting Accessibility permissions for Integrator.
+///
+/// # Returns
+/// `true` if permissions are already trusted, `false` if prompted or denied.
 pub fn request_accessibility() -> bool {
     let trusted = unsafe { integrator_kvm_macos_request_accessibility() };
     if trusted {
@@ -137,6 +231,10 @@ pub fn request_accessibility() -> bool {
     trusted
 }
 
+/// Queries the primary display bounds in Quartz global coordinates.
+///
+/// # Returns
+/// A `ScreenRect` representing the dimensions and origin of the main screen.
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
@@ -153,6 +251,10 @@ pub fn get_primary_screen_rect() -> ScreenRect {
     }
 }
 
+/// Configures the hook state when the local Mac is actively controlling the remote peer.
+///
+/// In controlling mode, the local mouse cursor is hidden and parked at `(park_x, park_y)`
+/// to prevent it from wandering across local windows or triggering native gestures.
 pub fn set_controlling_mode(
     controlling: bool,
     park_x: f32,
@@ -171,12 +273,19 @@ pub fn set_controlling_mode(
     }
 }
 
+/// Configures the hook state when the local Mac is controlled by the remote peer.
+///
+/// Warps the cursor to the entry coordinate `(entry_x, entry_y)` and ensures the cursor is visible.
 pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
     unsafe {
         integrator_kvm_macos_set_controlled(controlled, entry_x as f64, entry_y as f64);
     }
 }
 
+/// Inspects the active `NSDraggingSession` or pasteboard to retrieve files currently being dragged.
+///
+/// # Returns
+/// A list of filesystem paths being dragged, or an empty vector if no drag is active.
 pub fn probe_active_drag_paths() -> Vec<PathBuf> {
     let ptr = unsafe { integrator_kvm_macos_probe_drag_paths() };
     if ptr.is_null() {
@@ -195,12 +304,20 @@ pub fn probe_active_drag_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Cancels the local AppKit drag session after responsibility has been handed off to the peer.
 pub fn cancel_local_drag_after_handoff() {
     unsafe {
         integrator_kvm_macos_cancel_local_drag();
     }
 }
 
+/// Extracts a high-resolution icon thumbnail from a local file, encoded as Base64 PNG.
+///
+/// # Arguments
+/// * `path` - Path to the file or directory.
+///
+/// # Returns
+/// `Some(base64_string)` if an icon was generated, otherwise `None`.
 pub fn extract_file_icon_png_b64(path: &std::path::Path) -> Option<String> {
     let c_path = CString::new(path.to_string_lossy().as_bytes()).ok()?;
     let ptr = unsafe { integrator_kvm_macos_icon_png_b64(c_path.as_ptr()) };
@@ -215,12 +332,22 @@ pub fn extract_file_icon_png_b64(path: &std::path::Path) -> Option<String> {
     if b64.is_empty() { None } else { Some(b64) }
 }
 
+/// Injects synthetic pointer movement into Quartz at absolute coordinates `(x, y)`.
+///
+/// If `left_held` is true, posts a `kCGEventLeftMouseDragged` event; otherwise `kCGEventMouseMoved`.
 pub fn inject_mouse_move(x: f32, y: f32, left_held: bool) {
     unsafe {
         integrator_kvm_macos_inject_mouse_move(x as f64, y as f64, left_held);
     }
 }
 
+/// Injects synthetic mouse button transitions into Quartz.
+///
+/// # Arguments
+/// * `button` - Target mouse button (Left, Right, Middle).
+/// * `pressed` - True for mouse down, false for mouse up.
+/// * `x` - Current pointer X position.
+/// * `y` - Current pointer Y position.
 pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: f32) {
     let btn = match button {
         RemoteMouseButton::Left => 0,
@@ -232,6 +359,9 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: 
     }
 }
 
+/// Injects synthetic high-resolution scroll wheel deltas into Quartz.
+///
+/// Values are clamped within `[-5000.0, 5000.0]` to prevent driver-level overflow.
 pub fn inject_scroll(dx: f32, dy: f32) {
     let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
     let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
@@ -240,6 +370,10 @@ pub fn inject_scroll(dx: f32, dy: f32) {
     }
 }
 
+/// Injects a synthetic keyboard key transition into Quartz Event Services.
+///
+/// Translates the canonical `LogicalKey` to the corresponding macOS virtual `CGKeyCode`,
+/// sets modifier flags, and posts to `kCGHIDEventTap`.
 pub fn inject_key(key: LogicalKey, pressed: bool, mods: ModifierMask) {
     if let Some(kc) = logical_to_macos_keycode(key) {
         unsafe {
@@ -255,6 +389,7 @@ pub fn inject_key(key: LogicalKey, pressed: bool, mods: ModifierMask) {
     }
 }
 
+/// Displays the floating translucent drag ghost HUD at `(x, y)`.
 pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, icon_b64: Option<&str>) {
     let Ok(c_title) = CString::new(title) else { return };
     let Ok(c_sub) = CString::new(subtitle) else { return };
@@ -270,18 +405,27 @@ pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, icon_b64: Op
     }
 }
 
+/// Moves the active drag ghost HUD to new pointer coordinates `(x, y)`.
 pub fn move_drag_ghost(x: f32, y: f32) {
     unsafe {
         integrator_kvm_macos_move_drag_ghost(x as f64, y as f64);
     }
 }
 
+/// Hides and dismisses the drag ghost HUD window.
 pub fn hide_drag_ghost() {
     unsafe {
         integrator_kvm_macos_hide_drag_ghost();
     }
 }
 
+/// Initiates an AppKit native `NSDraggingSession` on the receiving Mac using staged payload files.
+///
+/// # Arguments
+/// * `paths` - Filesystem paths to the staged files on local disk.
+/// * `session_id` - Drag session identifier for completion tracking.
+/// * `x` - Initial cursor X position in Quartz coordinates.
+/// * `y` - Initial cursor Y position in Quartz coordinates.
 pub fn begin_native_drop_drag(paths: &[PathBuf], session_id: &str, x: f32, y: f32) {
     let str_paths: Vec<String> = paths
         .iter()
@@ -303,6 +447,7 @@ pub fn begin_native_drop_drag(paths: &[PathBuf], session_id: &str, x: f32, y: f3
     }
 }
 
+/// Callback triggered by Swift when an active AppKit dragging session finishes or is cancelled.
 extern "C" fn on_drag_ended(accepted: bool, session_id_ptr: *const c_char) {
     let Some(svc) = KVM_SERVICE_REF.get() else { return };
     let sid = if session_id_ptr.is_null() {
@@ -313,6 +458,19 @@ extern "C" fn on_drag_ended(accepted: bool, session_id_ptr: *const c_char) {
     svc.on_native_drag_ended(&sid, accepted);
 }
 
+/// Core C-ABI callback receiving intercepted raw Quartz events from `kvm_macos.swift`.
+///
+/// Event kinds:
+/// - `1`: Mouse movement (absolute X/Y, relative dX/dY, button bitmask)
+/// - `2`: Mouse button transition (button index, pressed boolean, X, Y)
+/// - `3`: Mouse scroll deltas (dX, dY)
+/// - `4`: Key down / up (virtual keycode, pressed boolean, modifier flags)
+/// - `5`: Modifier flags changed (e.g. Shift, Control, Alt, Command, CapsLock)
+///
+/// Returns:
+/// - `0`: Pass event through natively to macOS applications
+/// - `1`: Swallow event (`kCGEventNull`)
+/// - `2`: Swallow event and warp cursor to center park position
 extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64) -> i32 {
     let Some(svc) = KVM_SERVICE_REF.get() else {
         return 0;
@@ -364,6 +522,7 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
     }
 }
 
+/// Converts raw 64-bit CoreGraphics event flags into canonical `ModifierMask`.
 fn cg_flags_to_modifiers(raw: u64) -> ModifierMask {
     ModifierMask {
         shift: (raw & 0x0002_0000) != 0,
@@ -405,6 +564,7 @@ fn macos_flags_changed_key(kc: u16, raw_flags: u64, mods: ModifierMask) -> Optio
     }
 }
 
+/// Translates a macOS physical/virtual `CGKeyCode` into a canonical `LogicalKey`.
 pub fn macos_keycode_to_logical(kc: u16) -> Option<LogicalKey> {
     use LogicalKey::*;
     Some(match kc {
@@ -494,6 +654,7 @@ pub fn macos_keycode_to_logical(kc: u16) -> Option<LogicalKey> {
     })
 }
 
+/// Translates a canonical `LogicalKey` into a macOS `CGKeyCode`.
 pub fn logical_to_macos_keycode(key: LogicalKey) -> Option<u16> {
     use LogicalKey::*;
     Some(match key {

@@ -20,6 +20,7 @@ src-tauri/target/
 app/macos_clip_files
 app/win_clip_files.exe
 app/touchbar_hud
+macos/build/
 
 # Windows WinUI build artifacts
 app/ui-windows/bin/

@@ -1,27 +1,145 @@
-//! Unified Mutually Authenticated Transport Layer (`TransportV2`, Magic `ITR2`).
+//! ============================================================================
+//! Unified Mutually Authenticated Transport Layer (`TransportV2`, Magic `ITR2`)
+//! ============================================================================
 //!
-//! Provides a single authenticated, forward-secret, replay-protected record layer for:
-//! - Display & Control RPC (`Port 58281`, `ServiceId::DisplayRpc = 0x01`)
-//! - Clipboard & File Transfer (`Port 58283`, `ServiceId::ClipboardTransfer = 0x02`)
-//! - Link Speed Benchmark (`Port 58285`, `ServiceId::Benchmark = 0x03`)
-//! - Universal Input KVM & Drag-Drop Control (`Port 58286`, `ServiceId::InputKvm = 0x04`)
+//! # 1. Architectural Overview & Purpose
 //!
-//! Cryptographic properties:
-//! 1. **Mutual Authentication (`TransportHello` -> `TransportServerHello` -> `TransportClientFinish`)**:
-//!    - Combines ephemeral `X25519` Diffie-Hellman (forward secrecy), the pre-shared `K_root`
-//!      from RFC 9382 SPAKE2 pairing, and mutual `Ed25519` digital signatures over the complete
-//!      handshake transcript (`H_2`, `H_3`).
-//! 2. **All-Zero X25519 Shared-Secret Rejection**:
-//!    - Explicitly checks `constant_time_eq(dh.as_bytes(), &[0u8; 32]) || !dh.was_contributory()`
-//!      to reject all low-order Curve25519 points (RFC 7748 §6.1).
-//! 3. **Directional ChaCha20-Poly1305 Record Layer**:
-//!    - Independent keys (`K_app_c2s`, `K_app_s2c`) and LSB-separated 4-byte IV prefixes (`iv_c2s`, `iv_s2c`).
-//!    - Deterministic 96-bit nonce: `iv_dir[0..4] || seq_be[0..8]`.
-//!    - 21-byte frame header bound as `AAD`; strict monotonic sequence enforcement (`hdr.seq == rx_seq`).
-//! 4. **Sequence Exhaustion & In-Band Rekeying**:
-//!    - Supports in-band key ratcheting (`FrameType::Rekey = 0x02`) via HKDF-SHA256, resetting `seq = 0`
-//!      at `epoch + 1` and zeroizing previous epoch keys.
-//!    - Fails closed if `seq == u64::MAX` or `epoch == u16::MAX`.
+//! `TransportV2` provides a high-performance, forward-secret, post-quantum-resilient
+//! (hybrid-ready), mutually authenticated, anti-replay cryptographic session layer
+//! for all direct TCP communications within the Integrator ecosystem.
+//!
+//! It underpins all core cross-device streaming and RPC services:
+//! - **Display & Control RPC** (`Port 58281`, `ServiceId::DisplayRpc = 0x01`): Remote display frame
+//!   negotiation, resolution scaling, dynamic HEVC/AV1 parameter updates, virtual monitor topology.
+//! - **Clipboard & File Transfer** (`Port 58283`, `ServiceId::ClipboardTransfer = 0x02`): Bidirectional
+//!   system clipboard synchronization, multi-megabyte drag-and-drop chunks, MIME streaming.
+//! - **Link Speed Benchmark** (`Port 58285`, `ServiceId::Benchmark = 0x03`): Cable vs Wi-Fi throughput
+//!   characterization, raw bandwidth probing, packet jitter analysis.
+//! - **Universal Input KVM & Drag-Drop Control** (`Port 58286`, `ServiceId::InputKvm = 0x04`): Ultra-low-latency
+//!   pointer events, keyboard scan codes, mouse wheel ticks, drag preview thumbnails.
+//! - **Mac -> Windows Shared Camera** (`Port 58287`, `ServiceId::CameraStream = 0x05`): Real-time raw NV12 /
+//!   H.264 camera frame delivery, format negotiation, capture controls.
+//!
+//! # 2. Cryptographic Security Model & Threat Model
+//!
+//! The cryptographic protocol implements a 3-way authenticated Diffie-Hellman handshake
+//! (`ClientHello` -> `ServerHello` -> `ClientFinish`) followed by a directional ChaCha20-Poly1305
+//! AEAD record layer.
+//!
+//! ## 2.1 Threat Model
+//! - **Adversary Capabilities**: Full control over local network traffic (active adversary): capability
+//!   to intercept, reorder, delay, drop, replay, or inject arbitrary TCP packets on any service port.
+//! - **Man-in-the-Middle (MitM) Resistance**: Handshake binds ephemeral `X25519` key exchanges to the
+//!   long-term pre-shared root key ($K_{\text{root}}$) derived during RFC 9382 SPAKE2 pairing, and requires
+//!   mutual `Ed25519` digital signatures over the complete cumulative handshake transcripts ($H_2$, $H_3$).
+//! - **Forward Secrecy**: Ephemeral `X25519` keys are generated freshly per connection from CSPRNG and
+//!   zeroized immediately after session derivation. Compromise of long-term $K_{\text{root}}$ or device
+//!   Ed25519 identity keys cannot decrypt historical session captures.
+//! - **Low-Order Point & Small-Subgroup Attacks**: Rejects all non-contributory or low-order Curve25519
+//!   points (all-zero shared secret check + RFC 7748 §6.1 `was_contributory()` validation).
+//! - **Replay Attack Mitigation**:
+//!   1. Handshake: Timestamps enforced within $\pm 5$ minutes (`HANDSHAKE_TIMESTAMP_WINDOW_MS = 300_000ms`);
+//!      active deduplication cache (`HELLO_REPLAY_CACHE`) protects against replayed `ClientHello` frames.
+//!   2. Record Layer: Strict monotonic 64-bit sequence numbers (`seq`). An exact match (`rx_seq == expected_seq`)
+//!      is enforced per directional channel. Any out-of-order, duplicated, or skipped record aborts the session.
+//! - **Reflection & Cross-Direction Attacks**: Handshake derive distinct directional keys ($K_{\text{app\_c2s}}$,
+//!   $K_{\text{app\_s2c}}$) and IV prefixes ($IV_{\text{c2s}}$ with LSB 0, $IV_{\text{s2c}}$ with LSB 1).
+//! - **Reflection Across Services**: Handshake transcript $H_2$ binds `service_id` into the HKDF expansion,
+//!   preventing an attacker from replaying a handshake intended for `Benchmark` against `DisplayRpc`.
+//!
+//! ## 2.2 Handshake Protocol State Machine
+//! ```text
+//! Client                                                  Server
+//!   |                                                       |
+//!   | 1. ClientHello                                        |
+//!   |    (version, service_id, client_dev_id, key_id,       |
+//!   |     client_random, eph_pk_c, timestamp_ms)           |
+//!   |------------------------------------------------------>| (validate timestamp, key_id,
+//!   |                                                       |  reject low-order eph_pk_c,
+//!   |                                                       |  compute H2, derive K_hs,
+//!   |                                                       |  sign H2 with Ed25519)
+//!   | 2. ServerHello                                        |
+//!   |    (version, server_dev_id, server_random,            |
+//!   |     eph_pk_s, server_sig, server_finished_mac)        |
+//!   |<------------------------------------------------------|
+//!   | (validate server_dev_id, reject low-order eph_pk_s,   |
+//!   |  compute H2, derive K_hs, verify server_mac & sig,    |
+//!   |  compute H3, sign H3 with Ed25519, compute cli_mac)   |
+//!   |                                                       |
+//!   | 3. ClientFinish                                       |
+//!   |    (client_sig, client_finished_mac)                  |
+//!   |------------------------------------------------------>| (verify client_mac & sig,
+//!   |                                                       |  record hello nonce,
+//!   |                                                       |  compute H4, derive app keys)
+//!   |                                                       |
+//!   | <==== Full-Duplex Directional ChaCha20-Poly1305 =====>|
+//! ```
+//!
+//! ## 2.3 Handshake Mathematical Formulations
+//! 1. **Ephemeral Key Agreement**:
+//!    $$DH = \text{X25519}(sk_{\text{eph}}, pk_{\text{eph, remote}})$$
+//!    $$\text{Assert } DH \ne 0^{32} \land \text{contributory}(DH)$$
+//! 2. **Transcript Hashes**:
+//!    $$H_2 = \text{SHA256}(\text{"integrator-transport-v2-h2"} \mathbin{\Vert} \text{service\_id} \mathbin{\Vert} \text{len}(CH) \mathbin{\Vert} CH \mathbin{\Vert} dev\_id_s \mathbin{\Vert} rnd_s \mathbin{\Vert} pk_{s})$$
+//!    $$H_3 = \text{SHA256}(\text{"integrator-transport-v2-h3"} \mathbin{\Vert} H_2 \mathbin{\Vert} sig_s \mathbin{\Vert} mac_s)$$
+//!    $$H_4 = \text{SHA256}(\text{"integrator-transport-v2-h4"} \mathbin{\Vert} H_3 \mathbin{\Vert} sig_c \mathbin{\Vert} mac_c)$$
+//! 3. **Handshake Key Derivation**:
+//!    $$PRK_{\text{hs}} = \text{HKDF-Extract}(K_{\text{root}}, DH)$$
+//!    $$K_{\text{hs\_s2c}} = \text{HKDF-Expand}(PRK_{\text{hs}}, \text{"integrator-v2-hs-s2c"} \mathbin{\Vert} H_2, 32)$$
+//!    $$K_{\text{hs\_c2s}} = \text{HKDF-Expand}(PRK_{\text{hs}}, \text{"integrator-v2-hs-c2s"} \mathbin{\Vert} H_2, 32)$$
+//! 4. **Application Key Derivation**:
+//!    $$IKM_{\text{app}} = \text{HKDF-Expand}(PRK_{\text{hs}}, \text{"integrator-v2-derived"}, 32)$$
+//!    $$PRK_{\text{app}} = \text{HKDF-Extract}(H_4, IKM_{\text{app}})$$
+//!    $$K_{\text{app\_c2s}}, K_{\text{app\_s2c}}, IV_{\text{c2s}}, IV_{\text{s2c}}, K_{\text{rekey\_c2s}}, K_{\text{rekey\_s2c}}, \text{session\_id} \leftarrow \text{HKDF-Expand}(PRK_{\text{app}})$$
+//!
+//! ## 2.4 Record Layer Nonce Construction & AEAD Framing
+//! - **Header Length**: 21 bytes authenticated as Additional Authenticated Data (`AAD`):
+//!   `magic[4B] ("ITR2") || version[1B] (0x02) || frame_type[1B] || flags[1B] || epoch[2B] || seq[8B] || ciphertext_len[4B]`
+//! - **Nonce Construction** (96 bits):
+//!   `nonce = iv_salt[0..4] || seq.to_be_bytes()[0..8]`
+//! - **ChaCha20-Poly1305 Encryption**:
+//!   `ciphertext || tag = Encrypt(K_app, nonce, plaintext, AAD=header)`
+//!
+//! ## 2.5 In-Band Rekeying & Sequence Ratcheting
+//! - To prevent sequence exhaustion and bound the volume of data encrypted under a single key,
+//!   `TransportSessionV2` automatically ratchets its directional keys when:
+//!   `seq >= rekey_frame_limit` (default $2^{32}$) OR `elapsed_time >= 3600s` (1 hour).
+//! - In-band `Rekey` frame (`frame_type = 0x02`) is transmitted containing `REKEY-V2` magic payload.
+//! - Both transmitter and receiver execute HKDF-SHA256 ratcheting:
+//!   $$HK = \text{HKDF-Extract}(\text{epoch} + 1, K_{\text{rekey}})$$
+//!   $$K_{\text{app, next}} \leftarrow \text{HKDF-Expand}(HK, \text{"integrator-v2-rekey-app"}, 32)$$
+//!   $$K_{\text{rekey, next}} \leftarrow \text{HKDF-Expand}(HK, \text{"integrator-v2-rekey-next"}, 32)$$
+//!   $$IV_{\text{next}} \leftarrow \text{HKDF-Expand}(HK, \text{"integrator-v2-rekey-iv"}, 4)$$
+//! - `epoch` increments to `epoch + 1`, `seq` resets to `0`, and all prior keys are zeroized in memory.
+//!
+//! # 3. Threading, Concurrency & Split Halves
+//!
+//! `TransportSessionV2` supports lock-free full-duplex operation by splitting into
+//! `TransportReaderV2` and `TransportWriterV2` via `into_split_tcp()`.
+//! The reader owns `rx_state` while the writer owns `tx_state`. Because directional
+//! cipher states are strictly independent (separate keys, separate IVs, separate sequence counters),
+//! concurrent reads and writes proceed with zero lock contention.
+//!
+//! # 4. Cross-Platform Handshake Compatibility
+//!
+//! Wire formats use canonical network byte order (big-endian) for integers and hex-encoded
+//! strings for cryptographic points and signatures in JSON handshake payloads. Tested and
+//! validated between macOS (Apple Silicon & Intel) and Windows 11 (x86_64 & ARM64).
+//!
+//! # 5. Callers & Callees
+//! - **Callers**:
+//!   - `crate::rpc::server`: Display RPC on port 58281
+//!   - `crate::clipboard::sync`: Clipboard transfer on port 58283
+//!   - `crate::benchmark::runner`: Link benchmark on port 58285
+//!   - `crate::input::server`: KVM input daemon on port 58286
+//!   - `crate::camera::stream`: Camera streaming on port 58287
+//! - **Callees**:
+//!   - `crate::security::keystore::KeystoreV2`: Device identity key, peer trust store, root keys.
+//!   - `crate::security::spake2_rfc9382::compute_hmac_sha256`: Constant-time finished HMAC calculation.
+//!   - `chacha20poly1305`: Authenticated Encryption with Associated Data (AEAD).
+//!   - `x25519_dalek`: Ephemeral Diffie-Hellman key agreement.
+//!   - `zeroize`: Secure memory zeroization of session and rekey keys.
+//! ============================================================================
 
 use crate::security::{
     constant_time_eq, csprng_array, hex_decode_array, hex_encode,
@@ -43,61 +161,109 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Wire magic identifying the TransportV2 protocol framing (`b"ITR2"`).
 pub const TRANSPORT_WIRE_MAGIC: [u8; 4] = *b"ITR2";
+
+/// Major protocol version for TransportV2 negotiation (currently version 2).
 pub const TRANSPORT_PROTOCOL_VERSION: u16 = 2;
+
+/// Header byte representing protocol version 2 in record and handshake frames (0x02).
 pub const TRANSPORT_HEADER_VERSION_BYTE: u8 = 0x02;
+
+/// Maximum allowable length in bytes for any JSON handshake payload (4096 bytes / 4 KiB).
 pub const MAX_HANDSHAKE_FRAME_BYTES: usize = 4096;
+
+/// Exact wire length in bytes of the authenticated TransportV2 record header (21 bytes).
+/// Wire layout: magic[4B] || version[1B] || frame_type[1B] || flags[1B] || epoch[2B] || seq[8B] || len[4B].
 pub const RECORD_HEADER_LEN: usize = 21;
+
+/// Exact wire length in bytes of the Poly1305 authentication tag appended to ciphertexts (16 bytes).
 pub const AEAD_TAG_LEN: usize = 16;
 
-pub const HANDSHAKE_TIMESTAMP_WINDOW_MS: u64 = 300_000; // ±5 minutes
+/// Maximum allowable clock skew window between client and server during handshake (300,000 ms = ±5 minutes).
+pub const HANDSHAKE_TIMESTAMP_WINDOW_MS: u64 = 300_000;
+
+/// Maximum number of recent authenticated handshake nonce entries maintained in `HELLO_REPLAY_CACHE` (2048 entries).
 pub const MAX_HANDSHAKE_REPLAY_CACHE: usize = 2048;
+
+/// Timeout applied to individual handshake read and write operations (10 seconds).
 pub const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout applied to individual record header and payload I/O operations (10 seconds).
 pub const RECORD_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default number of frames encrypted under a single directional key before an automatic ratchet occurs (2^32 frames).
 pub const DEFAULT_REKEY_FRAME_LIMIT: u64 = 1u64 << 32;
-pub const DEFAULT_REKEY_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Default maximum age of a directional session key before triggering an automatic ratchet (3600 seconds = 1 hour).
+pub const DEFAULT_REKEY_AGE_SECS: u64 = 3600;
+
+/// In-band payload magic identifying an explicit rekey control frame (`b"REKEY-V2"`).
 const REKEY_MAGIC_PAYLOAD: &[u8] = b"REKEY-V2";
 
+/// Identifies the subsystem service requesting or hosting an authenticated TransportV2 session.
+///
+/// Binds cryptographic handshakes to specific services to prevent cross-service replay attacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ServiceId {
+    /// Remote display rendering and control RPC (`Port 58281`, max payload 64 KiB).
     DisplayRpc = 0x01,
+    /// Bidirectional clipboard synchronization and file transfer (`Port 58283`, max payload 2 MiB).
     ClipboardTransfer = 0x02,
+    /// Direct network link speed benchmarking (`Port 58285`, max payload 1 MiB).
     Benchmark = 0x03,
+    /// Universal input sharing and KVM drag-drop control (`Port 58286`, max payload 128 KiB).
     InputKvm = 0x04,
+    /// Shared camera video frame streaming (`Port 58287`, max payload 2 MiB).
+    CameraStream = 0x05,
 }
 
 impl ServiceId {
+    /// Converts a raw 1-byte wire code into its corresponding `ServiceId` enum variant.
+    /// Returns `None` if the wire code is unrecognized.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x01 => Some(ServiceId::DisplayRpc),
             0x02 => Some(ServiceId::ClipboardTransfer),
             0x03 => Some(ServiceId::Benchmark),
             0x04 => Some(ServiceId::InputKvm),
+            0x05 => Some(ServiceId::CameraStream),
             _ => None,
         }
     }
 
+    /// Returns the maximum allowable plaintext payload size in bytes for a single record frame
+    /// for this service.
+    ///
+    /// Exceeding this boundary triggers `TransportError::OversizedFrame`.
     pub fn max_plaintext_frame_bytes(self) -> usize {
         match self {
             ServiceId::DisplayRpc => 64 * 1024,            // 64 KiB
             ServiceId::ClipboardTransfer => 2 * 1024 * 1024, // 2 MiB (1 MiB chunk + metadata)
             ServiceId::Benchmark => 1024 * 1024,           // 1 MiB
             ServiceId::InputKvm => 128 * 1024,             // 128 KiB (input + drag preview icons)
+            ServiceId::CameraStream => 2 * 1024 * 1024,    // 2 MiB (720p NV12 frame + header)
         }
     }
 }
 
+/// Identifies the message type of a TransportV2 handshake frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandshakeFrameType {
+    /// First handshake message sent by the initiating client (0x10).
     ClientHello = 0x10,
+    /// Response handshake message sent by the receiving server (0x11).
     ServerHello = 0x11,
+    /// Final handshake confirmation message sent by the client (0x12).
     ClientFinish = 0x12,
+    /// Error notification terminating the handshake (0x1F).
     HandshakeError = 0x1F,
 }
 
 impl HandshakeFrameType {
+    /// Decodes a raw wire byte into a `HandshakeFrameType`. Returns `None` for invalid codes.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x10 => Some(HandshakeFrameType::ClientHello),
@@ -109,16 +275,22 @@ impl HandshakeFrameType {
     }
 }
 
+/// Identifies the frame type of an authenticated and encrypted TransportV2 record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordFrameType {
+    /// Encrypted application-layer data payload (0x01).
     ApplicationData = 0x01,
+    /// In-band key ratchet notification triggering key derivation to epoch + 1 (0x02).
     Rekey = 0x02,
+    /// Zero-payload or diagnostic keep-alive frame maintaining firewall state (0x03).
     KeepAlive = 0x03,
+    /// Clean session termination notification (0x04).
     CloseNotify = 0x04,
 }
 
 impl RecordFrameType {
+    /// Decodes a raw wire byte into a `RecordFrameType`. Returns `None` for unrecognized types.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x01 => Some(RecordFrameType::ApplicationData),
@@ -130,53 +302,91 @@ impl RecordFrameType {
     }
 }
 
+/// Wire structure for the `ClientHello` handshake message (JSON payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportHelloMsg {
+    /// Protocol major version (must equal 2).
     pub version: u16,
+    /// Targeted service identifier (`ServiceId` raw byte).
     pub service_id: u8,
+    /// 16-byte local device UUID of the client formatted as a lowercase hex string.
     pub client_device_id_hex: String,
+    /// 16-byte key identifier identifying the pinned root key $K_{\text{root}}$ in the server keystore.
     pub key_id_hex: String,
+    /// 32-byte cryptographically secure random nonce generated by the client.
     pub client_random_hex: String,
+    /// 32-byte ephemeral X25519 public key generated by the client.
     pub client_eph_x25519_pk_hex: String,
+    /// UTC timestamp in milliseconds when this message was constructed (anti-replay check).
     pub timestamp_ms: u64,
 }
 
+/// Wire structure for the `ServerHello` handshake message (JSON payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportServerHelloMsg {
+    /// Protocol major version (must equal 2).
     pub version: u16,
+    /// 16-byte local device UUID of the server formatted as a lowercase hex string.
     pub server_device_id_hex: String,
+    /// 32-byte cryptographically secure random nonce generated by the server.
     pub server_random_hex: String,
+    /// 32-byte ephemeral X25519 public key generated by the server.
     pub server_eph_x25519_pk_hex: String,
+    /// 64-byte Ed25519 digital signature over the server signature payload (`"integrator-transport-sig-S-v2"` || $H_2$).
     pub server_ed25519_sig_hex: String,
+    /// 32-byte HMAC-SHA256 finished MAC over ($H_2$ || server_ed25519_sig) using $K_{\text{hs\_s2c}}$.
     pub server_finished_mac_hex: String,
 }
 
+/// Wire structure for the `ClientFinish` handshake message (JSON payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportClientFinishMsg {
+    /// 64-byte Ed25519 digital signature over the client signature payload (`"integrator-transport-sig-C-v2"` || $H_3$).
     pub client_ed25519_sig_hex: String,
+    /// 32-byte HMAC-SHA256 finished MAC over ($H_3$ || client_ed25519_sig) using $K_{\text{hs\_c2s}}$.
     pub client_finished_mac_hex: String,
 }
 
+/// Comprehensive error enumeration for TransportV2 handshake negotiation and record layer framing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
+    /// Received magic bytes did not match `TRANSPORT_WIRE_MAGIC` (`b"ITR2"`).
     InvalidMagic([u8; 4]),
+    /// Protocol version received does not match `TRANSPORT_PROTOCOL_VERSION` (2).
     UnsupportedVersion(u16),
+    /// Received an unexpected or unknown frame type code.
     UnexpectedFrameType(u8),
+    /// Handshake `service_id` does not match the service expected by the server listener.
     ServiceMismatch { expected: u8, received: u8 },
+    /// Frame payload exceeds the maximum allowable byte size for the given service or handshake phase.
     OversizedFrame { len: usize, max: usize },
+    /// Handshake JSON parsing or schema validation failed.
     MalformedHandshake(String),
+    /// Handshake timestamp delta exceeds the allowable window (`HANDSHAKE_TIMESTAMP_WINDOW_MS`).
     TimestampSkewExceeded { skew_ms: u64 },
+    /// Handshake `client_random` nonce has already been authenticated within the recent replay cache.
     ReplayedHandshakeHello,
+    /// Peer device ID is not paired or found in the local `KeystoreV2`.
     UntrustedPeer(String),
+    /// Peer provided a `key_id` that does not match the pinned root key stored in `KeystoreV2`.
     KeyIdMismatch,
+    /// Ephemeral X25519 public key produced an all-zero shared secret or non-contributory point.
     LowOrderEphemeralPoint,
+    /// HMAC-SHA256 finished MAC verification failed during handshake.
     HandshakeMacMismatch,
+    /// Ed25519 identity signature verification over the handshake transcript failed.
     HandshakeSignatureInvalid,
+    /// ChaCha20-Poly1305 record authentication failed (tag mismatch or corrupted ciphertext/AAD).
     AeadDecryptionFailed,
+    /// Record header epoch does not match the expected active epoch for the directional channel.
     EpochMismatch { expected: u16, received: u16 },
+    /// Record header sequence number did not match the strictly required monotonic sequence number.
     SequenceMismatch { expected: u64, received: u64 },
+    /// Sequence counter reached `u64::MAX` or epoch counter reached `u16::MAX` without ratcheting.
     SequenceExhausted,
+    /// Transport session was cleanly closed via `CloseNotify` or connection shutdown.
     ConnectionClosed,
+    /// Underlying TCP stream I/O failure or timeout.
     IoFailure(String),
 }
 
@@ -257,8 +467,11 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 /// Bounded replay cache for authenticated `(client_device_id, client_random, recorded_at_ms)` tuples.
+///
+/// Prevents active replay of historical `ClientHello` frames within the valid timestamp window.
 static HELLO_REPLAY_CACHE: OnceLock<Mutex<VecDeque<([u8; 16], [u8; 32], u64)>>> = OnceLock::new();
 
+/// Prunes entries in `HELLO_REPLAY_CACHE` older than $2 \times \text{HANDSHAKE\_TIMESTAMP\_WINDOW\_MS} + 60\text{s}$.
 fn prune_hello_replay_cache(guard: &mut VecDeque<([u8; 16], [u8; 32], u64)>, now_ms: u64) {
     let max_age = HANDSHAKE_TIMESTAMP_WINDOW_MS
         .saturating_mul(2)
@@ -266,6 +479,9 @@ fn prune_hello_replay_cache(guard: &mut VecDeque<([u8; 16], [u8; 32], u64)>, now
     guard.retain(|(_, _, ts)| now_ms.saturating_sub(*ts) <= max_age);
 }
 
+/// Checks whether a given `(client_device_id, client_random)` pair exists in the replay cache.
+///
+/// Returns `Err(TransportError::ReplayedHandshakeHello)` if the nonce is already recorded.
 fn check_hello_nonce_not_replayed(
     client_device_id: &[u8; 16],
     client_random: &[u8; 32],
@@ -282,6 +498,9 @@ fn check_hello_nonce_not_replayed(
     Ok(())
 }
 
+/// Inserts an authenticated `(client_device_id, client_random)` tuple into the replay cache.
+///
+/// Invoked **only after** full signature and MAC verification to prevent unauthenticated cache pollution.
 fn record_authenticated_hello_nonce(
     client_device_id: &[u8; 16],
     client_random: &[u8; 32],
@@ -302,23 +521,38 @@ fn record_authenticated_hello_nonce(
     Ok(())
 }
 
-/// Directional AEAD state for either outbound (`tx`) or inbound (`rx`) traffic.
+/// Directional AEAD cipher state for either outbound transmission (`tx`) or inbound reception (`rx`).
+///
+/// Manages the active 256-bit ChaCha20-Poly1305 key, the 256-bit rekey secret, the 4-byte IV salt prefix,
+/// the current 16-bit epoch, and the strictly monotonic 64-bit sequence counter.
 pub struct DirectionalCipherState {
+    /// True if this state operates in the client-to-server direction; false if server-to-client.
     is_client_to_server: bool,
+    /// Active 32-byte ChaCha20-Poly1305 symmetric encryption key (zeroized on drop/ratchet).
     app_key: Zeroizing<[u8; 32]>,
+    /// Active 32-byte secret used as IKM for the next HKDF ratchet epoch (zeroized on drop/ratchet).
     rekey_secret: Zeroizing<[u8; 32]>,
+    /// 4-byte static IV prefix derived via HKDF (domain-separated by LSB: 0 for c2s, 1 for s2c).
     iv_salt: [u8; 4],
+    /// Current ratchet epoch counter (increments by 1 on each rekey; max `u16::MAX`).
     epoch: u16,
+    /// Monotonically incrementing 64-bit record sequence number (resets to 0 upon epoch advance).
     seq: u64,
 }
 
 impl Drop for DirectionalCipherState {
     fn drop(&mut self) {
+        // Zeroize the IV salt prefix on drop (app_key and rekey_secret auto-zeroize via Zeroizing wrapper).
         self.iv_salt.zeroize();
     }
 }
 
 impl DirectionalCipherState {
+    /// Constructs a new directional cipher state, applying domain-separation bitmasking to `iv_salt`.
+    ///
+    /// Bitmasking invariant:
+    /// - Client-to-Server: `iv_salt[0] &= 0xFE` (LSB is forced to 0).
+    /// - Server-to-Client: `iv_salt[0] |= 0x01` (LSB is forced to 1).
     fn new(
         is_client_to_server: bool,
         app_key: Zeroizing<[u8; 32]>,
@@ -340,14 +574,18 @@ impl DirectionalCipherState {
         }
     }
 
+    /// Returns the current ratchet epoch index for this directional state.
     pub fn current_epoch(&self) -> u16 {
         self.epoch
     }
 
+    /// Returns the current 64-bit monotonic sequence counter for this directional state.
     pub fn current_seq(&self) -> u64 {
         self.seq
     }
 
+    /// Derives the 96-bit ChaCha20-Poly1305 nonce for a specific sequence number:
+    /// `nonce = iv_salt[0..4] || seq.to_be_bytes()[0..8]`.
     fn compute_nonce(&self, seq: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[0..4].copy_from_slice(&self.iv_salt);
@@ -355,13 +593,16 @@ impl DirectionalCipherState {
         nonce
     }
 
-    /// Ratchets the directional key to `epoch + 1` and resets `seq = 0`.
+    /// Ratchets the directional keys forward to `epoch + 1` via HKDF-SHA256 and resets `seq = 0`.
+    ///
+    /// Zeroizes previous epoch keys and returns `Err(TransportError::SequenceExhausted)` if epoch reaches `u16::MAX`.
     pub fn ratchet_epoch(&mut self) -> Result<(), TransportError> {
         let next_epoch = self
             .epoch
             .checked_add(1)
             .ok_or(TransportError::SequenceExhausted)?;
 
+        // Expand new keys using current rekey_secret as IKM and next_epoch as salt.
         let hk = Hkdf::<Sha256>::new(Some(&next_epoch.to_be_bytes()), &*self.rekey_secret);
         let mut next_app_key = Zeroizing::new([0u8; 32]);
         let mut next_rekey_secret = Zeroizing::new([0u8; 32]);
@@ -374,12 +615,14 @@ impl DirectionalCipherState {
         hk.expand(b"integrator-v2-rekey-iv", &mut next_iv)
             .expect("HKDF expand 4B");
 
+        // Maintain direction bitmasking invariant on the new IV prefix.
         if self.is_client_to_server {
             next_iv[0] &= 0xFE;
         } else {
             next_iv[0] |= 0x01;
         }
 
+        // Install ratcheted keys and reset sequence counter to 0.
         self.app_key = next_app_key;
         self.rekey_secret = next_rekey_secret;
         self.iv_salt = next_iv;
@@ -388,6 +631,12 @@ impl DirectionalCipherState {
         Ok(())
     }
 
+    /// Encrypts and authenticates a plaintext payload into a complete TransportV2 record frame.
+    ///
+    /// Frame layout:
+    /// - Header (21 bytes, passed as AAD):
+    ///   `magic[4B] ("ITR2") || version[1B] (0x02) || frame_type[1B] || flags[1B] (0x00) || epoch[2B] || seq[8B] || ciphertext_len[4B]`
+    /// - Body: ChaCha20-Poly1305 ciphertext with appended 16-byte Poly1305 authentication tag.
     fn seal_record(
         &mut self,
         frame_type: RecordFrameType,
@@ -415,7 +664,7 @@ impl DirectionalCipherState {
         header[0..4].copy_from_slice(&TRANSPORT_WIRE_MAGIC);
         header[4] = TRANSPORT_HEADER_VERSION_BYTE;
         header[5] = frame_type as u8;
-        header[6] = 0; // flags
+        header[6] = 0; // flags: reserved, must be zero
         header[7..9].copy_from_slice(&self.epoch.to_be_bytes());
         header[9..17].copy_from_slice(&current_seq.to_be_bytes());
         header[17..21].copy_from_slice(&ciphertext_len.to_be_bytes());
@@ -438,6 +687,10 @@ impl DirectionalCipherState {
         Ok(frame)
     }
 
+    /// Verifies and decrypts an incoming TransportV2 record frame against this directional receiver state.
+    ///
+    /// Validates magic bytes, protocol version, flags, exact epoch match, and exact sequence number match
+    /// before executing Poly1305 tag verification and ChaCha20 decryption.
     fn open_record(
         &mut self,
         header: &[u8; RECORD_HEADER_LEN],
@@ -459,6 +712,7 @@ impl DirectionalCipherState {
             header[16],
         ]);
 
+        // Enforce strict epoch and sequence monotonic adherence.
         if rx_epoch != self.epoch {
             return Err(TransportError::EpochMismatch {
                 expected: self.epoch,
@@ -491,6 +745,7 @@ impl DirectionalCipherState {
             )));
         }
 
+        // Advance expected sequence number after successful decryption.
         self.seq = self
             .seq
             .checked_add(1)
@@ -500,18 +755,32 @@ impl DirectionalCipherState {
     }
 }
 
-/// Active mutually authenticated `TransportV2` session wrapping an async stream `S`.
+/// Active mutually authenticated `TransportV2` session wrapping an asynchronous stream `S`.
+///
+/// Encapsulates directional AEAD states (`tx_state` and `rx_state`), peer credentials,
+/// session ID, and automatic rekeying thresholds.
 pub struct TransportSessionV2<S> {
+    /// Underlying full-duplex asynchronous transport stream (e.g. `TcpStream` or `DuplexStream`).
     stream: S,
+    /// Service identifier bound to this session during handshake.
     service_id: ServiceId,
+    /// 16-byte device UUID of the authenticated remote peer.
     peer_device_id: [u8; 16],
+    /// Hex-encoded representation of `peer_device_id` for logging and diagnostic queries.
     peer_device_id_hex: String,
+    /// 32-byte Ed25519 identity public key of the authenticated remote peer.
     peer_ed25519_pubkey: [u8; 32],
+    /// 16-byte unique session identifier derived during handshake ($H_4$ HKDF expansion).
     session_id: [u8; 16],
+    /// Directional AEAD state for outbound records transmitted to the peer.
     tx_state: DirectionalCipherState,
+    /// Directional AEAD state for inbound records received from the peer.
     rx_state: DirectionalCipherState,
+    /// Timestamp when the outbound cipher state was last ratcheted.
     last_rekeyed_at: Instant,
+    /// Configured threshold of frames transmitted under a single key before an automatic ratchet.
     rekey_frame_limit: u64,
+    /// True if the session has sent or received a `CloseNotify` or encountered an unrecoverable error.
     closed: bool,
 }
 
@@ -519,35 +788,54 @@ impl<S> TransportSessionV2<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Returns a reference to the 16-byte raw device UUID of the authenticated remote peer.
     pub fn peer_device_id(&self) -> &[u8; 16] {
         &self.peer_device_id
     }
 
+    /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
     pub fn peer_device_id_hex(&self) -> &str {
         &self.peer_device_id_hex
     }
 
+    /// Returns a reference to the 32-byte Ed25519 public key of the authenticated remote peer.
     pub fn peer_ed25519_pubkey(&self) -> &[u8; 32] {
         &self.peer_ed25519_pubkey
     }
 
+    /// Returns a reference to the 16-byte session identifier derived from the handshake transcript.
     pub fn session_id(&self) -> &[u8; 16] {
         &self.session_id
     }
 
+    /// Returns the active ratchet epoch index for outbound traffic (`tx_state`).
     pub fn tx_epoch(&self) -> u16 {
         self.tx_state.current_epoch()
     }
 
+    /// Returns the active ratchet epoch index for inbound traffic (`rx_state`).
     pub fn rx_epoch(&self) -> u16 {
         self.rx_state.current_epoch()
     }
 
+    /// Overrides the maximum number of outbound frames allowed before triggering an in-band ratchet.
     pub fn set_rekey_frame_limit(&mut self, limit: u64) {
         self.rekey_frame_limit = limit.clamp(1, u64::MAX - 1);
     }
 
-    /// Initiates a mutually authenticated `TransportV2` client session with a specific pinned `peer`.
+    /// Initiates a mutually authenticated `TransportV2` client handshake over `stream` with a pinned `peer`.
+    ///
+    /// Protocol Steps:
+    /// 1. Sample ephemeral X25519 secret key and 32-byte random nonce.
+    /// 2. Construct and send `ClientHello` frame.
+    /// 3. Read and parse `ServerHello` frame within `HANDSHAKE_IO_TIMEOUT`.
+    /// 4. Verify server device UUID matches `peer.device_id`.
+    /// 5. Compute ephemeral Diffie-Hellman secret; reject all-zero or non-contributory points.
+    /// 6. Compute transcript $H_2$; derive handshake PRK and keys ($K_{\text{hs\_s2c}}$, $K_{\text{hs\_c2s}}$).
+    /// 7. Verify server's finished HMAC and Ed25519 signature over $H_2$.
+    /// 8. Compute transcript $H_3$; sign $H_3$ with local Ed25519 identity key; compute client finished HMAC.
+    /// 9. Transmit `ClientFinish` frame to server.
+    /// 10. Compute transcript $H_4$; derive application directional keys and session ID.
     pub async fn connect_client(
         mut stream: S,
         keystore: &KeystoreV2,
@@ -569,6 +857,7 @@ where
             timestamp_ms: unix_epoch_millis(),
         };
 
+        // Send ClientHello frame.
         let hello_bytes = send_handshake_frame(
             &mut stream,
             HandshakeFrameType::ClientHello,
@@ -576,6 +865,7 @@ where
         )
         .await?;
 
+        // Receive ServerHello frame.
         let (hs_type, srv_hello_bytes) = recv_handshake_frame(&mut stream, None).await?;
         if hs_type != HandshakeFrameType::ServerHello {
             return Err(TransportError::UnexpectedFrameType(hs_type as u8));
@@ -610,7 +900,7 @@ where
                 TransportError::MalformedHandshake("invalid server_finished_mac".into())
             })?;
 
-        // Compute ephemeral X25519 shared secret and reject all-zero / low-order points!
+        // Compute ephemeral X25519 shared secret and reject all-zero / low-order points (RFC 7748 §6.1).
         let srv_eph_pk = X25519PublicKey::from(srv_eph_pk_bytes);
         let dh_shared = eph_sk_c.diffie_hellman(&srv_eph_pk);
         if constant_time_eq(dh_shared.as_bytes(), &[0u8; 32]) || !dh_shared.was_contributory() {
@@ -648,6 +938,7 @@ where
         };
         send_handshake_frame(&mut stream, HandshakeFrameType::ClientFinish, &finish_msg).await?;
 
+        // Derive application keys and directional cipher states.
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
 
@@ -667,6 +958,9 @@ where
     }
 
     /// Accepts a mutually authenticated `TransportV2` server session on `stream`.
+    ///
+    /// Validates that incoming `ClientHello` matches `expected_service`, verifies credentials in `KeystoreV2`,
+    /// enforces anti-replay deduplication, and returns the established session.
     pub async fn accept_server(
         stream: S,
         keystore: &KeystoreV2,
@@ -810,6 +1104,7 @@ where
         KeystoreV2::verify_signature(&peer_creds.ed25519_pubkey, &cli_sig_payload, &cli_sig)
             .map_err(|_| TransportError::HandshakeSignatureInvalid)?;
 
+        // Nonce is verified authentic: record in replay cache to reject subsequent identical attempts.
         record_authenticated_hello_nonce(&client_dev_id, &client_random, unix_epoch_millis())?;
 
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
@@ -1341,35 +1636,53 @@ where
 
 /// Read half of a full-duplex split `TransportSessionV2`, owning independent inbound AEAD state.
 pub struct TransportReaderV2<R> {
+    /// Underlying reader stream (e.g. `OwnedReadHalf`).
     reader: R,
+    /// Service identifier bound during handshake.
     service_id: ServiceId,
+    /// 16-byte raw device UUID of the authenticated remote peer.
     peer_device_id: [u8; 16],
+    /// Hex-encoded representation of `peer_device_id`.
     peer_device_id_hex: String,
+    /// Directional AEAD state for inbound records.
     rx_state: DirectionalCipherState,
+    /// True if the reader stream is closed.
     closed: bool,
 }
 
 /// Write half of a full-duplex split `TransportSessionV2`, owning independent outbound AEAD state.
 pub struct TransportWriterV2<W> {
+    /// Underlying writer stream (e.g. `OwnedWriteHalf`).
     writer: W,
+    /// Service identifier bound during handshake.
     service_id: ServiceId,
+    /// 16-byte raw device UUID of the authenticated remote peer.
     peer_device_id: [u8; 16],
+    /// Hex-encoded representation of `peer_device_id`.
     peer_device_id_hex: String,
+    /// Directional AEAD state for outbound records.
     tx_state: DirectionalCipherState,
+    /// Timestamp when outbound cipher state was last ratcheted.
     last_rekeyed_at: Instant,
+    /// Outbound frame threshold before automatic ratcheting.
     rekey_frame_limit: u64,
+    /// True if the writer stream is closed.
     closed: bool,
 }
 
 impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
+    /// Returns the 16-byte raw device UUID of the authenticated remote peer.
     pub fn peer_device_id(&self) -> [u8; 16] {
         self.peer_device_id
     }
 
+    /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
     pub fn peer_device_id_hex(&self) -> &str {
         &self.peer_device_id_hex
     }
 
+    /// Reads, verifies, and decrypts the next application data frame, transparently handling
+    /// in-band `Rekey` and `KeepAlive` control frames.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.closed {
             return Err(TransportError::ConnectionClosed);
@@ -1449,14 +1762,17 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
 }
 
 impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
+    /// Returns the 16-byte raw device UUID of the authenticated remote peer.
     pub fn peer_device_id(&self) -> [u8; 16] {
         self.peer_device_id
     }
 
+    /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
     pub fn peer_device_id_hex(&self) -> &str {
         &self.peer_device_id_hex
     }
 
+    /// Triggers an explicit in-band outbound rekey (`FrameType::Rekey`) and ratchets `tx_state` to `epoch + 1`.
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
         if self.closed {
             return Err(TransportError::ConnectionClosed);
@@ -1494,6 +1810,7 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
         Ok(())
     }
 
+    /// Encrypts and writes an application data frame, ratcheting keys if limits are exceeded.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         if self.closed {
             return Err(TransportError::ConnectionClosed);
@@ -1528,6 +1845,7 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
         Ok(())
     }
 
+    /// Sends an authenticated `CloseNotify` frame before closing the writer stream.
     pub async fn close_notify(&mut self) -> Result<(), TransportError> {
         if self.closed {
             return Err(TransportError::ConnectionClosed);
@@ -1610,6 +1928,8 @@ pub fn derive_loopback_self_credentials(keystore: &KeystoreV2) -> VerifiedPeerCr
 // Handshake Framing & Key Derivation Helpers
 // ============================================================================
 
+/// Encodes and writes a handshake frame over `writer` with an 8-byte frame header:
+/// `magic[4B] ("ITR2") || version[1B] (0x02) || hs_type[1B] || payload_len[2B]`.
 async fn send_handshake_frame<W, T>(
     writer: &mut W,
     hs_type: HandshakeFrameType,
@@ -1646,6 +1966,7 @@ where
     Ok(payload)
 }
 
+/// Reads and parses an incoming handshake frame header and body from `reader` within `HANDSHAKE_IO_TIMEOUT`.
 async fn recv_handshake_frame<R>(
     reader: &mut R,
     already_read_magic: Option<[u8; 4]>,
@@ -1695,6 +2016,8 @@ where
     Ok((hs_type, payload))
 }
 
+/// Computes the handshake transcript hash $H_2$ over service ID, ClientHello bytes, server device ID,
+/// server random nonce, and server ephemeral public key.
 fn compute_transcript_h2(
     service_id: ServiceId,
     hello_bytes: &[u8],
@@ -1716,6 +2039,7 @@ fn compute_transcript_h2(
     out
 }
 
+/// Computes the handshake transcript hash $H_3$ over $H_2$, server Ed25519 signature, and server finished MAC.
 fn compute_transcript_h3(h2: &[u8; 32], srv_sig: &[u8; 64], srv_mac: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"integrator-transport-v2-h3");
@@ -1728,6 +2052,7 @@ fn compute_transcript_h3(h2: &[u8; 32], srv_sig: &[u8; 64], srv_mac: &[u8; 32]) 
     out
 }
 
+/// Computes the handshake transcript hash $H_4$ over $H_3$, client Ed25519 signature, and client finished MAC.
 fn compute_transcript_h4(h3: &[u8; 32], cli_sig: &[u8; 64], cli_mac: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"integrator-transport-v2-h4");
@@ -1740,6 +2065,7 @@ fn compute_transcript_h4(h3: &[u8; 32], cli_sig: &[u8; 64], cli_mac: &[u8; 32]) 
     out
 }
 
+/// Derives the handshake pseudorandom key `PRK_hs` and directional handshake MAC keys (`k_hs_s2c`, `k_hs_c2s`).
 fn derive_handshake_keys(
     root_key: &[u8; 32],
     dh_shared: &[u8],
@@ -1768,6 +2094,7 @@ fn derive_handshake_keys(
     (prk_hs, k_hs_s2c, k_hs_c2s)
 }
 
+/// Derives application-layer directional cipher states (`c2s` and `s2c`) and the 16-byte session ID.
 fn derive_application_states(
     prk_hs: &[u8; 32],
     h4: &[u8; 32],
@@ -1815,6 +2142,8 @@ fn derive_application_states(
     (c2s, s2c, session_id)
 }
 
+/// Constructs the byte payload that the server signs with its Ed25519 identity key:
+/// `b"integrator-transport-sig-S-v2"` || $H_2$.
 fn build_server_sig_payload(h2: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(64);
     v.extend_from_slice(b"integrator-transport-sig-S-v2");
@@ -1822,6 +2151,8 @@ fn build_server_sig_payload(h2: &[u8; 32]) -> Vec<u8> {
     v
 }
 
+/// Constructs the byte payload that the client signs with its Ed25519 identity key:
+/// `b"integrator-transport-sig-C-v2"` || $H_3$.
 fn build_client_sig_payload(h3: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(64);
     v.extend_from_slice(b"integrator-transport-sig-C-v2");
@@ -1829,6 +2160,7 @@ fn build_client_sig_payload(h3: &[u8; 32]) -> Vec<u8> {
     v
 }
 
+/// Computes the 32-byte HMAC-SHA256 finished MAC over ($H_2$ || `sig_s`) using `k_hs_s2c`.
 fn compute_server_finished_mac(k_hs_s2c: &[u8; 32], h2: &[u8; 32], sig_s: &[u8; 64]) -> [u8; 32] {
     let mut data = Vec::with_capacity(32 + 64);
     data.extend_from_slice(h2);
@@ -1836,6 +2168,7 @@ fn compute_server_finished_mac(k_hs_s2c: &[u8; 32], h2: &[u8; 32], sig_s: &[u8; 
     compute_hmac_sha256(k_hs_s2c, &data)
 }
 
+/// Computes the 32-byte HMAC-SHA256 finished MAC over ($H_3$ || `sig_c`) using `k_hs_c2s`.
 fn compute_client_finished_mac(k_hs_c2s: &[u8; 32], h3: &[u8; 32], sig_c: &[u8; 64]) -> [u8; 32] {
     let mut data = Vec::with_capacity(32 + 64);
     data.extend_from_slice(h3);

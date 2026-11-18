@@ -1,25 +1,144 @@
+//! # Universal Clipboard Wire Protocol & Framing Specifications
+//!
+//! ## 1. Module Purpose & Scope
+//! This module defines the wire protocol data models, streaming frame identifiers, resource
+//! consumption boundaries, and serialization formats for the Integrator Universal Clipboard.
+//!
+//! ### Core Subsystem Responsibilities:
+//! - **Control Framing**: Serializes clipboard announcements and requests (`ClipboardMessage`)
+//!   carrying SHA-256 content hashes, plain text strings, inline RGBA bitmaps, or lazy multi-file
+//!   descriptors (`LazyAnnouncement`).
+//! - **Zero-RAM Binary Streaming Protocol**: Defines the binary frame markers used when streaming
+//!   large multi-gigabyte directory trees or uncompressed high-resolution images across
+//!   `TransportSessionV2` without buffering complete files in physical memory:
+//!   - `FRAME_DIR (0x01)`: Directory header (creates directory level in isolated staging area).
+//!   - `FRAME_FILE (0x02)`: File metadata header (relative path, file size in bytes).
+//!   - `FRAME_FILE_DATA (0x03)`: Raw file content chunk (up to 256 KiB per AEAD packet).
+//!   - `FRAME_FILE_HASH (0x04)`: Per-file SHA-256 verification digest (32 bytes).
+//!   - `FRAME_IMAGE_DATA (0x05)`: Raw RGBA pixel stream chunk.
+//!   - `FRAME_END (0xFF)`: Terminal stream marker and session-level digest commit.
+//! - **Resource Bounds Enforcement**: Hard caps on text size, image dimensions, directory depth,
+//!   and cumulative transfer volume prevent memory exhaustion or disk denial-of-service attacks.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                          Clipboard Framing & Streaming Wire Flow                       │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!   Local Workstation Copy                               Remote Workstation Paste
+//!  ┌───────────────────────┐                           ┌───────────────────────────┐
+//!  │ User copies files     │                           │ User presses Cmd+V/Ctrl+V │
+//!  └───────────┬───────────┘                           └─────────────┬─────────────┘
+//!              │                                                     │
+//!              ▼                                                     ▼
+//!  ┌───────────────────────┐      LazyAnnouncement       ┌───────────────────────────┐
+//!  │ LazyAnnouncement      ├────────────────────────────►│ Interceptor triggers     │
+//!  │ - session_id (hex)    │    (Metadata announcement)  │ RequestStream(session_id) │
+//!  │ - total_bytes, roots  │                             └─────────────┬─────────────┘
+//!  └───────────────────────┘                                           │
+//!              ▲                                                       │
+//!              │           RequestStream(session_id)                   │
+//!              └───────────────────────────────────────────────────────┘
+//!                                      │
+//!                                      ▼
+//!  ┌───────────────────────────────────────────────────────────────────────────────┐
+//!  │ Binary Streaming Loop over TransportSessionV2 (Port 58285, 256 KiB AEAD)      │
+//!  │   [0x01] FRAME_DIR       -> "Projects/App"                                    │
+//!  │   [0x02] FRAME_FILE      -> "Projects/App/main.rs" (size: 4096B)              │
+//!  │   [0x03] FRAME_FILE_DATA -> Chunk 1..N (256 KiB)                              │
+//!  │   [0x04] FRAME_FILE_HASH -> SHA-256 (32B)                                     │
+//!  │   [0xFF] FRAME_END       -> End of stream marker                              │
+//!  └───────────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/clipboard/service.rs`: Serializes control messages, decodes frame tags, and checks quotas.
+//! - `src/kvm/service.rs`: Uses `LazyAnnouncement` and `StreamRequest` during cross-screen drag staging.
+//!
+//! ### Downstream Callees:
+//! - `serde`: JSON serialization for control frames.
+//! - `sha2::Sha256`: Digest verification for transferred content.
+//!
+//! ## 3. Threading & Concurrency Model
+//! All structures are immutable data transfer objects (DTOs) implementing `Send + Sync + Clone`.
+//! They can be freely transmitted across asynchronous Tokio channels and tasks.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Image Allocation Overflow Defense**: `validate_image_bounds` performs checked multiplications
+//!   (`width.checked_mul(height)?.checked_mul(4)?`) to eliminate integer overflow before buffer allocations.
+//! - **Base64 Canonical Bit Validation**: Custom Base64 deserialization verifies that unused padding
+//!   bits are strictly zero, preventing steganographic covert channels or non-canonical malleability.
+//! - **Path Length & Depth Caps**: `MAX_DIRECTORY_DEPTH = 16` prevents stack overflow during recursion.
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Frame marker byte: Directory creation notification (`0x01`).
 pub const FRAME_DIR: u8 = 0x01;
+
+/// Frame marker byte: File header containing relative path and file byte length (`0x02`).
 pub const FRAME_FILE: u8 = 0x02;
+
+/// Frame marker byte: Raw file content chunk (`0x03`).
 pub const FRAME_FILE_DATA: u8 = 0x03;
+
+/// Frame marker byte: Per-file SHA-256 digest validation frame (`0x04`).
 pub const FRAME_FILE_HASH: u8 = 0x04;
+
+/// Frame marker byte: Raw RGBA pixel stream chunk (`0x05`).
 pub const FRAME_IMAGE_DATA: u8 = 0x05;
+
+/// Frame marker byte: Terminal end-of-stream delimiter (`0xFF`).
 pub const FRAME_END: u8 = 0xFF;
 
-// Security limits against memory exhaustion & path traversal attacks
-pub const MAX_TEXT_CHARS: usize = 10 * 1024 * 1024;               // 10 MiB text
-pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;              // 64 MiB uncompressed RGBA
-pub const MAX_IMAGE_DIMENSION: usize = 8_192;                     // Max 8192x8192 px (checked pre-allocation)
-pub const MAX_CLIPBOARD_HEADER_BYTES: usize = 16 * 1024 * 1024;   // Max serialized control header (16 MiB)
-pub const MAX_TRANSFER_FILES: usize = 1_000;                      // Max 1,000 entries in a single copy
-pub const MAX_ROOTS: usize = MAX_TRANSFER_FILES;
-pub const MAX_DIRECTORY_DEPTH: usize = 16;                        // Max 16 directory depth levels
-pub const MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;   // 16 GiB per file
-pub const MAX_TOTAL_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;// 32 GiB total per copy
-pub const MAX_AUTO_STAGE_BYTES: u64 = 128 * 1024 * 1024;          // 128 MiB background auto-stage cap
+// Security limits against memory exhaustion, recursive tree attacks, and disk exhaustion:
 
-/// Validates image dimensions & byte length (`width * height * 4 == byte_len <= MAX_IMAGE_BYTES`).
+/// Maximum allowed plain text string length in characters (10 MiB).
+pub const MAX_TEXT_CHARS: usize = 10 * 1024 * 1024;
+
+/// Maximum allowed uncompressed RGBA image buffer size in bytes (64 MiB).
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum allowed width or height in pixels for clipboard image frames (8,192 px).
+pub const MAX_IMAGE_DIMENSION: usize = 8_192;
+
+/// Maximum allowed length in bytes for serialized control message headers (16 MiB).
+pub const MAX_CLIPBOARD_HEADER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum count of individual files or folders allowed in a single clipboard transfer (1,000).
+pub const MAX_TRANSFER_FILES: usize = 1_000;
+
+/// Maximum count of top-level root items allowed in a multi-file selection (1,000).
+pub const MAX_ROOTS: usize = MAX_TRANSFER_FILES;
+
+/// Maximum directory nesting depth allowed during recursive tree transfers (16 levels).
+pub const MAX_DIRECTORY_DEPTH: usize = 16;
+
+/// Maximum allowable size in bytes for a single file payload (16 GiB).
+pub const MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Maximum cumulative transfer size in bytes allowed across an entire clipboard session (32 GiB).
+pub const MAX_TOTAL_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Background automatic file pre-staging threshold (128 MiB). Transfers under this threshold
+/// pre-stage into cache for instantaneous pasting.
+pub const MAX_AUTO_STAGE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Validates image dimensions and total byte length against strict security invariants.
+///
+/// Ensures:
+/// 1. Dimensions are non-zero and do not exceed `MAX_IMAGE_DIMENSION` (8,192 px).
+/// 2. `width * height * 4` does not overflow `usize`.
+/// 3. Calculated byte length exactly equals `byte_len` and is within `MAX_IMAGE_BYTES` (64 MiB).
+///
+/// # Arguments
+/// * `width` - Image width in pixels.
+/// * `height` - Image height in pixels.
+/// * `byte_len` - Declared payload byte length.
+///
+/// # Returns
+/// `Some(expected_bytes)` on successful validation, or `None` if out of bounds.
 pub(crate) fn validate_image_bounds(
     width: usize,
     height: usize,
@@ -39,50 +158,84 @@ pub(crate) fn validate_image_bounds(
     Some(expected)
 }
 
+/// Metadata announcement for lazy file transfers.
+///
+/// Broadcast when files or folders are copied to the local clipboard. Carries summary
+/// statistics without transmitting the actual file contents until requested.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LazyAnnouncement {
+    /// 64-bit random hex session identifier generated by the source machine.
     pub session_id: String,
+
+    /// User-visible name of the primary copied root item (e.g. `"Archive.zip"`).
     pub root_name: String,
+
+    /// List of all top-level root item names in a multi-file selection.
     #[serde(default)]
     pub roots: Vec<String>,
+
+    /// Total count of all files and folders included in the transfer.
     pub total_files: usize,
+
+    /// Cumulative uncompressed payload size in bytes across all files.
     pub total_bytes: u64,
 }
 
+/// Request sent by the receiving peer to initiate binary streaming for a staged file session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamRequest {
+    /// Session identifier of the lazy announcement to stream.
     pub session_id: String,
 }
 
+/// Enumeration of all discrete clipboard payload types exchanged over the network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClipboardPayload {
+    /// UTF-8 plain text string payload.
     Text(String),
-    /// Compact inline RGBA image (base64-encoded for backwards compatibility / small icons).
+
+    /// Compact inline RGBA image with base64 encoding (used for small icons and clipboard previews).
     Image {
+        /// Width in pixels.
         width: usize,
+        /// Height in pixels.
         height: usize,
+        /// Base64-encoded raw RGBA pixel data.
         #[serde(with = "rgba_base64")]
         rgba: Vec<u8>,
     },
-    /// Binary-streamed RGBA image header; `byte_len` raw bytes follow in `FRAME_IMAGE_DATA` chunks.
+
+    /// Header declaring an upcoming binary RGBA image stream. Raw bytes follow in `FRAME_IMAGE_DATA` chunks.
     ImageStream {
+        /// Width in pixels.
         width: usize,
+        /// Height in pixels.
         height: usize,
+        /// Expected cumulative byte count (`width * height * 4`).
         byte_len: usize,
     },
+
+    /// Lazy announcement advertising available files on the remote clipboard.
     LazyAnnouncement(LazyAnnouncement),
-    // Request by receiver upon Cmd+V / Ctrl+V to open streaming pipe
+
+    /// Request emitted when the user presses `Cmd+V` / `Ctrl+V` to pull the announced file stream.
     RequestStream(StreamRequest),
-    // Request by receiver upon Drag-to-Drop release at edge
+
+    /// Request emitted when a cross-screen drag session is dropped onto the local workspace.
     RequestDragStream(StreamRequest),
 }
 
+/// Envelope wrapping a clipboard payload alongside its cryptographic content hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardMessage {
+    /// SHA-256 hexadecimal digest of the payload content for deduplication and integrity checking.
     pub hash: String,
+
+    /// Typed clipboard content payload.
     pub payload: ClipboardPayload,
 }
 
+/// Custom high-performance Base64 serialization module with strict canonical padding validation.
 mod rgba_base64 {
     use super::*;
     use serde::de::Error;
@@ -90,6 +243,7 @@ mod rgba_base64 {
     const B64_ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+    /// Serializes raw byte slices into standard Base64 ASCII strings.
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -116,6 +270,7 @@ mod rgba_base64 {
         serializer.serialize_str(&out)
     }
 
+    /// Decodes an individual Base64 ASCII character to its 6-bit value.
     fn decode_char(b: u8) -> Option<u8> {
         match b {
             b'A'..=b'Z' => Some(b - b'A'),
@@ -127,6 +282,7 @@ mod rgba_base64 {
         }
     }
 
+    /// Deserializes a Base64 string into raw bytes, enforcing canonical padding bit verification.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
     where
         D: Deserializer<'de>,

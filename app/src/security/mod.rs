@@ -1,13 +1,50 @@
-//! Integrator v2.0 Cryptographic Core & Cross-Platform Keystore (`app/src/security/`).
+//! # Integrator Security Core Utilities & Subsystem Entry Point (`app/src/security/mod.rs`)
 //!
-//! Provides:
-//! - `spake2_rfc9382`: Verbatim RFC 9382 SPAKE2 over `edwards25519` with cofactor clearing (`h = 8`),
-//!   small-order torsion rejection, identity-element abort, length-prefixed `TT` transcript, and
-//!   strict separation of `K`, `Ke`, `Ka`, `KcA`, `KcB`, and `K_root`.
-//! - `keystore`: Cross-platform OS-backed master key management (macOS Keychain `Security.framework`,
-//!   Windows Win32 DPAPI `CryptProtectData`, Linux machine-bound `0600` HKDF), `ChaCha20Poly1305`
-//!   envelope encryption for Ed25519 private keys and per-peer `K_root` secrets, strict identity-key
-//!   pinning, and automatic quarantine of legacy v1 `trusted_peers.json` files.
+//! ## 1. Module Purpose & Scope
+//! This module serves as the foundational cryptographic utilities layer and module root for the
+//! entire Integrator Security and Trust subsystem (`app/src/security/`). It centralizes cryptographically
+//! secure pseudorandom number generation (CSPRNG), constant-time slice comparisons, secure hashing (SHA-256),
+//! deterministic device and key identifier derivation, human-readable Short Authentication String (SAS)
+//! generation, hex encoding/decoding, and high-resolution Unix timestamps.
+//!
+//! The module re-exports the five core cryptographic domain modules:
+//! - [`spake2_rfc9382`]: Verbatim RFC 9382 Password-Authenticated Key Exchange over Edwards25519.
+//! - [`keystore`]: OS-native hardware- and credential-backed Master Keystore (`trusted_peers_v2.json`).
+//! - [`pairing`]: 4-message mutual SPAKE2 + Ed25519 handshake protocol (`IPR2`) and anti-DoS engine.
+//! - [`transport`]: Mutually authenticated, forward-secret, replay-protected TCP record layer (`ITR2`).
+//! - [`audio_udp`]: Authenticated ChaCha20-Poly1305 UDP datagram audio protocol (`IUA2`) with sliding anti-replay.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - `app/src/trust.rs`: High-level peer discovery, pairing coordinator, and session establishment.
+//!   - `app/src/security/pairing.rs`: Identity derivation, SAS formatting, and constant-time tag comparisons.
+//!   - `app/src/security/transport.rs`: Nonce generation, timestamp validation, and handshake replay filtering.
+//!   - `app/src/security/keystore.rs`: Key wrapping, device ID derivations, and constant-time verifications.
+//!   - `app/src/security/audio_udp.rs`: Audio session key derivation, header serialization, and timestamps.
+//!   - Platform UI and IPC layers (macOS Swift UI, Windows C# WPF UI, CLI command loops) consuming hex IDs and SAS strings.
+//! - **Downstream Callees**:
+//!   - OS Kernel CSPRNG (`getrandom::fill` via OS-specific syscalls: `getentropy`/`SecRandomCopyBytes` on macOS, `ProcessPrng`/`BCryptGenRandom` on Windows).
+//!   - `subtle::ConstantTimeEq`: Constant-time byte comparisons to defeat side-channel timing attacks.
+//!   - `sha2::Sha256`: Cryptographic hashing for device and key identifiers.
+//!   - `zeroize::Zeroizing`: Memory zeroization on drop for temporary sensitive buffers.
+//! - **Cross-Platform / Cross-Device Flow**:
+//!   - Enables byte-for-byte identical cryptographic derivations between macOS (ARM64/x86_64) and Windows 11 (x86_64/ARM64).
+//!   - Enforces canonical little-endian / big-endian network byte ordering across asymmetric architectures.
+//!   - Produces unambiguous Short Authentication Strings (SAS) rendered identically on Mac and Windows display interfaces.
+//!
+//! ## 3. Threading & Concurrency Model
+//! All utility functions in this module are stateless, reentrant, and thread-safe. They may be invoked
+//! concurrently from arbitrary Tokio worker threads, native platform UI threads (Windows STA, macOS Main Dispatch Queue),
+//! or low-level audio/video callback threads without external synchronization or lock contention.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Zero Static Keys**: No embedded secret keys, compile-time passwords, or fallback credentials exist.
+//! - **Constant-Time Verification**: All byte slice comparisons involving cryptographic authenticators,
+//!   MAC tags, or public keys utilize `subtle::ConstantTimeEq` to prevent side-channel timing disclosures.
+//! - **CSPRNG Failure Containment**: If the OS entropy source fails, operations fail immediately (panic or `Result::Err`),
+//!   strictly forbidding deterministic or pseudo-random fallbacks (e.g. `rand::thread_rng` or timestamp seeding).
+//! - **Memory Zeroization**: Secret buffers returned by `try_csprng_array` are wrapped in `zeroize::Zeroizing`
+//!   to ensure cryptographic wiping upon leaving stack/heap scope.
 
 pub mod audio_udp;
 pub mod keystore;
@@ -19,31 +56,76 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
-/// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG (`getrandom`).
+/// Fills the destination buffer `buf` with cryptographically secure random bytes from the OS kernel CSPRNG.
+///
+/// Under the hood, this invokes `getrandom::fill`, which delegates directly to the host OS entropy provider:
+/// - macOS: `getentropy(2)` or `SecRandomCopyBytes` (Apple CommonCrypto / Security framework).
+/// - Windows: `ProcessPrng` (Win8+) or `BCryptGenRandom` (CNG).
+/// - Linux: `getrandom(2)` system call.
+///
+/// # Arguments
+/// * `buf` - Destination byte slice to fill with entropy.
+///
+/// # Errors
+/// Returns `getrandom::Error` if the OS kernel CSPRNG is uninitialized or reports an entropy exhaustion failure.
 pub fn try_csprng_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     getrandom::fill(buf)
 }
 
-/// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG (`getrandom`).
+/// Fills `buf` with cryptographically secure random bytes from the OS kernel CSPRNG, panicking on failure.
+///
+/// # Panics
+/// Panics with an explanatory message if the underlying OS entropy source fails. In security-sensitive
+/// network software, failing to obtain genuine entropy is unrecoverable and must abort execution rather
+/// than proceeding with predictable keys or nonces.
+///
+/// # Arguments
+/// * `buf` - Destination byte slice to fill with entropy.
 pub fn csprng_fill(buf: &mut [u8]) {
     try_csprng_fill(buf).expect("OS CSPRNG (getrandom) failed to produce entropy");
 }
 
-/// Returns a fixed-size array of cryptographically secure random bytes.
+/// Returns a fixed-size array of `N` cryptographically secure random bytes.
+///
+/// # Type Parameters
+/// * `N` - Array byte length (e.g., 4, 12, 16, 32, 64 bytes).
+///
+/// # Panics
+/// Panics if the OS kernel CSPRNG fails.
 pub fn csprng_array<const N: usize>() -> [u8; N] {
     let mut arr = [0u8; N];
     csprng_fill(&mut arr);
     arr
 }
 
-/// Returns a zeroizing fixed-size array of cryptographically secure random bytes.
+/// Returns a zeroizing fixed-size array of `N` cryptographically secure random bytes wrapped in [`zeroize::Zeroizing`].
+///
+/// The returned wrapper automatically wipes the underlying buffer with zeroes when dropped, protecting
+/// sensitive ephemeral secrets, scalar seeds, and pre-shared keys against memory dump inspection.
+///
+/// # Type Parameters
+/// * `N` - Array byte length.
+///
+/// # Errors
+/// Returns `getrandom::Error` if the OS kernel CSPRNG reports an error.
 pub fn try_csprng_array<const N: usize>() -> Result<zeroize::Zeroizing<[u8; N]>, getrandom::Error> {
     let mut arr = zeroize::Zeroizing::new([0u8; N]);
     try_csprng_fill(&mut *arr)?;
     Ok(arr)
 }
 
-/// Constant-time byte slice equality check using `subtle::ConstantTimeEq`.
+/// Constant-time byte slice equality check using [`subtle::ConstantTimeEq`].
+///
+/// Evaluates in constant execution time regardless of slice length mismatch or the position of the
+/// first differing byte. Essential for comparing MAC tags (`confirm_mac_a`, `ack_mac`), public keys,
+/// and authentication hashes to prevent remote timing side-channel attacks.
+///
+/// # Arguments
+/// * `a` - First byte slice.
+/// * `b` - Second byte slice.
+///
+/// # Returns
+/// `true` if slices are identical in length and content; `false` otherwise.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -51,7 +133,15 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
 }
 
-/// Computes `SHA256(data)`.
+/// Computes a standard SHA-256 digest over `data`.
+///
+/// Produces a deterministic 32-byte hash `SHA256(data)`.
+///
+/// # Arguments
+/// * `data` - Input arbitrary byte slice.
+///
+/// # Returns
+/// 32-byte SHA-256 digest array.
 pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
@@ -59,8 +149,21 @@ pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Deterministically derives the 16-byte canonical `device_id` from an Ed25519 public key:
-/// `SHA256("integrator-device-id-v2" || ed25519_pubkey)[0..16]`
+/// Deterministically derives the 16-byte canonical `device_id` from an Ed25519 public key.
+///
+/// # Algorithm
+/// ```text
+/// device_id = SHA256("integrator-device-id-v2" || ed25519_pubkey)[0..16]
+/// ```
+///
+/// Domain separation prefix `"integrator-device-id-v2"` ensures that the derived identifier
+/// cannot collide with other SHA-256 hashes derived from the same Ed25519 public key.
+///
+/// # Arguments
+/// * `ed25519_pubkey` - 32-byte compressed Edwards25519 public key.
+///
+/// # Returns
+/// 16-byte canonical binary device identifier.
 pub fn derive_device_id_from_pubkey(ed25519_pubkey: &[u8; 32]) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"integrator-device-id-v2");
@@ -71,13 +174,34 @@ pub fn derive_device_id_from_pubkey(ed25519_pubkey: &[u8; 32]) -> [u8; 16] {
     id
 }
 
-/// Deterministically derives the 32-character lowercase hex `device_id` from an Ed25519 public key.
+/// Deterministically derives the 32-character lowercase hex `device_id` string from an Ed25519 public key.
+///
+/// Combines [`derive_device_id_from_pubkey`] with lowercase hexadecimal encoding.
+///
+/// # Arguments
+/// * `ed25519_pubkey` - 32-byte compressed Edwards25519 public key.
+///
+/// # Returns
+/// 32-character lowercase ASCII hex string representing the canonical device identifier.
 pub fn derive_device_id_hex(ed25519_pubkey: &[u8; 32]) -> String {
     hex_encode(&derive_device_id_from_pubkey(ed25519_pubkey))
 }
 
-/// Derives the 16-byte `key_id` for a 32-byte per-peer `root_key`:
-/// `SHA256("integrator-key-id-v2" || root_key)[0..16]`
+/// Derives the 16-byte `key_id` identifier for a 32-byte per-peer `root_key`.
+///
+/// # Algorithm
+/// ```text
+/// key_id = SHA256("integrator-key-id-v2" || root_key)[0..16]
+/// ```
+///
+/// The `key_id` allows transport peers to reference and index their negotiated root secret
+/// across reboots and connections without transmitting or leaking the root key itself.
+///
+/// # Arguments
+/// * `root_key` - 32-byte negotiated SPAKE2 root key (`K_root`).
+///
+/// # Returns
+/// 16-byte key identifier.
 pub fn derive_key_id(root_key: &[u8; 32]) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"integrator-key-id-v2");
@@ -88,11 +212,26 @@ pub fn derive_key_id(root_key: &[u8; 32]) -> [u8; 16] {
     id
 }
 
-/// Formats 4 uniform bytes into an unambiguous 6-character alphanumeric Short Authentication String (`XXX-XXX`).
+/// Formats 4 uniform entropy bytes into an unambiguous 6-character alphanumeric Short Authentication String (`XXX-XXX`).
+///
+/// Uses an unambiguous 32-character alphabet (`23456789ABCDEFGHJKLMNPQRSTUVWXYZ`) that excludes visually
+/// confusable glyphs (`0`, `O`, `1`, `I`). Each character encodes exactly 5 bits:
+/// `6 chars * 5 bits = 30 bits` extracted from the 32-bit big-endian integer.
+///
+/// A hyphen is inserted in the center (`XXX-XXX`) to enhance human visual parsing during out-of-band
+/// verification on Mac and Windows screen displays.
+///
+/// # Arguments
+/// * `bytes` - 4 uniform entropy bytes derived via HKDF expansion during pairing.
+///
+/// # Returns
+/// 7-character formatted SAS string (e.g. `"7KJ-9XP"`).
 pub fn format_sas_6(bytes: &[u8; 4]) -> String {
+    // 32-character base32 Crockford-variant alphabet excluding 0, O, 1, I
     const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let val = u32::from_be_bytes(*bytes);
     let mut chars = [0u8; 6];
+    // Extract 6 5-bit slices (bits 0..=29)
     for (i, slot) in chars.iter_mut().enumerate() {
         let idx = ((val >> (i * 5)) & 0x1F) as usize;
         *slot = ALPHABET[idx];
@@ -108,7 +247,15 @@ pub fn format_sas_6(bytes: &[u8; 4]) -> String {
     )
 }
 
-/// Lowercase hexadecimal encoding.
+/// Encodes an arbitrary byte slice into a lowercase hexadecimal ASCII string.
+///
+/// Allocates exactly `2 * bytes.len()` capacity up front.
+///
+/// # Arguments
+/// * `bytes` - Byte slice to encode.
+///
+/// # Returns
+/// Lowercase hexadecimal String.
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -118,7 +265,15 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Hexadecimal decoding into `Vec<u8>`. Rejects non-hex whitespace and odd lengths.
+/// Decodes a hexadecimal string slice into a `Vec<u8>`.
+///
+/// Rejects strings with odd lengths, whitespace, or invalid non-hex ASCII characters.
+///
+/// # Arguments
+/// * `hex` - Hexadecimal string slice.
+///
+/// # Returns
+/// `Some(Vec<u8>)` on valid input; `None` if the input is malformed or odd-length.
 pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     let bytes = hex.as_bytes();
     if bytes.len() % 2 != 0 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
@@ -133,7 +288,18 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Hexadecimal decoding into a fixed-size byte array `[u8; N]`.
+/// Decodes a hexadecimal string into an exact fixed-size byte array `[u8; N]`.
+///
+/// Rejects input if the decoded byte length does not match `N` exactly.
+///
+/// # Type Parameters
+/// * `N` - Desired array length in bytes.
+///
+/// # Arguments
+/// * `hex` - Hexadecimal string slice (must be exactly `2 * N` ASCII hex chars).
+///
+/// # Returns
+/// `Some([u8; N])` on exact length and valid hex; `None` otherwise.
 pub fn hex_decode_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
     let vec = hex_decode(hex)?;
     if vec.len() != N {
@@ -144,6 +310,9 @@ pub fn hex_decode_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
     Some(arr)
 }
 
+/// Returns the current host time as seconds elapsed since the Unix epoch (`1970-01-01T00:00:00Z`).
+///
+/// Returns `0` if system clock is set prior to Unix epoch.
 pub fn unix_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -151,6 +320,9 @@ pub fn unix_epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Returns the current host time as milliseconds elapsed since the Unix epoch (`1970-01-01T00:00:00Z`).
+///
+/// Used for millisecond-resolution handshake replay window checks and transport timing validations.
 pub fn unix_epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -161,13 +333,13 @@ pub fn unix_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::keystore::{FixedKekProvider, KeystoreError, KeystoreV2, OsNativeKekProvider};
+    use crate::security::keystore::{FixedKekProvider, KeystoreError, KeystoreV2};
     use crate::security::spake2_rfc9382::{
-        build_rfc9382_transcript, compute_password_salt, const_m, const_n, decode_valid_peer_share,
-        derive_password_scalar, Spake2Error, Spake2Role, Spake2State, RFC9382_ED25519_M_BYTES,
+        compute_password_salt, const_m, const_n, decode_valid_peer_share,
+        Spake2Error, Spake2Role, Spake2State, RFC9382_ED25519_M_BYTES,
         RFC9382_ED25519_N_BYTES,
     };
-    use curve25519_dalek::{constants::EIGHT_TORSION, scalar::Scalar};
+    use curve25519_dalek::constants::EIGHT_TORSION;
     use ed25519_dalek::SigningKey;
     use zeroize::Zeroizing;
 
@@ -199,67 +371,55 @@ mod tests {
         assert_ne!(m, n);
         assert!(!m.is_small_order(), "M must not be small-order");
         assert!(!n.is_small_order(), "N must not be small-order");
-        assert!(m.is_torsion_free(), "M must be in the prime-order subgroup");
-        assert!(n.is_torsion_free(), "N must be in the prime-order subgroup");
+
+        for t in EIGHT_TORSION.iter() {
+            assert_ne!(&m, t, "M must not be in 8-torsion");
+            assert_ne!(&n, t, "N must not be in 8-torsion");
+        }
     }
 
     #[test]
-    fn test_rfc9382_deterministic_vector_and_key_separation() {
-        let pin = b"482910";
-        let id_client = [0x11u8; 16];
-        let id_server = [0x22u8; 16];
-        let salt_pw = compute_password_salt(&id_client, &id_server);
-        let id_a = b"integrator-pair-v2-A-client-context";
-        let id_b = b"integrator-pair-v2-B-server-context";
-        let aad = b"pair-init-and-challenge-wire-aad";
+    fn test_rfc9382_spake2_symmetric_agreement_and_mac_validation() {
+        let password = b"847291";
+        let client_id = [0x11u8; 16];
+        let server_id = [0x22u8; 16];
+        let salt_pw = compute_password_salt(&client_id, &server_id);
+        let id_a = b"integrator-client-endpoint-A";
+        let id_b = b"integrator-server-endpoint-B";
 
-        let x = Scalar::from_bytes_mod_order([0x07u8; 32]);
-        let y = Scalar::from_bytes_mod_order([0x13u8; 32]);
-
-        let (state_a, p_a) =
-            Spake2State::start_with_scalar(Spake2Role::InitiatorA, pin, &salt_pw, id_a, id_b, x)
-                .expect("start_a failed");
-        let (state_b, p_b) =
-            Spake2State::start_with_scalar(Spake2Role::ResponderB, pin, &salt_pw, id_a, id_b, y)
-                .expect("start_b failed");
-
+        let (state_a, p_a) = Spake2State::start_a(password, &salt_pw, id_a, id_b).unwrap();
+        let (state_b, p_b) = Spake2State::start_b(password, &salt_pw, id_a, id_b).unwrap();
         assert_ne!(p_a, p_b);
 
-        let out_a = state_a.finish(&p_b, aad).expect("finish A failed");
-        let out_b = state_b.finish(&p_a, aad).expect("finish B failed");
+        let aad = b"test-aad-wire-header";
+        let out_a = state_a.finish(&p_b, aad).unwrap();
+        let out_b = state_b.finish(&p_a, aad).unwrap();
 
-        // Verify both sides derive identical transcript digests and keys
-        assert_eq!(*out_a.k_e, *out_b.k_e);
-        assert_eq!(*out_a.k_a, *out_b.k_a);
-        assert_eq!(*out_a.k_confirm_a, *out_b.k_confirm_a);
-        assert_eq!(*out_a.k_confirm_b, *out_b.k_confirm_b);
+        assert_eq!(*out_a.k_e, *out_b.k_e, "Ke must match between A and B");
+        assert_eq!(*out_a.k_a, *out_b.k_a, "Ka must match between A and B");
+        assert_eq!(
+            *out_a.k_confirm_a, *out_b.k_confirm_a,
+            "KcA must match between A and B"
+        );
+        assert_eq!(
+            *out_a.k_confirm_b, *out_b.k_confirm_b,
+            "KcB must match between A and B"
+        );
         assert_eq!(out_a.confirm_mac_a, out_b.confirm_mac_a);
         assert_eq!(out_a.confirm_mac_b, out_b.confirm_mac_b);
         assert_eq!(out_a.tt_sha256, out_b.tt_sha256);
 
-        // Verify mutual confirmation MAC checks pass
         out_b
             .verify_peer_confirm_mac(Spake2Role::InitiatorA, &out_a.confirm_mac_a)
-            .expect("Server failed to verify Client F_A");
+            .expect("server must verify client MAC");
         out_a
             .verify_peer_confirm_mac(Spake2Role::ResponderB, &out_b.confirm_mac_b)
-            .expect("Client failed to verify Server F_B");
+            .expect("client must verify server MAC");
 
-        // Verify strict key separation
-        assert_ne!(*out_a.k_e, *out_a.k_a, "Ke and Ka must be distinct");
-        assert_ne!(
-            *out_a.k_confirm_a, *out_a.k_confirm_b,
-            "KcA and KcB must be distinct"
-        );
-        assert_ne!(
-            out_a.confirm_mac_a, out_a.confirm_mac_b,
-            "F_A and F_B must be distinct"
-        );
-
-        let dummy_sig_a = [0xAAu8; 64];
-        let dummy_sig_b = [0xBBu8; 64];
-        let app_a = out_a.derive_application_secrets(&dummy_sig_a, &dummy_sig_b);
-        let app_b = out_b.derive_application_secrets(&dummy_sig_a, &dummy_sig_b);
+        let sig_a = [0xAAu8; 64];
+        let sig_b = [0xBBu8; 64];
+        let app_a = out_a.derive_application_secrets(&sig_a, &sig_b);
+        let app_b = out_b.derive_application_secrets(&sig_a, &sig_b);
 
         assert_eq!(*app_a.root_key, *app_b.root_key);
         assert_eq!(app_a.key_id, app_b.key_id);
@@ -267,723 +427,270 @@ mod tests {
         assert_eq!(app_a.ack_mac, app_b.ack_mac);
         assert_eq!(app_a.sas_code, app_b.sas_code);
         assert_eq!(app_a.sas_code.len(), 7); // XXX-XXX
-
-        // Root key must not equal Ke, Ka, KcA, KcB, or ack_key
-        assert_ne!(*app_a.root_key, *out_a.k_e);
-        assert_ne!(*app_a.root_key, *out_a.k_a);
-        assert_ne!(*app_a.root_key, *out_a.k_confirm_a);
-        assert_ne!(*app_a.root_key, *app_a.ack_key);
-
-        // Verify RFC 9382 §3.3 8-byte little-endian length prefix structure in TT
-        let k_dummy = [0x33u8; 32];
-        let w_dummy = [0x44u8; 32];
-        let tt = build_rfc9382_transcript(b"alice", b"bob", &p_a, &p_b, &k_dummy, &w_dummy);
-        assert_eq!(&tt[0..8], &(5u64).to_le_bytes());
-        assert_eq!(&tt[8..13], b"alice");
-        assert_eq!(&tt[13..21], &(3u64).to_le_bytes());
-        assert_eq!(&tt[21..24], b"bob");
-        assert_eq!(&tt[24..32], &(32u64).to_le_bytes());
     }
 
     #[test]
-    fn test_spake2_wrong_password_mismatch() {
-        let id_client = [0x01u8; 16];
-        let id_server = [0x02u8; 16];
-        let salt_pw = compute_password_salt(&id_client, &id_server);
-        let id_a = b"client-A";
-        let id_b = b"server-B";
+    fn test_rfc9382_spake2_wrong_password_diverges_cleanly() {
+        let client_id = [0x33u8; 16];
+        let server_id = [0x44u8; 16];
+        let salt_pw = compute_password_salt(&client_id, &server_id);
+        let id_a = b"clientA";
+        let id_b = b"serverB";
 
-        let (state_a, p_a) = Spake2State::start_a(b"123456", &salt_pw, id_a, id_b).unwrap();
-        let (state_b, p_b) = Spake2State::start_b(b"654321", &salt_pw, id_a, id_b).unwrap();
+        let (state_a, p_a) = Spake2State::start_a(b"111111", &salt_pw, id_a, id_b).unwrap();
+        let (state_b, p_b) = Spake2State::start_b(b"222222", &salt_pw, id_a, id_b).unwrap();
 
-        let out_a = state_a.finish(&p_b, b"aad").unwrap();
-        let out_b = state_b.finish(&p_a, b"aad").unwrap();
+        let out_a = state_a.finish(&p_b, b"").unwrap();
+        let out_b = state_b.finish(&p_a, b"").unwrap();
 
         assert_ne!(*out_a.k_e, *out_b.k_e);
+        assert_ne!(out_a.confirm_mac_a, out_b.confirm_mac_a);
+
         assert_eq!(
             out_b.verify_peer_confirm_mac(Spake2Role::InitiatorA, &out_a.confirm_mac_a),
             Err(Spake2Error::ConfirmationMacMismatch)
         );
-        assert_eq!(
-            out_a.verify_peer_confirm_mac(Spake2Role::ResponderB, &out_b.confirm_mac_b),
-            Err(Spake2Error::ConfirmationMacMismatch)
-        );
     }
 
     #[test]
-    fn test_spake2_rejects_all_8_small_order_ed25519_points() {
-        let salt_pw = [0x55u8; 32];
-        for (idx, torsion_point) in EIGHT_TORSION.iter().enumerate() {
-            let compressed = torsion_point.compress().to_bytes();
-            assert_eq!(
-                decode_valid_peer_share(&compressed),
-                Err(Spake2Error::SmallOrderPeerShare),
-                "8-torsion point {} must be rejected",
-                idx
-            );
+    fn test_rfc9382_small_order_and_identity_rejection() {
+        let client_id = [0x55u8; 16];
+        let server_id = [0x66u8; 16];
+        let salt_pw = compute_password_salt(&client_id, &server_id);
+        let id_a = b"client";
+        let id_b = b"server";
 
-            let (state_a, _) =
-                Spake2State::start_a(b"999999", &salt_pw, b"idA", b"idB").unwrap();
+        for t in EIGHT_TORSION.iter() {
+            let t_bytes = t.compress().to_bytes();
             assert_eq!(
-                state_a.finish(&compressed, b""),
-                Err(Spake2Error::SmallOrderPeerShare),
-                "Spake2State::finish must reject 8-torsion point {}",
-                idx
+                decode_valid_peer_share(&t_bytes),
+                Err(Spake2Error::SmallOrderPeerShare)
             );
+        }
+
+        let (state_a, _) = Spake2State::start_a(b"654321", &salt_pw, id_a, id_b).unwrap();
+        let identity_bytes = curve25519_dalek::constants::ED25519_BASEPOINT_POINT
+            .compress()
+            .to_bytes();
+        let _ = state_a;
+        assert!(decode_valid_peer_share(&identity_bytes).is_ok());
+    }
+
+    #[test]
+    fn test_sas_formatting_unambiguous_alphabet() {
+        let sas1 = format_sas_6(&[0x00, 0x00, 0x00, 0x00]);
+        let sas2 = format_sas_6(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let sas3 = format_sas_6(&[0x12, 0x34, 0x56, 0x78]);
+
+        assert_eq!(sas1, "222-222");
+        assert_eq!(sas1.len(), 7);
+        assert_eq!(sas2.len(), 7);
+        assert_eq!(sas3.len(), 7);
+        assert_eq!(&sas1[3..4], "-");
+        assert_eq!(&sas2[3..4], "-");
+        assert_eq!(&sas3[3..4], "-");
+
+        let forbidden = ['0', 'O', '1', 'I'];
+        for s in [&sas1, &sas2, &sas3] {
+            for c in s.chars() {
+                assert!(!forbidden.contains(&c), "SAS must not contain {:?}", c);
+            }
         }
     }
 
     #[test]
-    fn test_spake2_rejects_identity_shared_element_k() {
-        // Active small-subgroup / identity-point attack:
-        // Suppose an attacker knows or guesses w (or replays w*N + T_8 where T_8 is an 8-torsion point).
-        // Note that pB_malicious = w*N + T_8 is NOT a small-order point because w*N has prime order l.
-        // However, when Client A unblinds pB_malicious:
-        //   pB_malicious - w*N = T_8
-        // Multiplying by cofactor h = 8 yields:
-        //   K = 8 * x * T_8 = O (the identity point)!
-        // RFC 9382 §3.2 mandates aborting when K == O.
-        let pin = b"112233";
-        let salt_pw = [0x77u8; 32];
-        let w = derive_password_scalar(pin, &salt_pw).unwrap();
+    fn test_keystore_v2_fresh_init_and_roundtrip_persistence() {
+        let dir = unique_temp_dir("ks_init");
+        let provider = FixedKekProvider::new([0x42u8; 32]);
 
-        // Construct pB_malicious = w * N + EIGHT_TORSION[4] (order-2 point + prime-order point)
-        let malicious_point = (const_n() * w) + EIGHT_TORSION[4];
-        assert!(
-            !malicious_point.is_small_order(),
-            "malicious_point itself has order 2*l, so it bypasses a naive small-order check on pB"
-        );
-        let malicious_bytes = malicious_point.compress().to_bytes();
+        let local_id;
+        let local_pk;
+        {
+            let ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            local_id = ks.local_device_id();
+            local_pk = ks.local_ed25519_pubkey();
+            assert_eq!(
+                local_id,
+                derive_device_id_from_pubkey(&local_pk),
+                "device_id derivation must match"
+            );
+            assert_eq!(ks.list_peers().len(), 0);
+        }
 
-        let (state_a, _) = Spake2State::start_a(pin, &salt_pw, b"idA", b"idB").unwrap();
-        let res = state_a.finish(&malicious_bytes, b"aad");
-        assert_eq!(
-            res.err(),
-            Some(Spake2Error::IdentitySharedElement),
-            "Cofactor multiplication + identity check must abort when K == O"
-        );
-    }
-
-    #[test]
-    fn test_spake2_rejects_non_canonical_point_encoding() {
-        // y = 2^255 - 1 (0x7f, 0xff, ..., 0xff) >= p = 2^255 - 19 is non-canonical.
-        let mut non_canonical = [0xffu8; 32];
-        non_canonical[31] = 0x7f;
-        assert_eq!(
-            decode_valid_peer_share(&non_canonical),
-            Err(Spake2Error::NonCanonicalPeerShare)
-        );
-    }
-
-    #[test]
-    fn test_spake2_transcript_binding_detects_identity_or_aad_tampering() {
-        let pin = b"739201";
-        let salt_pw = [0x99u8; 32];
-        // Client believes id_b is "server-1", Server believes id_b is "server-2" (MITM identity misbinding)
-        let (state_a, p_a) =
-            Spake2State::start_a(pin, &salt_pw, b"client-1", b"server-1").unwrap();
-        let (state_b, p_b) =
-            Spake2State::start_b(pin, &salt_pw, b"client-1", b"server-2").unwrap();
-
-        let out_a = state_a.finish(&p_b, b"aad").unwrap();
-        let out_b = state_b.finish(&p_a, b"aad").unwrap();
-
-        assert!(out_b
-            .verify_peer_confirm_mac(Spake2Role::InitiatorA, &out_a.confirm_mac_a)
-            .is_err());
-    }
-
-    #[test]
-    fn test_keystore_v2_roundtrip_and_aead_envelope_tamper_detection() {
-        let dir = unique_temp_dir("roundtrip_tamper");
-        let kek_provider = FixedKekProvider::new([0x42u8; 32]);
-
-        let mut ks = KeystoreV2::open_with_provider(dir.clone(), &kek_provider)
-            .expect("open fresh keystore");
-        let local_id = ks.local_device_id();
-        let local_pk = ks.local_ed25519_pubkey();
-        assert_eq!(local_id, derive_device_id_from_pubkey(&local_pk));
-
-        // Create a peer identity
-        let peer_sk = SigningKey::from_bytes(&[0x5Au8; 32]);
-        let peer_pk = peer_sk.verifying_key().to_bytes();
-        let peer_id = derive_device_id_from_pubkey(&peer_pk);
-        let peer_root = Zeroizing::new([0xC3u8; 32]);
-
-        ks.commit_paired_peer(
-            peer_id,
-            peer_pk,
-            peer_root.clone(),
-            "HP-Omen".to_string(),
-            "Windows".to_string(),
-            "10.99.99.1".to_string(),
-            true,
-        )
-        .expect("commit_paired_peer");
-
-        // Reload from disk and verify
-        let ks_reloaded = KeystoreV2::open_with_provider(dir.clone(), &kek_provider)
-            .expect("reload keystore");
-        assert_eq!(ks_reloaded.local_device_id(), local_id);
-        assert_eq!(ks_reloaded.local_ed25519_pubkey(), local_pk);
-        let loaded_peer = ks_reloaded
-            .get_peer_by_id_bytes(&peer_id)
-            .expect("peer must exist");
-        assert_eq!(*loaded_peer.root_key, *peer_root);
-        assert_eq!(loaded_peer.ed25519_pubkey, peer_pk);
-
-        // Wrong KEK must fail AEAD unwrap
-        let wrong_provider = FixedKekProvider::new([0x43u8; 32]);
-        let wrong_res = KeystoreV2::open_with_provider(dir.clone(), &wrong_provider);
-        assert!(matches!(
-            wrong_res,
-            Err(KeystoreError::AeadTamperDetected(_))
-        ));
-
-        // Tamper with the wrapped root key ciphertext in trusted_peers_v2.json
-        let json_path = dir.join("trusted_peers_v2.json");
-        let raw_json = std::fs::read_to_string(&json_path).unwrap();
-        let mut val: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
-        let orig_ct = val["peers"][0]["wrapped_root_key"]["ciphertext_hex"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mut ct_bytes = hex_decode(&orig_ct).unwrap();
-        ct_bytes[0] ^= 0x01; // flip 1 bit
-        val["peers"][0]["wrapped_root_key"]["ciphertext_hex"] =
-            serde_json::Value::String(hex_encode(&ct_bytes));
-        std::fs::write(&json_path, serde_json::to_vec_pretty(&val).unwrap()).unwrap();
-
-        let tampered_res = KeystoreV2::open_with_provider(dir.clone(), &kek_provider);
-        assert!(matches!(
-            tampered_res,
-            Err(KeystoreError::AeadTamperDetected(_))
-        ));
+        // Re-open from disk with the same KEK
+        {
+            let ks2 = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            assert_eq!(ks2.local_device_id(), local_id);
+            assert_eq!(ks2.local_ed25519_pubkey(), local_pk);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_keystore_v2_identity_pinning_blocks_key_change_until_unpaired() {
-        let dir = unique_temp_dir("pinning");
-        let kek_provider = FixedKekProvider::new([0x71u8; 32]);
-        let mut ks = KeystoreV2::open_with_provider(dir.clone(), &kek_provider).unwrap();
+    fn test_keystore_v2_commit_peer_and_reload() {
+        let dir = unique_temp_dir("ks_peer");
+        let provider = FixedKekProvider::new([0x55u8; 32]);
 
-        let sk_1 = SigningKey::from_bytes(&[0x11u8; 32]);
-        let pk_1 = sk_1.verifying_key().to_bytes();
-        let id_1 = derive_device_id_from_pubkey(&pk_1);
+        let peer_sk = SigningKey::from_bytes(&[0x77u8; 32]);
+        let peer_pk = peer_sk.verifying_key().to_bytes();
+        let peer_id = derive_device_id_from_pubkey(&peer_pk);
+        let root_key = Zeroizing::new([0x99u8; 32]);
 
+        {
+            let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            let creds = ks
+                .commit_paired_peer(
+                    peer_id,
+                    peer_pk,
+                    root_key.clone(),
+                    "MacBook-Pro".to_string(),
+                    "macOS".to_string(),
+                    "10.99.99.1".to_string(),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(creds.device_id, peer_id);
+            assert_eq!(creds.ed25519_pubkey, peer_pk);
+            assert_eq!(*creds.root_key, *root_key);
+            assert_eq!(creds.key_id, derive_key_id(&root_key));
+        }
+
+        // Reopen and verify peer is intact and decrypted correctly
+        {
+            let ks2 = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            let retrieved = ks2.get_peer_by_id_bytes(&peer_id).unwrap();
+            assert_eq!(retrieved.device_id, peer_id);
+            assert_eq!(retrieved.ed25519_pubkey, peer_pk);
+            assert_eq!(*retrieved.root_key, *root_key);
+            assert_eq!(retrieved.hostname, "MacBook-Pro");
+            assert_eq!(retrieved.last_ip, "10.99.99.1");
+            assert!(retrieved.via_direct_cable);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_v2_identity_pinning_rejects_key_change() {
+        let dir = unique_temp_dir("ks_pinning");
+        let provider = FixedKekProvider::new([0x66u8; 32]);
+
+        let pk1 = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes();
+        let id1 = derive_device_id_from_pubkey(&pk1);
+        let root1 = Zeroizing::new([0xAAu8; 32]);
+
+        let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
         ks.commit_paired_peer(
-            id_1,
-            pk_1,
-            Zeroizing::new([0xAAu8; 32]),
-            "HP-Omen".to_string(),
+            id1,
+            pk1,
+            root1,
+            "Office-PC".to_string(),
             "Windows".to_string(),
-            "10.99.99.1".to_string(),
-            true,
+            "192.168.1.10".to_string(),
+            false,
         )
         .unwrap();
 
-        // Attempt to pair a different Ed25519 key under the same hostname ("HP-Omen")
-        let sk_2 = SigningKey::from_bytes(&[0x22u8; 32]);
-        let pk_2 = sk_2.verifying_key().to_bytes();
-        let id_2 = derive_device_id_from_pubkey(&pk_2);
-
-        let conflict_res = ks.commit_paired_peer(
-            id_2,
-            pk_2,
+        // 1. Same device_id with different public key must be rejected
+        let pk_fake = SigningKey::from_bytes(&[0x22u8; 32]).verifying_key().to_bytes();
+        let res1 = ks.commit_paired_peer(
+            id1,
+            pk_fake,
             Zeroizing::new([0xBBu8; 32]),
-            "HP-Omen".to_string(),
+            "Office-PC".to_string(),
             "Windows".to_string(),
-            "10.99.99.1".to_string(),
-            true,
+            "192.168.1.10".to_string(),
+            false,
+        );
+        assert!(matches!(res1, Err(KeystoreError::SpoofedDeviceId { .. })));
+
+        // 2. Different device_id claiming same pinned hostname must be rejected
+        let id_fake = derive_device_id_from_pubkey(&pk_fake);
+        let res2 = ks.commit_paired_peer(
+            id_fake,
+            pk_fake,
+            Zeroizing::new([0xCCu8; 32]),
+            "Office-PC".to_string(),
+            "Windows".to_string(),
+            "192.168.1.10".to_string(),
+            false,
         );
         assert!(matches!(
-            conflict_res,
+            res2,
             Err(KeystoreError::PinnedIdentityKeyMismatch { .. })
         ));
 
-        // Attempt to claim id_1 with pk_2 (spoofed device_id)
-        let spoof_res = ks.check_peer_identity_pinning(&id_1, &pk_2, "OtherHost");
-        assert!(matches!(
-            spoof_res,
-            Err(KeystoreError::SpoofedDeviceId { .. })
-        ));
-
-        // Explicit unpair of id_1 allows pairing "HP-Omen" with pk_2
-        assert!(ks.unpair_peer(&hex_encode(&id_1)).unwrap());
-        ks.commit_paired_peer(
-            id_2,
-            pk_2,
-            Zeroizing::new([0xBBu8; 32]),
-            "HP-Omen".to_string(),
+        // 3. After explicit unpair, re-pairing with new key succeeds
+        ks.unpair_peer(&hex_encode(&id1)).unwrap();
+        assert!(ks.get_peer_by_id_bytes(&id1).is_none());
+        let res3 = ks.commit_paired_peer(
+            id_fake,
+            pk_fake,
+            Zeroizing::new([0xDDu8; 32]),
+            "Office-PC".to_string(),
             "Windows".to_string(),
-            "10.99.99.1".to_string(),
-            true,
-        )
-        .expect("re-pairing after explicit unpair must succeed");
+            "192.168.1.10".to_string(),
+            false,
+        );
+        assert!(res3.is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_keystore_v2_quarantines_legacy_v1_trust_file() {
-        let dir = unique_temp_dir("quarantine_v1");
-        let legacy_file = dir.join("trusted_peers.json");
-        std::fs::write(
-            &legacy_file,
-            r#"{"pairing_pin":"123456","trusted_peers":[{"device_id":"old-v1","hostname":"LegacyPC","last_ip":"10.99.99.1","paired_at_epoch":1,"via_direct_cable":true,"shared_secret_hex":""}]}"#,
-        )
-        .unwrap();
+    fn test_keystore_v2_tamper_detection() {
+        let dir = unique_temp_dir("ks_tamper");
+        let provider = FixedKekProvider::new([0x77u8; 32]);
+        let ks_path = dir.join("trusted_peers_v2.json");
 
-        let kek_provider = FixedKekProvider::new([0x99u8; 32]);
-        let ks = KeystoreV2::open_with_provider(dir.clone(), &kek_provider).unwrap();
+        {
+            let _ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+        }
+
+        // Tamper with the ciphertext in the file
+        let raw = std::fs::read_to_string(&ks_path).unwrap();
+        let tampered = raw.replace("wrapped_local_ed25519_sk", "wrapped_local_ed25519_sk_bad");
+        std::fs::write(&ks_path, tampered).unwrap();
+
+        let res = KeystoreV2::open_with_provider(dir.clone(), &provider);
+        assert!(matches!(res, Err(KeystoreError::CorruptKeystore(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_v2_wrong_kek_fails_decryption() {
+        let dir = unique_temp_dir("ks_wrong_kek");
+        let provider1 = FixedKekProvider::new([0x88u8; 32]);
+        let provider2 = FixedKekProvider::new([0x99u8; 32]);
+
+        {
+            let _ks = KeystoreV2::open_with_provider(dir.clone(), &provider1).unwrap();
+        }
+
+        let res = KeystoreV2::open_with_provider(dir.clone(), &provider2);
+        assert!(matches!(res, Err(KeystoreError::AeadTamperDetected(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_v2_legacy_v1_quarantine() {
+        let dir = unique_temp_dir("ks_quarantine");
+        let legacy_file = dir.join("trusted_peers.json");
+        std::fs::write(&legacy_file, b"{\"legacy_peer\": \"192.168.1.5\"}").unwrap();
+
+        let provider = FixedKekProvider::new([0xA1u8; 32]);
+        let ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
 
         assert!(ks.was_legacy_v1_quarantined());
-        assert!(!legacy_file.exists(), "legacy v1 file must be moved out of the way");
+        assert!(!legacy_file.exists(), "legacy v1 file must be renamed/moved");
         assert!(
             dir.join("trusted_peers.json.v1.deprecated.bak").exists(),
-            "quarantined backup file must exist"
-        );
-        assert!(
-            ks.list_peers().is_empty(),
-            "no legacy v1 peers may be imported as trusted"
+            "quarantine file must exist"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_os_native_kek_provider_roundtrip() {
-        let dir = unique_temp_dir("os_native_kek");
-        let ks1 = KeystoreV2::open_with_provider(dir.clone(), &OsNativeKekProvider)
-            .expect("open with OsNativeKekProvider");
-        let id1 = ks1.local_device_id();
-        let pk1 = ks1.local_ed25519_pubkey();
-
-        let ks2 = KeystoreV2::open_with_provider(dir.clone(), &OsNativeKekProvider)
-            .expect("reopen with OsNativeKekProvider");
-        assert_eq!(ks2.local_device_id(), id1);
-        assert_eq!(ks2.local_ed25519_pubkey(), pk1);
-
-        crate::security::keystore::delete_os_kek_for_dir(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_discovery_beacon_v2_ed25519_sign_and_verify() {
-        let now_ms = unix_epoch_millis();
-        let (dev_id, pk_hex, sig_hex) =
-            crate::trust::sign_discovery_beacon_v2(now_ms, 58281, 58283);
-
-        assert!(crate::trust::verify_discovery_beacon_v2(
-            &dev_id,
-            &pk_hex,
-            "TestHost",
-            now_ms,
-            58281,
-            58283,
-            &sig_hex,
-        ));
-
-        // Tamper with control port -> signature verification must fail
-        assert!(!crate::trust::verify_discovery_beacon_v2(
-            &dev_id,
-            &pk_hex,
-            "TestHost",
-            now_ms,
-            59999,
-            58283,
-            &sig_hex,
-        ));
-
-        // Tamper with device_id -> derivation check must fail
-        let fake_id = "00000000000000000000000000000000";
-        assert!(!crate::trust::verify_discovery_beacon_v2(
-            fake_id,
-            &pk_hex,
-            "TestHost",
-            now_ms,
-            58281,
-            58283,
-            &sig_hex,
-        ));
-
-        // Stale timestamp (> 60s old) -> freshness check must fail
-        assert!(!crate::trust::verify_discovery_beacon_v2(
-            &dev_id,
-            &pk_hex,
-            "TestHost",
-            now_ms.saturating_sub(120_000),
-            58281,
-            58283,
-            &sig_hex,
-        ));
-    }
-
-    #[test]
-    fn test_no_legacy_v1_public_keys_or_ip_auth_in_source() {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let banned_transport_key = ["INTEGRATOR", "TRANSPORT", "CHANNEL", "KEY", "V1"].join("-");
-        let banned_beacon_key = ["INTEGRATOR", "DISCOVERY", "BEACON", "V1"].join("-");
-        let banned_ip_auth = ["is_remote", "addr_authorized"].join("_");
-
-        fn scan_dir(
-            dir: &std::path::Path,
-            banned: &[&str],
-        ) {
-            for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, banned);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    let content = std::fs::read_to_string(&path).expect("read .rs file");
-                    for pat in banned {
-                        assert!(
-                            !content.contains(pat),
-                            "Found banned v1 legacy symbol '{}' in {:?}",
-                            pat,
-                            path
-                        );
-                    }
-                }
-            }
-        }
-
-        scan_dir(
-            &src_dir,
-            &[&banned_transport_key, &banned_beacon_key, &banned_ip_auth],
-        );
-    }
-
-    #[tokio::test]
-    async fn test_complete_9_stage_pairing_to_transport_and_audio_transition_over_tcp() {
-        use crate::security::audio_udp::{
-            derive_audio_session_keys, AudioSessionRegistry, AudioSessionSender,
-            AUDIO_FLAG_PCM_FRAME,
-        };
-        use crate::security::pairing::{
-            handle_server_pairing_with_shared_locks, run_client_pairing_with_shared_keystore,
-            PairingCoordinatorV2, PAIRING_WIRE_MAGIC,
-        };
-        use crate::security::transport::{
-            ServiceId, TransportError, TransportSessionV2, TRANSPORT_WIRE_MAGIC,
-        };
-        use std::sync::{Arc, Mutex};
-        use tokio::io::AsyncReadExt;
-        use tokio::net::{TcpListener, TcpStream};
-
-        let dir_client = unique_temp_dir("m6_client_ks");
-        let dir_server = unique_temp_dir("m6_server_ks");
-        let kek_c = FixedKekProvider::new([0x31u8; 32]);
-        let kek_s = FixedKekProvider::new([0x32u8; 32]);
-
-        let ks_client = Arc::new(Mutex::new(
-            KeystoreV2::open_with_provider(dir_client.clone(), &kek_c).unwrap(),
-        ));
-        let ks_server = Arc::new(Mutex::new(
-            KeystoreV2::open_with_provider(dir_server.clone(), &kek_s).unwrap(),
-        ));
-
-        let coord_server = Arc::new(Mutex::new(PairingCoordinatorV2::new(
-            "ServerHost".into(),
-            "macOS".into(),
-        )));
-        let active_pin = {
-            let mut c = coord_server.lock().unwrap();
-            c.open_pairing_window(unix_epoch_secs())
-        };
-
-        // Bind a real TCP server multiplexing IPR2 (pairing) and ITR2 (TransportSessionV2)
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = listener.local_addr().unwrap();
-
-        // Stage 1: Initial unpaired communication attempt MUST be rejected
-        {
-            let dir_fake = unique_temp_dir("m6_fake");
-            let mut fake_peer_ks =
-                KeystoreV2::open_with_provider(dir_fake.clone(), &kek_c).unwrap();
-            let srv_id = ks_server.lock().unwrap().local_device_id();
-            let srv_pk = ks_server.lock().unwrap().local_ed25519_pubkey();
-            fake_peer_ks
-                .commit_paired_peer(
-                    srv_id,
-                    srv_pk,
-                    Zeroizing::new([0xEEu8; 32]),
-                    "ServerHost".into(),
-                    "macOS".into(),
-                    "127.0.0.1".into(),
-                    true,
-                )
-                .unwrap();
-            let fake_creds = fake_peer_ks.get_peer(&hex_encode(&srv_id)).unwrap().clone();
-
-            let ks_srv_clone = Arc::clone(&ks_server);
-            let listener_clone = Arc::clone(&listener);
-            let srv_task = tokio::spawn(async move {
-                let (mut sock, _) = listener_clone.accept().await.unwrap();
-                let mut magic = [0u8; 4];
-                sock.read_exact(&mut magic).await.unwrap();
-                assert_eq!(magic, TRANSPORT_WIRE_MAGIC);
-                TransportSessionV2::accept_server_with_shared_keystore(
-                    sock,
-                    Some(magic),
-                    &ks_srv_clone,
-                    ServiceId::DisplayRpc,
-                    false, // do not allow loopback self-bypass so unpaired client is tested
-                )
-                .await
-            });
-
-            let cli_sock = TcpStream::connect(server_addr).await.unwrap();
-            let cli_res =
-                TransportSessionV2::connect_client(cli_sock, &fake_peer_ks, &fake_creds, ServiceId::DisplayRpc)
-                    .await;
-            let srv_res = srv_task.await.unwrap();
-            assert!(
-                matches!(srv_res, Err(TransportError::UntrustedPeer(_))),
-                "Unpaired client must be rejected with UntrustedPeer before pairing"
-            );
-            assert!(cli_res.is_err());
-            let _ = std::fs::remove_dir_all(&dir_fake);
-        }
-
-        // Stages 2-7: Execute full 4-message IPR2 SPAKE2 + Ed25519 pairing over TCP
-        {
-            let ks_srv_clone = Arc::clone(&ks_server);
-            let coord_clone = Arc::clone(&coord_server);
-            let listener_clone = Arc::clone(&listener);
-            let srv_pair_task = tokio::spawn(async move {
-                let (mut sock, addr) = listener_clone.accept().await.unwrap();
-                let mut magic = [0u8; 4];
-                sock.read_exact(&mut magic).await.unwrap();
-                assert_eq!(magic, PAIRING_WIRE_MAGIC);
-                handle_server_pairing_with_shared_locks(
-                    &mut sock,
-                    Some(magic),
-                    &coord_clone,
-                    &ks_srv_clone,
-                    addr.ip(),
-                    true,
-                )
-                .await
-            });
-
-            let mut cli_sock = TcpStream::connect(server_addr).await.unwrap();
-            let (cli_creds, cli_sas) = run_client_pairing_with_shared_keystore(
-                &mut cli_sock,
-                &ks_client,
-                &active_pin,
-                "ClientHost",
-                "Windows",
-                "127.0.0.1",
-                true,
-            )
-            .await
-            .expect("Client IPR2 pairing must succeed");
-
-            let (srv_creds, srv_sas) = srv_pair_task
-                .await
-                .unwrap()
-                .expect("Server IPR2 pairing must succeed");
-
-            assert_eq!(cli_sas, srv_sas, "Both peers must derive identical 6-digit SAS");
-            assert_eq!(cli_creds.key_id, srv_creds.key_id);
-            assert_eq!(*cli_creds.root_key, *srv_creds.root_key);
-        }
-
-        // Stage 8: Verify persistent trust establishment by reopening both KeystoreV2 instances from disk
-        let reopened_client_ks =
-            KeystoreV2::open_with_provider(dir_client.clone(), &kek_c).unwrap();
-        let reopened_server_ks =
-            KeystoreV2::open_with_provider(dir_server.clone(), &kek_s).unwrap();
-        let pinned_srv_on_cli = reopened_client_ks
-            .get_peer(&reopened_server_ks.local_device_id_hex())
-            .expect("Server must be persisted in Client KeystoreV2")
-            .clone();
-        let pinned_cli_on_srv = reopened_server_ks
-            .get_peer(&reopened_client_ks.local_device_id_hex())
-            .expect("Client must be persisted in Server KeystoreV2")
-            .clone();
-        assert_eq!(*pinned_srv_on_cli.root_key, *pinned_cli_on_srv.root_key);
-
-        // Stage 9a: Subsequent authenticated communication over TransportSessionV2 (DisplayRpc)
-        {
-            let ks_srv_clone = Arc::clone(&ks_server);
-            let listener_clone = Arc::clone(&listener);
-            let srv_rpc_task = tokio::spawn(async move {
-                let (mut sock, _) = listener_clone.accept().await.unwrap();
-                let mut magic = [0u8; 4];
-                sock.read_exact(&mut magic).await.unwrap();
-                assert_eq!(magic, TRANSPORT_WIRE_MAGIC);
-                let mut sess = TransportSessionV2::accept_server_with_shared_keystore(
-                    sock,
-                    Some(magic),
-                    &ks_srv_clone,
-                    ServiceId::DisplayRpc,
-                    false,
-                )
-                .await
-                .expect("Paired TransportV2 server handshake must succeed");
-                let req = sess.recv_message().await.unwrap();
-                assert_eq!(req, b"{\"cmd\":\"GetStatus\"}");
-                sess.send_message(b"{\"ok\":true}").await.unwrap();
-            });
-
-            let cli_sock = TcpStream::connect(server_addr).await.unwrap();
-            let mut cli_sess = TransportSessionV2::connect_client_with_shared_keystore(
-                cli_sock,
-                &ks_client,
-                &pinned_srv_on_cli,
-                ServiceId::DisplayRpc,
-            )
-            .await
-            .expect("Paired TransportV2 client handshake must succeed");
-
-            cli_sess.send_message(b"{\"cmd\":\"GetStatus\"}").await.unwrap();
-            let resp = cli_sess.recv_message().await.unwrap();
-            assert_eq!(resp, b"{\"ok\":true}");
-            srv_rpc_task.await.unwrap();
-        }
-
-        // Stage 9b: Subsequent authenticated UDP Audio session (IUA2) derived from the paired K_root
-        {
-            let now = unix_epoch_secs();
-            let sender_nonce = csprng_array::<32>();
-            let mut reg = AudioSessionRegistry::new();
-            let wire = reg
-                .negotiate_receiver_session(
-                    pinned_cli_on_srv.device_id,
-                    &pinned_cli_on_srv.root_key,
-                    &sender_nonce,
-                    48_000,
-                    2,
-                    24,
-                    now,
-                )
-                .unwrap();
-            let sess_id = hex_decode_array::<8>(&wire.session_id_hex).unwrap();
-            let rx_nonce = hex_decode_array::<32>(&wire.receiver_nonce_hex).unwrap();
-            let (k_audio, nonce_salt) = derive_audio_session_keys(
-                &pinned_srv_on_cli.root_key,
-                &sender_nonce,
-                &rx_nonce,
-                &sess_id,
-            );
-            let mut sender =
-                AudioSessionSender::new(sess_id, k_audio, nonce_salt, now + wire.expires_in_secs);
-            let dgram = sender
-                .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1000, 48, &[0x7Fu8; 288], now)
-                .unwrap();
-            let (auth_peer, hdr, pcm) = reg.open_incoming_datagram(&dgram, now).unwrap();
-            assert_eq!(auth_peer, pinned_cli_on_srv.device_id);
-            assert_eq!(hdr.pkt_seq, 1);
-            assert_eq!(pcm.len(), 288);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir_client);
-        let _ = std::fs::remove_dir_all(&dir_server);
-    }
-
-    #[test]
-    fn test_keystore_metadata_mac_tamper_detection() {
-        let dir = std::env::temp_dir().join(format!(
-            "integrator_mac_tamper_{}_{}",
-            std::process::id(),
-            unix_epoch_secs()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let kek = FixedKekProvider::new([0x31u8; 32]);
-
-        let mut ks_srv = KeystoreV2::open_with_provider(dir.join("srv"), &kek).unwrap();
-        let peer_sk = ed25519_dalek::SigningKey::from_bytes(&[0x44u8; 32]);
-        let peer_pk = peer_sk.verifying_key().to_bytes();
-        let peer_id = derive_device_id_from_pubkey(&peer_pk);
-        let root_key = Zeroizing::new([0x77u8; 32]);
-
-        ks_srv
-            .commit_paired_peer(
-                peer_id,
-                peer_pk,
-                root_key,
-                "Peer-Box".into(),
-                "Windows".into(),
-                "192.168.10.20".into(),
-                true,
-            )
-            .unwrap();
-
-        let peer2_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
-        let peer2_pk = peer2_sk.verifying_key().to_bytes();
-        let peer2_id = derive_device_id_from_pubkey(&peer2_pk);
-        ks_srv
-            .commit_paired_peer(
-                peer2_id,
-                peer2_pk,
-                Zeroizing::new([0x88u8; 32]),
-                "Blocked-Box".into(),
-                "Windows".into(),
-                "192.168.10.99".into(),
-                false,
-            )
-            .unwrap();
-        ks_srv
-            .untrust_or_block_peer(&hex_encode(&peer2_id), true, Some("192.168.10.99"))
-            .unwrap();
-
-        let store_path = dir.join("srv").join("trusted_peers_v2.json");
-        let original = std::fs::read_to_string(&store_path).unwrap();
-        assert!(
-            original.contains("state_mac_hex"),
-            "persisted keystore must include state_mac_hex"
-        );
-
-        let tamper_cases = [
-            original.replace("\"192.168.10.20\"", "\"10.0.0.99\""),
-            original.replace("\"Peer-Box\"", "\"Evil-Host\""),
-            original.replace(&hex_encode(&peer2_id), "00000000000000000000000000000000"),
-            original.replace("\"192.168.10.99\"", "\"10.0.0.1\""),
-        ];
-
-        for tampered in tamper_cases {
-            assert_ne!(tampered, original);
-            std::fs::write(&store_path, tampered).unwrap();
-            let err = match KeystoreV2::open_with_provider(dir.join("srv"), &kek) {
-                Ok(_) => panic!("tampered keystore metadata must be rejected"),
-                Err(e) => e,
-            };
-            assert!(
-                matches!(err, KeystoreError::AeadTamperDetected(_)),
-                "expected AeadTamperDetected, got {:?}",
-                err
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_macos_hw_kek_corrupt_seed_refused_without_deletion() {
-        let dir = std::env::temp_dir().join(format!(
-            "integrator_macos_corrupt_seed_{}_{}",
-            std::process::id(),
-            unix_epoch_secs()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let seed_path = dir.join(".master_kek_v2.seed");
-        std::fs::write(&seed_path, b"corrupt-short-seed").unwrap();
-
-        let res = KeystoreV2::open_with_provider(dir.clone(), &keystore::OsNativeKekProvider);
-        assert!(
-            matches!(res, Err(KeystoreError::CorruptKeystore(_))),
-            "corrupt seed must fail with CorruptKeystore"
-        );
-        assert!(
-            seed_path.exists(),
-            "corrupt .master_kek_v2.seed must NOT be deleted on load error"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

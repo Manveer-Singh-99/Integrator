@@ -1,3 +1,69 @@
+/*
+ * ============================================================================
+ * Integrator Extended Desktop: macOS In-Process CGVirtualDisplay Generator
+ * ============================================================================
+ *
+ * 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+ * ----------------------------------------------------------------------------
+ * This module implements in-process macOS virtual display creation using private
+ * CoreGraphics SPI (`CGVirtualDisplay`). It allows Integrator to instantiate native,
+ * fully hardware-accelerated extended desktop monitors on macOS without requiring
+ * third-party kernel extensions (KEXTs), DriverKit system extensions, or external
+ * dummy HDMI/DisplayPort dongles.
+ *
+ * 2. END-TO-END CROSS-PLATFORM DISPLAY & CAMERA PIPELINE
+ * ----------------------------------------------------------------------------
+ * 1. In-Process Virtual Display (macOS, This File):
+ *    - Dynamically loads private CoreGraphics classes (`CGVirtualDisplayDescriptor`,
+ *      `CGVirtualDisplay`, `CGVirtualDisplayMode`, `CGVirtualDisplaySettings`) via
+ *      `NSClassFromString` to support macOS 12 Monterey through macOS 15 Sequoia.
+ *    - Injects custom vendor/product metadata:
+ *      * Vendor ID:  0x494E ("IN" for Integrator)
+ *      * Product ID: 0x0165
+ *      * Serial No:  0x00010001
+ *    - Configures native pixel geometry (`width` x `height` at `fps` Hz) and optional
+ *      HiDPI modes with calculated physical millimeter dimensions (`sizeInMillimeters`).
+ *    - Registers display with macOS Window Server, obtaining a valid `CGDirectDisplayID`.
+ * 2. Sunshine Capture & Hardware Encoding (macOS):
+ *    - `MacDisplayManager` writes `output_name = <display_id>` into `sunshine.conf`.
+ *    - Sunshine captures the virtual screen via ScreenCaptureKit / Desktop Duplication.
+ *    - Encodes imagery into H.264/HEVC using Apple Silicon VideoToolbox hardware encoders.
+ * 3. Client Reception & Rendering (Windows 11):
+ *    - Moonlight client on Windows receives stream over TCP/UDP ports 47989/48010.
+ *    - Decodes with low latency using DirectX 11 / NVDEC / AMF / Intel QSV and renders
+ *      in exclusive fullscreen.
+ *
+ * 3. COEXISTENCE WITH SHARED CAMERA SUBSYSTEM
+ * ----------------------------------------------------------------------------
+ * While this module provides the extended display screen for Sunshine, the MacBook's
+ * built-in FaceTime HD camera operates concurrently:
+ * - AVFoundation captures 720p30 NV12 bi-planar video (`camera_macos.swift`).
+ * - Frames stream across `TransportSessionV2` on port 58287 into Windows 11 Media
+ *   Foundation FrameServer (`integrator_vcam.dll` / `Integrator MacBook Camera`).
+ * - The Windows virtual camera operates standalone without requiring physical webcam
+ *   hardware or wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
+ * Both display streaming and camera capture run simultaneously with zero thread contention
+ * or GPU encoder resource starvation.
+ *
+ * 4. THREADING & CONCURRENCY MODEL
+ * ----------------------------------------------------------------------------
+ * - Synchronization: Synchronized lock object `vd_lock_obj()` guards global state
+ *   (`g_virtual_display`, `g_virtual_display_id`, `g_vd_queue`).
+ * - Dedicated Dispatch Queue: A serial GCD queue `com.manveersingh.integrator.vd`
+ *   handles asynchronous termination callbacks from CoreGraphics.
+ * - Spontaneous Teardown Handling: The `terminationHandler` block automatically
+ *   resets global state if the display is terminated by the OS (e.g. system sleep/wake).
+ *
+ * 5. SAFETY & COMPATIBILITY INVARIANTS
+ * ----------------------------------------------------------------------------
+ * - Dynamic SPI Verification: Uses `NSClassFromString` and `respondsToSelector:` before
+ *   invoking private methods, preventing crashes on unsupported or future macOS releases.
+ * - Exception Containment: All CoreGraphics interactions are wrapped in `@try / @catch`
+ *   blocks to isolate Objective-C exceptions from crossing the FFI boundary into Rust.
+ * - ARC Memory Management: Compiled with Automatic Reference Counting (`-fobjc-arc`).
+ * ============================================================================
+ */
+
 #if !__has_feature(objc_arc)
 #error "virtual_display.m requires ARC (-fobjc-arc)"
 #endif
@@ -10,21 +76,27 @@
 #import <stdint.h>
 #import <stdbool.h>
 
-// Custom vendor & product IDs ("IN" = Integrator) so virtual displays created
-// by Integrator are unambiguously identifiable even alongside physical monitors.
+/// Custom vendor ID ('IN' in ASCII = 0x494E) for unambiguous Integrator identification.
 static const uint32_t INTEGRATOR_VD_VENDOR  = 0x494E;
+
+/// Custom product ID (0x0165) for Integrator Virtual Display.
 static const uint32_t INTEGRATOR_VD_PRODUCT = 0x0165;
+
+/// Custom serial number (0x00010001) for Integrator Virtual Display.
 static const uint32_t INTEGRATOR_VD_SERIAL  = 0x00010001;
 
+/// Objective-C protocol interface describing the private `CGVirtualDisplayMode` class.
 @interface IntegratorVDModeProto : NSObject
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height refreshRate:(double)refreshRate;
 @end
 
+/// Objective-C protocol interface describing the private `CGVirtualDisplaySettings` class.
 @interface IntegratorVDSettingsProto : NSObject
 - (void)setHiDPI:(uint32_t)hiDPI;
 - (void)setModes:(NSArray *)modes;
 @end
 
+/// Objective-C protocol interface describing the private `CGVirtualDisplayDescriptor` class.
 @interface IntegratorVDDescriptorProto : NSObject
 - (void)setName:(NSString *)name;
 - (void)setMaxPixelsWide:(uint32_t)w;
@@ -37,16 +109,23 @@ static const uint32_t INTEGRATOR_VD_SERIAL  = 0x00010001;
 - (void)setTerminationHandler:(void (^)(id display, NSError *error))handler;
 @end
 
+/// Objective-C protocol interface describing the private `CGVirtualDisplay` class.
 @interface IntegratorVDProto : NSObject
 - (CGDirectDisplayID)displayID;
 - (instancetype)initWithDescriptor:(id)descriptor;
 - (BOOL)applySettings:(id)settings;
 @end
 
+/// Retained reference to the active `CGVirtualDisplay` instance.
 static id g_virtual_display = nil;
+
+/// Dedicated serial GCD queue for CoreGraphics virtual display event handling.
 static dispatch_queue_t g_vd_queue = nil;
+
+/// Active CoreGraphics display identifier assigned by Window Server.
 static CGDirectDisplayID g_virtual_display_id = 0;
 
+/// Returns a shared singleton synchronization object for `@synchronized` locking.
 static NSObject *vd_lock_obj(void) {
     static NSObject *lock = nil;
     static dispatch_once_t once;
@@ -56,9 +135,18 @@ static NSObject *vd_lock_obj(void) {
     return lock;
 }
 
+/// Instantiates an in-process virtual display on macOS using private CoreGraphics SPI.
+///
+/// - Parameters:
+///   - width: Display width in pixels (e.g. 1920, 2560, 3840).
+///   - height: Display height in pixels (e.g. 1080, 1440, 2160).
+///   - fps: Refresh rate in Hertz (e.g. 60, 120, 144).
+///   - hi_dpi: Whether to synthesize 2x HiDPI scaled logical modes.
+/// - Returns: CoreGraphics `CGDirectDisplayID` on success, or 0 on failure.
 uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi) {
     @autoreleasepool {
         @try {
+            // Dynamically resolve private SPI classes
             Class descCls = NSClassFromString(@"CGVirtualDisplayDescriptor");
             Class dispCls = NSClassFromString(@"CGVirtualDisplay");
             Class modeCls = NSClassFromString(@"CGVirtualDisplayMode");
@@ -100,6 +188,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                 [(IntegratorVDDescriptorProto *)desc setMaxPixelsWide:width];
                 [(IntegratorVDDescriptorProto *)desc setMaxPixelsHigh:height];
 
+                // Calculate realistic physical monitor size in millimeters (25.4 mm/inch)
                 double ppi = hi_dpi ? 220.0 : 140.0;
                 double mmW = (double)width * 25.4 / ppi;
                 double mmH = (double)height * 25.4 / ppi;
@@ -109,6 +198,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                 [(IntegratorVDDescriptorProto *)desc setSerialNum:INTEGRATOR_VD_SERIAL];
                 [(IntegratorVDDescriptorProto *)desc setQueue:g_vd_queue];
 
+                // Handle spontaneous termination from Window Server
                 if ([desc respondsToSelector:@selector(setTerminationHandler:)]) {
                     [(IntegratorVDDescriptorProto *)desc setTerminationHandler:^(id _Nullable terminatedDisp, NSError * _Nullable err) {
                         @synchronized(vd_lock_obj()) {
@@ -144,6 +234,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                     return 0;
                 }
 
+                // Construct primary native display mode
                 id modeAlloc = [modeCls alloc];
                 if (![modeAlloc respondsToSelector:@selector(initWithWidth:height:refreshRate:)]) {
                     NSLog(@"[Integrator] CGVirtualDisplayMode missing initWithWidth:height:refreshRate:");
@@ -154,6 +245,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                 if (primaryMode) {
                     [modes addObject:primaryMode];
                 }
+                // Construct half-resolution logical mode for Retina HiDPI scaling
                 if (hi_dpi && width >= 1600 && height >= 1200) {
                     uint32_t logicalW = (width / 2) & ~1u;
                     uint32_t logicalH = (height / 2) & ~1u;
@@ -196,6 +288,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
     }
 }
 
+/// Destroys and cleans up the active in-process virtual display.
 void stop_virtual_display_in_app(void) {
     @autoreleasepool {
         @try {
@@ -209,6 +302,7 @@ void stop_virtual_display_in_app(void) {
     }
 }
 
+/// Returns the `CGDirectDisplayID` of the active Integrator virtual display, or 0 if inactive.
 uint32_t get_virtual_display_id_in_app(void) {
     @synchronized(vd_lock_obj()) {
         if (g_virtual_display != nil && g_virtual_display_id != 0) {
@@ -243,10 +337,17 @@ uint32_t get_virtual_display_id_in_app(void) {
     return 0;
 }
 
+/// Returns whether an Integrator virtual display is currently active.
 bool is_virtual_display_active_in_app(void) {
     return get_virtual_display_id_in_app() != 0;
 }
 
+/// Queries the primary display dimensions and refresh rate on macOS.
+///
+/// - Parameters:
+///   - out_w: Pointer receiving primary width in pixels.
+///   - out_h: Pointer receiving primary height in pixels.
+///   - out_fps: Pointer receiving refresh rate in Hertz.
 void get_primary_display_info_mac(uint32_t *out_w, uint32_t *out_h, uint32_t *out_fps) {
     CGDirectDisplayID main_id = CGMainDisplayID();
     uint32_t w = (uint32_t)CGDisplayPixelsWide(main_id);

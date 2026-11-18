@@ -1,7 +1,130 @@
-//! Universal Control KVM & Cross-Screen Drag-and-Drop Engine.
+//! # Universal Input KVM & Cross-Screen Drag-and-Drop Engine
 //!
-//! Runs full-duplex over `TransportSessionV2` (`ServiceId::InputKvm`, TCP port `INPUT_PORT = 58286`),
-//! strictly requiring paired + pinned peer trust (zero IP bypass, zero v1 fallback).
+//! ## 1. Module Purpose & Scope
+//! The `KvmService` is the central orchestration engine for Integrator's Universal Control KVM
+//! (Keyboard, Video/Mouse control multiplexer) and Cross-Screen Drag-and-Drop subsystem.
+//!
+//! It binds TCP port `INPUT_PORT = 58286`, running full-duplex encrypted communication over
+//! `TransportSessionV2` (`ServiceId::InputKvm`). The service strictly requires mutual cryptographic
+//! authentication against the local Ed25519 pinned trust store (`trust.rs`), enforcing zero IP bypass
+//! and zero legacy fallback.
+//!
+//! ### Core Responsibilities:
+//! 1. **State Machine Management**: Tracks workstation control roles across three mutually exclusive
+//!    states: `Idle` (local mouse/keyboard control active), `ControllingPeer` (swallowing local input
+//!    and streaming deltas to remote workstation), and `ControlledByPeer` (synthesizing remote inputs
+//!    locally).
+//! 2. **Edge Dwell & Boundary Hopping**: Filters raw mouse coordinates through edge dwell timers
+//!    (`hop_delay_ms`) and corner guard thresholds (`DEAD_CORNER_PX`) to prevent accidental transitions
+//!    during casual cursor gestures near display borders.
+//! 3. **Input Transformation & Remapping**: Normalizes coordinates into unit intervals `[0.0, 1.0]`
+//!    accounting for asymmetric desk offsets, and bidirectionally maps modifier keys (e.g. macOS `Command ⌘`
+//!    ↔ Windows `Ctrl`) when modifier translation is enabled.
+//! 4. **Cross-Screen Drag & Drop**: Detects active OS file drags when approaching edges, generates
+//!    metadata previews (`DragOffer`), renders floating liquid glass HUD badges, streams payload chunks
+//!    concurrently over `ClipboardService`, and initiates native drops (`NSDraggingSession` / OLE `DoDragDrop`).
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                            KvmService Subsystem Architecture                           │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!              ┌─────────────────────────────────────────────────────────┐
+//!              │                     Core Bootstrap                      │
+//!              │                 (src/core.rs / main.rs)                 │
+//!              └────────────────────────────┬────────────────────────────┘
+//!                                           │ Instantiates & Starts
+//!                                           ▼
+//!              ┌─────────────────────────────────────────────────────────┐
+//!              │                       KvmService                        │
+//!              │  - State Machine: Idle | ControllingPeer | Controlled   │
+//!              │  - Edge Dwell & Dead Corner Detection                   │
+//!              │  - Key Remapping & Modifier Bitmask Harmonization       │
+//!              │  - Drag Session Lifetime & Staged Temp Cleanup          │
+//!              └───────┬─────────────────┬───────────────────┬───────────┘
+//!                      │                 │                   │
+//!           Outbound   │     Inbound     │                   │
+//!           Commands   │     Packets     │                   │
+//!                      ▼                 ▼                   │
+//!       ┌───────────────────────────────┐                    │
+//!       │      TransportSessionV2       │                    │
+//!       │     (ServiceId::InputKvm)     │                    │
+//!       │   ChaCha20-Poly1305 over TCP  │                    │
+//!       └──────────────┬────────────────┘                    │
+//!                      │ Port 58286                          │
+//!                      ▼                                     │
+//!             Remote Workstation                             │
+//!                                                            │
+//!       ┌────────────────────────────────────────────────────┴───────────┐
+//!       │ Native OS Hooks & Hardware Injection Drivers                    │
+//!       │  - macOS:   macos_backend.rs -> kvm_macos.swift (CGEventTap)   │
+//!       │  - Windows: windows_backend.rs -> kvm_windows.cpp (LL-Hooks)   │
+//!       └────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/core.rs`: Instantiates `KvmService::new`, calls `start()` during startup, monitors status via
+//!   `get_status_snapshot()`, and invokes `shutdown()` on exit.
+//! - Native OS Hook Callbacks (`on_local_mouse_move`, `on_local_mouse_button`, `on_local_mouse_scroll`,
+//!   `on_local_key_event`): Ingest raw OS events synchronously from the platform backend.
+//! - UI View Models: Read and write desk layout topology via `get_layout()` and `update_layout()`.
+//!
+//! ### Downstream Callees:
+//! - `crate::security::transport::TransportSessionV2`: Encrypted wire framing.
+//! - `crate::clipboard::ClipboardService`: Staging and streaming bulk file payloads during drag-and-drop.
+//! - `crate::discovery::DiscoveryManager`: Resolves paired peer IP addresses and OS capabilities.
+//! - `crate::features::FeatureManager`: Verifies `"input_kvm"` feature enablement.
+//! - `super::layout`: Mathematical projection, coordinate normalization, and mirror symmetry.
+//! - `super::macos_backend` / `super::windows_backend`: Hardware input capture and injection.
+//!
+//! ## 3. State Machine Transitions
+//!
+//! ```text
+//!                  ┌─────────────────────────────────────────┐
+//!                  │                  IDLE                   │
+//!                  │  (Local inputs control local desktop)   │
+//!                  └───────────┬─────────────────▲───────────┘
+//!                              │                 │
+//!          Cursor pushed past  │                 │ Cursor pushed past
+//!          boundary edge with  │                 │ boundary edge back
+//!          dwell timer expiry  │                 │ into local screen
+//!                              ▼                 │
+//!   ┌──────────────────────────────────┐         │
+//!   │         CONTROLLING_PEER         │         │
+//!   │  - Swallows local mouse/keys     │         │
+//!   │  - Cursor parked at center       │─────────┘
+//!   │  - Streams deltas over TCP       │
+//!   └──────────────────────────────────┘
+//!                              ▲
+//!                              │
+//!            Remote cursor pushed into local display bounds
+//!                              │
+//!                              ▼
+//!   ┌──────────────────────────────────┐
+//!   │        CONTROLLED_BY_PEER        │
+//!   │  - Replays incoming wire events  │
+//!   │  - Warps cursor to entry point   │
+//!   │  - Local mouse move can break in │
+//!   └──────────────────────────────────┘
+//! ```
+//!
+//! ## 4. Threading & Concurrency Model
+//! - **Tokio Async Engine**: Handles inbound TCP listener connections (`INPUT_PORT`), connection retries,
+//!   background file staging tasks, and outbound serialization channels.
+//! - **Native Hook Threads**: Dedicated platform threads execute OS hooks (`CFRunLoop` on macOS, Win32
+//!   `GetMessage` pump on Windows).
+//! - **Fast-Path Lock-Free Check**: `controlling_peer_fast` (`AtomicBool`) provides sub-microsecond
+//!   atomic state queries inside OS hook procedures without acquiring synchronous locks.
+//!
+//! ## 5. Security & Safety Invariants
+//! - **Cryptographic Mutual Authentication**: Handshakes require verified Ed25519 signatures and
+//!   ephemeral X25519 session keys (`TransportSessionV2`).
+//! - **Path Traversal Shielding**: Cross-screen drag staging sanitizes relative filenames, blocking
+//!   absolute paths, `..` traversals, and symlink creation.
+//! - **Automatic Input Release**: Any network disruption or session teardown immediately dispatches
+//!   `force_release_all`, releasing all synthetic keys and mouse buttons to prevent stuck keys.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,56 +159,96 @@ use super::protocol::{
 #[cfg(target_os = "windows")]
 use super::windows_backend;
 
+/// Maximum allowable wire message size in bytes (96 KiB) to prevent memory amplification attacks.
 const MAX_WIRE_MESSAGE_BYTES: usize = 96 * 1024;
+
+/// Capacity of the asynchronous outbound command channel queue.
 const OUTBOUND_QUEUE_CAP: usize = 1024;
+
+/// Reserved queue slots prioritized for critical release and escape commands.
 const RESERVED_CONTROL_SLOTS: usize = 128;
+
+/// Maximum simultaneous in-flight TCP accept handshakes permitted.
 const MAX_ACCEPT_HANDSHAKES: usize = 16;
 
+/// Directive returned by OS hook ingestion routines instructing the OS driver how to handle the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookDecision {
+    /// Pass the event through untouched to the local operating system and foreground application.
     PassThrough,
+    /// Swallow the event, preventing the local operating system and windows from processing it.
     Swallow,
+    /// Swallow the event and immediately warp the hardware cursor to the center park coordinates.
     SwallowAndParkCenter,
 }
 
+/// Comprehensive point-in-time runtime status telemetry snapshot of the KVM subsystem.
 #[derive(Debug, Clone, Serialize)]
 pub struct KvmStatusSnapshot {
+    /// Whether Universal Input KVM functionality is enabled in user settings.
     pub enabled: bool,
+    /// Whether Cross-Screen Drag & Drop functionality is enabled.
     pub dragdrop_enabled: bool,
+    /// Whether the low-level OS input hook (`CGEventTap` or `WH_MOUSE_LL`) is actively running.
     pub hook_active: bool,
+    /// Current state machine role description (`"idle"`, `"controlling"`, `"controlled"`).
     pub role: String,
+    /// IP address of the currently paired connected peer workstation, if connected.
     pub connected_peer_ip: Option<String>,
+    /// Operating system of the connected peer (`"macos"` or `"windows"`).
     pub peer_os: Option<String>,
+    /// Physical width of the remote peer's primary display in pixels.
     pub peer_width: u32,
+    /// Physical height of the remote peer's primary display in pixels.
     pub peer_height: u32,
+    /// User-visible label of an active file drag-and-drop session in transit.
     pub active_drag_label: Option<String>,
+    /// Current desk layout arrangement and edge configuration.
     pub layout: KvmLayoutConfig,
 }
 
+/// State machine variants governing workstation input authority.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum KvmRole {
+    /// Local machine inputs control the local desktop.
     Idle,
+    /// Local machine is currently swallowing local inputs and streaming them to the peer.
     ControllingPeer {
+        /// Target peer IP address receiving input commands.
         peer_ip: String,
+        /// Active drag session identifier if a cross-screen drag is in flight.
         active_drag_session: Option<String>,
+        /// Cursor X coordinate to restore when control returns to the local screen.
         restore_x: f32,
+        /// Cursor Y coordinate to restore when control returns to the local screen.
         restore_y: f32,
     },
+    /// Local machine is currently being remote-controlled by the peer workstation.
     ControlledByPeer {
+        /// Controlling peer IP address.
         peer_ip: String,
+        /// Edge where the remote cursor entered the local screen.
         entry_edge: ScreenEdge,
+        /// Current simulated cursor X position.
         cur_x: f32,
+        /// Current simulated cursor Y position.
         cur_y: f32,
+        /// Active drag session identifier if receiving files.
         active_drag_session: Option<String>,
+        /// User-visible preview title for the active drag operation.
         active_drag_label: Option<String>,
+        /// Indicates if a native OS dragging session (`NSDraggingSession` or OLE) has been initiated.
         native_drag_started: bool,
     },
 }
 
+/// Outbound commands dispatched across the internal asynchronous actor channel.
 #[derive(Debug)]
 enum KvmOutboundCmd {
+    /// Direct serialized wire message to transmit over the transport session.
     Wire(KvmWireMessage),
+    /// Request to initiate a cross-screen drag session with a set of local file paths.
     EnterWithDragPaths {
         entry_edge: ScreenEdge,
         norm_pos: f32,
@@ -94,6 +257,7 @@ enum KvmOutboundCmd {
     },
 }
 
+/// Central coordinator service managing KVM state, networking, hooks, and drag sessions.
 pub struct KvmService {
     discovery: DiscoveryManager,
     clipboard: ClipboardService,

@@ -1,3 +1,78 @@
+//! # Windows Win32 Low-Level Hooks & SendInput KVM Backend
+//!
+//! ## 1. Module Purpose & Scope
+//! This module provides the Windows 10/11-specific hardware input capture, invisible guard/edge
+//! probe window management, synthetic event injection, and OLE COM drag-and-drop integration for
+//! the Integrator Universal Input KVM subsystem.
+//!
+//! ### Core Subsystem Responsibilities:
+//! - **Low-Level Hook Event Interception**: Installs thread-level Win32 low-level mouse and
+//!   keyboard hooks (`WH_MOUSE_LL`, `WH_KEYBOARD_LL`) via `SetWindowsHookExW` in `kvm_windows.cpp`
+//!   to intercept physical user inputs before they reach desktop windows.
+//! - **Invisible Edge Probe & Corner Guard Windows**: Deploys 1-pixel transparent layered windows
+//!   (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW`) along active screen edges to detect
+//!   physical pointer dwell, corner avoidance, and active OLE drag-and-drop operations.
+//! - **Synthetic Input Injection**: Synthesizes remote mouse movement, button transitions, mouse
+//!   wheel deltas, and keyboard key state changes using the Win32 `SendInput` API with scan codes
+//!   and virtual-key codes (`VK_*`).
+//! - **Cross-Screen OLE Drag & Drop**: Intercepts in-flight OLE drag operations (`IDropTarget`,
+//!   `DoDragDrop`), renders a layered GDI translucent ghost window HUD, and initiates native
+//!   file drops on the receiving Windows workstation.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                           Windows KVM Backend Architecture                             │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!                     ┌────────────────────────────────────────┐
+//!                     │         KvmService (service.rs)        │
+//!                     └───────────────▲────────┬───────────────┘
+//!                                     │        │
+//!      on_win_event / on_drag_ended   │        │ inject_mouse_move / inject_key
+//!                                     │        │
+//!                     ┌───────────────┴────────▼───────────────┐
+//!                     │     windows_backend.rs (Rust FFI)      │
+//!                     └───────────────▲────────┬───────────────┘
+//!                                     │        │
+//!         C FFI Event Callbacks       │        │ C FFI Injection Calls
+//!                                     │        │
+//!                     ┌───────────────┴────────▼───────────────┐
+//!                     │       kvm_windows.cpp (Win32/C++)      │
+//!                     │  - WH_MOUSE_LL / WH_KEYBOARD_LL        │
+//!                     │  - SendInput with MOUSEINPUT / KEYBD   │
+//!                     │  - Edge Probe & Corner Guard HWNDs     │
+//!                     │  - OLE IDataObject / IDropTarget HUD   │
+//!                     └────────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/kvm/service.rs`: Invokes `start`, `stop`, `set_controlling_mode`, `set_controlled_mode`,
+//!   `sync_edge_probe`, `inject_mouse_move`, `inject_mouse_button`, `inject_scroll`, `inject_key`,
+//!   and drag ghost window controls.
+//!
+//! ### Downstream Callees:
+//! - `src/kvm_windows.cpp`: Interacts with Win32 User32, GDI32, and OLE32 APIs:
+//!   - `integrator_kvm_win_start_hooks` / `integrator_kvm_win_stop_hooks`: Manages Win32 hook thread.
+//!   - `integrator_kvm_win_inject_*`: Injects inputs tagged with `kIntegratorEventTag = 0x494E5447`.
+//!   - `integrator_kvm_win_begin_native_drag`: Spawns OLE STA thread executing `DoDragDrop`.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - Low-level hooks and edge windows run on a dedicated Win32 message-pump thread (`g_hook_thread`).
+//! - OLE `DoDragDrop` operations execute on a separate dedicated COM STA thread (`g_ole_thread`)
+//!   to avoid stalling the primary input hook message pump.
+//! - Atomic variables (`HOOK_ACTIVE`, `g_controlling_peer`) provide lock-free fast-path state checks
+//!   inside the time-critical hook procedures (`LowLevelMouseProc`, `LowLevelKeyboardProc`).
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Anti-Feedback Tagging**: All synthetic events injected via `SendInput` attach `kIntegratorEventTag`
+//!   (`0x494E5447` / "INTG") to the `dwExtraInfo` field. Hook procedures discard matching events
+//!   to prevent destructive feedback looping.
+//! - **Extended Key Flag Correctness**: Navigation keys (arrows, Home, End, PageUp, PageDown, Delete)
+//!   and right-side modifiers (Right Alt / AltGr, Right Control) set `KEYEVENTF_EXTENDEDKEY`
+//!   to maintain compatibility with Windows keyboard drivers.
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
@@ -8,11 +83,19 @@ use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton, ScreenEdge};
 use crate::kvm::service::{HookDecision, KvmService};
 
+/// Global handle to the active `KvmService` coordinator for routing incoming Windows events.
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
+
+/// Atomic indicator showing whether the Windows low-level input hooks are currently active.
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mutual exclusion lock guarding hook thread initialization and teardown routines.
 static START_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
+/// C-compatible callback function pointer for Windows input events.
 type KvmWinEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
+
+/// C-compatible callback function pointer for OLE drag-and-drop termination.
 type KvmWinDragEndedCallback = extern "C" fn(bool, *const c_char);
 
 extern "C" {
@@ -61,6 +144,12 @@ extern "C" {
     fn integrator_kvm_win_cancel_remote_drag();
 }
 
+/// Initializes the Windows KVM input backend, spawning the hook thread and installing low-level hooks.
+///
+/// If hook installation fails initially, a background worker thread retries up to 10 times.
+///
+/// # Arguments
+/// * `service` - Reference to the core `KvmService` coordinator.
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
     let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -90,6 +179,7 @@ pub fn start(service: Arc<KvmService>) {
     }
 }
 
+/// Uninstalls the Windows low-level hooks and terminates the hook message-pump thread.
 pub fn stop() {
     let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     HOOK_ACTIVE.store(false, Ordering::Release);
@@ -98,12 +188,18 @@ pub fn stop() {
     }
 }
 
+/// Returns whether the Windows low-level hooks are currently installed and operational.
 pub fn is_hook_active() -> bool {
     let active = unsafe { integrator_kvm_win_is_hook_active() };
     HOOK_ACTIVE.store(active, Ordering::Release);
     active
 }
 
+/// Configures the transparent edge probe window along the specified screen boundary.
+///
+/// # Arguments
+/// * `enabled` - True to show and position the edge probe window, false to hide it.
+/// * `peer_edge` - Cardinal edge where the remote peer is located.
 pub fn sync_edge_probe(enabled: bool, peer_edge: ScreenEdge) {
     let mode = match peer_edge {
         ScreenEdge::Left => 0,
@@ -116,6 +212,10 @@ pub fn sync_edge_probe(enabled: bool, peer_edge: ScreenEdge) {
     }
 }
 
+/// Queries the primary display bounds in virtual desktop coordinates via `GetSystemMetrics`.
+///
+/// # Returns
+/// A `ScreenRect` describing the primary display dimensions.
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
@@ -132,6 +232,7 @@ pub fn get_primary_screen_rect() -> ScreenRect {
     }
 }
 
+/// Sets controlling mode on Windows, hiding the cursor and parking it at `(park_x, park_y)`.
 pub fn set_controlling_mode(
     controlling: bool,
     park_x: f32,
@@ -150,6 +251,7 @@ pub fn set_controlling_mode(
     }
 }
 
+/// Sets controlled mode on Windows, restoring cursor visibility and warping to `(entry_x, entry_y)`.
 pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
     unsafe {
         integrator_kvm_win_set_controlled(
@@ -160,6 +262,10 @@ pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
     }
 }
 
+/// Retrieves the paths of files currently being dragged over the edge probe window.
+///
+/// # Returns
+/// A list of filesystem paths from the active OLE `IDataObject`.
 pub fn probe_active_drag_paths() -> Vec<PathBuf> {
     let ptr = unsafe { integrator_kvm_win_take_drag_paths() };
     if ptr.is_null() {
@@ -178,24 +284,28 @@ pub fn probe_active_drag_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Cancels local drag state after handoff to peer.
 pub fn cancel_local_drag_after_handoff() {
     unsafe {
         integrator_kvm_win_cancel_local_drag();
     }
 }
 
+/// Cancels an in-progress remote OLE drag operation.
 pub fn cancel_remote_drag() {
     unsafe {
         integrator_kvm_win_cancel_remote_drag();
     }
 }
 
+/// Injects synthetic pointer movement using Win32 `SendInput` (`MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE`).
 pub fn inject_mouse_move(x: f32, y: f32, _left_held: bool) {
     unsafe {
         integrator_kvm_win_inject_mouse_move(x.round() as i32, y.round() as i32);
     }
 }
 
+/// Injects synthetic mouse button down/up transitions via Win32 `SendInput`.
 pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, _x: f32, _y: f32) {
     let btn = match button {
         RemoteMouseButton::Left => 0,
@@ -207,6 +317,7 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, _x: f32, _y
     }
 }
 
+/// Injects synthetic mouse wheel scrolling deltas via Win32 `SendInput` (`MOUSEEVENTF_WHEEL` / `MOUSEEVENTF_HWHEEL`).
 pub fn inject_scroll(dx: f32, dy: f32) {
     let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
     let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
@@ -215,6 +326,7 @@ pub fn inject_scroll(dx: f32, dy: f32) {
     }
 }
 
+/// Injects a synthetic keyboard key transition via Win32 `SendInput` (`KEYEVENTF_KEYUP`, `KEYEVENTF_EXTENDEDKEY`).
 pub fn inject_key(key: LogicalKey, pressed: bool, _mods: ModifierMask) {
     if let Some((vk, ext)) = logical_to_win_vk(key) {
         unsafe {
@@ -223,6 +335,7 @@ pub fn inject_key(key: LogicalKey, pressed: bool, _mods: ModifierMask) {
     }
 }
 
+/// Displays the translucent GDI drag ghost window at coordinates `(x, y)`.
 pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, _icon_b64: Option<&str>) {
     let Ok(c_title) = CString::new(title) else { return };
     let Ok(c_sub) = CString::new(subtitle) else { return };
@@ -236,18 +349,23 @@ pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, _icon_b64: O
     }
 }
 
+/// Moves the drag ghost window to updated pointer coordinates `(x, y)`.
 pub fn move_drag_ghost(x: f32, y: f32) {
     unsafe {
         integrator_kvm_win_move_drag_ghost(x.round() as i32, y.round() as i32);
     }
 }
 
+/// Hides and dismisses the drag ghost window.
 pub fn hide_drag_ghost() {
     unsafe {
         integrator_kvm_win_hide_drag_ghost();
     }
 }
 
+/// Initiates a native OLE `DoDragDrop` session on Windows using staged payload files.
+///
+/// Executed on a dedicated COM STA worker thread to prevent blocking the input message loop.
 pub fn begin_native_drop_drag(
     paths: &[PathBuf],
     session_id: &str,
@@ -273,6 +391,7 @@ pub fn begin_native_drop_drag(
     }
 }
 
+/// Callback invoked when an active Windows OLE drag session finishes.
 extern "C" fn on_drag_ended(accepted: bool, session_id_ptr: *const c_char) {
     let Some(svc) = KVM_SERVICE_REF.get() else { return };
     let sid = if session_id_ptr.is_null() {
@@ -283,6 +402,18 @@ extern "C" fn on_drag_ended(accepted: bool, session_id_ptr: *const c_char) {
     svc.on_native_drag_ended(&sid, accepted);
 }
 
+/// Core C-ABI callback receiving intercepted raw Windows hook events from `kvm_windows.cpp`.
+///
+/// Event kinds:
+/// - `1`: Mouse movement (absolute X/Y, relative dX/dY, button bitmask)
+/// - `2`: Mouse button transition (button index, pressed boolean, X, Y)
+/// - `3`: Mouse scroll deltas (dX, dY)
+/// - `4`: Keyboard transition (virtual-key code, pressed boolean, modifier bits)
+///
+/// Returns:
+/// - `0`: Pass event through natively (`CallNextHookEx`)
+/// - `1`: Swallow event (suppress dispatch to Windows)
+/// - `2`: Swallow event and warp cursor to center park position
 extern "C" fn on_win_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64) -> i32 {
     let Some(svc) = KVM_SERVICE_REF.get() else {
         return 0;
@@ -318,6 +449,7 @@ extern "C" fn on_win_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64
     }
 }
 
+/// Translates raw bitfield modifier flags into a canonical `ModifierMask`.
 fn win_flags_to_modifiers(raw: u64) -> ModifierMask {
     ModifierMask {
         shift: (raw & 1) != 0,
@@ -327,6 +459,7 @@ fn win_flags_to_modifiers(raw: u64) -> ModifierMask {
     }
 }
 
+/// Translates a Windows Virtual-Key code (`VK_*`) into a canonical `LogicalKey`.
 pub fn win_vk_to_logical(vk: u16) -> Option<LogicalKey> {
     use LogicalKey::*;
     Some(match vk {
@@ -416,6 +549,9 @@ pub fn win_vk_to_logical(vk: u16) -> Option<LogicalKey> {
     })
 }
 
+/// Translates a canonical `LogicalKey` into a Windows Virtual-Key code (`VK_*`) and extended-key flag.
+///
+/// Extended keys include navigation clusters, right-hand modifier variants, and numeric keypad keys.
 pub fn logical_to_win_vk(key: LogicalKey) -> Option<(u16, bool)> {
     use LogicalKey::*;
     Some(match key {

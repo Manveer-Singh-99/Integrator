@@ -1,3 +1,76 @@
+//
+//  kvm_macos.swift
+//  Integrator Universal Input KVM - macOS Native Quartz & AppKit Driver
+//
+//  ========================================================================================
+//  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+//  ========================================================================================
+//  This file provides the native macOS implementation for hardware input capture, cursor
+//  virtualization, synthetic Quartz injection, and cross-screen drag-and-drop bridging for
+//  the Integrator Universal Input KVM subsystem.
+//
+//  Key Subsystem Capabilities:
+//  - Quartz Event Tap (`CGEventTap`): Captures pointer moves, drags, clicks, scroll wheel deltas,
+//    and keyboard transitions at the `kCGHIDEventTap` level on a dedicated high-priority Mach port
+//    run-loop thread.
+//  - Background Cursor Hiding & Warping: Uses private CoreGraphics WindowServer connection properties
+//    (`CGSSetConnectionProperty("SetsCursorInBackground")`) and `CGAssociateMouseAndMouseCursorPosition`
+//    to seamlessly hide and park the macOS cursor while the user is actively controlling the
+//    paired Windows workstation.
+//  - IOKit HID Hardware State Synchronization: Interacts directly with the IOKit HID System
+//    (`IOHIDSetModifierLockState`, `IOHIDGetModifierLockState`) to synchronize physical Caps Lock
+//    LED and latch states between macOS and Windows keyboards.
+//  - Liquid Glass Drag Ghost HUD: Renders an AppKit floating translucent panel (`NSVisualEffectView`
+//    with `.hudWindow` material) displaying live file transfer badges, thumbnails, and progress
+//    during cross-screen file drags.
+//  - macOS Sequoia Native `NSDraggingSession` Ingestion: Intercepts active file drags from Finder
+//    or other macOS applications via `NSPasteboard(name: .drag)` and synthesizes native drag-and-drop
+//    sessions onto local target applications upon remote handoff.
+//
+//  ========================================================================================
+//  2. ARCHITECTURAL LINKAGES & CALL FLOW
+//  ========================================================================================
+//  Upstream Callers:
+//  - `src/kvm/macos_backend.rs`: Rust FFI bridge that invokes `@_cdecl` entry points:
+//    - `integrator_kvm_macos_start_tap`: Starts the Mach port event tap run-loop thread.
+//    - `integrator_kvm_macos_stop_tap`: Teardown and unregistration of the tap.
+//    - `integrator_kvm_macos_set_controlling`: Toggles background parking and cursor hiding.
+//    - `integrator_kvm_macos_inject_*`: Synthesizes remote inputs into the local Quartz event stream.
+//    - `integrator_kvm_macos_show_drag_ghost` / `hide_drag_ghost`: Controls the floating HUD badge.
+//    - `integrator_kvm_macos_begin_native_drag`: Initiates native AppKit drag sessions.
+//
+//  Downstream Callees:
+//  - CoreGraphics Quartz Services (`CGEventTapCreate`, `CGEventPost`, `CGWarpMouseCursorPosition`).
+//  - AppKit (`NSPanel`, `NSVisualEffectView`, `NSDraggingSession`, `NSWorkspace`).
+//  - IOKit Framework (`IOServiceGetMatchingService`, `IOHIDSetModifierLockState`).
+//  - C FFI Callbacks to Rust: `KvmEventCallback` (`on_cg_event`) and `KvmDragEndedCallback`.
+//
+//  ========================================================================================
+//  3. THREADING & CONCURRENCY MODEL
+//  ========================================================================================
+//  - Mach Port Run-Loop Thread: The `CGEventTap` executes on a dedicated `Thread` named
+//    `"Integrator.KvmEventTap"` with `.userInteractive` QoS. It runs an independent `CFRunLoop`
+//    to guarantee zero latency drops or dropped frames even if the main thread is busy.
+//  - AppKit UI Thread: All `NSPanel`, `NSWindow`, and `NSView` mutations are dispatched
+//    asynchronously to `DispatchQueue.main`.
+//  - Synchronization: Thread safety across the C FFI boundary is enforced using discrete locks:
+//    - `gStateLock`: Protects atomic flags, callback pointers, and modifier key tracking.
+//    - `gTapLifecycleLock`: Guards tap thread startup and shutdown.
+//    - `gHidLock`: Guards shared IOKit HID connection handles.
+//
+//  ========================================================================================
+//  4. SECURITY & SAFETY INVARIANTS
+//  ========================================================================================
+//  - Event Tagging (`kIntegratorEventTag = 0x494E5447`): Every synthetic event posted by Integrator
+//    has its `eventSourceUserData` field tagged with "INTG". The `CGEventTap` callback checks this
+//    field and immediately passes tagged events through, preventing infinite feedback loops.
+//  - Accessibility Permission Verification: `AXIsProcessTrusted()` is verified before creating the
+//    tap, preventing crashes or OS security exceptions.
+//  - Watchdog Protection: The native drag injector window uses a 600ms `DispatchWorkItem` watchdog
+//    that automatically tears down the transparent capture window if an aborted drag occurs,
+//    ensuring the desktop never gets blocked by orphan invisible windows.
+//
+
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -5,18 +78,23 @@ import Foundation
 import IOKit
 import IOKit.hid
 
-// Tag attached to all synthetic CGEvents injected by Integrator so our CGEventTap
-// passes them through immediately without re-capturing or feedback-looping.
-private let kIntegratorEventTag: Int64 = 0x494E5447 // "INTG"
+/// Tag attached to all synthetic CGEvents injected by Integrator ("INTG" in ASCII hex: 0x494E5447).
+/// Allows the CGEventTap to immediately distinguish injected events from physical user inputs.
+private let kIntegratorEventTag: Int64 = 0x494E5447
 
-// Callback signatures implemented in Rust (`app/src/kvm/macos_backend.rs`)
-// Event types:
-//   1 = MouseMoveAbsOrDelta (x, y, dx, dy, buttonMask)
-//   2 = MouseButton (button: 0=left,1=right,2=middle; pressed: 0/1)
-//   3 = MouseScroll (dx, dy)
-//   4 = KeyEvent (keyCode, pressed: 0/1, cgFlagsRaw)
-//   5 = FlagsChanged (keyCode, 0, cgFlagsRaw)
-// Returns: 0 = pass through natively, 1 = swallow event, 2 = swallow and warp cursor to center (park_x, park_y)
+/// C-ABI callback signatures implemented in Rust (`app/src/kvm/macos_backend.rs`).
+///
+/// Event kinds:
+/// - 1 = MouseMoveAbsOrDelta (x, y, dx, dy, leftHeldMask)
+/// - 2 = MouseButton (button: 0=left, 1=right, 2=middle; pressed: 0/1)
+/// - 3 = MouseScroll (dx, dy)
+/// - 4 = KeyEvent (keyCode, pressed: 0/1, cgFlagsRaw)
+/// - 5 = FlagsChanged (keyCode, 0, cgFlagsRaw)
+///
+/// Return values from Rust:
+/// - 0 = Pass through natively to local macOS applications.
+/// - 1 = Swallow event (`kCGEventNull`).
+/// - 2 = Swallow event and warp cursor to center park position.
 public typealias KvmEventCallback = @convention(c) (
     Int32,      // kind
     Double,     // a (x or dx or button or keyCode)
@@ -26,8 +104,10 @@ public typealias KvmEventCallback = @convention(c) (
     UInt64      // extra flags / buttonMask
 ) -> Int32
 
+/// C-ABI callback signature invoked when an AppKit dragging session completes or cancels.
 public typealias KvmDragEndedCallback = @convention(c) (Bool, UnsafePointer<CChar>?) -> Void
 
+/// Generic thread-safe container protected by an internal `NSLock`.
 private final class SafeBox<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: T?
@@ -46,24 +126,31 @@ private final class SafeBox<T>: @unchecked Sendable {
     }
 }
 
+// Global synchronization locks
 private let gStateLock = NSLock()
 private let gTapLifecycleLock = NSLock()
 private let gHidLock = NSLock()
 
+// Active C FFI callback pointers
 private var gKvmCallback: KvmEventCallback? = nil
 private var gDragEndedCallback: KvmDragEndedCallback? = nil
 
+// Quartz Event Tap & RunLoop references
 private var gEventTap: CFMachPort? = nil
 private var gTapThread: Thread? = nil
 private var gTapRunLoop: CFRunLoop? = nil
+
+// Runtime state flags
 private var gControllingPeer: Bool = false
 private var gCursorHidden: Bool = false
 private var gDragChangeCountAtDown: Int = -1
 
+// Cursor parking coordinates
 private var gParkX: Double = 400.0
 private var gParkY: Double = 300.0
 private var gControllingEnteredAt: Double = 0.0
 
+// Remote modifier key latch state tracking
 private var gRemoteShiftLeft: Bool = false
 private var gRemoteShiftRight: Bool = false
 private var gRemoteCtrlLeft: Bool = false
@@ -73,11 +160,14 @@ private var gRemoteAltRight: Bool = false
 private var gRemoteMetaLeft: Bool = false
 private var gRemoteMetaRight: Bool = false
 
+// CoreGraphics private WindowServer state
 private var gBgCursorConfigured: Bool = false
 private var gCoreGraphicsHandle: UnsafeMutableRawPointer? = nil
 private var gAtExitRegistered: Bool = false
 private var gHidConn: io_connect_t = 0
 
+/// Configures the WindowServer connection to allow hiding the cursor while the application
+/// is running in the background without active window focus.
 private func enableBackgroundCursorHiding() {
     gStateLock.lock()
     let already = gBgCursorConfigured
@@ -104,6 +194,7 @@ private func enableBackgroundCursorHiding() {
     _ = setProp(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 }
 
+/// Executes a closure with a valid IOKit HID System connection handle.
 private func withHidConnection<T>(_ body: (io_connect_t) -> T?) -> T? {
     gHidLock.lock()
     defer { gHidLock.unlock() }
@@ -128,6 +219,7 @@ private func withHidConnection<T>(_ body: (io_connect_t) -> T?) -> T? {
     return body(gHidConn)
 }
 
+/// Toggles the macOS hardware Caps Lock modifier lock state via IOKit HID.
 private func toggleMacCapsLock() -> Bool? {
     return withHidConnection { conn in
         var cur = false
@@ -144,6 +236,7 @@ private func toggleMacCapsLock() -> Bool? {
     }
 }
 
+/// Queries whether the macOS hardware Caps Lock is currently locked on.
 private func currentMacCapsLockOn() -> Bool {
     return withHidConnection { conn in
         var cur = false
@@ -154,6 +247,7 @@ private func currentMacCapsLockOn() -> Bool {
     } ?? false
 }
 
+/// Captures all currently held synthetic remote modifier key codes and resets their tracking state.
 private func snapshotAndClearRemoteModKeysLocked() -> [UInt16] {
     var downCodes: [UInt16] = []
     if gRemoteShiftLeft { downCodes.append(56) }
@@ -177,6 +271,7 @@ private func snapshotAndClearRemoteModKeysLocked() -> [UInt16] {
 
 // MARK: - Primary Screen Geometry
 
+/// Queries the primary display bounds in Quartz global coordinates.
 @_cdecl("integrator_kvm_macos_screen_rect")
 public func integrator_kvm_macos_screen_rect(
     outX: UnsafeMutablePointer<Double>?,
@@ -193,6 +288,7 @@ public func integrator_kvm_macos_screen_rect(
 
 // MARK: - Cursor Visibility & Warp
 
+/// Sets the controlling mode on macOS. When controlling, parks and hides the local cursor.
 @_cdecl("integrator_kvm_macos_set_controlling")
 public func integrator_kvm_macos_set_controlling(
     controlling: Bool,
@@ -249,6 +345,7 @@ public func integrator_kvm_macos_set_controlling(
     }
 }
 
+/// Sets the controlled mode on macOS. When entering, shows the cursor and warps to entry coordinates.
 @_cdecl("integrator_kvm_macos_set_controlled")
 public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double, entryY: Double) {
     var modsToRelease: [UInt16] = []
@@ -288,6 +385,7 @@ public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double
 
 // MARK: - Drag Source Probe (`NSPasteboard(name: .drag)`)
 
+/// Inspects the active AppKit drag pasteboard to retrieve the list of file paths being dragged.
 @_cdecl("integrator_kvm_macos_probe_drag_paths")
 public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CChar>? {
     let resultBox = SafeBox<String>()
@@ -323,9 +421,9 @@ public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CCha
     return strdup(s)
 }
 
+/// Injects synthetic Escape key to cancel Finder's local drag session after cross-screen handoff.
 @_cdecl("integrator_kvm_macos_cancel_local_drag")
 public func integrator_kvm_macos_cancel_local_drag() {
-    // Inject tagged Escape key so Finder exits its local CoreDrag cleanly after handoff
     let src = CGEventSource(stateID: .hidSystemState)
     if let down = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true) {
         down.setIntegerValueField(.eventSourceUserData, value: kIntegratorEventTag)
@@ -337,6 +435,7 @@ public func integrator_kvm_macos_cancel_local_drag() {
     }
 }
 
+/// Generates a Base64-encoded PNG thumbnail icon for the specified file.
 @_cdecl("integrator_kvm_macos_icon_png_b64")
 public func integrator_kvm_macos_icon_png_b64(pathPtr: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
     guard let pathPtr = pathPtr else { return nil }
@@ -372,6 +471,7 @@ public func integrator_kvm_macos_icon_png_b64(pathPtr: UnsafePointer<CChar>?) ->
     return strdup(out)
 }
 
+/// Frees heap-allocated C strings returned to Rust.
 @_cdecl("integrator_kvm_macos_free_str")
 public func integrator_kvm_macos_free_str(ptr: UnsafeMutablePointer<CChar>?) {
     if let p = ptr {
@@ -381,6 +481,7 @@ public func integrator_kvm_macos_free_str(ptr: UnsafeMutablePointer<CChar>?) {
 
 // MARK: - Synthetic Input Injection
 
+/// Injects synthetic pointer movement into Quartz at absolute coordinates `(x, y)`.
 @_cdecl("integrator_kvm_macos_inject_mouse_move")
 public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHeld: Bool) {
     guard x.isFinite, y.isFinite else { return }
@@ -393,6 +494,7 @@ public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHel
     }
 }
 
+/// Injects synthetic mouse button transitions into Quartz.
 @_cdecl("integrator_kvm_macos_inject_mouse_button")
 public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Bool, x: Double, y: Double) {
     guard x.isFinite, y.isFinite else { return }
@@ -417,6 +519,7 @@ public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Boo
     }
 }
 
+/// Injects synthetic scroll wheel deltas into Quartz.
 @_cdecl("integrator_kvm_macos_inject_scroll")
 public func integrator_kvm_macos_inject_scroll(dx: Double, dy: Double) {
     let safeDx = dx.isFinite ? Swift.max(-4000.0, Swift.min(4000.0, dx * 12.0)) : 0.0
@@ -431,6 +534,7 @@ public func integrator_kvm_macos_inject_scroll(dx: Double, dy: Double) {
     }
 }
 
+/// Injects a synthetic keyboard key transition into Quartz, managing CapsLock and modifier tracking.
 @_cdecl("integrator_kvm_macos_inject_key")
 public func integrator_kvm_macos_inject_key(keyCode: UInt16, pressed: Bool, shift: Bool, ctrl: Bool, alt: Bool, meta: Bool) {
     let src = CGEventSource(stateID: .hidSystemState)
@@ -514,6 +618,7 @@ private var gGhostTitleLabel: NSTextField? = nil
 private var gGhostSubtitleLabel: NSTextField? = nil
 private var gGhostIconView: NSImageView? = nil
 
+/// Creates or returns the cached translucent floating HUD panel.
 private func ensureGhostPanel() -> NSPanel {
     if let existing = gGhostPanel {
         return existing
@@ -568,11 +673,13 @@ private func ensureGhostPanel() -> NSPanel {
     return panel
 }
 
+/// Converts Quartz top-left origin coordinates to AppKit bottom-left screen coordinates.
 private func cgPointToAppKitScreenOrigin(cgX: Double, cgY: Double) -> NSPoint {
     let mainH = Double(CGDisplayBounds(CGMainDisplayID()).size.height)
     return NSPoint(x: cgX + 18.0, y: (mainH - cgY) - 62.0)
 }
 
+/// Shows the floating translucent drag ghost HUD at Quartz coordinates `(cgX, cgY)`.
 @_cdecl("integrator_kvm_macos_show_drag_ghost")
 public func integrator_kvm_macos_show_drag_ghost(
     cgX: Double,
@@ -602,6 +709,7 @@ public func integrator_kvm_macos_show_drag_ghost(
     }
 }
 
+/// Moves the active drag ghost HUD window to updated pointer coordinates.
 @_cdecl("integrator_kvm_macos_move_drag_ghost")
 public func integrator_kvm_macos_move_drag_ghost(cgX: Double, cgY: Double) {
     guard cgX.isFinite, cgY.isFinite else { return }
@@ -611,6 +719,7 @@ public func integrator_kvm_macos_move_drag_ghost(cgX: Double, cgY: Double) {
     }
 }
 
+/// Hides and orders out the drag ghost HUD window.
 @_cdecl("integrator_kvm_macos_hide_drag_ghost")
 public func integrator_kvm_macos_hide_drag_ghost() {
     DispatchQueue.main.async {
@@ -620,6 +729,7 @@ public func integrator_kvm_macos_hide_drag_ghost() {
 
 // MARK: - Native Sequoia `NSDraggingSession` Bridge
 
+/// Invisible drag source view that initiates a native AppKit `NSDraggingSession`.
 private final class IntegratorDragSourceView: NSView, NSDraggingSource {
     var fileURLs: [URL] = []
     var sessionId: String = ""
@@ -688,6 +798,7 @@ private var gDragInjectorWindow: NSWindow? = nil
 private var gDragInjectorView: IntegratorDragSourceView? = nil
 private var gDragSessionSeq: UInt64 = 0
 
+/// Begins a native macOS AppKit `NSDraggingSession` using staged payload files.
 @_cdecl("integrator_kvm_macos_begin_native_drag")
 public func integrator_kvm_macos_begin_native_drag(
     pathsJsonPtr: UnsafePointer<CChar>?,
@@ -786,6 +897,7 @@ public func integrator_kvm_macos_begin_native_drag(
 
 // MARK: - CGEventTap Hook Thread
 
+/// Low-level Mach port callback for the Quartz Event Tap.
 private func handleTapEvent(
     proxy: CGEventTapProxy,
     type: CGEventType,
@@ -894,6 +1006,7 @@ private func handleTapEvent(
     return Unmanaged.passUnretained(event)
 }
 
+/// Checks whether the Quartz Event Tap is currently enabled and Accessibility is trusted.
 @_cdecl("integrator_kvm_macos_is_tap_active")
 public func integrator_kvm_macos_is_tap_active() -> Bool {
     gStateLock.lock()
@@ -903,6 +1016,7 @@ public func integrator_kvm_macos_is_tap_active() -> Bool {
     return CGEvent.tapIsEnabled(tap: tap) && AXIsProcessTrusted()
 }
 
+/// Prompts the user for Accessibility permission if not already granted.
 @_cdecl("integrator_kvm_macos_request_accessibility")
 public func integrator_kvm_macos_request_accessibility() -> Bool {
     if AXIsProcessTrusted() {
@@ -920,6 +1034,7 @@ public func integrator_kvm_macos_request_accessibility() -> Bool {
     return AXIsProcessTrusted()
 }
 
+/// Starts the Mach port event tap run-loop thread and registers the Quartz callback.
 @_cdecl("integrator_kvm_macos_start_tap")
 public func integrator_kvm_macos_start_tap(
     cb: KvmEventCallback?,
@@ -1020,6 +1135,7 @@ public func integrator_kvm_macos_start_tap(
     return started
 }
 
+/// Disables and removes the Quartz Event Tap, stopping its background run loop.
 @_cdecl("integrator_kvm_macos_stop_tap")
 public func integrator_kvm_macos_stop_tap() {
     gTapLifecycleLock.lock()

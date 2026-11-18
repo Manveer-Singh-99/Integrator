@@ -1,10 +1,77 @@
-//! Cross-platform helper for native OS file clipboard operations (`CF_HDROP` / `NSPasteboard`).
+//! # Cross-Platform Native OS File Clipboard Driver
 //!
-//! - macOS: `NSPasteboard` file URLs via linked Swift FFI (`read_pasteboard_files_in_app` /
-//!   `write_pasteboard_files_in_app`) using `\0`-delimited paths, with `macos_clip_files --nul` as fallback.
-//! - Windows: Native Win32 `CF_HDROP` (`DROPFILES`) APIs using a message-only `HWND_MESSAGE` owner window
-//!   so `EmptyClipboard()` + `SetClipboardData(CF_HDROP, ...)` preserves ownership, with `win_clip_files.exe --nul`
-//!   as fallback.
+//! ## 1. Module Purpose & Scope
+//! This module provides the native OS clipboard integration for file and directory copying on
+//! macOS and Windows 10/11.
+//!
+//! ### Core Subsystem Responsibilities:
+//! - **macOS File Clipboard (`NSPasteboard`)**: Reads and writes file URL lists using linked Swift
+//!   FFI bindings (`read_pasteboard_files_in_app` / `write_pasteboard_files_in_app`) operating over
+//!   `\0`-delimited UTF-8 byte streams. Falls back to the isolated helper binary `macos_clip_files --nul`
+//!   if in-process AppKit calls fail or encounter sandbox boundaries.
+//! - **Windows File Clipboard (`CF_HDROP` / `DROPFILES`)**: Directly manages native Win32 clipboard
+//!   APIs (`OpenClipboard`, `EmptyClipboard`, `SetClipboardData`) using a message-only `HWND_MESSAGE`
+//!   owner window to ensure clipboard ownership is retained without locking desktop foreground threads.
+//!   Encodes wide character strings (`DROPFILES` struct with `fWide = TRUE`). Falls back to
+//!   `win_clip_files.exe --nul` if COM STA isolation is required.
+//! - **Cache Directory Lifecycle & Pruning**: Enforces private directory permissions (`0o700`),
+//!   strictly forbids symlink traversals, and performs periodic depth-first pruning (`PRUNE_INTERVAL = 300s`)
+//!   to clean up expired clipboard files older than 24 hours.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                         Native File Clipboard Integration                              │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!                      ┌────────────────────────────────────────┐
+//!                      │       ClipboardService (service.rs)    │
+//!                      └──────────────────┬─────────────────────┘
+//!                                         │
+//!                     read_files()        │ write_files(paths)
+//!                                         ▼
+//!                      ┌────────────────────────────────────────┐
+//!                      │    FileClipboardHelper (file_helper.rs)│
+//!                      └──────────┬──────────────────┬──────────┘
+//!                                 │                  │
+//!               macOS Compilation │                  │ Windows Compilation
+//!                                 ▼                  ▼
+//!              ┌─────────────────────────┐    ┌─────────────────────────┐
+//!              │  Swift AppKit FFI       │    │  Win32 User32 / Shell32 │
+//!              │  (NSPasteboard fileURLs)│    │  (CF_HDROP / DROPFILES) │
+//!              └────────────┬────────────┘    └────────────┬────────────┘
+//!                           │                              │
+//!                   Fallback│                      Fallback│
+//!                           ▼                              ▼
+//!              ┌─────────────────────────┐    ┌─────────────────────────┐
+//!              │  macos_clip_files --nul │    │ win_clip_files.exe --nul│
+//!              └─────────────────────────┘    └─────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/clipboard/service.rs`: Calls `read_files` when the OS sequence changes to detect newly
+//!   copied files, and calls `write_files` upon successfully streaming incoming files to register
+//!   them in the local OS clipboard.
+//!
+//! ### Downstream Callees:
+//! - macOS Swift FFI: `read_pasteboard_files_in_app`, `write_pasteboard_files_in_app`.
+//! - Windows Win32 APIs: `user32.dll`, `shell32.dll`.
+//! - Local Filesystem: Private cache directory management under `app_data_dir() / "clipboard_cache"`.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - Designed for execution inside `tokio::task::spawn_blocking` pools since Win32 clipboard calls
+//!   and disk walks perform synchronous blocking I/O.
+//! - `last_prune` is guarded by an internal `Mutex<Instant>` to ensure background pruning is throttled
+//!   to at most once every 5 minutes regardless of clipboard read frequency.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Symlink Rejection**: Both the base application data directory and the `clipboard_cache`
+//!   directory are checked via `symlink_metadata`. If any component is a symlink, execution bails immediately.
+//! - **NUL-Delimited Path Parsing**: Paths are exchanged using `\0`-delimiters without `.trim()` mangling,
+//!   preserving valid whitespace in filenames while rejecting interior NUL characters.
+//! - **Subprocess Hardening**: When spawning fallback binaries, Windows applies `CREATE_NO_WINDOW = 0x08000000`,
+//!   preventing flashing command prompt windows on the user's screen.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
@@ -28,8 +95,11 @@ const MACOS_RETRY_READ_CAP: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Cross-platform helper managing native file clipboard interactions and disk cache lifecycle.
 pub struct FileClipboardHelper {
+    /// Isolated filesystem directory where staged clipboard files are written.
     cache_dir: PathBuf,
+    /// Timestamp of the most recent disk cache cleanup walk.
     last_prune: Mutex<Instant>,
 }
 

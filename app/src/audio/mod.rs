@@ -1,15 +1,80 @@
-//! Experimental Authenticated UDP Audio Sink (`IUA2` on Port `58284`) and local speaker chime synthesis.
+//! # Authenticated UDP Audio Sink (`IUA2`) & Acoustic Chime Subsystem
 //!
-//! Binds [`AUDIO_PORT`] (`58284/udp`) as an authenticated UDP audio preview sink where:
-//! - Sessions are negotiated over `TransportSessionV2` (`DisplayRpcRequest::NegotiateAudioSession`),
-//!   binding a fresh `audio_session_id` (`[u8; 8]`), `K_audio` (`32B`), and `nonce_salt` (`4B`)
-//!   to the peer's `K_root` and fresh `sender_nonce` / `receiver_nonce` entropy.
-//! - Every UDP datagram is authenticated and decrypted with `ChaCha20-Poly1305` (`IUA2` 32B header as `AAD`,
-//!   `nonce_salt[4B] || pkt_seq[8B]` 96-bit nonce) and checked against a 64-packet sliding-window
-//!   anti-replay bitmask (`ReplayWindow64` updated only after AEAD tag verification succeeds).
-//! - Unauthenticated, replayed, pre-window, or expired datagrams are dropped with rate-limited logging.
-//! - Full WASAPI <-> CoreAudio duplex streaming is not yet implemented (`is_active` remains `false`);
-//!   local 24-bit 48kHz stereo WAV chime synthesis is provided for speaker verification.
+//! ## 1. Module Purpose & Scope
+//! This module implements the experimental Authenticated UDP Audio Sink (`IUA2` protocol) on UDP port
+//! `AUDIO_PORT = 58284` and local speaker test chime synthesis for the Integrator engine.
+//!
+//! ### Core Subsystem Responsibilities:
+//! 1. **Cryptographic UDP Audio Protocol (`IUA2`)**:
+//!    - Binds UDP port 58284 to receive low-latency audio datagrams without TCP head-of-line blocking.
+//!    - Every session is negotiated out-of-band over mutually authenticated `TransportSessionV2`
+//!      via `DisplayRpcRequest::NegotiateAudioSession`.
+//!    - Derives a session-specific 256-bit AEAD key `K_audio`, an 8-byte `audio_session_id`, and a
+//!      4-byte `nonce_salt` using HKDF-SHA256 seeded from the peer's root master key `K_root` and
+//!      fresh CSPRNG nonces (`sender_nonce` and `receiver_nonce`).
+//! 2. **AEAD Datagram Decryption & Replay Prevention**:
+//!    - Each incoming datagram is authenticated and decrypted using `ChaCha20-Poly1305`.
+//!    - The 32-byte canonical `IUA2` datagram header serves as Additional Authenticated Data (AAD).
+//!    - The 96-bit nonce is constructed as `nonce_salt[4B] || pkt_seq[8B]`.
+//!    - Replay attacks are defeated using an in-memory 64-packet sliding window bitmask (`ReplayWindow64`),
+//!      updated strictly *after* AEAD authentication tag verification succeeds.
+//! 3. **Local Acoustic Chime Synthesis**:
+//!    - Synthesizes 24-bit 48kHz stereo uncompressed PCM WAV files to verify audio output drivers
+//!      on both macOS (invoking `/usr/bin/afplay`) and Windows (invoking `powershell -c System.Media.SoundPlayer`).
+//!    - Spawns background reaper threads (`reap_child`) to prevent zombie process accumulation.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                         Audio Subsystem & IUA2 Wire Protocol                           │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!                     Peer Machine                              Local Machine
+//!              ┌────────────────────────┐                ┌────────────────────────┐
+//!              │  DisplayController     │                │   DisplayController    │
+//!              │  (RPC Client)          │                │   (RPC Server)         │
+//!              └───────────┬────────────┘                └───────────┬────────────┘
+//!                          │                                         │
+//!                          │ NegotiateAudioSession (TransportV2)     │
+//!                          ├────────────────────────────────────────►│
+//!                          │                                         │
+//!                          │ NegotiatedAudioSessionWire (K_audio)    │
+//!                          │◄────────────────────────────────────────┤
+//!                          │                                         │
+//!                          ▼                                         ▼
+//!              ┌────────────────────────┐                ┌────────────────────────┐
+//!              │   AudioSessionSender   │                │   AudioManager (Sink)  │
+//!              │   - Seal Datagram      │                │   - UDP Port 58284     │
+//!              │   - Increment Seq      │                │   - Anti-Replay Bitmask│
+//!              └───────────┬────────────┘                │   - ChaCha20-Poly1305  │
+//!                          │                             └───────────▲────────────┘
+//!                          │ Authenticated IUA2 UDP                  │
+//!                          └─────────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/core.rs`: Spawns the background UDP sink task `AudioManager::start_udp_audio_sink()` and
+//!   queries health status via `AudioManager::status()`.
+//! - RPC Handlers (`DisplayRpcRequest::NegotiateAudioSession`): Call `AudioManager::handle_negotiate_session_for_peer()`.
+//! - Settings UI: Invokes `AudioManager::play_test_chime()` to trigger audible speaker tests.
+//!
+//! ### Downstream Callees:
+//! - `crate::security::audio_udp`: Core primitives (`AudioSessionRegistry`, `ReplayWindow64`, `AudioSessionSender`).
+//! - `crate::trust`: Verified peer trust lookup.
+//! - OS subprocesses: `/usr/bin/afplay` (macOS) and PowerShell (Windows).
+//!
+//! ## 3. Threading & Concurrency Model
+//! - The UDP audio sink runs on a dedicated Tokio asynchronous task polling `tokio::net::UdpSocket`.
+//! - Active audio session keys are guarded in memory by `AUDIO_SESSION_REGISTRY` (`Mutex<AudioSessionRegistry>`).
+//! - Child process execution for acoustic chimes is isolated from the Tokio async worker pool.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Zero Cleartext UDP**: Unauthenticated packets lacking a registered session ID or failing AEAD
+//!   tag verification are discarded immediately.
+//! - **Sliding Replay Window**: Duplicate sequence numbers or packets older than the 64-packet window
+//!   are dropped to prevent packet injection or replay attacks.
+//! - **Session Expiration**: Inactive audio sessions automatically expire after `MAX_NEGOTIATED_AUDIO_TTL_SECS = 600s`.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};

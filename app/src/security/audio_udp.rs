@@ -1,15 +1,121 @@
-//! Authenticated UDP Audio Sessions (`IUA2` on Port `58284`).
+//! ============================================================================
+//! Authenticated UDP Audio Sessions (`IUA2` on Port `58284`)
+//! ============================================================================
 //!
-//! Eliminates unauthenticated IP-based UDP audio filtering and replaces it with:
-//! 1. Control-plane session negotiation over `TransportSessionV2` (`DisplayRpc` on port `58281`),
-//!    binding a fresh `audio_session_id` (`[u8; 8]`), `K_audio` (`32B`), and `nonce_salt` (`4B`)
-//!    to the peer's `K_root` and fresh `sender_nonce` / `receiver_nonce` entropy.
-//! 2. Per-datagram `ChaCha20-Poly1305` authenticated encryption with a 32-byte `IUA2` header bound
-//!    as AEAD `AAD` and a unique 96-bit nonce (`nonce_salt[4B] || pkt_seq.to_be_bytes()[8B]`).
-//! 3. DTLS/WireGuard-style 64-packet sliding-window anti-replay protection (`ReplayWindow64`) that
-//!    is updated **only** after Poly1305 tag verification succeeds, preventing window-poisoning DoS.
-//! 4. Session lifecycle enforcement: 15-minute maximum session TTL (`900s`), 60-second idle timeout,
-//!    and sequence-exhaustion cutoff (`2^48 - 1`).
+//! # 1. Architectural Overview & Purpose
+//!
+//! `audio_udp` provides a high-throughput, ultra-low-latency, authenticated, and
+//! anti-replay protected UDP datagram channel for streaming real-time PCM audio between
+//! macOS and Windows 11 host endpoints on UDP port `58284`.
+//!
+//! Prior ad-hoc designs relied on raw unauthenticated UDP streams filtered purely by
+//! client IP address, rendering the audio path vulnerable to IP spoofing, packet injection,
+//! eavesdropping, replay attacks, and denial-of-service via resource exhaustion.
+//!
+//! `IUA2` ("Integrator UDP Audio v2") replaces this with a cryptographically secure protocol:
+//! 1. **Control-Plane Key Exchange**: Audio session keys ($K_{\text{audio}}$) and nonce salts
+//!    are never negotiated over UDP. Instead, they are derived via mutual RPC over the existing,
+//!    authenticated TCP `TransportSessionV2` channel (`DisplayRpc` on port `58281`).
+//! 2. **Authenticated Encryption (ChaCha20-Poly1305)**: Every UDP datagram encapsulates a
+//!    fixed 32-byte header authenticated as Additional Authenticated Data (`AAD`), followed by
+//!    ChaCha20 ciphertext and a 16-byte Poly1305 authentication tag.
+//! 3. **Sliding-Window Anti-Replay Protection**: Employs a 64-packet bitmask sliding window
+//!    (RFC 6479 / DTLS / WireGuard style). Crucially, the window is mutated **strictly after**
+//!    AEAD tag verification succeeds, completely preventing window-poisoning DoS attacks.
+//! 4. **Session Bounding & Resource Governance**: Enforces a 15-minute hard session TTL (`900s`),
+//!    a 60-second idle inactivity timeout, an anti-overflow sequence cutoff ($2^{48}-1$), and
+//!    strict per-peer and global active session limits.
+//!
+//! # 2. Cryptographic Specification & Threat Model
+//!
+//! ## 2.1 Threat Model
+//! - **Adversary Capabilities**: Full control over network transit (active adversary): capability
+//!   to inject forged UDP packets, duplicate valid datagrams, reorder audio frames, alter timing,
+//!   and truncate or tamper with audio payloads.
+//! - **Spoofing Resistance**: Every datagram binds the 8-byte `session_id` and is encrypted with
+//!   $K_{\text{audio}}$. An adversary without knowledge of $K_{\text{audio}}$ cannot forge valid
+//!   Poly1305 authentication tags.
+//! - **Replay Attack Resistance**: Out-of-order packets arriving within 64 packets of the highest
+//!   seen sequence number are tracked via a 64-bit sliding bitmask. Stale packets ($> 64$ behind)
+//!   or duplicate packets are dropped immediately.
+//! - **Window-Poisoning DoS Prevention**: An adversary injecting packets with artificially huge
+//!   sequence numbers (e.g. $2^{40}$) cannot cause the receiver to drop valid lower-sequence packets
+//!   because sequence commit occurs **only after** Poly1305 MAC verification succeeds.
+//! - **Eavesdropping Resistance**: PCM audio payloads are encrypted with ChaCha20 symmetric stream cipher.
+//!
+//! ## 2.2 Control-Plane Session Derivation (over TCP TransportV2)
+//! ```text
+//! Sender (e.g. macOS Audio Source)                 Receiver (e.g. Windows 11 Audio Sink)
+//!   |                                                       |
+//!   | 1. NegotiateAudioSession (DisplayRpc via TCP 58281)   |
+//!   |    sender_nonce (32B CSPRNG), format parameters       |
+//!   |------------------------------------------------------>| (lookup peer K_root,
+//!   |                                                       |  generate session_id (8B),
+//!   |                                                       |  generate receiver_nonce (32B),
+//!   |                                                       |  derive K_audio, nonce_salt,
+//!   |                                                       |  register receiver session)
+//!   | 2. NegotiatedAudioSessionWire                         |
+//!   |    session_id, receiver_nonce, expires_in_secs        |
+//!   |<------------------------------------------------------|
+//!   | (derive K_audio, nonce_salt using sender K_root)      |
+//!   |                                                       |
+//!   | <========== Authenticated UDP Datagrams (Port 58284) ==========>
+//! ```
+//!
+//! ## 2.3 Mathematical Key Derivation
+//! Given:
+//! - $K_{\text{root}}$: 32-byte shared root key from SPAKE2 pairing stored in `KeystoreV2`.
+//! - $N_{\text{sender}}$: 32-byte cryptographically secure random nonce generated by the sender.
+//! - $N_{\text{receiver}}$: 32-byte cryptographically secure random nonce generated by the receiver.
+//! - $ID_{\text{session}}$: 8-byte unique random session identifier.
+//!
+//! Key derivation proceeds via HKDF-SHA256 (RFC 5869):
+//! $$Salt_{\text{audio}} = \text{SHA256}(\text{"INTEGRATOR-AUDIO-SALT-V2"} \mathbin{\Vert} N_{\text{sender}} \mathbin{\Vert} N_{\text{receiver}} \mathbin{\Vert} ID_{\text{session}})$$
+//! $$PRK_{\text{audio}} = \text{HKDF-Extract}(Salt_{\text{audio}}, K_{\text{root}})$$
+//! $$K_{\text{audio}} = \text{HKDF-Expand}(PRK_{\text{audio}}, \text{"integrator-udp-audio-key-v2"}, 32)$$
+//! $$IV_{\text{salt}} = \text{HKDF-Expand}(PRK_{\text{audio}}, \text{"integrator-udp-audio-iv-v2"}, 4)$$
+//!
+//! ## 2.4 Wire Datagram Layout (32-byte Header + Ciphertext + 16-byte Tag)
+//! ```text
+//! 0                   1                   2                   3
+//! 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |       Magic "IUA2" (4B)       |  Version (2B) |   Flags (2B)  |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                       Session ID (8B)                         |
+//! |                                                               |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                    Packet Sequence (8B)                       |
+//! |                                                               |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                    Timestamp Microseconds (4B)                |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |       Frame Samples (2B)      |       Payload Length (2B)     |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                ChaCha20 Ciphertext (1..4096B)                 |
+//! |                              ...                              |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                    Poly1305 Tag (16B)                         |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! ```
+//!
+//! ## 2.5 96-Bit AEAD Nonce Construction
+//! Nonce is strictly deterministic and collision-free:
+//! $$\text{Nonce}_{96} = IV_{\text{salt}}[0..4] \mathbin{\Vert} \text{pkt\_seq}.\text{to\_be\_bytes}()[0..8]$$
+//! Because sequence numbers increment monotonically and never repeat within a session,
+//! $(K_{\text{audio}}, \text{Nonce}_{96})$ uniqueness invariant is guaranteed.
+//!
+//! # 3. Callers & Callees
+//! - **Callers**:
+//!   - `crate::audio::AudioManager`: Initializes sender sessions on macOS audio capture, sends PCM frames.
+//!   - `crate::rpc::server`: Receives `NegotiateAudioSession` over TCP port 58281, interacts with `AudioSessionRegistry`.
+//!   - Windows UDP audio daemon: Binds UDP socket 58284, passes datagrams to `AudioSessionRegistry::open_incoming_datagram()`.
+//! - **Callees**:
+//!   - `chacha20poly1305`: Authenticated Encryption with Associated Data (AEAD).
+//!   - `hkdf`: Key derivation from master $K_{\text{root}}$.
+//!   - `sha2`: Cryptographic hashing for salt generation.
+//!   - `crate::security::keystore::KeystoreV2`: Sources pinned master root keys.
+//! ============================================================================
 
 use crate::security::{constant_time_eq, csprng_array, unix_epoch_secs};
 use chacha20poly1305::{
@@ -23,66 +129,81 @@ use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// 4-byte magic prefix for Integrator UDP Audio v2 datagrams (`"IUA2"`).
+/// 4-byte magic prefix identifying Integrator UDP Audio v2 datagrams (`"IUA2"`).
 pub const AUDIO_UDP_WIRE_MAGIC: [u8; 4] = *b"IUA2";
 
-/// Protocol version `2` for Integrator UDP Audio v2.
+/// Major protocol version for Integrator UDP Audio (version 2).
 pub const AUDIO_UDP_PROTOCOL_VERSION: u16 = 2;
 
-/// Fixed 32-byte `IUA2` datagram header size (authenticated as AEAD `AAD`).
+/// Fixed length in bytes of the authenticated `IUA2` datagram header (32 bytes).
+/// Wire layout: magic[4B] || version[2B] || flags[2B] || session_id[8B] || seq[8B] || timestamp_us[4B] || samples[2B] || len[2B].
 pub const AUDIO_UDP_HEADER_LEN: usize = 32;
 
-/// 16-byte Poly1305 authentication tag size.
+/// Exact length in bytes of the Poly1305 authentication tag appended to each datagram (16 bytes).
 pub const AUDIO_UDP_TAG_LEN: usize = 16;
 
-/// Minimum encrypted PCM payload size (`1` byte).
+/// Minimum allowable plaintext PCM payload size in bytes (1 byte).
 pub const MIN_AUDIO_PAYLOAD_LEN: usize = 1;
 
-/// Maximum encrypted PCM payload size (`4096` bytes, comfortably below 64 KiB and standard jumbo/MTU bounds).
+/// Maximum allowable plaintext PCM payload size in bytes (4096 bytes / 4 KiB).
+/// Safely accommodates 2ms to 20ms uncompressed PCM frames without IP fragmentation.
 pub const MAX_AUDIO_PAYLOAD_LEN: usize = 4096;
 
-/// Minimum wire datagram size (`32B header + 1B payload + 16B tag = 49B`).
+/// Minimum allowable size in bytes for a complete received UDP datagram (32B header + 1B payload + 16B tag = 49 bytes).
 pub const MIN_AUDIO_DATAGRAM_LEN: usize =
     AUDIO_UDP_HEADER_LEN + MIN_AUDIO_PAYLOAD_LEN + AUDIO_UDP_TAG_LEN;
 
-/// Maximum wire datagram size (`32B header + 4096B payload + 16B tag = 4144B`).
+/// Maximum allowable size in bytes for a complete received UDP datagram (32B header + 4096B payload + 16B tag = 4144 bytes).
 pub const MAX_AUDIO_DATAGRAM_LEN: usize =
     AUDIO_UDP_HEADER_LEN + MAX_AUDIO_PAYLOAD_LEN + AUDIO_UDP_TAG_LEN;
 
-/// Maximum UDP audio session lifetime (`15 minutes = 900 seconds`).
+/// Maximum active lifetime in seconds for an authenticated UDP audio session (900 seconds = 15 minutes).
 pub const AUDIO_SESSION_TTL_SECS: u64 = 900;
 
-/// Maximum UDP audio session idle timeout (`60 seconds`).
+/// Maximum allowable idle duration in seconds without received packets before session expiration (60 seconds).
 pub const AUDIO_SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
 
-/// Maximum active UDP audio sessions tracked concurrently.
+/// Maximum number of active UDP audio sessions tracked concurrently in the global registry (16 sessions).
 pub const MAX_ACTIVE_AUDIO_SESSIONS: usize = 16;
 
-/// Maximum active UDP audio sessions per paired peer device.
+/// Maximum number of concurrent active UDP audio sessions permitted per paired peer device (2 sessions).
 pub const MAX_PER_PEER_AUDIO_SESSIONS: usize = 2;
 
-/// Maximum packet sequence number (`2^48 - 1`) before requiring session rotation.
+/// Maximum allowable packet sequence number ($2^{48}-1$) before forcing session rotation to prevent sequence rollover.
 pub const MAX_AUDIO_PACKET_SEQ: u64 = (1u64 << 48) - 1;
 
-/// Frame flag for standard PCM audio data.
+/// Datagram header flag indicating standard uncompressed PCM audio payload (0x0001).
 pub const AUDIO_FLAG_PCM_FRAME: u16 = 0x0001;
 
-/// Frame flag for authenticated keepalive datagrams.
+/// Datagram header flag indicating an authenticated zero-payload keepalive packet (0x0002).
 pub const AUDIO_FLAG_KEEPALIVE: u16 = 0x0002;
 
+/// Error enumeration representing failures during UDP audio datagram parsing, verification, or session management.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioUdpError {
+    /// Datagram byte length is outside allowable bounds (`MIN_AUDIO_DATAGRAM_LEN..=MAX_AUDIO_DATAGRAM_LEN`).
     PacketBounds(usize),
+    /// Received magic bytes do not match `AUDIO_UDP_WIRE_MAGIC` (`"IUA2"`).
     InvalidMagic([u8; 4]),
+    /// Datagram header protocol version does not match `AUDIO_UDP_PROTOCOL_VERSION` (2).
     UnsupportedVersion(u16),
+    /// Header flags are unrecognized or conflicting (must be `AUDIO_FLAG_PCM_FRAME` or `AUDIO_FLAG_KEEPALIVE`).
     InvalidFlags(u16),
+    /// Sequence number is 0 or exceeds `MAX_AUDIO_PACKET_SEQ`.
     InvalidSequenceNumber(u64),
+    /// Declared payload length in header does not match actual received datagram payload length.
     PayloadLengthMismatch { header_len: usize, actual_len: usize },
+    /// Datagram references an 8-byte `session_id` that does not exist in the active registry.
     UnknownSession([u8; 8]),
+    /// Session has expired past its 15-minute TTL or 60-second idle inactivity timeout.
     SessionExpired,
+    /// Packet sequence number is older than the 64-packet anti-replay sliding window.
     PacketTooOld { pkt_seq: u64, highest_seq: u64 },
+    /// Packet sequence number has already been received within the active 64-packet window (replay detected).
     DuplicatePacket(u64),
+    /// ChaCha20-Poly1305 AEAD decryption or authentication tag verification failed.
     AeadFailed,
+    /// Control-plane session negotiation parameters are invalid (e.g. sample rate out of bounds, zero nonce).
     InvalidHandshakeParam(&'static str),
 }
 
@@ -125,19 +246,27 @@ impl fmt::Display for AudioUdpError {
 
 impl std::error::Error for AudioUdpError {}
 
-/// Wire representation of the 32-byte `IUA2` header (authenticated as AEAD `AAD`).
+/// In-memory representation of the 32-byte `IUA2` header authenticated as AEAD `AAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioDatagramHeader {
+    /// Protocol version (must equal 2).
     pub version: u16,
+    /// Frame flags (`AUDIO_FLAG_PCM_FRAME` or `AUDIO_FLAG_KEEPALIVE`).
     pub flags: u16,
+    /// 8-byte session identifier assigned during control-plane negotiation.
     pub session_id: [u8; 8],
+    /// Monotonically incrementing 64-bit packet sequence number (1..=2^48 - 1).
     pub pkt_seq: u64,
+    /// Microsecond timestamp modulo 2^32 for jitter buffer scheduling and audio sync.
     pub timestamp_us: u32,
+    /// Number of audio sample frames encapsulated in this datagram (e.g. 96 for 2ms at 48kHz).
     pub frame_samples: u16,
+    /// Byte length of the encrypted audio payload (1..=4096 bytes).
     pub payload_len: u16,
 }
 
 impl AudioDatagramHeader {
+    /// Serializes this header into a 32-byte canonical network byte order (big-endian) wire buffer.
     pub fn to_bytes(&self) -> [u8; AUDIO_UDP_HEADER_LEN] {
         let mut out = [0u8; AUDIO_UDP_HEADER_LEN];
         out[0..4].copy_from_slice(&AUDIO_UDP_WIRE_MAGIC);
@@ -151,6 +280,9 @@ impl AudioDatagramHeader {
         out
     }
 
+    /// Parses and validates a 32-byte wire slice into an `AudioDatagramHeader`.
+    ///
+    /// Validates magic bytes, protocol version, flags, non-zero sequence bounds, and payload bounds.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, AudioUdpError> {
         if buf.len() < AUDIO_UDP_HEADER_LEN {
             return Err(AudioUdpError::PacketBounds(buf.len()));
@@ -204,15 +336,19 @@ impl AudioDatagramHeader {
 
 /// 64-packet sliding-window anti-replay state (RFC 6479 / DTLS / WireGuard style).
 ///
-/// `check_before_aead` performs a read-only check before decryption; `commit_after_aead`
-/// mutates the window ONLY after Poly1305 tag verification succeeds.
+/// Designed to decouple pre-decryption replay checks from post-decryption state updates:
+/// - `check_before_aead` performs a read-only check before AEAD decryption.
+/// - `commit_after_aead` updates the window and bitmap ONLY after Poly1305 tag verification succeeds.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayWindow64 {
+    /// Highest valid sequence number authenticated and committed so far.
     highest_seq: u64,
+    /// 64-bit bitmask where bit `k` indicates whether `highest_seq - k` has been received.
     bitmap: u64,
 }
 
 impl ReplayWindow64 {
+    /// Constructs an empty anti-replay sliding window.
     pub fn new() -> Self {
         Self {
             highest_seq: 0,
@@ -220,12 +356,13 @@ impl ReplayWindow64 {
         }
     }
 
+    /// Returns the highest authenticated packet sequence number committed to this window.
     pub fn highest_seq(&self) -> u64 {
         self.highest_seq
     }
 
-    /// Pre-AEAD check: verifies `pkt_seq` is non-zero, below `MAX_AUDIO_PACKET_SEQ`,
-    /// not older than `highest_seq - 63`, and not already marked in `bitmap`.
+    /// Pre-AEAD verification: checks whether `pkt_seq` is valid, within the sliding window,
+    /// and not already received, without modifying internal state.
     pub fn check_before_aead(&self, pkt_seq: u64) -> Result<(), AudioUdpError> {
         if pkt_seq == 0 || pkt_seq >= MAX_AUDIO_PACKET_SEQ {
             return Err(AudioUdpError::InvalidSequenceNumber(pkt_seq));
@@ -249,7 +386,9 @@ impl ReplayWindow64 {
         Ok(())
     }
 
-    /// Post-AEAD commit: marks `pkt_seq` as received and advances `highest_seq` if needed.
+    /// Post-AEAD commit: marks `pkt_seq` as received in `bitmap`, advancing the sliding window if `pkt_seq > highest_seq`.
+    ///
+    /// Must only be called after successful Poly1305 tag verification.
     pub fn commit_after_aead(&mut self, pkt_seq: u64) {
         if self.highest_seq == 0 {
             self.highest_seq = pkt_seq;
@@ -273,11 +412,13 @@ impl ReplayWindow64 {
     }
 }
 
-/// Derives `(k_audio, nonce_salt)` from `K_root`, `sender_nonce`, `receiver_nonce`, and `session_id`:
-/// - `salt_audio = SHA256("INTEGRATOR-AUDIO-SALT-V2" || sender_nonce || receiver_nonce || session_id)`
-/// - `prk = HKDF-Extract(salt_audio, K_root)`
-/// - `k_audio = HKDF-Expand(prk, "integrator-udp-audio-key-v2", 32)`
-/// - `nonce_salt = HKDF-Expand(prk, "integrator-udp-audio-iv-v2", 4)`
+/// Derives the 32-byte audio encryption key `k_audio` and 4-byte `nonce_salt` from master $K_{\text{root}}$:
+///
+/// Mathematical primitives:
+/// - $Salt_{\text{audio}} = \text{SHA256}(\text{"INTEGRATOR-AUDIO-SALT-V2"} \mathbin{\Vert} N_{\text{sender}} \mathbin{\Vert} N_{\text{receiver}} \mathbin{\Vert} ID_{\text{session}})$
+/// - $PRK = \text{HKDF-Extract}(Salt_{\text{audio}}, K_{\text{root}})$
+/// - $K_{\text{audio}} = \text{HKDF-Expand}(PRK, \text{"integrator-udp-audio-key-v2"}, 32)$
+/// - $Nonce_{\text{salt}} = \text{HKDF-Expand}(PRK, \text{"integrator-udp-audio-iv-v2"}, 4)$
 pub fn derive_audio_session_keys(
     k_root: &[u8; 32],
     sender_nonce: &[u8; 32],
@@ -301,6 +442,7 @@ pub fn derive_audio_session_keys(
     (k_audio, nonce_salt)
 }
 
+/// Constructs a 96-bit ChaCha20-Poly1305 nonce: `nonce_salt[0..4] || pkt_seq.to_be_bytes()[0..8]`.
 #[inline]
 fn build_audio_aead_nonce(nonce_salt: &[u8; 4], pkt_seq: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
@@ -309,17 +451,25 @@ fn build_audio_aead_nonce(nonce_salt: &[u8; 4], pkt_seq: u64) -> [u8; 12] {
     nonce
 }
 
-/// Sender-side state for encrypting outbound `IUA2` UDP audio datagrams.
+/// Sender-side state for encrypting and transmitting outbound `IUA2` UDP audio datagrams.
+///
+/// Implements `ZeroizeOnDrop` to securely erase cryptographic keys and salts on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AudioSessionSender {
+    /// 8-byte session identifier bound during control-plane negotiation.
     session_id: [u8; 8],
+    /// 32-byte ChaCha20-Poly1305 symmetric audio encryption key.
     k_audio: Zeroizing<[u8; 32]>,
+    /// 4-byte static IV salt prefix for nonce derivation.
     nonce_salt: [u8; 4],
+    /// Monotonically incrementing sequence number for the next outbound packet.
     next_seq: u64,
+    /// Absolute epoch timestamp in seconds when this session expires.
     expires_at_secs: u64,
 }
 
 impl AudioSessionSender {
+    /// Constructs a new `AudioSessionSender` instance.
     pub fn new(
         session_id: [u8; 8],
         k_audio: Zeroizing<[u8; 32]>,
@@ -335,19 +485,25 @@ impl AudioSessionSender {
         }
     }
 
+    /// Returns the 8-byte session identifier.
     pub fn session_id(&self) -> [u8; 8] {
         self.session_id
     }
 
+    /// Returns the expiration timestamp in epoch seconds.
     pub fn expires_at_secs(&self) -> u64 {
         self.expires_at_secs
     }
 
+    /// Returns the sequence number that will be assigned to the next transmitted datagram.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
 
-    /// Seals a PCM or keepalive audio payload into a complete `IUA2` wire datagram.
+    /// Seals a PCM audio payload or keepalive frame into a complete `IUA2` wire datagram.
+    ///
+    /// Constructs the 32-byte header, serializes it as AAD, derives the 96-bit nonce,
+    /// executes ChaCha20-Poly1305 encryption, and returns the assembled datagram.
     pub fn seal_datagram(
         &mut self,
         flags: u16,
@@ -409,20 +565,32 @@ impl AudioSessionSender {
 
 /// Receiver-side state for a single authenticated `IUA2` UDP audio session.
 pub struct AudioSessionReceiver {
+    /// 8-byte session identifier bound during control-plane negotiation.
     session_id: [u8; 8],
+    /// 16-byte raw device UUID of the authenticated remote peer.
     peer_device_id: [u8; 16],
+    /// 32-byte ChaCha20-Poly1305 symmetric audio decryption key.
     k_audio: Zeroizing<[u8; 32]>,
+    /// 4-byte static IV salt prefix for nonce derivation.
     nonce_salt: [u8; 4],
+    /// Configured PCM audio sample rate in Hz (e.g. 48000).
     sample_rate: u32,
+    /// Configured audio channel count (1..=8).
     channels: u8,
+    /// Configured audio bit depth per sample (16, 24, or 32).
     bit_depth: u8,
+    /// Epoch timestamp in seconds when this session was initialized.
     created_at_secs: u64,
+    /// Epoch timestamp in seconds when this session hard-expires.
     expires_at_secs: u64,
+    /// Epoch timestamp in seconds when the last authentic datagram was decrypted.
     last_activity_secs: u64,
+    /// 64-packet sliding-window anti-replay state.
     replay_window: ReplayWindow64,
 }
 
 impl AudioSessionReceiver {
+    /// Constructs a new `AudioSessionReceiver` instance.
     pub fn new(
         session_id: [u8; 8],
         peer_device_id: [u8; 16],
@@ -448,41 +616,56 @@ impl AudioSessionReceiver {
         }
     }
 
+    /// Returns the 8-byte session identifier.
     pub fn session_id(&self) -> [u8; 8] {
         self.session_id
     }
 
+    /// Returns the 16-byte device UUID of the authenticated remote peer.
     pub fn peer_device_id(&self) -> [u8; 16] {
         self.peer_device_id
     }
 
+    /// Returns the configured PCM sample rate in Hz.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
+    /// Returns the configured channel count.
     pub fn channels(&self) -> u8 {
         self.channels
     }
 
+    /// Returns the configured bit depth per sample.
     pub fn bit_depth(&self) -> u8 {
         self.bit_depth
     }
 
+    /// Returns the epoch timestamp in seconds when this receiver session was created.
     pub fn created_at_secs(&self) -> u64 {
         self.created_at_secs
     }
 
+    /// Returns the epoch timestamp in seconds when this receiver session expires.
     pub fn expires_at_secs(&self) -> u64 {
         self.expires_at_secs
     }
 
+    /// Checks whether this session has expired due to hard TTL (`AUDIO_SESSION_TTL_SECS`) or idle inactivity (`AUDIO_SESSION_IDLE_TIMEOUT_SECS`).
     pub fn is_expired(&self, now_secs: u64) -> bool {
         now_secs >= self.expires_at_secs
             || now_secs.saturating_sub(self.last_activity_secs) > AUDIO_SESSION_IDLE_TIMEOUT_SECS
     }
 
-    /// Verifies and decrypts an `IUA2` datagram against this session, updating the
-    /// 64-packet replay window ONLY after Poly1305 tag verification succeeds.
+    /// Verifies and decrypts an incoming `IUA2` datagram against this session.
+    ///
+    /// Execution order guarantees DoS resilience:
+    /// 1. Bounds and length consistency checks.
+    /// 2. Session expiration check.
+    /// 3. Read-only pre-AEAD anti-replay check.
+    /// 4. ChaCha20-Poly1305 authentication tag verification and decryption over AAD.
+    /// 5. PCM frame sample length consistency validation.
+    /// 6. Post-AEAD commit to `replay_window` and update of `last_activity_secs`.
     pub fn open_datagram(
         &mut self,
         datagram: &[u8],
@@ -548,29 +731,39 @@ impl AudioSessionReceiver {
 /// Wire parameters returned inside `DisplayRpcResponse` when negotiating a UDP audio session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegotiatedAudioSessionWire {
+    /// 8-byte session identifier formatted as a 16-character lowercase hex string.
     pub session_id_hex: String,
+    /// 32-byte receiver random nonce formatted as a 64-character lowercase hex string.
     pub receiver_nonce_hex: String,
+    /// Active session lifetime in seconds (`AUDIO_SESSION_TTL_SECS`).
     pub expires_in_secs: u64,
 }
 
 /// Registry of active `AudioSessionReceiver` instances keyed by 8-byte `session_id`.
+///
+/// Manages session lifecycle, concurrent session limits, and datagram demultiplexing.
 #[derive(Default)]
 pub struct AudioSessionRegistry {
     sessions: HashMap<[u8; 8], AudioSessionReceiver>,
 }
 
 impl AudioSessionRegistry {
+    /// Constructs an empty `AudioSessionRegistry`.
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
         }
     }
 
+    /// Prunes all expired sessions from the registry.
     pub fn prune_expired(&mut self, now_secs: u64) {
         self.sessions.retain(|_, s| !s.is_expired(now_secs));
     }
 
     /// Negotiates and registers a new `AudioSessionReceiver` for an authenticated peer.
+    ///
+    /// Validates parameters, enforces per-peer and global session capacity limits,
+    /// generates unique nonces, derives session keys, and returns `NegotiatedAudioSessionWire`.
     pub fn negotiate_receiver_session(
         &mut self,
         peer_device_id: [u8; 16],
@@ -689,6 +882,7 @@ impl AudioSessionRegistry {
         Ok((peer_id, hdr, plain))
     }
 
+    /// Returns the number of currently active, non-expired sessions at `now_secs`.
     pub fn active_session_count_at(&self, now_secs: u64) -> usize {
         self.sessions
             .values()
@@ -696,6 +890,7 @@ impl AudioSessionRegistry {
             .count()
     }
 
+    /// Returns the number of currently active sessions at the current system time.
     pub fn active_session_count(&self) -> usize {
         self.active_session_count_at(unix_epoch_secs())
     }

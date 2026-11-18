@@ -1,28 +1,79 @@
-//! Cross-Platform OS-Backed Keystore & Identity Pinning (`trusted_peers_v2.json`).
+//! # Cross-Platform OS-Backed Keystore & Identity Pinning (`app/src/security/keystore.rs`)
 //!
-//! Architecture:
-//! 1. **Layer 1 (OS Native Secret Store)**:
-//!    - **macOS**: Stores the 256-bit Master Keystore Encryption Key (`K_kek`) in the macOS login
-//!      Keychain via native `Security.framework` (`SecItemCopyMatching`, `SecItemAdd`, `SecItemDelete`)
-//!      under service `"com.integrator.security.keystore.v2"`, account `"master-kek-v2"`.
-//!    - **Windows**: Protects `K_kek` using Win32 Data Protection API (`CryptProtectData` /
-//!      `CryptUnprotectData` in `crypt32.dll`) with `CRYPTPROTECT_UI_FORBIDDEN` (bound to the
-//!      current Windows user logon credentials) and application-specific secondary entropy
-//!      `"INTEGRATOR-WIN32-DPAPI-ENTROPY-V2"`, stored at `%LOCALAPPDATA%\Integrator\security\master_kek_v2.dpapi`.
-//!    - **Linux / Other Unix**: Derives `K_kek` via HKDF-SHA256 combining `/etc/machine-id`, UID,
-//!      and a mode-`0600` random key file `~/.integrator/security/master_kek_v2.key`.
-//! 2. **Layer 2 (AEAD Envelope Store)**:
-//!    - All long-term secrets in `trusted_peers_v2.json` (`local_ed25519_sk` and per-peer `K_root`)
-//!      are individually encrypted with `ChaCha20Poly1305` under `K_kek`.
-//!    - Each record's `device_id`, `ed25519_pubkey`, and `key_id` are cryptographically bound into
-//!      the `ChaCha20Poly1305` AAD, preventing offline JSON tampering or public-key substitution.
-//! 3. **Strict Identity-Key Pinning & Legacy Quarantine**:
-//!    - `device_id` is deterministically derived from `ed25519_pubkey`.
-//!    - Once a peer is pinned, any attempt to re-register or connect with a different `ed25519_pubkey`
-//!      for the same `device_id` or `hostname` is rejected with `KeystoreError::PinnedIdentityKeyMismatch`
-//!      until the user explicitly unpairs/forgets the peer.
-//!    - Legacy v1 `trusted_peers.json` files (which lack pinned Ed25519 public keys and PAKE root keys)
-//!      are automatically quarantined to `trusted_peers.json.v1.deprecated.bak` on startup.
+//! ## 1. Module Purpose & Architectural Scope
+//! This module owns all persistent cryptographic state for the Integrator application, governing the
+//! storage, lifecycle, encryption, identity-key pinning, and access control of:
+//! - The local host's master Ed25519 identity keypair (`local_ed25519_sk`, `local_ed25519_pk`).
+//! - The canonical 16-byte local `device_id` derived from `local_ed25519_pk`.
+//! - Per-peer pre-shared root keys ($K_{\text{root}}$) negotiated via RFC 9382 SPAKE2 pairing.
+//! - Pinned remote peer metadata (device IDs, public keys, key IDs, hostnames, last-seen IPs, direct-cable flags).
+//! - Active network and device blocklists (`blocked_device_ids`, `blocked_ips`).
+//!
+//! All long-term secrets are stored on disk in `~/.integrator/security/trusted_peers_v2.json` (or Windows
+//! `%LOCALAPPDATA%\Integrator\security\trusted_peers_v2.json`) under multi-layered defense-in-depth protection.
+//!
+//! ## 2. Multi-Layer Security Architecture
+//! 1. **Layer 1: OS-Native Root of Trust (Master Keystore Encryption Key, $K_{\text{kek}}$)**:
+//!    - **macOS (`target_os = "macos"`)**:
+//!      - Queries Apple Keychain Services (`Security.framework`) non-interactively using
+//!        `kSecUseAuthenticationUIFail` under service `"com.integrator.security.keystore.v2"`, account
+//!        `"master-kek-v2-<account_hash>"`.
+//!      - Suppresses interactive macOS security dialogs (`NoUiKeychainGuard`) to prevent GUI lockups.
+//!      - If no pre-existing keychain entry exists, derives $K_{\text{kek}}$ by binding an unguessable
+//!        256-bit CSPRNG seed (`.master_kek_v2.seed`, mode `0600`) to machine hardware identifiers
+//!        (`IOPlatformUUID`, `IOPlatformSerialNumber` via `IOKit.framework`) and the current user's UID via HKDF-SHA256.
+//!    - **Windows (`target_os = "windows"`)**:
+//!      - Protects $K_{\text{kek}}$ using the Win32 Data Protection API (`CryptProtectData` and
+//!        `CryptUnprotectData` in `crypt32.dll`).
+//!      - Passes `CRYPTPROTECT_UI_FORBIDDEN` to guarantee silent, headless operation without credential prompts.
+//!      - Binds encryption to current Windows user login credentials combined with secondary application entropy
+//!        `"INTEGRATOR-WIN32-DPAPI-ENTROPY-V2"`.
+//!      - Securely zeroes sensitive plaintexts in volatile memory before releasing memory via `LocalFree`.
+//!      - Stored at `%LOCALAPPDATA%\Integrator\security\master_kek_v2.dpapi`.
+//!    - **Linux / Other Unix (`not(any(macos, windows))`**:
+//!      - Derives $K_{\text{kek}}$ by combining a mode-`0600` CSPRNG seed file (`.master_kek_v2.seed`),
+//!        `/etc/machine-id`, and effective user ID (EUID) via HKDF-SHA256.
+//! 2. **Layer 2: AEAD Envelope Encryption**:
+//!    - Plaintext private keys (`local_ed25519_sk`) and peer root keys ($K_{\text{root}}$) are NEVER written to disk in the clear.
+//!    - Each secret is wrapped with `ChaCha20Poly1305` using an independent 12-byte CSPRNG nonce.
+//!    - Authenticated Additional Data (`AAD`) binds the owner's `device_id`, `ed25519_pubkey`, and `key_id` directly
+//!      into the Poly1305 authenticator, cryptographically preventing record-swapping or JSON key substitution.
+//! 3. **Layer 3: Whole-File Metadata Integrity MAC**:
+//!    - An HMAC-SHA256 integrity tag (`state_mac_hex`) authenticates the entire serialized keystore contents
+//!      (schema version, local identity, all peers, blocklists, quarantine flag) under a dedicated MAC key
+//!      derived from $K_{\text{kek}}$ (`KEYSTORE_META_MAC_INFO`).
+//!    - Detects unauthorized offline modifications to unencrypted metadata (e.g. modifying pinned hostnames or tampering with blocklists).
+//! 4. **Layer 4: Strict Identity-Key Pinning & Anti-Spoofing**:
+//!    - `device_id` is deterministically derived: $\text{SHA256}(\text{"integrator-device-id-v2"} \,\|\, \text{pubkey})[0..16]$.
+//!    - Any mismatch between claimed `device_id` and presented `ed25519_pubkey` is rejected with [`KeystoreError::SpoofedDeviceId`].
+//!    - Once a peer is pinned, any connection or re-pairing attempt presenting a different `ed25519_pubkey` for the
+//!      same `device_id` or non-empty `hostname` is rejected with [`KeystoreError::PinnedIdentityKeyMismatch`].
+//!    - Pinned identities can only be updated after an explicit user unpair action (`unpair_peer`).
+//! 5. **Layer 5: Legacy v1 Keystore Quarantine**:
+//!    - Scans for deprecated v1 `trusted_peers.json` files lacking Ed25519 keys or PAKE roots.
+//!    - Automatically renames them to `trusted_peers.json.v1.deprecated.bak` with mode `0600` to prevent insecure fallback.
+//! 6. **Layer 6: Filesystem Safety & Atomic Replacement**:
+//!    - Directory and file creation enforces POSIX mode `0700` / `0600`.
+//!    - Disallows following symlinks or Windows reparse points (`O_NOFOLLOW`, `FILE_ATTRIBUTE_REPARSE_POINT`).
+//!    - Atomic writes: writes to a hidden temporary file with PID and CSPRNG hex suffix, calls `sync_all()`, and renames over target.
+//!    - Maximum file size bounded by `MAX_KEYSTORE_FILE_BYTES` (16 MiB).
+//!
+//! ## 3. Architectural Linkages & Callers/Callees
+//! - **Upstream Callers**:
+//!   - `app/src/trust.rs`: High-level peer status queries, beacon signing/verification, unpair/block operations.
+//!   - `app/src/security/pairing.rs`: Identity verification, peer commitment upon successful SPAKE2 handshake.
+//!   - `app/src/security/transport.rs`: Pinned peer credential lookups for `TransportSessionV2` mutual handshake.
+//!   - `app/src/security/audio_udp.rs`: Looking up $K_{\text{root}}$ to derive authenticated UDP audio session keys.
+//! - **Downstream Callees**:
+//!   - `chacha20poly1305`: Envelope encryption and decryption.
+//!   - `ed25519_dalek`: Local signing key management, signature creation and strict verification.
+//!   - OS Cryptographic APIs (`crypt32.dll` on Windows, `Security.framework` on macOS).
+//!
+//! ## 4. Threading & Concurrency Model
+//! Access to the active keystore is managed through the global thread-safe singleton [`global_keystore`],
+//! which wraps a `KeystoreV2` instance inside an `std::sync::Mutex`. In async contexts, callers acquire the
+//! mutex guard synchronously for brief operations and drop it before invoking `.await` points, ensuring the
+//! returned futures remain `Send`.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -42,32 +93,50 @@ use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
+/// Schema version identifier for Integrator v2 keystores (`2`).
 pub const KEYSTORE_SCHEMA_VERSION: u32 = 2;
 
+/// AAD prefix binding local identity records to prevent AEAD ciphertext swapping.
 const AAD_LOCAL_IDENTITY_PREFIX: &[u8] = b"integrator-keystore-v2-local-id";
+
+/// AAD prefix binding remote peer root keys to prevent AEAD ciphertext swapping.
 const AAD_PEER_ROOT_PREFIX: &[u8] = b"integrator-keystore-v2-peer-root";
+
+/// HKDF salt for deriving the whole-file metadata MAC key.
 const KEYSTORE_META_MAC_SALT: &[u8] = b"integrator-keystore-v2-meta-salt";
+
+/// HKDF info string for deriving the whole-file metadata MAC key.
 const KEYSTORE_META_MAC_INFO: &[u8] = b"integrator-keystore-v2-meta-mac";
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Errors encountered during keystore initialization, cryptographic wrapping, or identity pinning checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeystoreError {
+    /// OS native secret store failure (Keychain, DPAPI, or CSPRNG).
     OsKeystoreFailure(String),
+    /// Filesystem input/output error (stat, open, read, write, permissions).
     IoFailure(String),
+    /// JSON serialization or deserialization failure.
     SerializationFailure(String),
+    /// Keystore format corruption, non-UTF8 bytes, or schema version mismatch.
     CorruptKeystore(String),
+    /// ChaCha20-Poly1305 AEAD tag verification failure or metadata HMAC mismatch (tampering detected).
     AeadTamperDetected(String),
+    /// Claimed device ID does not match the deterministic SHA-256 derivation from the Ed25519 public key.
     SpoofedDeviceId {
         claimed_hex: String,
         derived_hex: String,
     },
+    /// Security alert: remote peer presented an Ed25519 public key conflicting with the already-pinned key.
     PinnedIdentityKeyMismatch {
         peer_identifier: String,
         pinned_pubkey_hex: String,
         presented_pubkey_hex: String,
     },
+    /// Requested peer device ID was not found in the trust store.
     PeerNotFound(String),
+    /// Connection rejected because the peer device ID or IP address is on the blocklist.
     PeerBlocked(String),
 }
 
@@ -108,12 +177,22 @@ impl std::fmt::Display for KeystoreError {
 
 impl std::error::Error for KeystoreError {}
 
-/// Trait abstracting the OS Master Keystore Encryption Key (`K_kek`) provider.
+/// Trait abstracting the retrieval or generation of the 256-bit Master Keystore Encryption Key ($K_{\text{kek}}$).
 pub trait KekProvider: Send + Sync {
+    /// Loads the existing $K_{\text{kek}}$ from the OS secure storage or initializes a fresh one.
+    ///
+    /// # Arguments
+    /// * `storage_dir` - Directory containing keystore configuration and platform key tokens.
+    ///
+    /// # Returns
+    /// 32-byte master key wrapped in [`zeroize::Zeroizing`].
     fn load_or_create_kek(&self, storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, KeystoreError>;
 }
 
-/// Default production OS KEK provider (macOS Keychain / Windows DPAPI / Linux HKDF+0600).
+/// Default production implementation of [`KekProvider`], delegating to OS native secret storage:
+/// - macOS: Apple Keychain Services / Hardware-bound sealed seed.
+/// - Windows: Win32 DPAPI (`CryptProtectData`).
+/// - Linux: Machine-ID + EUID + mode-0600 seed file.
 pub struct OsNativeKekProvider;
 
 impl KekProvider for OsNativeKekProvider {
@@ -133,12 +212,13 @@ impl KekProvider for OsNativeKekProvider {
     }
 }
 
-/// Deterministic/custom in-memory KEK provider for isolated unit and adversarial tests.
+/// Deterministic in-memory [`KekProvider`] for isolated unit and adversarial integration tests.
 pub struct FixedKekProvider {
     kek: Zeroizing<[u8; 32]>,
 }
 
 impl FixedKekProvider {
+    /// Constructs a test KEK provider with fixed 32-byte key material.
     pub fn new(kek_bytes: [u8; 32]) -> Self {
         Self {
             kek: Zeroizing::new(kek_bytes),
@@ -152,61 +232,96 @@ impl KekProvider for FixedKekProvider {
     }
 }
 
+/// On-disk representation of an envelope-encrypted 32-byte secret (e.g., Ed25519 secret key seed or PAKE root key).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AeadWrappedSecret {
+    /// 24-character hexadecimal representation of the 12-byte CSPRNG nonce.
     pub nonce_hex: String,
+    /// 96-character hexadecimal representation of the 48-byte AEAD output (32-byte ciphertext + 16-byte Poly1305 tag).
     pub ciphertext_hex: String,
 }
 
+/// On-disk record for a pinned trusted peer inside `trusted_peers_v2.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPeerRecordV2 {
+    /// Record schema version (`2`).
     pub schema_version: u32,
+    /// 32-character lowercase hex canonical device ID: $\text{SHA256}(\text{"integrator-device-id-v2"} \,\|\, \text{pubkey})[0..16]$.
     pub device_id_hex: String,
+    /// 64-character lowercase hex compressed Edwards25519 public key.
     pub ed25519_pubkey_hex: String,
+    /// 32-character lowercase hex key ID: $\text{SHA256}(\text{"integrator-key-id-v2"} \,\|\, K_{\text{root}})[0..16]$.
     pub key_id_hex: String,
+    /// Verified hostname of the peer device at the time of pairing.
     pub hostname: String,
+    /// Operating system string (e.g. `"macOS"`, `"Windows"`).
     pub os: String,
+    /// Most recently verified IP address string (e.g. `"10.99.99.1"`).
     pub last_ip: String,
+    /// Unix epoch timestamp (seconds) when mutual pairing completed.
     pub paired_at_epoch: u64,
+    /// True if paired over a direct USB-C / Thunderbolt cable interface.
     pub via_direct_cable: bool,
+    /// Envelope-encrypted 32-byte root key ($K_{\text{root}}$) with AAD binding.
     pub wrapped_root_key: AeadWrappedSecret,
 }
 
+/// Top-level on-disk JSON structure of `trusted_peers_v2.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeystoreFileV2 {
+    /// File schema version (must equal [`KEYSTORE_SCHEMA_VERSION`] = 2).
     pub schema_version: u32,
+    /// Local machine's canonical 32-character hex device ID.
     pub local_device_id_hex: String,
+    /// Local machine's 64-character hex Ed25519 public key.
     pub local_ed25519_pubkey_hex: String,
+    /// Envelope-encrypted local Ed25519 secret key seed (32 bytes).
     pub wrapped_local_ed25519_sk: AeadWrappedSecret,
+    /// Array of pinned trusted peer records.
     #[serde(default)]
     pub peers: Vec<TrustedPeerRecordV2>,
+    /// List of explicitly blocked 32-hex device IDs.
     #[serde(default)]
     pub blocked_device_ids: Vec<String>,
+    /// List of explicitly blocked IP address strings.
     #[serde(default)]
     pub blocked_ips: Vec<String>,
+    /// True if legacy v1 `trusted_peers.json` files were detected and quarantined.
     #[serde(default)]
     pub legacy_v1_quarantined: bool,
+    /// 64-character hex HMAC-SHA256 integrity tag over all serialized metadata fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_mac_hex: Option<String>,
 }
 
-/// Verified in-memory representation of a pinned peer with its unwrapped `K_root`.
+/// Verified in-memory representation of an authenticated, pinned peer with its decrypted root key.
 #[derive(Clone)]
 pub struct VerifiedPeerCredentials {
+    /// 16-byte binary canonical device ID.
     pub device_id: [u8; 16],
+    /// 32-character lowercase hex canonical device ID.
     pub device_id_hex: String,
+    /// 32-byte binary compressed Edwards25519 public key.
     pub ed25519_pubkey: [u8; 32],
+    /// 16-byte binary key identifier.
     pub key_id: [u8; 16],
+    /// Decrypted 32-byte root secret ($K_{\text{root}}$) wrapped in [`zeroize::Zeroizing`].
     pub root_key: Zeroizing<[u8; 32]>,
+    /// Verified hostname of the peer device.
     pub hostname: String,
+    /// Operating system of the peer device.
     pub os: String,
+    /// Most recent verified IP address string.
     pub last_ip: String,
+    /// Unix epoch timestamp (seconds) when pairing completed.
     pub paired_at_epoch: u64,
+    /// True if paired over a direct physical link.
     pub via_direct_cable: bool,
 }
 
 impl std::fmt::Debug for VerifiedPeerCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redacts raw root_key material from Debug output to prevent accidental log leakage
         f.debug_struct("VerifiedPeerCredentials")
             .field("device_id_hex", &self.device_id_hex)
             .field("ed25519_pubkey", &super::hex_encode(&self.ed25519_pubkey))
@@ -217,6 +332,7 @@ impl std::fmt::Debug for VerifiedPeerCredentials {
     }
 }
 
+/// Active in-memory manager for local cryptographic identity and trusted peer credentials.
 pub struct KeystoreV2 {
     storage_dir: PathBuf,
     keystore_path: PathBuf,
@@ -232,13 +348,23 @@ pub struct KeystoreV2 {
 }
 
 impl KeystoreV2 {
-    /// Opens or initializes the production v2 keystore in the default directory (`~/.integrator/security`).
+    /// Opens or initializes the production v2 keystore in the default directory.
+    ///
+    /// # Errors
+    /// Returns [`KeystoreError`] if OS secret storage or directory operations fail.
     pub fn open_default() -> Result<Self, KeystoreError> {
         let dir = try_default_keystore_dir()?;
         Self::open_with_provider(dir, &OsNativeKekProvider)
     }
 
-    /// Opens or initializes a v2 keystore in `storage_dir` using the given `KekProvider`.
+    /// Opens or initializes a v2 keystore in `storage_dir` using the specified `provider`.
+    ///
+    /// Performs directory validation, legacy v1 quarantine, master KEK acquisition, and loads
+    /// or initializes the keystore file.
+    ///
+    /// # Arguments
+    /// * `storage_dir` - Directory path for keystore storage.
+    /// * `provider` - KEK provider implementation.
     pub fn open_with_provider(
         storage_dir: PathBuf,
         provider: &dyn KekProvider,
@@ -258,6 +384,7 @@ impl KeystoreV2 {
         }
     }
 
+    /// Initializes a brand new keystore with a fresh Ed25519 signing keypair from the OS CSPRNG.
     fn initialize_fresh(
         storage_dir: PathBuf,
         keystore_path: PathBuf,
@@ -290,6 +417,10 @@ impl KeystoreV2 {
         Ok(store)
     }
 
+    /// Loads and decrypts an existing `trusted_peers_v2.json` file.
+    ///
+    /// Validates whole-file metadata HMAC, unwraps local Ed25519 secret key, verifies public key
+    /// correspondence, unwraps all peer root keys with AAD binding, and populates the in-memory cache.
     fn load_existing(
         storage_dir: PathBuf,
         keystore_path: PathBuf,
@@ -480,22 +611,40 @@ impl KeystoreV2 {
         Ok(store)
     }
 
+    /// Returns the local machine's 16-byte binary canonical device identifier.
     pub fn local_device_id(&self) -> [u8; 16] {
         self.local_device_id
     }
 
+    /// Returns the local machine's 32-character lowercase hex canonical device identifier.
     pub fn local_device_id_hex(&self) -> &str {
         &self.local_device_id_hex
     }
 
+    /// Returns the local machine's 32-byte Ed25519 public key.
     pub fn local_ed25519_pubkey(&self) -> [u8; 32] {
         self.local_verifying_key.to_bytes()
     }
 
+    /// Signs an arbitrary message (e.g. handshake transcript digest) with the local Ed25519 signing key.
+    ///
+    /// # Arguments
+    /// * `message` - Input message slice to sign.
+    ///
+    /// # Returns
+    /// 64-byte Ed25519 digital signature.
     pub fn sign_transcript(&self, message: &[u8]) -> [u8; 64] {
         self.local_signing_key.sign(message).to_bytes()
     }
 
+    /// Strictly verifies an Ed25519 signature using `VerifyingKey::verify_strict`.
+    ///
+    /// Rejects malleable, non-canonical, or small-order Ed25519 signatures per RFC 8032.
+    ///
+    /// # Arguments
+    /// * `pubkey_bytes` - 32-byte Ed25519 public key.
+    /// * `message` - Authenticated message slice.
+    /// * `signature_bytes` - 64-byte Ed25519 signature.
     pub fn verify_signature(
         pubkey_bytes: &[u8; 32],
         message: &[u8],
@@ -504,21 +653,29 @@ impl KeystoreV2 {
         let vk = VerifyingKey::from_bytes(pubkey_bytes).map_err(|_| {
             KeystoreError::CorruptKeystore("invalid Ed25519 public key bytes".into())
         })?;
-        // Use verify_strict to reject malleable or small-order Ed25519 signatures.
         let sig = Signature::from_bytes(signature_bytes);
         vk.verify_strict(message, &sig)
             .map_err(|_| KeystoreError::AeadTamperDetected("Ed25519 signature verification failed".into()))
     }
 
+    /// Returns whether any legacy v1 `trusted_peers.json` files were quarantined during initialization.
     pub fn was_legacy_v1_quarantined(&self) -> bool {
         self.legacy_v1_quarantined
     }
 
-    /// Checks whether a candidate peer identity conflicts with any already-pinned peer.
-    /// Rejects both:
-    /// 1. Claimed `device_id` that does not match `SHA256("integrator-device-id-v2" || pubkey)[0..16]`.
-    /// 2. A peer with the same `hostname` (non-empty) that is already pinned to a different `ed25519_pubkey`,
-    ///    preventing silent key replacement without an explicit user unpair action.
+    /// Checks whether a candidate peer identity conflicts with any already-pinned peer record.
+    ///
+    /// Rejects:
+    /// 1. Self-pairing: attempting to pair the device with its own identity.
+    /// 2. Spoofed device ID: `peer_device_id != SHA256("integrator-device-id-v2" || pk)[0..16]`.
+    /// 3. Blocked device ID.
+    /// 4. Public key conflict: candidate has same `device_id` but different `ed25519_pk`.
+    /// 5. Hostname conflict: candidate has same `hostname` (non-empty) but different `ed25519_pk`.
+    ///
+    /// # Arguments
+    /// * `peer_device_id` - 16-byte binary device ID.
+    /// * `peer_ed25519_pk` - 32-byte Ed25519 public key.
+    /// * `hostname` - Declared peer hostname string.
     pub fn check_peer_identity_pinning(
         &self,
         peer_device_id: &[u8; 16],
@@ -575,7 +732,16 @@ impl KeystoreV2 {
         Ok(())
     }
 
-    /// Commits a newly paired (or re-keyed same-identity) peer into the keystore and atomically persists to disk.
+    /// Commits a newly paired peer into the keystore and atomically persists state to disk.
+    ///
+    /// # Arguments
+    /// * `peer_device_id` - 16-byte binary device ID.
+    /// * `peer_ed25519_pk` - 32-byte Ed25519 public key.
+    /// * `root_key` - 32-byte negotiated SPAKE2 root key.
+    /// * `hostname` - Remote machine hostname.
+    /// * `os` - Remote machine OS.
+    /// * `last_ip` - Remote machine IP address.
+    /// * `via_direct_cable` - True if paired over direct physical cable.
     pub fn commit_paired_peer(
         &mut self,
         peer_device_id: [u8; 16],
@@ -613,7 +779,13 @@ impl KeystoreV2 {
         Ok(creds)
     }
 
-    /// Explicitly unpairs/revokes a pinned peer so a new key or fresh pairing can be established.
+    /// Explicitly unpairs and forgets a pinned peer by its device ID hex.
+    ///
+    /// # Arguments
+    /// * `device_id_hex` - 32-character hex device ID.
+    ///
+    /// # Returns
+    /// `true` if the peer was found and removed; `false` if not found.
     pub fn unpair_peer(&mut self, device_id_hex: &str) -> Result<bool, KeystoreError> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
         let mut next_peers = self.peers.clone();
@@ -625,7 +797,7 @@ impl KeystoreV2 {
         Ok(removed)
     }
 
-    /// Removes a peer from trust and optionally adds its `device_id` (and known IP) to the blocklist.
+    /// Removes a peer from trust and optionally blocks its device ID and IP address.
     pub fn untrust_or_block_peer(
         &mut self,
         device_id_hex: &str,
@@ -672,14 +844,17 @@ impl KeystoreV2 {
         Ok(())
     }
 
+    /// Returns a slice of all currently blocked device ID strings.
     pub fn blocked_device_ids(&self) -> &[String] {
         &self.blocked_device_ids
     }
 
+    /// Returns a slice of all currently blocked IP address strings.
     pub fn blocked_ips(&self) -> &[String] {
         &self.blocked_ips
     }
 
+    /// Checks if a device ID or IP address is currently blocked.
     pub fn is_device_or_ip_blocked(&self, device_id_hex: &str, ip: &str) -> bool {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
         let clean_ip = ip.trim();
@@ -687,6 +862,7 @@ impl KeystoreV2 {
             || (!clean_ip.is_empty() && self.blocked_ips.iter().any(|bip| bip == clean_ip))
     }
 
+    /// Finds a pinned peer matching a specific IP address, excluding blocked peers.
     pub fn find_peer_by_ip(&self, ip: &str) -> Option<&VerifiedPeerCredentials> {
         let clean_ip = ip.trim();
         if clean_ip.is_empty() || self.blocked_ips.iter().any(|bip| bip == clean_ip) {
@@ -697,6 +873,7 @@ impl KeystoreV2 {
         })
     }
 
+    /// Looks up a pinned peer by its 32-character hex device ID, excluding blocked peers.
     pub fn get_peer(&self, device_id_hex: &str) -> Option<&VerifiedPeerCredentials> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
         if self.blocked_device_ids.iter().any(|b| b == &canonical) {
@@ -705,17 +882,20 @@ impl KeystoreV2 {
         self.peers.get(&canonical)
     }
 
+    /// Looks up a pinned peer by its 16-byte binary device ID.
     pub fn get_peer_by_id_bytes(&self, device_id: &[u8; 16]) -> Option<&VerifiedPeerCredentials> {
         let hex = super::hex_encode(device_id);
         self.get_peer(&hex)
     }
 
+    /// Returns a sorted list of all active pinned peers.
     pub fn list_peers(&self) -> Vec<VerifiedPeerCredentials> {
         let mut out: Vec<VerifiedPeerCredentials> = self.peers.values().cloned().collect();
         out.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.device_id_hex.cmp(&b.device_id_hex)));
         out
     }
 
+    /// Updates the `last_ip` record for a pinned peer after a verified packet or handshake.
     pub fn update_peer_last_ip(
         &mut self,
         device_id_hex: &str,
@@ -743,10 +923,12 @@ impl KeystoreV2 {
         Ok(())
     }
 
+    /// Persists current in-memory state to disk atomically.
     pub fn persist_to_disk(&self) -> Result<(), KeystoreError> {
         self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips)
     }
 
+    /// Internal serialization, AEAD encryption, HMAC calculation, and atomic write.
     fn persist_state(
         &self,
         peers_map: &HashMap<String, VerifiedPeerCredentials>,
@@ -805,6 +987,7 @@ impl KeystoreV2 {
     }
 }
 
+/// Computes the HMAC-SHA256 integrity tag over all serialized keystore metadata fields.
 fn compute_keystore_file_mac(
     kek: &[u8; 32],
     file_obj: &KeystoreFileV2,
@@ -857,6 +1040,8 @@ fn compute_keystore_file_mac(
     Ok(out)
 }
 
+/// Constructs the AAD byte slice binding local identity record:
+/// `AAD_LOCAL_IDENTITY_PREFIX || device_id || pubkey`.
 fn build_local_identity_aad(device_id: &[u8; 16], pubkey: &[u8; 32]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AAD_LOCAL_IDENTITY_PREFIX.len() + 16 + 32);
     aad.extend_from_slice(AAD_LOCAL_IDENTITY_PREFIX);
@@ -865,6 +1050,8 @@ fn build_local_identity_aad(device_id: &[u8; 16], pubkey: &[u8; 32]) -> Vec<u8> 
     aad
 }
 
+/// Constructs the AAD byte slice binding peer root key record:
+/// `AAD_PEER_ROOT_PREFIX || device_id || pubkey || key_id`.
 fn build_peer_root_aad(device_id: &[u8; 16], pubkey: &[u8; 32], key_id: &[u8; 16]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AAD_PEER_ROOT_PREFIX.len() + 16 + 32 + 16);
     aad.extend_from_slice(AAD_PEER_ROOT_PREFIX);
@@ -874,6 +1061,7 @@ fn build_peer_root_aad(device_id: &[u8; 16], pubkey: &[u8; 32], key_id: &[u8; 16
     aad
 }
 
+/// Wraps a 32-byte secret with `ChaCha20Poly1305` using an ephemeral 12-byte CSPRNG nonce and authenticated AAD.
 fn wrap_secret_32(
     kek: &[u8; 32],
     secret: &[u8; 32],
@@ -901,6 +1089,7 @@ fn wrap_secret_32(
     })
 }
 
+/// Unwraps an envelope-encrypted 32-byte secret, verifying the Poly1305 authentication tag against `aad`.
 fn unwrap_secret_32(
     kek: &[u8; 32],
     wrapped: &AeadWrappedSecret,
@@ -911,6 +1100,7 @@ fn unwrap_secret_32(
     let ciphertext = super::hex_decode(&wrapped.ciphertext_hex)
         .ok_or_else(|| KeystoreError::AeadTamperDetected("invalid wrapped ciphertext_hex".into()))?;
 
+    // 32 bytes plaintext + 16 bytes Poly1305 AEAD tag = 48 bytes
     if ciphertext.len() != 32 + 16 {
         return Err(KeystoreError::AeadTamperDetected(format!(
             "unexpected wrapped secret length {} (expected 48)",
@@ -940,8 +1130,12 @@ fn unwrap_secret_32(
     Ok(out)
 }
 
+/// Maximum permitted keystore file size (16 MiB) to prevent decompression or memory exhaustion.
 const MAX_KEYSTORE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Resolves the default security keystore directory for the current platform:
+/// - Windows: `%LOCALAPPDATA%\Integrator\security` or `%USERPROFILE%\.integrator\security`.
+/// - macOS/Linux: `$HOME/.integrator/security`.
 pub fn try_default_keystore_dir() -> Result<PathBuf, KeystoreError> {
     #[cfg(target_os = "windows")]
     {
@@ -975,10 +1169,12 @@ pub fn try_default_keystore_dir() -> Result<PathBuf, KeystoreError> {
     }
 }
 
+/// Convenience accessor for [`try_default_keystore_dir`], returning `None` if unresolvable.
 pub fn default_keystore_dir() -> Option<PathBuf> {
     try_default_keystore_dir().ok()
 }
 
+/// Verifies that a path is a regular file and NOT a symlink or Windows reparse point.
 fn verify_non_symlink_regular_file(path: &Path) -> Result<fs::Metadata, KeystoreError> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| KeystoreError::IoFailure(format!("stat {}: {}", path.display(), e)))?;
@@ -1008,6 +1204,7 @@ fn verify_non_symlink_regular_file(path: &Path) -> Result<fs::Metadata, Keystore
     Ok(meta)
 }
 
+/// Safely reads the byte contents of a keystore file, rejecting symlinks and oversized files.
 fn read_secure_bytes(path: &Path) -> Result<Vec<u8>, KeystoreError> {
     let meta = verify_non_symlink_regular_file(path)?;
     if meta.len() > MAX_KEYSTORE_FILE_BYTES {
@@ -1044,6 +1241,7 @@ fn read_secure_bytes(path: &Path) -> Result<Vec<u8>, KeystoreError> {
     Ok(buf)
 }
 
+/// Validates or creates the keystore directory with restrictive access permissions (POSIX `0700`).
 fn ensure_secure_directory(dir: &Path) -> Result<(), KeystoreError> {
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
@@ -1104,6 +1302,8 @@ fn ensure_secure_directory(dir: &Path) -> Result<(), KeystoreError> {
     Ok(())
 }
 
+/// Atomically writes `content` to `target` file by first writing to a random tempfile with mode `0600`
+/// and renaming it over `target`.
 fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result<(), KeystoreError> {
     ensure_secure_directory(dir)?;
     let mut rnd = [0u8; 6];
@@ -1258,6 +1458,7 @@ struct NoUiKeychainGuard {
 
 #[cfg(target_os = "macos")]
 impl NoUiKeychainGuard {
+    /// Acquires a global mutex and disables interactive Keychain UI dialogs via `SecKeychainSetUserInteractionAllowed(0)`.
     fn acquire() -> Self {
         use std::os::raw::c_int;
         use std::sync::OnceLock;
@@ -1300,6 +1501,7 @@ impl Drop for NoUiKeychainGuard {
 }
 
 #[cfg(target_os = "macos")]
+/// Queries Apple IOKit registry for immutable hardware identifiers (`IOPlatformUUID`, `IOPlatformSerialNumber`).
 fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
     use core_foundation::base::{kCFAllocatorDefault, CFGetTypeID, CFTypeRef, TCFType};
     use core_foundation::string::{CFString, CFStringRef};
@@ -1357,6 +1559,7 @@ fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
         return Ok(binding);
     }
 
+    // CLI fallback via `/usr/sbin/ioreg` if IOKit direct symbols fail
     if let Ok(out) = std::process::Command::new("/usr/sbin/ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
@@ -1391,6 +1594,7 @@ fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
 }
 
 #[cfg(target_os = "macos")]
+/// Derives $K_{\text{kek}}$ by combining a mode-`0600` random seed file with macOS hardware identity (`IOPlatformUUID`).
 fn macos_hw_bound_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
@@ -1506,6 +1710,7 @@ fn macos_hw_bound_load_or_create_kek(
 }
 
 #[cfg(target_os = "macos")]
+/// Loads existing $K_{\text{kek}}$ from macOS Keychain Services or derives a hardware-bound seed key.
 fn macos_keychain_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
@@ -1626,6 +1831,7 @@ pub fn delete_os_kek_for_dir(storage_dir: &Path) {
 }
 
 #[cfg(target_os = "windows")]
+/// Protects or unprotects $K_{\text{kek}}$ using Win32 Data Protection API (`CryptProtectData` / `CryptUnprotectData`).
 fn windows_dpapi_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
@@ -1796,6 +2002,7 @@ fn windows_dpapi_load_or_create_kek(
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+/// Fallback implementation for generic Unix systems binding `/etc/machine-id` and EUID.
 fn unix_fallback_load_or_create_kek(
     storage_dir: &Path,
 ) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
@@ -1853,9 +2060,10 @@ fn unix_fallback_load_or_create_kek(
     Ok(derived)
 }
 
-/// Global singleton accessor for the production v2 keystore.
+/// Global singleton accessor for the production v2 keystore wrapped in a thread-safe `Mutex`.
 static GLOBAL_KEYSTORE_V2: OnceLock<Result<Mutex<KeystoreV2>, KeystoreError>> = OnceLock::new();
 
+/// Attempts to initialize or retrieve the global singleton keystore mutex.
 pub fn try_global_keystore() -> Result<&'static Mutex<KeystoreV2>, KeystoreError> {
     let init = GLOBAL_KEYSTORE_V2.get_or_init(|| {
         #[cfg(test)]
@@ -1879,6 +2087,7 @@ pub fn try_global_keystore() -> Result<&'static Mutex<KeystoreV2>, KeystoreError
     }
 }
 
+/// Retrieves the global singleton keystore mutex, panicking if initialization fails.
 pub fn global_keystore() -> &'static Mutex<KeystoreV2> {
     try_global_keystore().unwrap_or_else(|e| {
         panic!("Failed to initialize Integrator v2 security keystore: {}", e)

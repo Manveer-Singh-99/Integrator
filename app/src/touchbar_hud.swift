@@ -1,3 +1,61 @@
+//
+//  touchbar_hud.swift
+//  Integrator TouchBar HUD - Liquid Glass Controls & Telemetry Streamer
+//
+//  ========================================================================================
+//  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+//  ========================================================================================
+//  This file provides the native macOS TouchBar (`NSTouchBar`) HUD controller for MacBook Pro
+//  models, implementing tactile hardware-level monitoring, remote clipboard paste interception,
+//  and interactive liquid-glass controls.
+//
+//  Key Subsystem Capabilities:
+//  - Viscous Liquid Glass Pill Views (`GoopyLiquidGlassPillView`): Implements squishy, rubber-band
+//    drag-stretch physics with Spring animations, Frosted HUD blur materials (`NSVisualEffectView`
+//    with `.hudWindow`), and continuous corner curves.
+//  - Live Telemetry Streamer: Displays real-time GPU metrics from the connected Windows 11 host
+//    (GPU temperature °C, clock speed MHz, power consumption W, VRAM utilization %, display latency ms,
+//    and frame rates).
+//  - Remote File Paste Interceptor (`PasteboardShortcutInterceptor`): Installs a passive `CGEventTap`
+//    listening for `Cmd+V`. When a remote file announcement is pending, it intercepts the shortcut,
+//    updates the TouchBar with a haptic pulse, and triggers asynchronous zero-RAM streaming via
+//    `trigger_rust_remote_paste()`.
+//  - In-App Pasteboard Native File Helper: Implements `read_pasteboard_files_in_app` and
+//    `write_pasteboard_files_in_app` using `\0`-delimited UTF-8 byte arrays directly on the main
+//    AppKit thread, avoiding external helper process spawn latency.
+//
+//  ========================================================================================
+//  2. ARCHITECTURAL LINKAGES & CALL FLOW
+//  ========================================================================================
+//  Upstream Callers:
+//  - `src/clipboard/service.rs`: Invokes C-ABI functions:
+//    - `notify_touchbar_remote_file`: Announces pending remote files on TouchBar.
+//    - `update_touchbar_paste_progress`: Telemeters transfer % and MB/s stream velocity.
+//    - `reset_touchbar_paste_progress`: Clears transfer indicators upon completion.
+//  - `src/clipboard/file_helper.rs`: Calls `read_pasteboard_files_in_app` and `write_pasteboard_files_in_app`.
+//
+//  Downstream Callees:
+//  - AppKit TouchBar Framework (`NSTouchBar`, `NSTouchBarItem`, `NSCustomTouchBarItem`).
+//  - Quartz Core Graphics (`CGEventTapCreate`, `CGEventPost`).
+//  - Rust FFI: Calls `trigger_rust_remote_paste()` to initiate asynchronous file streaming.
+//
+//  ========================================================================================
+//  3. THREADING & CONCURRENCY MODEL
+//  ========================================================================================
+//  - AppKit Main Thread: All TouchBar UI item creation and label updates execute on `DispatchQueue.main`.
+//  - Shortcut Interceptor RunLoop: The `CGEventTap` executes on a dedicated Mach port `Thread`.
+//  - Async Rust Handoff: Shortcut triggers dispatch to `DispatchQueue.global(qos: .userInitiated)`
+//    before invoking `trigger_rust_remote_paste()`, ensuring the UI thread is never blocked.
+//
+//  ========================================================================================
+//  4. SECURITY & SAFETY INVARIANTS
+//  ========================================================================================
+//  - Stale Paste Expiration: In-flight paste sessions automatically expire after 60 seconds if
+//    the remote host fails to stream data, unblocking future paste shortcuts.
+//  - Buffer Capacity Verification: `read_pasteboard_files_in_app` strictly verifies output buffer
+//    capacities before copying NUL-delimited bytes, returning `-1` on overflow.
+//
+
 import AppKit
 import Foundation
 import IOKit

@@ -1,5 +1,62 @@
-//! Desk Layout configuration, mirror symmetry, normalized screen-edge geometry,
-//! dead-corner protection, and atomic persistence (`kvm_layout.json`).
+//! # Desk Layout, Screen Geometry & Coordinate Normalization Engine
+//!
+//! ## 1. Module Purpose & Scope
+//! This module provides the mathematical foundations, coordinate transformation pipeline,
+//! mirror symmetry algorithms, dead-corner filtering, and atomic disk persistence for the
+//! Integrator Universal Input KVM system.
+//!
+//! When two heterogeneous workstations (e.g. a 16-inch MacBook Pro Liquid Retina XDR display
+//! at 3456x2234 logical/physical scale and a Windows 11 PC driving a 3840x2160 4K monitor)
+//! sit side-by-side, their coordinate systems cannot be naively mapped 1:1. This module
+//! projects multi-monitor spaces into normalized unit intervals `[0.0, 1.0]` along active
+//! transition edges, taking into account user-defined vertical/horizontal desk offsets,
+//! monitor resolution differences, and corner exclusion zones.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
+//! │                    Display Geometry & Coordinate Normalization Flow                    │
+//! └────────────────────────────────────────────────────────────────────────────────────────┘
+//!
+//!     MacBook Screen (1440 x 900)                    Windows 11 Screen (1920 x 1080)
+//!  ┌──────────────────────────────┐              ┌──────────────────────────────────────┐
+//!  │                              │              │                                      │
+//!  │  Cursor Exits Right Edge     │              │  Cursor Enters Left Edge             │
+//!  │  Y = 450.0 px (50% height)   │              │  Y = 540.0 px (50% height)           │
+//!  │                              ├─────────────►│                                      │
+//!  │  compute_normalized_edge_pos │   Network    │  resolve_entry_point                 │
+//!  │  norm_pos = 0.500            │  Wire Msg    │  (x = 6.0 px, y = 540.0 px)          │
+//!  └──────────────────────────────┘              └──────────────────────────────────────┘
+//! ```
+//!
+//! ### Upstream Callers:
+//! - `src/kvm/service.rs`: Calls `is_in_dead_corner` and `compute_normalized_edge_pos` on pointer
+//!   movement hooks when the cursor touches an outer display boundary, and calls `resolve_entry_point`
+//!   upon receiving `KvmWireMessage::EnterScreen`.
+//! - `src/kvm/service.rs`: Calls `load_layout_config`, `save_layout_config`, and `mirror_layout_for_peer`
+//!   during startup, configuration updates, and inbound layout synchronization.
+//!
+//! ### Downstream Callees:
+//! - `crate::system_info::app_data_dir()`: Obtains the platform-safe storage directory.
+//! - `crate::system_info::atomic_write_private()`: Flushes layout state to disk atomically via temporary files
+//!   and atomic renames (`rename` on Unix, `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows).
+//!
+//! ## 3. Threading & Concurrency Model
+//! - Geometric transformation functions (`compute_normalized_edge_pos`, `resolve_entry_point`,
+//!   `is_in_dead_corner`) are pure, non-blocking, and re-entrant. They are invoked synchronously
+//!   from OS event hook callbacks (`CGEventTap` on macOS, `WH_MOUSE_LL` on Windows) where execution
+//!   latency must stay under 500 microseconds.
+//! - File persistence (`save_layout_config`) is guarded by `LAYOUT_SAVE_LOCK` (`Mutex<()>`) to prevent
+//!   race conditions if rapid configuration changes arrive concurrently from local UI and remote RPC.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Sanitized Numerical Ranges**: Perpendicular alignment offset is strictly clamped to `[-0.5, 0.5]`
+//!   and tested for finite validity (`is_finite()`). All `NaN` or infinite inputs collapse safely to `0.0`.
+//! - **Clock Skew Bounding**: Monotonic synchronization timestamps (`updated_at_ms`) are validated
+//!   against local clock time with a maximum forward skew cap (`MAX_CLOCK_SKEW_MS = 300,000` ms / 5 minutes)
+//!   to thwart replay attacks or clock-tampering denial of service.
+//! - **Zero-Division Avoidance**: Zero or sub-pixel screen dimensions are caught and defaulted to 0.5.
 
 use std::fs;
 use std::path::PathBuf;
@@ -9,32 +66,62 @@ use tracing::warn;
 
 use super::protocol::{KvmLayoutConfig, ScreenEdge};
 
+/// Size of the corner exclusion zone in device pixels (36.0 px).
+///
+/// Prevents accidental KVM hops when interacting with edge-adjacent UI controls such as:
+/// - macOS Apple menu (top-left) and Control Center (top-right)
+/// - Windows Start menu (bottom-left) and Notification Center (bottom-right)
+/// - Window title bar maximize/close controls
 pub const DEAD_CORNER_PX: f32 = 36.0;
+
+/// Maximum allowable forward clock skew in milliseconds (5 minutes).
 const MAX_CLOCK_SKEW_MS: u64 = 300_000;
+
+/// Global synchronization lock ensuring atomic file serialization for layout configurations.
 static LAYOUT_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Axis-aligned bounding rectangle representing a physical or virtual screen surface.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenRect {
+    /// Horizontal origin coordinate (leftmost edge) in device-independent units.
     pub x: f32,
+    /// Vertical origin coordinate (topmost edge) in device-independent units.
     pub y: f32,
+    /// Physical or logical width of the screen in units.
     pub width: f32,
+    /// Physical or logical height of the screen in units.
     pub height: f32,
 }
 
 impl ScreenRect {
+    /// Returns the maximum horizontal coordinate (`x + width`) along the right boundary.
+    #[inline]
     pub fn max_x(&self) -> f32 {
         self.x + self.width
     }
 
+    /// Returns the maximum vertical coordinate (`y + height`) along the bottom boundary.
+    #[inline]
     pub fn max_y(&self) -> f32 {
         self.y + self.height
     }
 }
 
+/// Computes the absolute filesystem path for the persisted KVM layout configuration (`kvm_layout.json`).
+///
+/// Located inside the application data directory (`~/Library/Application Support/Integrator` on macOS,
+/// `%LOCALAPPDATA%\Integrator` on Windows).
 pub fn layout_config_path() -> PathBuf {
     crate::system_info::app_data_dir().join("kvm_layout.json")
 }
 
+/// Loads and validates the persisted KVM layout configuration from disk.
+///
+/// If the file does not exist, is unreadable, or contains invalid JSON syntax,
+/// the system emits a warning and safely falls back to `KvmLayoutConfig::default()`.
+///
+/// # Returns
+/// A validated, sanitized `KvmLayoutConfig`.
 pub fn load_layout_config() -> KvmLayoutConfig {
     let path = layout_config_path();
     if let Ok(raw) = fs::read_to_string(&path) {
@@ -51,6 +138,16 @@ pub fn load_layout_config() -> KvmLayoutConfig {
     KvmLayoutConfig::default()
 }
 
+/// Persists the provided KVM layout configuration to disk atomically.
+///
+/// Writes through a temporary sibling file and performs an atomic rename to prevent
+/// partial file corruption during sudden system reboot or power loss.
+///
+/// # Arguments
+/// * `cfg` - Configuration reference to sanitize and persist.
+///
+/// # Returns
+/// `Ok(())` on successful atomic write, or `std::io::Error` on filesystem failure.
 pub fn save_layout_config(cfg: &KvmLayoutConfig) -> std::io::Result<()> {
     let _guard = LAYOUT_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut sanitized = cfg.clone();
@@ -61,17 +158,31 @@ pub fn save_layout_config(cfg: &KvmLayoutConfig) -> std::io::Result<()> {
     crate::system_info::atomic_write_private(&path, json.as_bytes())
 }
 
+/// Clamps numerical ranges, normalizes strings, and bounds timestamps for `KvmLayoutConfig`.
+///
+/// Invariants enforced:
+/// - `alignment_offset`: finite and clamped within `[-0.5, 0.5]`
+/// - `hop_delay_ms`: clamped to a maximum of `250` ms
+/// - `drop_folder`: normalized to `"desktop"`, `"cache"`, or `"downloads"`
+/// - `updated_at_ms`: capped at `now + MAX_CLOCK_SKEW_MS`
 pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
+    // 1. Sanitize perpendicular alignment offset
     if !cfg.alignment_offset.is_finite() {
         cfg.alignment_offset = 0.0;
     }
     cfg.alignment_offset = cfg.alignment_offset.clamp(-0.5, 0.5);
+
+    // 2. Sanitize edge hop delay threshold
     cfg.hop_delay_ms = cfg.hop_delay_ms.min(250);
+
+    // 3. Normalize drop destination folder
     cfg.drop_folder = match cfg.drop_folder.trim().to_ascii_lowercase().as_str() {
         "desktop" => "desktop".to_string(),
         "cache" => "cache".to_string(),
         _ => "downloads".to_string(),
     };
+
+    // 4. Bound timestamp against unreasonable future clock skew
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -82,8 +193,17 @@ pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
     }
 }
 
-/// Computes the peer-side mirrored layout when the user sets local arrangement
-/// (e.g., if peer is on my `Right` with `+0.15` offset, peer sees me on its `Left` with `-0.15`).
+/// Computes the peer-side mirrored layout when the user configures local desk arrangement.
+///
+/// Enforces physical mirror symmetry:
+/// - If the peer is on my `Right`, the peer sees me on its `Left`.
+/// - If local has a `+0.25` perpendicular offset, peer has `-0.25`.
+///
+/// # Arguments
+/// * `local` - Local layout configuration.
+///
+/// # Returns
+/// The geometrically inverted `KvmLayoutConfig` for the peer workstation.
 pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
     KvmLayoutConfig {
         peer_edge: local.peer_edge.opposite(),
@@ -99,7 +219,20 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
     }
 }
 
-/// Checks whether `(x, y)` lies inside a corner dead-zone along `edge`.
+/// Checks whether coordinates `(x, y)` lie inside a corner dead-zone along `edge`.
+///
+/// Protects against accidental transitions when the user moves the cursor to access
+/// OS-level UI elements (e.g. menu bar corners, Apple logo, Window close button).
+/// Dead-zone depth is dynamically bounded to at most 15% of the edge dimension.
+///
+/// # Arguments
+/// * `rect` - Primary screen bounding box.
+/// * `edge` - Active boundary edge being approached.
+/// * `x` - Pointer X coordinate.
+/// * `y` - Pointer Y coordinate.
+///
+/// # Returns
+/// `true` if within a dead corner, suppressing KVM hopping.
 pub fn is_in_dead_corner(rect: ScreenRect, edge: ScreenEdge, x: f32, y: f32) -> bool {
     let guard_y = DEAD_CORNER_PX.min(rect.height * 0.15);
     let guard_x = DEAD_CORNER_PX.min(rect.width * 0.15);
@@ -115,6 +248,19 @@ pub fn is_in_dead_corner(rect: ScreenRect, edge: ScreenEdge, x: f32, y: f32) -> 
 
 /// Converts a local coordinate `(x, y)` exiting `exit_edge` into a normalized `[0.0, 1.0]`
 /// coordinate along that edge, accounting for perpendicular desk `alignment_offset`.
+///
+/// Clamps output within `[0.02, 0.98]` to guarantee the cursor lands cleanly on the active
+/// display area and avoids boundary singularity artifacts.
+///
+/// # Arguments
+/// * `rect` - Originating screen bounding box.
+/// * `exit_edge` - Cardinal boundary edge being crossed.
+/// * `x` - Current pointer X coordinate.
+/// * `y` - Current pointer Y coordinate.
+/// * `alignment_offset` - User-configured perpendicular offset `[-0.5, 0.5]`.
+///
+/// # Returns
+/// A normalized fractional position `[0.02, 0.98]`.
 pub fn compute_normalized_edge_pos(
     rect: ScreenRect,
     exit_edge: ScreenEdge,
@@ -150,6 +296,19 @@ pub fn compute_normalized_edge_pos(
 }
 
 /// Resolves an entry point `(px, py)` just inside `entry_edge` on the destination display.
+///
+/// Maps the incoming normalized position `norm_pos` to the target screen's dimensions,
+/// applying an inward inset (typically 6.0 px) so the cursor is immediately recognized
+/// as inside the target workstation's display bounds.
+///
+/// # Arguments
+/// * `target_rect` - Destination screen bounding box.
+/// * `entry_edge` - Cardinal boundary edge where cursor is entering.
+/// * `norm_pos` - Normalized position along the edge `[0.0, 1.0]`.
+/// * `inset_px` - Inset distance from the boundary in device pixels.
+///
+/// # Returns
+/// Target coordinates `(px, py)` in the destination display coordinate system.
 pub fn resolve_entry_point(
     target_rect: ScreenRect,
     entry_edge: ScreenEdge,
