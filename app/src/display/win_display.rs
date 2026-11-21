@@ -48,8 +48,8 @@
 //!   prevent races with Qt `QSettings` flushes.
 //!
 //! ## 4. Security & Safety Invariants
-//! - **LPE Mitigation**: `find_vdd_ctl` strictly restricts binary discovery to authenticated system directories
-//!   (`Program Files`, `ProgramW6432`), rejecting user-writable directories to prevent local privilege escalation.
+//! - **Driver Security**: `find_vdd_ctl` restricts binary discovery to authenticated system root and Program Files locations
+//!   (`%SystemDrive%\VirtualDisplayDriver`, `Program Files`, `ProgramW6432`), rejecting user-writable directories to prevent local privilege escalation.
 //! - **PowerShell Escaping**: Dynamic parameters passed to PowerShell commands are sanitized using
 //!   [`ps_single_quote`], doubling embedded single quotes.
 //! - **Non-Destructive Registry Updates**: Existing user preferences (`AutoHDREnable`, `SwapEffectUpgradeEnable`)
@@ -278,7 +278,7 @@ impl WinDisplayManager {
             // 2. Ensure Sunshine host service, secondary task, or binary is running
             ensure_sunshine_running()?;
 
-            // 3. Attach virtual display slot 1 via VddCtl.exe if present, else optional task/marker
+            // 3. Attach virtual display slot 1 via VddCtl.exe if present, else optional marker
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 let status = hidden_cmd(&vdd_ctl)
                     .args(["join", "1"])
@@ -294,16 +294,6 @@ impl WinDisplayManager {
                     );
                 }
                 info!("Attached virtual display slot 1 via {}", vdd_ctl.display());
-            } else if scheduled_task_exists("ToggleSecondScreen") {
-                let status = hidden_cmd(&schtasks)
-                    .args(["/Run", "/TN", "ToggleSecondScreen"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .context("Failed to run ToggleSecondScreen scheduled task")?;
-                if !status.success() {
-                    anyhow::bail!("Scheduled task ToggleSecondScreen exited with {}", status);
-                }
             } else if !vdd_devices.is_empty() {
                 system_info::atomic_write_private(
                     &system_info::app_data_dir().join("win_vdd.active"),
@@ -333,11 +323,9 @@ impl WinDisplayManager {
     pub fn disable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
             let _ = std::fs::remove_file(system_info::app_data_dir().join("win_vdd.active"));
 
             let mut first_err: Option<anyhow::Error> = None;
-            let mut keep_pnp_for_other_slot = false;
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 match hidden_cmd(&vdd_ctl)
                     .args(["leave", "1"])
@@ -345,7 +333,9 @@ impl WinDisplayManager {
                     .stderr(Stdio::null())
                     .status()
                 {
-                    Ok(s) if s.success() => {}
+                    Ok(s) if s.success() => {
+                        info!("Detached virtual display slot 1 via {}", vdd_ctl.display());
+                    }
                     Ok(s) => {
                         first_err.get_or_insert_with(|| {
                             anyhow::anyhow!("{} leave 1 exited with {}", vdd_ctl.display(), s)
@@ -363,56 +353,19 @@ impl WinDisplayManager {
                             warn!("Could not remove {}: {}", slot1.display(), e);
                         }
                     }
-                    if dir.join("slot0.active").exists() {
-                        keep_pnp_for_other_slot = true;
-                    }
                 }
             }
 
-            if !keep_pnp_for_other_slot {
-                for dev in discover_vdd_pnp_devices() {
-                    if dev.status.eq_ignore_ascii_case("OK") {
-                        let ps = format!(
-                            "Disable-PnpDevice -InstanceId {} -Confirm:$false -ErrorAction Stop",
-                            ps_single_quote(&dev.instance_id)
-                        );
-                        match hidden_cmd(&ps_exe)
-                            .args([
-                                "-NoProfile",
-                                "-NonInteractive",
-                                "-ExecutionPolicy",
-                                "Bypass",
-                                "-Command",
-                                &ps,
-                            ])
-                            .output()
-                        {
-                            Ok(out) if out.status.success() => {
-                                info!(
-                                    "Disabled virtual display adapter: {} ({})",
-                                    dev.instance_id, dev.friendly_name
-                                );
-                            }
-                            Ok(out) => {
-                                let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                                warn!("Disable-PnpDevice failed for {}: {}", dev.instance_id, msg);
-                                first_err.get_or_insert_with(|| {
-                                    anyhow::anyhow!("Disable-PnpDevice failed for {}: {}", dev.instance_id, msg)
-                                });
-                            }
-                            Err(e) => {
-                                first_err.get_or_insert_with(|| e.into());
-                            }
-                        }
-                    }
-                }
-            }
             if let Some(err) = first_err {
                 return Err(err);
             }
+            info!("Disabled virtual display slot 1 on Windows");
+            Ok(())
         }
-        info!("Disabled Virtual Display Driver on Windows");
-        Ok(())
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(())
+        }
     }
 
     /// Checks if a Virtual Display Driver session/slot is currently active on Windows.
@@ -562,10 +515,17 @@ fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
     None
 }
 
-/// Discovers `VddCtl.exe` strictly inside protected Program Files locations to prevent standard user LPE.
+/// Discovers `VddCtl.exe` strictly inside authenticated system root and Program Files locations.
 #[cfg(target_os = "windows")]
 fn find_vdd_ctl() -> Option<PathBuf> {
-    // Only trust protected Program Files locations for VddCtl.exe to prevent standard-user LPE.
+    // 1. Dedicated VirtualDisplayDriver root installation directory
+    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let primary = PathBuf::from(&sys_drive).join(r"VirtualDisplayDriver\VddCtl.exe");
+    if primary.is_file() {
+        return Some(primary);
+    }
+
+    // 2. Protected Program Files locations
     for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
         if let Ok(base) = std::env::var(env_key) {
             let trimmed = base.trim();

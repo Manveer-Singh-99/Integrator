@@ -289,7 +289,9 @@ impl DisplayController {
 
         #[cfg(target_os = "macos")]
         {
-            let _tx = self.transition_lock.lock().await;
+            let Ok(_tx) = self.transition_lock.try_lock() else {
+                return Ok("Display transition already in progress...".into());
+            };
             let is_running =
                 *self.host_active.read().await || MacDisplayManager::is_virtual_display_active();
             if is_running {
@@ -498,7 +500,9 @@ impl DisplayController {
 
         #[cfg(target_os = "windows")]
         {
-            let _tx = self.transition_lock.lock().await;
+            let Ok(_tx) = self.transition_lock.try_lock() else {
+                return Ok("Display transition already in progress...".into());
+            };
             let is_running =
                 *self.host_active.read().await || WinDisplayManager::is_vdd_active();
             if is_running {
@@ -597,13 +601,20 @@ impl DisplayController {
             .unwrap_or(fallback_host);
         let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
+        // Clamp display dimensions for secondary Mac slot to match VDD slot 1 native 2560x1600
+        let (stream_w, stream_h) = if active_port == 48989 || w > 2560 || h > 1600 {
+            (2560, 1600)
+        } else {
+            (w, h)
+        };
+
         // 3. Send RPC to peer to launch Moonlight client
         let rpc = DisplayRpcRequest::StartMoonlight {
             host_ip: my_ip,
             host_port: active_port,
             host_name,
-            width: w,
-            height: h,
+            width: stream_w,
+            height: stream_h,
             fps,
             bitrate_kbps,
             audio_on_host: false,
@@ -623,7 +634,7 @@ impl DisplayController {
             anyhow::bail!("Peer {} failed to start Moonlight: {}", peer_hostname, resp.message);
         }
 
-        let mode_summary = format!("{}x{} @ {}Hz", w, h, fps);
+        let mode_summary = format!("{}x{} @ {}Hz", stream_w, stream_h, fps);
         *self.host_active.write().await = true;
         *self.active_peer_ip.write().await = Some(peer_ip);
         *self.active_mode.write().await = Some(format!("PC -> {} ({})", peer_hostname, mode_summary));

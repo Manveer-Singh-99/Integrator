@@ -650,6 +650,8 @@ final class IntegratorViewModel: ObservableObject {
     @Published var isRunningSpeedTest = false
     /// General busy state indicator for long-running operations.
     @Published var isBusy = false
+    /// True while an extended display start or stop transition is in progress.
+    @Published var isDisplayToggling = false
 
     // MARK: - Local Interactive Form States
 
@@ -876,12 +878,14 @@ final class IntegratorViewModel: ObservableObject {
     ///   - refreshAfter: If true, automatically re-queries system status upon completion.
     ///   - suppressDataToast: If true, suppresses automatic success toasts.
     ///   - successToast: Custom toast message to show on success.
+    ///   - onCompleted: Optional callback invoked with success flag upon completion.
     func runAction(
         _ method: String,
         params: [String: Any] = [:],
         refreshAfter: Bool = true,
         suppressDataToast: Bool = false,
-        successToast: String? = nil
+        successToast: String? = nil,
+        onCompleted: ((Bool) -> Void)? = nil
     ) {
         let jsonStr: String
         if let data = try? JSONSerialization.data(withJSONObject: params),
@@ -900,6 +904,7 @@ final class IntegratorViewModel: ObservableObject {
             } else if !suppressDataToast, let str = Self.decodeStringResult(dataJson) {
                 self.showToast("success", str)
             }
+            onCompleted?(ok)
             if refreshAfter {
                 self.refresh()
             }
@@ -1568,17 +1573,27 @@ struct MainDashboardView: View {
 
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
-                    Button { vm.runAction("toggle_mac_to_pc") } label: {
+                    Button {
+                        vm.isDisplayToggling = true
+                        vm.runAction("toggle_mac_to_pc") { _ in
+                            vm.isDisplayToggling = false
+                        }
+                    } label: {
                         Text("Extend Mac -> PC").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!flags.display)
+                    .disabled(!flags.display || vm.isDisplayToggling)
 
-                    Button { vm.runAction("toggle_pc_to_mac") } label: {
+                    Button {
+                        vm.isDisplayToggling = true
+                        vm.runAction("toggle_pc_to_mac") { _ in
+                            vm.isDisplayToggling = false
+                        }
+                    } label: {
                         Text("Extend PC -> Mac").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(!flags.display)
+                    .disabled(!flags.display || vm.isDisplayToggling)
                 }
                 HStack(spacing: 8) {
                     Button("Apply GPU") {

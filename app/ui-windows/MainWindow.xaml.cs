@@ -1356,12 +1356,26 @@ namespace IntegratorUI
         /// <summary>
         /// Initiates or toggles extended screen display streaming from Mac to Windows PC.
         /// </summary>
-        private void ExtendMacToPc_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_mac_to_pc");
+        private void ExtendMacToPc_Click(object sender, RoutedEventArgs e)
+        {
+            if (BtnExtendMacToPc != null) BtnExtendMacToPc.IsEnabled = false;
+            RunInvoke("toggle_mac_to_pc", onCompleted: _ =>
+            {
+                if (BtnExtendMacToPc != null) BtnExtendMacToPc.IsEnabled = true;
+            });
+        }
 
         /// <summary>
         /// Initiates or toggles extended screen display streaming from Windows PC to Mac.
         /// </summary>
-        private void ExtendPcToMac_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_pc_to_mac");
+        private void ExtendPcToMac_Click(object sender, RoutedEventArgs e)
+        {
+            if (BtnExtendPcToMac != null) BtnExtendPcToMac.IsEnabled = false;
+            RunInvoke("toggle_pc_to_mac", onCompleted: _ =>
+            {
+                if (BtnExtendPcToMac != null) BtnExtendPcToMac.IsEnabled = true;
+            });
+        }
 
         /// <summary>
         /// Marks encode or decode GPU selection as dirty when changed by the user in the dropdowns.
