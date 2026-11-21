@@ -221,26 +221,6 @@ impl AudioManager {
         PACKETS_DRAINED.load(Ordering::Relaxed)
     }
 
-    /// Handles an incoming `DisplayRpcRequest::NegotiateAudioSession` over `TransportSessionV2`,
-    /// deriving a fresh `IUA2` session key from the caller's pinned `K_root` and registering it
-    /// in the local `AudioSessionRegistry`.
-    pub fn handle_negotiate_session(
-        caller_ip: IpAddr,
-        sender_nonce_hex: &str,
-        sample_rate: u32,
-        channels: u8,
-        bit_depth: u8,
-    ) -> Result<NegotiatedAudioSessionWire, String> {
-        Self::handle_negotiate_session_for_peer(
-            None,
-            caller_ip,
-            sender_nonce_hex,
-            sample_rate,
-            channels,
-            bit_depth,
-        )
-    }
-
     /// Resolves peer credentials directly by cryptographically authenticated `TransportSessionV2`
     /// `peer_device_id` when available, falling back to verified IP lookup only for local/test callers.
     pub fn handle_negotiate_session_for_peer(
@@ -645,7 +625,8 @@ mod tests {
     fn negotiate_and_verify_loopback_iua2_session() {
         let sender_nonce = security::csprng_array::<32>();
         let sender_nonce_hex = security::hex_encode(&sender_nonce);
-        let wire = AudioManager::handle_negotiate_session(
+        let wire = AudioManager::handle_negotiate_session_for_peer(
+            None,
             "127.0.0.1".parse().unwrap(),
             &sender_nonce_hex,
             48_000,

@@ -198,6 +198,7 @@ pub struct CameraStatus {
 }
 
 /// Parsed, zero-copy camera frame received over the network transport.
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedCameraFrame<'a> {
     /// Video frame width in pixels.
@@ -277,6 +278,7 @@ pub fn encode_camera_frame(
 /// Returns `Err` if the packet is shorter than [`CAMERA_FRAME_HEADER_LEN`], if the magic header
 /// does not equal [`CAMERA_FRAME_MAGIC`], if packet size does not match header length fields,
 /// or if dimensions/pixel format are unsupported.
+#[cfg(any(target_os = "windows", test))]
 pub fn decode_camera_frame(raw: &[u8]) -> Result<DecodedCameraFrame<'_>, String> {
     if raw.len() < CAMERA_FRAME_HEADER_LEN {
         return Err(format!("Truncated camera header ({} bytes)", raw.len()));

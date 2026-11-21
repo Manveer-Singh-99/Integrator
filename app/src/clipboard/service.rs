@@ -663,10 +663,6 @@ impl ClipboardService {
         }
     }
 
-    pub fn get_pending_remote(&self) -> Arc<RwLock<Option<LazyAnnouncement>>> {
-        Arc::clone(&self.pending_remote)
-    }
-
     async fn has_paired_peer(ip: IpAddr) -> bool {
         tokio::task::spawn_blocking(move || crate::trust::has_paired_peer_at_ip(ip))
             .await
@@ -1893,12 +1889,6 @@ end run"#;
         })
     }
 
-    /// Indexes local dragged files/folders using the shared clipboard security and quota protections.
-    pub fn collect_drag_items(paths: &[PathBuf]) -> Result<LocalPendingCopy> {
-        Self::collect_local_entries(paths)
-            .map_err(|_| anyhow::anyhow!("No valid non-symlink files found for cross-screen drag"))
-    }
-
     pub async fn register_drag_session(&self, copy: LocalPendingCopy) {
         let mut map = self.pending_drag_sessions.write().await;
         let mut order = self.pending_drag_order.write().await;
@@ -2305,13 +2295,6 @@ end run"#;
             .rev()
             .find(|e| e.session_id == session_id)
             .cloned()
-    }
-
-    /// Streams the peer's announced files into an isolated staging directory inside the local cache,
-    /// verifies per-file and manifest SHA-256 hashes, commits all verified root items under a
-    /// `(session_id, manifest_hash)` directory, and updates the native OS clipboard.
-    pub async fn stream_to_cache(&self, ann: LazyAnnouncement) -> Result<()> {
-        self.stream_to_cache_from(ann, None).await
     }
 
     async fn stream_to_cache_from(

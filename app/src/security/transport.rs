@@ -220,19 +220,6 @@ pub enum ServiceId {
 }
 
 impl ServiceId {
-    /// Converts a raw 1-byte wire code into its corresponding `ServiceId` enum variant.
-    /// Returns `None` if the wire code is unrecognized.
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0x01 => Some(ServiceId::DisplayRpc),
-            0x02 => Some(ServiceId::ClipboardTransfer),
-            0x03 => Some(ServiceId::Benchmark),
-            0x04 => Some(ServiceId::InputKvm),
-            0x05 => Some(ServiceId::CameraStream),
-            _ => None,
-        }
-    }
-
     /// Returns the maximum allowable plaintext payload size in bytes for a single record frame
     /// for this service.
     ///
@@ -765,12 +752,12 @@ pub struct TransportSessionV2<S> {
     /// Service identifier bound to this session during handshake.
     service_id: ServiceId,
     /// 16-byte device UUID of the authenticated remote peer.
+    #[cfg_attr(not(test), allow(dead_code))]
     peer_device_id: [u8; 16],
     /// Hex-encoded representation of `peer_device_id` for logging and diagnostic queries.
     peer_device_id_hex: String,
-    /// 32-byte Ed25519 identity public key of the authenticated remote peer.
-    peer_ed25519_pubkey: [u8; 32],
     /// 16-byte unique session identifier derived during handshake ($H_4$ HKDF expansion).
+    #[cfg_attr(not(test), allow(dead_code))]
     session_id: [u8; 16],
     /// Directional AEAD state for outbound records transmitted to the peer.
     tx_state: DirectionalCipherState,
@@ -789,6 +776,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     /// Returns a reference to the 16-byte raw device UUID of the authenticated remote peer.
+    #[cfg(test)]
     pub fn peer_device_id(&self) -> &[u8; 16] {
         &self.peer_device_id
     }
@@ -798,27 +786,26 @@ where
         &self.peer_device_id_hex
     }
 
-    /// Returns a reference to the 32-byte Ed25519 public key of the authenticated remote peer.
-    pub fn peer_ed25519_pubkey(&self) -> &[u8; 32] {
-        &self.peer_ed25519_pubkey
-    }
-
     /// Returns a reference to the 16-byte session identifier derived from the handshake transcript.
+    #[cfg(test)]
     pub fn session_id(&self) -> &[u8; 16] {
         &self.session_id
     }
 
     /// Returns the active ratchet epoch index for outbound traffic (`tx_state`).
+    #[cfg(test)]
     pub fn tx_epoch(&self) -> u16 {
         self.tx_state.current_epoch()
     }
 
     /// Returns the active ratchet epoch index for inbound traffic (`rx_state`).
+    #[cfg(test)]
     pub fn rx_epoch(&self) -> u16 {
         self.rx_state.current_epoch()
     }
 
     /// Overrides the maximum number of outbound frames allowed before triggering an in-band ratchet.
+    #[cfg(test)]
     pub fn set_rekey_frame_limit(&mut self, limit: u64) {
         self.rekey_frame_limit = limit.clamp(1, u64::MAX - 1);
     }
@@ -836,6 +823,7 @@ where
     /// 8. Compute transcript $H_3$; sign $H_3$ with local Ed25519 identity key; compute client finished HMAC.
     /// 9. Transmit `ClientFinish` frame to server.
     /// 10. Compute transcript $H_4$; derive application directional keys and session ID.
+    #[cfg(test)]
     pub async fn connect_client(
         mut stream: S,
         keystore: &KeystoreV2,
@@ -947,7 +935,6 @@ where
             service_id,
             peer_device_id: peer.device_id,
             peer_device_id_hex: peer.device_id_hex.clone(),
-            peer_ed25519_pubkey: peer.ed25519_pubkey,
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
@@ -961,6 +948,7 @@ where
     ///
     /// Validates that incoming `ClientHello` matches `expected_service`, verifies credentials in `KeystoreV2`,
     /// enforces anti-replay deduplication, and returns the established session.
+    #[cfg(test)]
     pub async fn accept_server(
         stream: S,
         keystore: &KeystoreV2,
@@ -978,6 +966,7 @@ where
     }
 
     /// Accepts a server session when the 4-byte `ITR2` magic has optionally already been read to demux the port.
+    #[cfg(test)]
     pub async fn accept_server_with_prefixed_magic(
         mut stream: S,
         already_read_magic: Option<[u8; 4]>,
@@ -1115,7 +1104,6 @@ where
             service_id: expected_service,
             peer_device_id: peer_creds.device_id,
             peer_device_id_hex: peer_creds.device_id_hex,
-            peer_ed25519_pubkey: peer_creds.ed25519_pubkey,
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
@@ -1474,7 +1462,6 @@ where
             service_id,
             peer_device_id: peer.device_id,
             peer_device_id_hex: peer.device_id_hex.clone(),
-            peer_ed25519_pubkey: peer.ed25519_pubkey,
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
@@ -1623,7 +1610,6 @@ where
             service_id: expected_service,
             peer_device_id: peer_creds.device_id,
             peer_device_id_hex: peer_creds.device_id_hex,
-            peer_ed25519_pubkey: peer_creds.ed25519_pubkey,
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
@@ -1640,10 +1626,6 @@ pub struct TransportReaderV2<R> {
     reader: R,
     /// Service identifier bound during handshake.
     service_id: ServiceId,
-    /// 16-byte raw device UUID of the authenticated remote peer.
-    peer_device_id: [u8; 16],
-    /// Hex-encoded representation of `peer_device_id`.
-    peer_device_id_hex: String,
     /// Directional AEAD state for inbound records.
     rx_state: DirectionalCipherState,
     /// True if the reader stream is closed.
@@ -1656,10 +1638,6 @@ pub struct TransportWriterV2<W> {
     writer: W,
     /// Service identifier bound during handshake.
     service_id: ServiceId,
-    /// 16-byte raw device UUID of the authenticated remote peer.
-    peer_device_id: [u8; 16],
-    /// Hex-encoded representation of `peer_device_id`.
-    peer_device_id_hex: String,
     /// Directional AEAD state for outbound records.
     tx_state: DirectionalCipherState,
     /// Timestamp when outbound cipher state was last ratcheted.
@@ -1671,15 +1649,6 @@ pub struct TransportWriterV2<W> {
 }
 
 impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
-    /// Returns the 16-byte raw device UUID of the authenticated remote peer.
-    pub fn peer_device_id(&self) -> [u8; 16] {
-        self.peer_device_id
-    }
-
-    /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
-    pub fn peer_device_id_hex(&self) -> &str {
-        &self.peer_device_id_hex
-    }
 
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
     /// in-band `Rekey` and `KeepAlive` control frames.
@@ -1762,15 +1731,6 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
 }
 
 impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
-    /// Returns the 16-byte raw device UUID of the authenticated remote peer.
-    pub fn peer_device_id(&self) -> [u8; 16] {
-        self.peer_device_id
-    }
-
-    /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
-    pub fn peer_device_id_hex(&self) -> &str {
-        &self.peer_device_id_hex
-    }
 
     /// Triggers an explicit in-band outbound rekey (`FrameType::Rekey`) and ratchets `tx_state` to `epoch + 1`.
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
@@ -1844,28 +1804,6 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
         }
         Ok(())
     }
-
-    /// Sends an authenticated `CloseNotify` frame before closing the writer stream.
-    pub async fn close_notify(&mut self) -> Result<(), TransportError> {
-        if self.closed {
-            return Err(TransportError::ConnectionClosed);
-        }
-        self.closed = true;
-        let frame = self.tx_state.seal_record(
-            RecordFrameType::CloseNotify,
-            b"",
-            self.service_id.max_plaintext_frame_bytes(),
-        )?;
-        tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&frame))
-            .await
-            .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.flush())
-            .await
-            .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        Ok(())
-    }
 }
 
 impl TransportSessionV2<tokio::net::TcpStream> {
@@ -1881,16 +1819,12 @@ impl TransportSessionV2<tokio::net::TcpStream> {
             TransportReaderV2 {
                 reader: read_half,
                 service_id: self.service_id,
-                peer_device_id: self.peer_device_id,
-                peer_device_id_hex: self.peer_device_id_hex.clone(),
                 rx_state: self.rx_state,
                 closed: self.closed,
             },
             TransportWriterV2 {
                 writer: write_half,
                 service_id: self.service_id,
-                peer_device_id: self.peer_device_id,
-                peer_device_id_hex: self.peer_device_id_hex,
                 tx_state: self.tx_state,
                 last_rekeyed_at: self.last_rekeyed_at,
                 rekey_frame_limit: self.rekey_frame_limit,

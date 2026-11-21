@@ -87,34 +87,12 @@ pub struct GpuTelemetry {
     pub core_clock_mhz: u32,
 }
 
-impl Default for GpuTelemetry {
-    /// Returns a default placeholder telemetry structure while hardware detection is in progress.
-    fn default() -> Self {
-        Self {
-            gpu_name: "Detecting GPU...".to_string(),
-            temperature_c: 0,
-            power_usage_watts: 0.0,
-            gpu_utilization_percent: 0,
-            memory_utilization_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            core_clock_mhz: 0,
-        }
-    }
-}
-
 /// Parses an unsigned 32-bit integer from a raw string, handling floating-point strings and invalid values.
 ///
 /// Rejects `NaN`, infinite values, and negative numbers, returning `0` on error or clamping to `u32::MAX`.
 #[cfg(any(target_os = "windows", test))]
 fn parse_optional_u32(raw: &str) -> u32 {
-    let clean = raw.trim();
-    clean
-        .parse::<f32>()
-        .ok()
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(|v| v.clamp(0.0, u32::MAX as f32).round() as u32)
-        .unwrap_or(0)
+    parse_optional_f32(raw).clamp(0.0, u32::MAX as f32).round() as u32
 }
 
 /// Parses an unsigned 64-bit integer from a raw string, handling scientific notation and non-numeric placeholders.

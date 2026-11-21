@@ -213,10 +213,12 @@ impl KekProvider for OsNativeKekProvider {
 }
 
 /// Deterministic in-memory [`KekProvider`] for isolated unit and adversarial integration tests.
+#[cfg(test)]
 pub struct FixedKekProvider {
     kek: Zeroizing<[u8; 32]>,
 }
 
+#[cfg(test)]
 impl FixedKekProvider {
     /// Constructs a test KEK provider with fixed 32-byte key material.
     pub fn new(kek_bytes: [u8; 32]) -> Self {
@@ -226,6 +228,7 @@ impl FixedKekProvider {
     }
 }
 
+#[cfg(test)]
 impl KekProvider for FixedKekProvider {
     fn load_or_create_kek(&self, _storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
         Ok(self.kek.clone())
@@ -659,6 +662,7 @@ impl KeystoreV2 {
     }
 
     /// Returns whether any legacy v1 `trusted_peers.json` files were quarantined during initialization.
+    #[cfg(test)]
     pub fn was_legacy_v1_quarantined(&self) -> bool {
         self.legacy_v1_quarantined
     }
@@ -1792,42 +1796,6 @@ fn macos_keychain_load_or_create_kek(
     // Do not create new ad-hoc CDHash-pinned items in login.keychain-db (which prompt for the
     // user's macOS password on every rebuild). Bind K_kek via IOPlatformUUID + UID + 0600 seed.
     macos_hw_bound_load_or_create_kek(storage_dir)
-}
-
-/// Removes the OS-stored master KEK for a specific `storage_dir` (used during test cleanup or full reset).
-pub fn delete_os_kek_for_dir(storage_dir: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        use core_foundation::base::{CFTypeRef, TCFType};
-        use core_foundation::dictionary::CFMutableDictionary;
-        use core_foundation::string::CFString;
-        use std::os::raw::c_int;
-
-        #[link(name = "Security", kind = "framework")]
-        extern "C" {
-            static kSecClass: CFTypeRef;
-            static kSecClassGenericPassword: CFTypeRef;
-            static kSecAttrService: CFTypeRef;
-            static kSecAttrAccount: CFTypeRef;
-            fn SecItemDelete(query: CFTypeRef) -> c_int;
-        }
-
-        let _no_ui_guard = NoUiKeychainGuard::acquire();
-        let service = CFString::new("com.integrator.security.keystore.v2");
-        let account_hash = super::hex_encode(
-            &super::sha256_digest(storage_dir.to_string_lossy().as_bytes())[0..8],
-        );
-        let account = CFString::new(&format!("master-kek-v2-{}", account_hash));
-        unsafe {
-            let mut del_q: CFMutableDictionary<CFTypeRef, CFTypeRef> = CFMutableDictionary::new();
-            del_q.set(kSecClass, kSecClassGenericPassword);
-            del_q.set(kSecAttrService, service.as_CFTypeRef());
-            del_q.set(kSecAttrAccount, account.as_CFTypeRef());
-            let _ = SecItemDelete(del_q.as_CFTypeRef());
-        }
-    }
-    let _ = fs::remove_file(storage_dir.join("master_kek_v2.dpapi"));
-    let _ = fs::remove_file(storage_dir.join(".master_kek_v2.seed"));
 }
 
 #[cfg(target_os = "windows")]

@@ -922,7 +922,7 @@ impl KvmService {
                     let paths_clone = paths.clone();
                     let first_path = paths.first().cloned();
                     let collected = tokio::task::spawn_blocking(move || {
-                        let copy = ClipboardService::collect_drag_items(&paths_clone)?;
+                        let copy = ClipboardService::collect_local_entries(&paths_clone)?;
                         let icon_b64 = Self::extract_icon_b64(first_path.as_deref());
                         Ok::<_, anyhow::Error>((copy, icon_b64))
                     })
