@@ -1202,6 +1202,7 @@ fn reg_query_sz(key: &str, value: &str) -> Option<String> {
 /// Apple Silicon Macs (`Mac14,*`, `Mac15,*`, `Mac16,*`) use generic `MacX,Y` model identifiers for both
 /// MacBooks and desktop Macs (Mac mini, Mac Studio, iMac, Mac Pro). Inspecting `AppleSmartBattery`
 /// presence reliably distinguishes Mac laptops from Mac desktops.
+#[allow(dead_code)]
 pub fn parse_mac_ioreg_battery_present(ioreg_output: &str) -> bool {
     let trimmed = ioreg_output.trim();
     if trimmed.is_empty() || !trimmed.contains("AppleSmartBattery") {
@@ -2323,6 +2324,7 @@ pub fn is_valid_contiguous_netmask(mask: Ipv4Addr) -> bool {
 
 /// Converts a CIDR prefix length (`1..=32`) into its canonical IPv4 subnet mask.
 #[inline]
+#[allow(dead_code)]
 pub fn prefix_to_mask(prefix: u8) -> Option<Ipv4Addr> {
     if !(1..=32).contains(&prefix) {
         return None;
@@ -2337,12 +2339,14 @@ pub fn prefix_to_mask(prefix: u8) -> Option<Ipv4Addr> {
 
 /// Computes the canonical network base address (`ip & mask`) for a given IPv4 address and subnet mask.
 #[inline]
+#[allow(dead_code)]
 pub fn compute_network_addr(ip: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(ip) & u32::from(mask))
 }
 
 /// Computes the canonical CIDR network string (e.g. `"172.20.10.0/28"`, `"192.168.48.0/22"`)
 /// for an IPv4 address and subnet mask without assuming `/24`.
+#[allow(dead_code)]
 pub fn compute_network_cidr(ip: Ipv4Addr, mask: Ipv4Addr) -> Option<String> {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() {
         return None;
@@ -2389,6 +2393,7 @@ pub fn is_same_subnet_as_peer(local_ip: Option<&str>, peer_ip: &str) -> bool {
 }
 
 /// Looks up which local network interface owns the specified `local_ip`.
+#[allow(dead_code)]
 pub fn interface_for_local_ip(local_ip: &str) -> Option<LocalInterfaceInfo> {
     list_local_ipv4_interfaces()
         .into_iter()
