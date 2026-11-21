@@ -815,6 +815,8 @@ namespace IntegratorUI
         [JsonPropertyName("storage_status")] public StorageStatusModel StorageStatus { get; set; } = new();
         /// <summary>User-configured preferred peer share name override.</summary>
         [JsonPropertyName("preferred_peer_share")] public string? PreferredPeerShare { get; set; }
+        /// <summary>User-configured local shared directory path.</summary>
+        [JsonPropertyName("local_shared_folder")] public string? LocalSharedFolder { get; set; }
 
         /// <summary>Spatial audio routing status.</summary>
         [JsonPropertyName("audio_status")] public AudioRoutingStatusModel AudioStatus { get; set; } = new();

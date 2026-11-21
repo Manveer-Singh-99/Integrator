@@ -552,6 +552,12 @@ namespace IntegratorUI
                     StorageSummaryText.Text = s.StorageStatus.Message;
                 else
                     StorageSummaryText.Text = "SMB volume ready on trusted peer";
+
+                LocalSharedFolderInput.Text = !string.IsNullOrWhiteSpace(s.LocalSharedFolder)
+                    ? s.LocalSharedFolder
+                    : @"Default (C:\Users\Public)";
+                BtnOpenInExplorer.Visibility = s.StorageMounted ? Visibility.Visible : Visibility.Collapsed;
+
                 if (!_preferredShareDirty && PreferredShareInput.FocusState == FocusState.Unfocused)
                 {
                     string desiredShare = s.PreferredPeerShare ?? string.Empty;
@@ -1580,6 +1586,46 @@ namespace IntegratorUI
                     _preferredShareDirty = false;
                 }
             });
+        }
+
+        /// <summary>
+        /// Prompts the user to select a local directory to share over SMB via native WinUI 3 FolderPicker.
+        /// </summary>
+        private async void ChooseFolder_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var picker = new Windows.Storage.Pickers.FolderPicker();
+                picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder;
+                picker.FileTypeFilter.Add("*");
+                IntPtr hwnd = WindowNative.GetWindowHandle(this);
+                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+                var folder = await picker.PickSingleFolderAsync();
+                if (folder != null && !string.IsNullOrWhiteSpace(folder.Path))
+                {
+                    RunInvoke("set_local_shared_folder", new { folder = folder.Path });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[Storage] FolderPicker error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Resets the user's custom shared folder preference back to default (Public directory).
+        /// </summary>
+        private void ResetFolder_Click(object sender, RoutedEventArgs e)
+        {
+            RunInvoke("set_local_shared_folder", new { folder = (string?)null }, preserveNulls: true);
+        }
+
+        /// <summary>
+        /// Opens the currently mounted remote SMB storage directory in Windows File Explorer.
+        /// </summary>
+        private void OpenInExplorer_Click(object sender, RoutedEventArgs e)
+        {
+            RunInvoke("open_shared_storage");
         }
 
         /// <summary>

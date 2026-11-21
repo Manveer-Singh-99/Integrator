@@ -301,6 +301,8 @@ pub struct AppPathPreferences {
     pub smb_share_name: Option<String>,
     /// Preferred remote peer SMB share name.
     pub peer_smb_share_name: Option<String>,
+    /// User-specified custom directory path for local SMB file sharing (overriding user home folder default).
+    pub local_shared_folder: Option<String>,
     /// Custom path to `sunshine.conf`.
     pub sunshine_conf_path: Option<String>,
     /// Custom path to `Moonlight` executable.
@@ -1342,6 +1344,32 @@ pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     Ok(changed)
 }
 
+/// Resolves the default shared folder on the local machine (e.g. `~/Public` on macOS, `C:\Users\Public` on Windows).
+pub fn default_local_shared_folder() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pub_dir = user_home_dir().join("Public");
+        if pub_dir.exists() {
+            Some(pub_dir.to_string_lossy().to_string())
+        } else {
+            Some(user_home_dir().to_string_lossy().to_string())
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let pub_dir = std::path::PathBuf::from(r"C:\Users\Public");
+        if pub_dir.exists() {
+            Some(pub_dir.to_string_lossy().to_string())
+        } else {
+            Some(user_home_dir().join("Public").to_string_lossy().to_string())
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 /// Discovers published local SMB shares dynamically using native tools (`sharing -l` on macOS, `net share` on Windows).
 pub fn list_local_smb_shares() -> Vec<String> {
     let mut shares = Vec::new();
@@ -1354,54 +1382,98 @@ pub fn list_local_smb_shares() -> Vec<String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = Command::new("/usr/bin/sharing").arg("-l").output() {
+        let sharing_bin = if std::path::Path::new("/usr/sbin/sharing").exists() {
+            "/usr/sbin/sharing"
+        } else {
+            "/usr/bin/sharing"
+        };
+        let mut got_shares = false;
+        // 1. Structured JSON parsing via /usr/sbin/sharing -l -f json
+        if let Ok(out) = Command::new(sharing_bin).args(["-l", "-f", "json"]).output() {
             if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let mut current_name: Option<String> = None;
-                let mut current_shared = false;
-                let mut public_shares = Vec::new();
-                let mut custom_shares = Vec::new();
-                for line in text.lines() {
-                    let t = line.trim();
-                    if let Some(rest) = t.strip_prefix("name:") {
-                        if let Some(n) = current_name.take() {
-                            if current_shared {
-                                if n.contains("Public Folder") {
-                                    public_shares.push(n);
-                                } else {
-                                    custom_shares.push(n);
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(obj) = val.as_object() {
+                        let pref_folder = prefs.local_shared_folder.as_deref();
+                        let mut folder_matched_share = None;
+                        for (share_label, item) in obj {
+                            let smb_shared = item.get("smb_shared").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                            if !smb_shared {
+                                continue;
+                            }
+                            let smb_name = item.get("smb_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(share_label.as_str())
+                                .trim();
+                            let share_path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(pf) = pref_folder {
+                                if share_path == pf || share_path.trim_end_matches('/') == pf.trim_end_matches('/') {
+                                    folder_matched_share = Some(smb_name.to_string());
                                 }
                             }
+                            if !smb_name.is_empty() && !shares.contains(&smb_name.to_string()) {
+                                shares.push(smb_name.to_string());
+                            }
+                            got_shares = true;
                         }
-                        current_name = Some(rest.trim().to_string());
-                        current_shared = false;
-                    } else if t.starts_with("shared:") {
-                        current_shared = t.contains('1');
-                    }
-                }
-                if let Some(n) = current_name {
-                    if current_shared {
-                        if n.contains("Public Folder") {
-                            public_shares.push(n);
-                        } else {
-                            custom_shares.push(n);
+                        if let Some(matched) = folder_matched_share {
+                            if let Some(pos) = shares.iter().position(|s| s == &matched) {
+                                shares.remove(pos);
+                            }
+                            shares.insert(0, matched);
                         }
                     }
                 }
-                for s in custom_shares.into_iter().chain(public_shares) {
-                    if !shares.contains(&s) {
-                        shares.push(s);
+            }
+        }
+        // 2. Fallback text parsing if JSON query failed or was unsupported
+        if !got_shares {
+            if let Ok(out) = Command::new(sharing_bin).arg("-l").output() {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let mut current_name: Option<String> = None;
+                    let mut current_shared = false;
+                    for line in text.lines() {
+                        let t = line.trim();
+                        if let Some(rest) = t.strip_prefix("name:") {
+                            if let Some(n) = current_name.take() {
+                                if current_shared && !shares.contains(&n) {
+                                    shares.push(n);
+                                }
+                            }
+                            current_name = Some(rest.trim().to_string());
+                            current_shared = false;
+                        } else if t.starts_with("shared:") {
+                            current_shared = t.contains('1');
+                        }
+                    }
+                    if let Some(n) = current_name {
+                        if current_shared && !shares.contains(&n) {
+                            shares.push(n);
+                        }
                     }
                 }
             }
         }
         if shares.is_empty() {
-            shares.push(get_hostname());
+            if let Some(ref custom_folder) = prefs.local_shared_folder {
+                if let Some(name) = std::path::Path::new(custom_folder).file_name().and_then(|n| n.to_str()) {
+                    shares.push(name.to_string());
+                }
+            } else {
+                shares.push("Public".to_string());
+            }
         }
     }
 
     #[cfg(target_os = "windows")]
     {
+        if let Some(ref custom_folder) = prefs.local_shared_folder {
+            if let Some(name) = std::path::Path::new(custom_folder).file_name().and_then(|n| n.to_str()) {
+                if !shares.contains(&name.to_string()) {
+                    shares.insert(0, name.to_string());
+                }
+            }
+        }
         if let Ok(out) = win_cmd(&system32_exe("net.exe")).arg("share").output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
@@ -1432,7 +1504,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
             }
         }
         if shares.is_empty() {
-            shares.push(get_hostname());
+            shares.push("Public".to_string());
         }
     }
 

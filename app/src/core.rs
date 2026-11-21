@@ -285,6 +285,8 @@ pub struct BridgeStatus {
     pub storage_status: StorageStatus,
     /// User-preferred peer SMB share name.
     pub preferred_peer_share: Option<String>,
+    /// User-configured local folder path being shared to peer.
+    pub local_shared_folder: Option<String>,
 
     // Audio Routing Status
     /// Active audio sink/source capture and playback routing states.
@@ -924,6 +926,64 @@ fn ensure_windows_firewall_rules() {
             .stderr(Stdio::null())
             .status();
     }
+
+    // Ensure inbound SMB file sharing (TCP 445/139) is permitted across all Integrator subnets (wired and wireless)
+    let smb_rule_name = "Integrator SMB File Sharing (TCP)";
+    let smb_matches = Command::new(&netsh)
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={}", smb_rule_name),
+            "verbose",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let txt = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+            txt.contains("localsubnet") && txt.contains("445")
+        })
+        .unwrap_or(false);
+
+    if !smb_matches {
+        let _ = Command::new(&netsh)
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={}", smb_rule_name),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let _ = Command::new(&netsh)
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", smb_rule_name),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                "localport=445,139",
+                &format!("remoteip={}", REMOTE_SCOPES),
+                "profile=any",
+                "enable=yes",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 impl IntegratorCore {
@@ -1085,6 +1145,7 @@ impl IntegratorCore {
         let (
             storage_status,
             preferred_peer_share,
+            local_shared_folder,
             autostart_enabled,
             (enc_gpu, dec_gpu),
             als,
@@ -1096,6 +1157,7 @@ impl IntegratorCore {
                 let st =
                     storage::StorageManager::status_with_share(bip.as_deref(), bsh.as_deref());
                 let pref = storage::StorageManager::get_preferred_peer_share();
+                let local_folder = storage::StorageManager::get_local_shared_folder();
                 let auto = autostart::AutostartManager::is_enabled();
                 #[cfg(target_os = "windows")]
                 let gpus = crate::display::win_display::WinDisplayManager::get_gpu_preferences();
@@ -1112,7 +1174,7 @@ impl IntegratorCore {
                     }
                 };
                 let trust_snap = trust::get_trust_snapshot();
-                (st, pref, auto, gpus, als, trust_snap)
+                (st, pref, local_folder, auto, gpus, als, trust_snap)
             }
         })
         .await
@@ -1125,6 +1187,7 @@ impl IntegratorCore {
                     remote_share: String::new(),
                     message: String::new(),
                 },
+                None,
                 None,
                 false,
                 ("auto".to_string(), "auto".to_string()),
@@ -1273,6 +1336,7 @@ impl IntegratorCore {
             storage_mounted: storage_status.is_mounted,
             storage_status,
             preferred_peer_share,
+            local_shared_folder,
 
             audio_status: audio::AudioManager::status(),
             camera_status: self.camera.status(),
@@ -1801,6 +1865,34 @@ impl IntegratorCore {
                     .await
                     .map_err(|e| e.to_string())??;
                     Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                }
+                "set_local_shared_folder" => {
+                    #[derive(Deserialize)]
+                    struct FolderArgs {
+                        folder: Option<String>,
+                    }
+                    let args: FolderArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let res = tokio::task::spawn_blocking(move || {
+                        storage::StorageManager::set_local_shared_folder(args.folder.as_deref())
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>(storage::StorageManager::get_local_shared_folder())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                }
+                "get_local_shared_folder" => {
+                    let res = tokio::task::spawn_blocking(storage::StorageManager::get_local_shared_folder)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::to_value(res).map_err(|e| e.to_string())?)
+                }
+                "open_shared_storage" => {
+                    tokio::task::spawn_blocking(storage::StorageManager::open_mounted_storage)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!("Opened mounted shared storage folder"))
                 }
                 "trust_peer_device" => {
                     #[derive(Deserialize)]

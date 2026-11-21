@@ -216,6 +216,84 @@ pub fn validate_smb_share_name(raw: &str) -> std::result::Result<String, String>
 }
 
 impl StorageManager {
+    /// Returns the currently active local shared folder path (user preference or default Public folder).
+    pub fn get_local_shared_folder() -> Option<String> {
+        system_info::load_path_preferences()
+            .local_shared_folder
+            .or_else(system_info::default_local_shared_folder)
+    }
+
+    /// Sets or clears the user-specified local folder path to share with peers.
+    pub fn set_local_shared_folder(folder: Option<&str>) -> std::io::Result<()> {
+        let mut prefs = system_info::load_path_preferences();
+        let validated = match folder.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(path_str) => {
+                let path = std::path::Path::new(path_str);
+                if !path.exists() || !path.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Specified shared folder does not exist or is not a directory: {}", path_str),
+                    ));
+                }
+                // Derive a valid share name from directory basename
+                let share_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Shared");
+                if let Ok(valid_name) = validate_smb_share_name(share_name) {
+                    prefs.smb_share_name = Some(valid_name.clone());
+                    #[cfg(target_os = "windows")]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        let net_exe = system_info::system32_exe("net.exe");
+                        let _ = std::process::Command::new(net_exe)
+                            .creation_flags(0x08000000)
+                            .args(["share", &format!("{}=\"{}\"", valid_name, path_str), "/grant:everyone,full"])
+                            .status();
+                    }
+                }
+                Some(path_str.to_string())
+            }
+            None => {
+                prefs.smb_share_name = None;
+                None
+            }
+        };
+        prefs.local_shared_folder = validated;
+        system_info::save_path_preferences(&prefs)
+    }
+
+    /// Opens the mounted shared storage directory in the platform-native file manager (Finder or File Explorer).
+    pub fn open_mounted_storage() -> Result<()> {
+        let active = detect_active_mount(None);
+        let Some(rec) = active else {
+            anyhow::bail!("No shared storage volume is currently mounted");
+        };
+        let path = rec.mount_path.trim();
+        if path.is_empty() {
+            anyhow::bail!("Mounted storage path is empty");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("/usr/bin/open").arg(path).status()?;
+            Ok(())
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("explorer.exe")
+                .arg(path)
+                .creation_flags(0x08000000)
+                .status()?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = path;
+            anyhow::bail!("Unsupported OS for opening storage")
+        }
+    }
+
     /// Updates the user's preferred remote SMB share name in persistent application preferences.
     ///
     /// Validates the share name using [`validate_smb_share_name`] before saving. Passing `None`
@@ -660,7 +738,8 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
                 }
             }
         }
-        None
+        // Fallback default share if anonymous enumeration was rejected
+        Some("Public".to_string())
     }
 
     #[cfg(target_os = "windows")]
@@ -677,7 +756,8 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
                 }
             }
         }
-        None
+        // Fallback default share if NetBIOS view was rejected
+        Some("Public".to_string())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -736,17 +816,25 @@ fn detect_active_mount_matching(
                     && (s.remote_share.is_empty()
                         || share_part.eq_ignore_ascii_case(&s.remote_share));
                 if !matches_saved_path && !matches_saved_ip_share {
-                    continue;
+                    let is_paired = ip_part.parse::<IpAddr>().map(trust::has_paired_peer_at_ip).unwrap_or(false);
+                    if !is_paired {
+                        continue;
+                    }
                 }
             } else {
-                continue;
+                let is_paired = ip_part.parse::<IpAddr>().map(trust::has_paired_peer_at_ip).unwrap_or(false);
+                if !is_paired {
+                    continue;
+                }
             }
 
-            return Some(ActiveMountRecord {
+            let rec = ActiveMountRecord {
                 peer_ip: ip_part,
                 remote_share: share_part,
                 mount_path: mount_path.to_string(),
-            });
+            };
+            save_active_mount(&rec);
+            return Some(rec);
         }
         None
     }
@@ -777,25 +865,33 @@ fn detect_active_mount_matching(
                     }
                 }
             } else if let Some(ref s) = saved {
-                if !host.eq_ignore_ascii_case(&s.peer_ip)
-                    || (!s.remote_share.is_empty()
-                        && !share_root.eq_ignore_ascii_case(&s.remote_share))
-                {
-                    continue;
+                let matches_saved_ip_share = host.eq_ignore_ascii_case(&s.peer_ip)
+                    && (s.remote_share.is_empty()
+                        || share_root.eq_ignore_ascii_case(&s.remote_share));
+                if !matches_saved_ip_share {
+                    let is_paired = host.parse::<IpAddr>().map(trust::has_paired_peer_at_ip).unwrap_or(false);
+                    if !is_paired {
+                        continue;
+                    }
                 }
             } else {
-                continue;
+                let is_paired = host.parse::<IpAddr>().map(trust::has_paired_peer_at_ip).unwrap_or(false);
+                if !is_paired {
+                    continue;
+                }
             }
 
             let mount_path = drive_opt
                 .map(|d| format!("{}\\", d))
                 .unwrap_or(full_unc);
 
-            return Some(ActiveMountRecord {
+            let rec = ActiveMountRecord {
                 peer_ip: host,
                 remote_share: share_root,
                 mount_path,
-            });
+            };
+            save_active_mount(&rec);
+            return Some(rec);
         }
         None
     }

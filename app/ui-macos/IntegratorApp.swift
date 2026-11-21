@@ -562,6 +562,8 @@ struct BridgeStatusModel: Codable {
     var storage_status: StorageStatusModel
     /// User's preferred SMB share name override.
     var preferred_peer_share: String?
+    /// User's configured local shared directory path.
+    var local_shared_folder: String?
 
     /// Spatial audio routing status.
     var audio_status: AudioRoutingStatusModel
@@ -667,6 +669,8 @@ final class IntegratorViewModel: ObservableObject {
     @Published var preferredShareInput: String = ""
     /// True if preferred share input has uncommitted edits.
     @Published var preferredShareDirty: Bool = false
+    /// User configured local shared folder path.
+    @Published var localSharedFolder: String = ""
     /// True Tone Correlated Color Temperature calibration slider value (Kelvin).
     @Published var trueToneCct: Double = 6500
     /// True Tone chromatic compensation factor slider value.
@@ -853,6 +857,7 @@ final class IntegratorViewModel: ObservableObject {
                 if !self.preferredShareDirty {
                     self.preferredShareInput = model.preferred_peer_share ?? ""
                 }
+                self.localSharedFolder = model.local_shared_folder ?? ""
                 // Clear paired PIN inputs for successfully authenticated peers
                 for peer in model.discovered_peers where peer.trusted {
                     self.pairPinInputs.removeValue(forKey: peer.ip)
@@ -2124,8 +2129,44 @@ struct MainDashboardView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
 
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Local Shared Folder")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text(vm.localSharedFolder.isEmpty ? (s?.local_shared_folder ?? "Default (~/Public)") : vm.localSharedFolder)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.1))
+                        .cornerRadius(6)
+                    Button("Choose Folder…") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseFiles = false
+                        panel.canChooseDirectories = true
+                        panel.allowsMultipleSelection = false
+                        panel.prompt = "Select Shared Folder"
+                        if panel.runModal() == .OK, let url = panel.url {
+                            let path = url.path
+                            vm.localSharedFolder = path
+                            vm.runAction("set_local_shared_folder", params: ["folder": path])
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    if !vm.localSharedFolder.isEmpty || s?.local_shared_folder != nil {
+                        Button("Reset") {
+                            vm.localSharedFolder = ""
+                            vm.runAction("set_local_shared_folder", params: ["folder": NSNull()])
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+
             HStack(spacing: 8) {
-                TextField("Preferred Share Name", text: Binding(
+                TextField("Preferred Peer Share Name", text: Binding(
                     get: { vm.preferredShareInput },
                     set: {
                         vm.preferredShareInput = $0
@@ -2147,6 +2188,13 @@ struct MainDashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!flags.storage)
+
+                if s?.storage_mounted == true {
+                    Button("Open in Finder") {
+                        vm.runAction("open_shared_storage")
+                    }
+                    .buttonStyle(.bordered)
+                }
                 Spacer()
             }
         }

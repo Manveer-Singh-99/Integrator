@@ -609,17 +609,31 @@
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="LocalSharedFolderInput" Grid.Column="0" IsReadOnly="True"
+                                             PlaceholderText="Local Shared Folder (Default: Public)" />
+                                    <Button x:Name="BtnChooseFolder" Grid.Column="1" Content="Choose Folder..." Click="ChooseFolder_Click" />
+                                    <Button x:Name="BtnResetFolder" Grid.Column="2" Content="Reset" Click="ResetFolder_Click" />
+                                </Grid>
+
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <TextBox x:Name="PreferredShareInput" Grid.Column="0" MaxLength="128"
-                                             PlaceholderText="Preferred Share Name"
+                                             PlaceholderText="Preferred Peer Share Name"
                                              TextChanged="PreferredShareInput_TextChanged"
                                              AutomationProperties.Name="Preferred Share Name" />
                                     <Button Grid.Column="1" Content="Set Share" Click="SetShare_Click" />
                                 </Grid>
 
-                                <StackPanel Orientation="Horizontal">
+                                <StackPanel Orientation="Horizontal" Spacing="8">
                                     <Button x:Name="BtnToggleMount" Content="Mount Shared Storage"
                                             Style="{StaticResource AccentButtonStyle}" Click="ToggleMount_Click" />
+                                    <Button x:Name="BtnOpenInExplorer" Content="Open in File Explorer"
+                                            Visibility="Collapsed" Click="OpenInExplorer_Click" />
                                 </StackPanel>
                             </StackPanel>
                         </Border>
