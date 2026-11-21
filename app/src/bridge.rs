@@ -49,6 +49,10 @@ use tracing::{info, warn};
 
 use crate::system_info;
 
+/// Default bounded timeout duration for each periodic watchdog TCP RTT probe.
+#[allow(dead_code)]
+const DEFAULT_WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
 /// Network link health monitor and latency prober targeting a specific peer endpoint.
 #[allow(dead_code)]
 pub struct LinkMonitor {
@@ -185,8 +189,8 @@ impl LinkMonitor {
                         break;
                     }
                 }
-                // Execute latency probe with 800ms bounded timeout
-                rtt_res = self.measure_rtt(Duration::from_millis(800)) => {
+                // Execute latency probe with bounded watchdog timeout
+                rtt_res = self.measure_rtt(DEFAULT_WATCHDOG_PROBE_TIMEOUT) => {
                     match rtt_res {
                         Some(rtt) => {
                             if !is_connected {

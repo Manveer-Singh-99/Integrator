@@ -78,10 +78,20 @@ use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton, ScreenEdge};
 use crate::kvm::service::{HookDecision, KvmService};
+
+/// Maximum number of background retry attempts when installing Win32 low-level KVM input hooks.
+const HOOK_RETRY_ATTEMPTS: usize = 10;
+
+/// Delay between consecutive Win32 low-level KVM hook installation retry attempts (2 seconds).
+const HOOK_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum absolute scroll wheel delta clamped per axis to prevent Win32 driver overflow (`5000.0`).
+const MAX_SCROLL_DELTA: f32 = 5000.0;
 
 /// Global handle to the active `KvmService` coordinator for routing incoming Windows events.
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
@@ -162,8 +172,8 @@ pub fn start(service: Arc<KvmService>) {
         std::thread::Builder::new()
             .name("kvm-win-hook-retry".into())
             .spawn(|| {
-                for _ in 0..10 {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                for _ in 0..HOOK_RETRY_ATTEMPTS {
+                    std::thread::sleep(HOOK_RETRY_INTERVAL);
                     let _g = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                     let activated = unsafe {
                         integrator_kvm_win_start_hooks(Some(on_win_event), Some(on_drag_ended))
@@ -219,16 +229,16 @@ pub fn sync_edge_probe(enabled: bool, peer_edge: ScreenEdge) {
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
-    let mut w = 1920.0;
-    let mut h = 1080.0;
+    let mut w = crate::config::DEFAULT_DISPLAY_WIDTH as f64;
+    let mut h = crate::config::DEFAULT_DISPLAY_HEIGHT as f64;
     unsafe {
         integrator_kvm_win_screen_rect(&mut x, &mut y, &mut w, &mut h);
     }
     ScreenRect {
         x: x as f32,
         y: y as f32,
-        width: (w as f32).max(320.0),
-        height: (h as f32).max(200.0),
+        width: (w as f32).max(crate::config::MIN_KVM_DISPLAY_WIDTH),
+        height: (h as f32).max(crate::config::MIN_KVM_DISPLAY_HEIGHT),
     }
 }
 
@@ -319,8 +329,8 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, _x: f32, _y
 
 /// Injects synthetic mouse wheel scrolling deltas via Win32 `SendInput` (`MOUSEEVENTF_WHEEL` / `MOUSEEVENTF_HWHEEL`).
 pub fn inject_scroll(dx: f32, dy: f32) {
-    let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
-    let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
+    let safe_dx = if dx.is_finite() { dx.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) } else { 0.0 };
+    let safe_dy = if dy.is_finite() { dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) } else { 0.0 };
     unsafe {
         integrator_kvm_win_inject_scroll(safe_dx as f64, safe_dy as f64);
     }

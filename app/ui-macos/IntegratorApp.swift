@@ -248,8 +248,10 @@ struct DiscoveredPeerModel: Codable, Identifiable, Hashable {
     var hostname: String
     /// Operating system string (e.g., "macOS", "Windows").
     var os: String
-    /// Hardware model string (e.g., "MacBookPro18,1", "Custom PC").
+    /// Hardware model string (e.g., "MacBookPro18,1", "Mac14,12", "Custom PC").
     var hardware_model: String
+    /// Hardware chassis form factor ("laptop", "desktop", or "unknown").
+    var form_factor: String?
     /// Reachable IPv4 address.
     var ip: String
     /// Local interface IP address used to communicate with this peer.
@@ -306,6 +308,57 @@ struct StorageStatusModel: Codable, Hashable {
     var message: String
 }
 
+// MARK: - UI Default Constants
+
+/// Centralized fallback constants and UI timing/sizing parameters for the macOS dashboard.
+private enum UiDefaults {
+    /// Fallback UDP transport port displayed for spatial audio when omitted by core status.
+    static let defaultAudioPort: UInt16 = 58284
+    /// Fallback TCP transport port displayed for shared camera streaming when omitted by core status.
+    static let defaultCameraPort: UInt16 = 58287
+    /// Fallback shared camera frame width in pixels.
+    static let defaultCameraWidth: UInt32 = 1280
+    /// Fallback shared camera frame height in pixels.
+    static let defaultCameraHeight: UInt32 = 720
+    /// Fallback shared camera frame rate in FPS.
+    static let defaultCameraFps: UInt32 = 30
+    /// Fallback Windows virtual camera friendly name when omitted by core status.
+    static let defaultCameraDeviceName: String = "Integrator Mac Camera"
+    /// Placeholder system GPU name filtered from explicit discrete/integrated GPU pickers.
+    static let defaultSystemGpuName: String = "Default System GPU"
+    /// Fallback remote peer hostname displayed in the desk layout schematic.
+    static let defaultPeerHostname: String = "Peer PC"
+    /// Fallback local workstation hostname displayed in the desk layout schematic.
+    static let defaultLocalHostname: String = "This Mac"
+    /// Interval in seconds between periodic `get_bridge_status` polls while dashboard is visible.
+    static let statusPollIntervalSec: TimeInterval = 2.0
+    /// Auto-dismiss duration in seconds for ephemeral toast notification banners.
+    static let toastDismissDelaySec: TimeInterval = 4.0
+    /// Exact character length required for SPAKE2 pairing PIN codes.
+    static let pairingPinLength: Int = 6
+    /// Visible prefix length for truncated peer device identifiers in trust cards.
+    static let deviceIdPreviewLength: Int = 12
+    /// Default CIE D65 neutral Correlated Color Temperature in Kelvin.
+    static let defaultTrueToneCct: Double = 6500
+    /// Initial dashboard window width in points.
+    static let defaultWindowWidth: CGFloat = 1240
+    /// Initial dashboard window height in points.
+    static let defaultWindowHeight: CGFloat = 820
+    /// Minimum resizable dashboard window width in points.
+    static let minWindowWidth: CGFloat = 960
+    /// Minimum resizable dashboard window height in points.
+    static let minWindowHeight: CGFloat = 640
+
+    /// Dynamically resolves the macOS user shared Public directory display label via `FileManager`.
+    static var defaultSharedPublicFolderLabel: String {
+        if let url = FileManager.default.urls(for: .sharedPublicDirectory, in: .userDomainMask).first {
+            let abbreviated = (url.path as NSString).abbreviatingWithTildeInPath
+            return "Default (\(abbreviated))"
+        }
+        return "Default (Public)"
+    }
+}
+
 /// Status of the low-latency authenticated UDP spatial audio stream.
 struct AudioRoutingStatusModel: Codable, Hashable {
     /// Human-readable description of active audio topology (e.g., "Mac -> PC Stereo").
@@ -318,13 +371,17 @@ struct AudioRoutingStatusModel: Codable, Hashable {
     var bit_depth: UInt8
     /// True if the audio capture or playback stream is actively running.
     var is_active: Bool
+    /// Active UDP transport port bound for spatial audio streaming.
+    var port: UInt16?
 }
 
 /// Telemetry and state of the Mac -> PC shared virtual camera pipeline.
 struct CameraStatusModel: Codable, Hashable {
-    /// True if camera capture hardware is supported and present.
+    /// True if camera capture platform subsystem is supported.
     var supported: Bool
-    /// True if the camera stream is actively transmitting frames over TCP :58287.
+    /// True if a video capture device (built-in, external USB, or Continuity Camera) is currently detected.
+    var camera_available: Bool?
+    /// True if the camera stream is actively transmitting frames.
     var active: Bool
     /// Operational role: "sender" (macOS) or "receiver" (Windows Virtual Camera).
     var role: String
@@ -342,6 +399,10 @@ struct CameraStatusModel: Codable, Hashable {
     var frames_transferred: UInt64
     /// Last error encountered during capture, encoding, or transmission.
     var last_error: String?
+    /// Active encrypted TCP transport port bound for virtual camera streaming.
+    var port: UInt16?
+    /// Friendly device name exposed by the Windows virtual camera.
+    var device_name: String?
 }
 
 /// Boolean feature flags controlling active subsystem daemons in Rust core.
@@ -428,6 +489,72 @@ struct LogEntryModel: Codable, Identifiable, Hashable {
     var message: String
 }
 
+/// Operating system permission audit status item returned inside `SetupHealthSnapshotModel`.
+struct PermissionStatusModel: Codable, Identifiable, Hashable {
+    /// Canonical permission identifier (e.g., "accessibility", "input_monitoring", "screen_recording").
+    var id: String
+    /// Human-readable permission title.
+    var title: String
+    /// Concise explanation of why Integrator needs this permission.
+    var description: String
+    /// True if permission is currently granted.
+    var granted: Bool
+    /// True if permission is required for core workstation functionality.
+    var required: Bool
+    /// True if Integrator can trigger a native OS prompt or automated fix directly.
+    var can_request_directly: Bool
+    /// Optional System Settings deep-link URI.
+    var settings_url: String?
+    /// Diagnostic status detail message.
+    var detail: String
+}
+
+/// Companion streaming tool or driver dependency status item returned inside `SetupHealthSnapshotModel`.
+struct DependencyStatusModel: Codable, Identifiable, Hashable {
+    /// Canonical dependency identifier ("sunshine", "moonlight", "usb_ncm", "vdd", "vcam").
+    var id: String
+    /// Human-readable dependency name.
+    var name: String
+    /// Explanation of which subsystem uses this tool or driver.
+    var description: String
+    /// True if detected as installed on the local machine.
+    var installed: Bool
+    /// Optional runtime flag indicating whether the service or daemon is currently running.
+    var running: Bool?
+    /// True if required for core streaming functionality.
+    var required: Bool
+    /// Detected binary or plist path on disk, if found.
+    var detected_path: String?
+    /// Primary installation method label (e.g., "Homebrew", "GitHub Release", "Guided Terminal Script").
+    var install_method: String
+    /// Copyable CLI installation command.
+    var install_command: String
+    /// Fallback official download or guide URL.
+    var download_url: String
+    /// True if 1-click guided installation is supported.
+    var can_auto_install: Bool
+}
+
+/// Complete cross-platform OS permissions and companion dependencies health snapshot.
+struct SetupHealthSnapshotModel: Codable, Hashable {
+    /// Operating system identifier ("macos", "windows").
+    var os: String
+    /// True if process is running with elevated privileges.
+    var is_elevated: Bool
+    /// True if at least one required permission or required dependency is missing.
+    var needs_attention: Bool
+    /// Number of missing required OS permissions.
+    var missing_required_permissions: Int
+    /// Number of missing required companion dependencies.
+    var missing_required_dependencies: Int
+    /// User-persisted flag suppressing automatic Setup sheet presentation on launch.
+    var suppress_launch_prompt: Bool
+    /// Audited OS permissions list.
+    var permissions: [PermissionStatusModel]
+    /// Audited companion dependencies list.
+    var dependencies: [DependencyStatusModel]
+}
+
 /// UI presentation wrapper around `LogEntryModel` ensuring unique SwiftUI list item identities.
 private struct RenderedLogEntry: Identifiable {
     /// Deduplicated identifier including ordinal counter.
@@ -486,6 +613,8 @@ struct BridgeStatusModel: Codable {
     var local_os: String
     /// Hardware product model name.
     var hardware_model: String
+    /// Local hardware chassis form factor ("laptop", "desktop", or "unknown").
+    var form_factor: String?
     /// Processor architecture and brand string.
     var cpu_brand: String
     /// Primary local display configuration.
@@ -511,6 +640,8 @@ struct BridgeStatusModel: Codable {
     var peer_name: String?
     /// Hardware model of the connected peer.
     var peer_hardware_model: String?
+    /// Hardware chassis form factor of the connected peer ("laptop", "desktop", or "unknown").
+    var peer_form_factor: String?
     /// Display geometry of the peer's primary monitor.
     var peer_display: DisplayGeometryModel?
     /// List of GPUs present on the peer machine.
@@ -585,6 +716,8 @@ struct BridgeStatusModel: Codable {
 
     /// True if Integrator is configured to launch at user login.
     var autostart_enabled: Bool
+    /// Cross-platform OS permissions and companion driver/tool setup health snapshot.
+    var setup_status: SetupHealthSnapshotModel?
     /// Rolling ring buffer of recent log entries from the Rust core.
     var recent_logs: [LogEntryModel]
 }
@@ -652,6 +785,10 @@ final class IntegratorViewModel: ObservableObject {
     @Published var isBusy = false
     /// True while an extended display start or stop transition is in progress.
     @Published var isDisplayToggling = false
+    /// Controls presentation of the Setup, Drivers & Permissions Assistant sheet.
+    @Published var showSetupSheet: Bool = false
+    /// Guard flag ensuring the automatic launch setup prompt is evaluated at most once per app launch.
+    private var didEvaluateLaunchSetupPrompt: Bool = false
 
     // MARK: - Local Interactive Form States
 
@@ -674,7 +811,7 @@ final class IntegratorViewModel: ObservableObject {
     /// User configured local shared folder path.
     @Published var localSharedFolder: String = ""
     /// True Tone Correlated Color Temperature calibration slider value (Kelvin).
-    @Published var trueToneCct: Double = 6500
+    @Published var trueToneCct: Double = UiDefaults.defaultTrueToneCct
     /// True Tone chromatic compensation factor slider value.
     @Published var trueToneComp: Double = 1.0
 
@@ -708,7 +845,7 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
-    /// Repeating 2.0-second timer polling the Rust core bridge status.
+    /// Repeating status polling timer querying the Rust core bridge status.
     private var pollTimer: Timer? = nil
     /// Flag indicating whether background polling is paused (e.g., window hidden or minimized).
     private var isPollingPaused: Bool = false
@@ -743,11 +880,11 @@ final class IntegratorViewModel: ObservableObject {
         pollTimer = nil
     }
 
-    /// Internal scheduler configuring a repeating 2.0-second main-thread timer.
+    /// Internal scheduler configuring a repeating main-thread status timer.
     private func schedulePollTimer() {
         pollTimer?.invalidate()
         guard !isPollingPaused else { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: UiDefaults.statusPollIntervalSec, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, !self.isPollingPaused else { return }
                 self.refresh()
@@ -755,7 +892,7 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
-    /// Displays an ephemeral toast banner for 4.0 seconds.
+    /// Displays an ephemeral toast banner for the configured toast duration.
     ///
     /// - Parameters:
     ///   - kind: Style type ("success", "error", or "info").
@@ -763,15 +900,15 @@ final class IntegratorViewModel: ObservableObject {
     func showToast(_ kind: String, _ msg: String) {
         toast = ToastBanner(kind: kind, message: msg)
         let capturedId = toast?.id
-        // Auto-dismiss the toast banner after exactly 4.0 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+        // Auto-dismiss the toast banner after the configured toast delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + UiDefaults.toastDismissDelaySec) { [weak self] in
             if self?.toast?.id == capturedId {
                 self?.toast = nil
             }
         }
     }
 
-    /// Determines the vendor tag ("nvidia", "amd", "intel", "apple", "discrete") for a GPU descriptor.
+    /// Determines the vendor tag ("nvidia", "amd", "intel", "apple", "qualcomm", "discrete") for a GPU descriptor.
     ///
     /// - Parameter gpu: GPU metadata model.
     /// - Returns: Canonical lowercase vendor tag.
@@ -780,7 +917,7 @@ final class IntegratorViewModel: ObservableObject {
         if combined.contains("nvidia") || combined.contains("geforce") || combined.contains("rtx") || combined.contains("gtx") || combined.contains("quadro") {
             return "nvidia"
         }
-        if combined.contains("amd") || combined.contains("radeon") {
+        if combined.contains("amd") || combined.contains("radeon") || combined.contains("firepro") {
             return "amd"
         }
         if combined.contains("intel") || combined.contains("arc") || combined.contains("iris") || combined.contains("uhd") {
@@ -789,7 +926,42 @@ final class IntegratorViewModel: ObservableObject {
         if combined.contains("apple") {
             return "apple"
         }
+        if combined.contains("qualcomm") || combined.contains("adreno") || combined.contains("snapdragon") {
+            return "qualcomm"
+        }
         return gpu.is_discrete ? "discrete" : "integrated"
+    }
+
+    /// Resolves the appropriate SF Symbol icon name for a Mac or Windows machine based on its
+    /// operating system, hardware product model, and form factor (Desktop vs Laptop).
+    static func deviceSymbol(os: String?, hardwareModel: String?, formFactor: String?) -> String {
+        let model = (hardwareModel ?? "").lowercased()
+        let ff = (formFactor ?? "").lowercased()
+        let osLower = (os ?? "").lowercased()
+        let isMac = osLower.contains("mac") || osLower == "darwin" || model.hasPrefix("mac") || model.hasPrefix("imac")
+        if isMac {
+            if model.contains("macstudio") || model.contains("mac studio") {
+                return "macstudio"
+            }
+            if model.contains("macmini") || model.contains("mac mini") {
+                return "macmini"
+            }
+            if model.contains("macpro") || model.contains("mac pro") {
+                return "macpro.gen3"
+            }
+            if model.contains("imac") || ff == "desktop" {
+                return "desktopcomputer"
+            }
+            if model.contains("macbook") || ff == "laptop" {
+                return "laptopcomputer"
+            }
+            return "desktopcomputer"
+        } else {
+            if ff == "laptop" || model.contains("laptop") || model.contains("notebook") || model.contains("thinkpad") || model.contains("surface") || model.contains("zephyrus") || model.contains("zenbook") {
+                return "laptopcomputer"
+            }
+            return "pc"
+        }
     }
 
     /// Builds unique picker options for GPU selection dropdowns.
@@ -800,7 +972,7 @@ final class IntegratorViewModel: ObservableObject {
         var options: [(tag: String, label: String)] = [("auto", "Auto (Recommended)")]
         var usedTags: Set<String> = ["auto"]
         for g in gpus {
-            if g.vendor == "System" && g.name == "Default System GPU" {
+            if g.vendor == "System" && g.name == UiDefaults.defaultSystemGpuName {
                 continue
             }
             let baseTag = gpuVendorTag(for: g)
@@ -842,6 +1014,14 @@ final class IntegratorViewModel: ObservableObject {
             switch res {
             case .success(let model):
                 self.status = model
+                if !self.didEvaluateLaunchSetupPrompt {
+                    self.didEvaluateLaunchSetupPrompt = true
+                    if let setup = model.setup_status,
+                       setup.needs_attention && !setup.suppress_launch_prompt
+                    {
+                        self.showSetupSheet = true
+                    }
+                }
                 // Preserve local draft of KVM layout if user is currently editing sliders
                 if !self.kvmLayoutDirty {
                     self.isApplyingRemoteLayout = true
@@ -981,6 +1161,33 @@ final class IntegratorViewModel: ObservableObject {
                 self?.showToast("error", e.message)
             }
         }
+    }
+
+    /// Forces an uncached OS permissions and companion dependencies probe from the Rust core.
+    func refreshSetupStatus() {
+        invoke("get_setup_status", params: "{}", as: SetupHealthSnapshotModel.self) { [weak self] res in
+            guard let self = self else { return }
+            switch res {
+            case .success(let snap):
+                self.status?.setup_status = snap
+                self.refresh()
+            case .failure(let e):
+                self.showToast("error", e.message)
+            }
+        }
+    }
+
+    /// Persists the user's preference to suppress or enable automatic Setup sheet prompting on app launch.
+    func setSuppressLaunchSetupPrompt(_ suppress: Bool) {
+        status?.setup_status?.suppress_launch_prompt = suppress
+        runAction(
+            "set_suppress_launch_setup_prompt",
+            params: ["suppress": suppress],
+            suppressDataToast: true,
+            successToast: suppress
+                ? "Automatic launch setup prompt disabled"
+                : "Automatic launch setup prompt enabled"
+        )
     }
 
     /// Helper deserializing a JSON string result from raw response bytes.
@@ -1370,6 +1577,9 @@ struct MainDashboardView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: vm.toast?.id)
+        .sheet(isPresented: $vm.showSetupSheet) {
+            SetupAssistantSheetView(vm: vm)
+        }
         .onAppear {
             // Begin periodic polling when view hierarchy attaches
             vm.startPolling()
@@ -1430,17 +1640,52 @@ struct MainDashboardView: View {
 
             Spacer()
 
+            // Quick-access Setup, Drivers & Permissions button in sidebar
+            Button {
+                vm.refreshSetupStatus()
+                vm.showSetupSheet = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .foregroundStyle(s?.setup_status?.needs_attention == true ? .orange : .green)
+                    Text("Setup & Permissions")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    if s?.setup_status?.needs_attention == true {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 8, height: 8)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    (s?.setup_status?.needs_attention == true ? Color.orange : Color.accentColor).opacity(0.14),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+            }
+            .buttonStyle(.plain)
+
             // Persistent bottom peer connection summary card
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 7) {
                     Circle()
                         .fill(s?.peer_connected == true ? .green : .orange)
                         .frame(width: 8, height: 8)
+                    if s?.peer_connected == true {
+                        Image(systemName: IntegratorViewModel.deviceSymbol(
+                            os: s?.peer_os,
+                            hardwareModel: s?.peer_hardware_model,
+                            formFactor: s?.peer_form_factor
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                     Text(s?.peer_name ?? "Discovering Peer...")
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                 }
-                Text(s?.link_description ?? "Awaiting Ethernet / TB / USB-C / Wi-Fi beacon")
+                Text(s?.link_description ?? "Awaiting USB-C / TB / Ethernet / Wi-Fi / Hotspot beacon")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -1467,6 +1712,14 @@ struct MainDashboardView: View {
     /// Top status bar displaying workstation host info, connection status pill, and quick action buttons.
     private var topBar: some View {
         HStack(spacing: 12) {
+            Image(systemName: IntegratorViewModel.deviceSymbol(
+                os: s?.os ?? "macos",
+                hardwareModel: s?.hardware_model,
+                formFactor: s?.form_factor
+            ))
+            .font(.system(size: 20, weight: .medium))
+            .foregroundStyle(.tint)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(s?.hostname ?? "Workstation")
                     .font(.title2.bold())
@@ -1481,6 +1734,18 @@ struct MainDashboardView: View {
                 text: s?.peer_connected == true ? "Peer Linked" : "Searching",
                 color: s?.peer_connected == true ? .green : .orange
             )
+
+            Button {
+                vm.refreshSetupStatus()
+                vm.showSetupSheet = true
+            } label: {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(s?.setup_status?.needs_attention == true ? Color.orange : Color.green)
+                        .frame(width: 7, height: 7)
+                    Label("Setup & Permissions", systemImage: "checkmark.shield")
+                }
+            }
 
             Button { vm.refresh() } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
@@ -1753,10 +2018,20 @@ struct MainDashboardView: View {
     /// Visual 2D monitor arrangement schematic reflecting relative workstation positions.
     private var deskMonitorSchematic: some View {
         let edge = vm.kvmLayout.peer_edge
-        let peerName = s?.peer_name ?? "Peer PC"
-        let localName = s?.hostname ?? "This Mac"
-        let localBox = monitorTile(localName, accent: true)
-        let peerBox = monitorTile(peerName, accent: false)
+        let peerName = s?.peer_name ?? UiDefaults.defaultPeerHostname
+        let localName = s?.hostname ?? UiDefaults.defaultLocalHostname
+        let localIcon = IntegratorViewModel.deviceSymbol(
+            os: s?.os ?? "macos",
+            hardwareModel: s?.hardware_model,
+            formFactor: s?.form_factor
+        )
+        let peerIcon = IntegratorViewModel.deviceSymbol(
+            os: s?.peer_os ?? "windows",
+            hardwareModel: s?.peer_hardware_model,
+            formFactor: s?.peer_form_factor
+        )
+        let localBox = monitorTile(localName, icon: localIcon, accent: true)
+        let peerBox = monitorTile(peerName, icon: peerIcon, accent: false)
 
         return Group {
             switch edge {
@@ -1774,21 +2049,26 @@ struct MainDashboardView: View {
     }
 
     /// Renders a single monitor rectangle in the desk layout schematic.
-    private func monitorTile(_ label: String, accent: Bool) -> some View {
-        Text(label)
-            .font(.caption.weight(.semibold))
-            .lineLimit(1)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 10)
-            .frame(minWidth: 82)
-            .background(
-                (accent ? Color.accentColor.opacity(0.24) : Color.secondary.opacity(0.18)),
-                in: RoundedRectangle(cornerRadius: 8)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(accent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.16), lineWidth: 1)
-            )
+    private func monitorTile(_ label: String, icon: String, accent: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .foregroundStyle(accent ? Color.accentColor : .secondary)
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .frame(minWidth: 82)
+        .background(
+            (accent ? Color.accentColor.opacity(0.24) : Color.secondary.opacity(0.18)),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(accent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.16), lineWidth: 1)
+        )
     }
 
     // MARK: - Card 3: Cross-Screen Drag & Drop
@@ -1915,7 +2195,7 @@ struct MainDashboardView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("Manual Peer IPv4 (e.g. 10.99.99.1)", text: $vm.manualIpInput)
+                TextField("Manual Peer IPv4 (e.g. 192.168.1.50 or 172.20.10.2)", text: $vm.manualIpInput)
                     .textFieldStyle(.roundedBorder)
                 Button("Add IP") {
                     let ip = vm.manualIpInput.trimmingCharacters(in: .whitespaces)
@@ -1955,6 +2235,13 @@ struct MainDashboardView: View {
                 let pinDraft = (vm.pairPinInputs[peer.ip] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        Image(systemName: IntegratorViewModel.deviceSymbol(
+                            os: peer.os,
+                            hardwareModel: peer.hardware_model,
+                            formFactor: peer.form_factor
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         Text(peer.hostname).font(.subheadline.weight(.semibold))
                         Text("(\(peer.ip))").font(.caption).foregroundStyle(.secondary)
                         Spacer()
@@ -1988,7 +2275,7 @@ struct MainDashboardView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
-                            .disabled(pinDraft.count != 6)
+                            .disabled(pinDraft.count != UiDefaults.pairingPinLength)
 
                             Button("Block") {
                                 vm.pairPinInputs.removeValue(forKey: peer.ip)
@@ -2024,7 +2311,7 @@ struct MainDashboardView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(tp.hostname) (Pinned Key)")
                             .font(.subheadline.weight(.semibold))
-                        Text("ID: \(String(tp.device_id.prefix(12)))… • \(tp.last_ip)")
+                        Text("ID: \(String(tp.device_id.prefix(UiDefaults.deviceIdPreviewLength)))… • \(tp.last_ip)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -2049,7 +2336,7 @@ struct MainDashboardView: View {
                 !(s?.discovered_peers ?? []).contains(where: { $0.device_id == bid && $0.blocked })
             } ?? [], id: \.self) { blockedId in
                 HStack(spacing: 8) {
-                    Text("Blocked Device: \(String(blockedId.prefix(12)))…")
+                    Text("Blocked Device: \(String(blockedId.prefix(UiDefaults.deviceIdPreviewLength)))…")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -2063,7 +2350,7 @@ struct MainDashboardView: View {
                 .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             }
 
-            Label("SPAKE2 + Ed25519 Mutual Auth Enforced on USB-C & LAN (v1.0 Locked)", systemImage: "checkmark.seal.fill")
+            Label("SPAKE2 + Ed25519 Mutual Auth Enforced Across All Links (v1.0 Locked)", systemImage: "checkmark.seal.fill")
                 .font(.caption2)
                 .foregroundStyle(.green)
         }
@@ -2149,7 +2436,7 @@ struct MainDashboardView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Text(vm.localSharedFolder.isEmpty ? (s?.local_shared_folder ?? "Default (~/Public)") : vm.localSharedFolder)
+                    Text(vm.localSharedFolder.isEmpty ? (s?.local_shared_folder ?? UiDefaults.defaultSharedPublicFolderLabel) : vm.localSharedFolder)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -2233,7 +2520,7 @@ struct MainDashboardView: View {
                 icon: "sun.max",
                 title: "True Tone & Chromatic Sync",
                 pillText: s?.ambient_supported == true
-                    ? String(format: "%.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? 6500)
+                    ? String(format: "%.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct))
                     : "Manual",
                 pillColor: flags.truetone ? .yellow : .secondary,
                 toggleBinding: Binding(
@@ -2304,11 +2591,15 @@ struct MainDashboardView: View {
 
     /// Card 10: Low-latency spatial audio UDP routing and test chime playback.
     private var audioCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let audioPort: UInt16 = {
+            if let p = s?.audio_status.port, p > 0 { return p }
+            return UiDefaults.defaultAudioPort
+        }()
+        return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "speaker.wave.3",
                 title: "Dynamic Audio Routing",
-                pillText: "UDP :58284",
+                pillText: "UDP :\(audioPort)",
                 pillColor: flags.audio ? .green : .secondary,
                 toggleBinding: Binding(
                     get: { flags.audio },
@@ -2332,11 +2623,24 @@ struct MainDashboardView: View {
 
     // MARK: - Card 10B: Mac -> PC Shared Camera
 
-    /// Card 10B: Mac AVFoundation 720p30 camera capture and encrypted TCP transmission to Windows virtual camera.
+    /// Card 10B: Mac AVFoundation camera capture and encrypted TCP transmission to Windows virtual camera.
     private var cameraCard: some View {
         let camEnabled = flags.camera ?? false
         let cam = s?.camera_status
         let camActive = cam?.active == true
+        let camWidth = (cam?.width ?? 0) > 0 ? (cam?.width ?? UiDefaults.defaultCameraWidth) : UiDefaults.defaultCameraWidth
+        let camHeight = (cam?.height ?? 0) > 0 ? (cam?.height ?? UiDefaults.defaultCameraHeight) : UiDefaults.defaultCameraHeight
+        let camFps = (cam?.fps ?? 0) > 0 ? (cam?.fps ?? UiDefaults.defaultCameraFps) : UiDefaults.defaultCameraFps
+        let camPort: UInt16 = {
+            if let p = cam?.port, p > 0 { return p }
+            return UiDefaults.defaultCameraPort
+        }()
+        let camDeviceName: String = {
+            if let name = cam?.device_name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return name
+            }
+            return UiDefaults.defaultCameraDeviceName
+        }()
         return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "video.fill",
@@ -2353,12 +2657,16 @@ struct MainDashboardView: View {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.orange)
+            } else if cam?.camera_available == false && !camActive {
+                Text("No camera hardware detected on this Mac. Connect a USB webcam or Continuity Camera.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } else if camActive {
-                Text("\(cam?.width ?? 1280)×\(cam?.height ?? 720) @ \(cam?.fps ?? 30)fps • \(cam?.frames_transferred ?? 0) frames sent over TCP :58287")
+                Text("\(camWidth)×\(camHeight) @ \(camFps)fps • \(cam?.frames_transferred ?? 0) frames sent over TCP :\(camPort)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else {
-                Text("Streams your MacBook camera (720p30) into Windows 'Integrator MacBook Camera' (TCP :58287).")
+                Text("Streams your Mac camera (\(camHeight)p\(camFps)) into Windows '\(camDeviceName)' (TCP :\(camPort)).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2456,6 +2764,255 @@ struct MainDashboardView: View {
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.10), lineWidth: 1))
         }
         .modifier(LiquidGlassCardModifier())
+    }
+}
+
+// MARK: - Setup, Drivers & Permissions Assistant Sheet
+
+/// Modal macOS Setup, Drivers & Permissions Assistant sheet presented automatically on launch when
+/// required permissions or streaming tools are missing (unless suppressed) or opened on-demand from the toolbar/sidebar.
+private struct SetupAssistantSheetView: View {
+    /// Shared ViewModel coordinating RPC dispatches and live status refreshes.
+    @ObservedObject var vm: IntegratorViewModel
+
+    /// Latest setup health snapshot from the bridge status.
+    private var setup: SetupHealthSnapshotModel? {
+        vm.status?.setup_status
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Sheet Header
+            HStack(spacing: 12) {
+                Image(systemName: setup?.needs_attention == true ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(setup?.needs_attention == true ? .orange : .green)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Setup, Drivers & Permissions Assistant")
+                        .font(.title3.bold())
+                    Text(headerSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                StatusPill(
+                    text: setup?.needs_attention == true ? "Action Needed" : "All Required Ready",
+                    color: setup?.needs_attention == true ? .orange : .green
+                )
+
+                Button {
+                    vm.refreshSetupStatus()
+                } label: {
+                    Label("Refresh Status", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Section 1: Operating System Permissions
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("macOS Privacy & Security Permissions", systemImage: "lock.shield")
+                                .font(.headline)
+                            Spacer()
+                            Button("Request All Missing Permissions") {
+                                vm.runAction("request_all_missing_permissions") { _ in
+                                    vm.refreshSetupStatus()
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled((setup?.missing_required_permissions ?? 0) == 0)
+                        }
+
+                        ForEach(setup?.permissions ?? []) { perm in
+                            permissionRow(perm)
+                        }
+                    }
+
+                    Divider()
+
+                    // Section 2: Drivers & Companion Streaming Tools
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Drivers & Companion Streaming Tools", systemImage: "shippingbox.fill")
+                            .font(.headline)
+
+                        ForEach(setup?.dependencies ?? []) { dep in
+                            dependencyRow(dep)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            Divider()
+
+            // Footer Bar: Suppress Launch Prompt Toggle + Close Button
+            HStack {
+                Toggle(
+                    "Don't prompt automatically on launch",
+                    isOn: Binding(
+                        get: { setup?.suppress_launch_prompt ?? false },
+                        set: { vm.setSuppressLaunchSetupPrompt($0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .font(.caption)
+
+                Spacer()
+
+                Button("Done") {
+                    vm.showSetupSheet = false
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(minWidth: 740, idealWidth: 780, minHeight: 560, idealHeight: 620)
+    }
+
+    /// Summary subtitle in the Setup sheet header.
+    private var headerSubtitle: String {
+        guard let snap = setup else {
+            return "Auditing macOS TCC permissions and companion streaming tools…"
+        }
+        if !snap.needs_attention {
+            return "All required macOS permissions and streaming tools are configured."
+        }
+        return "\(snap.missing_required_permissions) required permission(s) and \(snap.missing_required_dependencies) required tool(s) need attention."
+    }
+
+    /// Renders an individual OS permission audit row with status badge, detail text, and 1-click Request / Settings actions.
+    private func permissionRow(_ perm: PermissionStatusModel) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: perm.granted ? "checkmark.circle.fill" : (perm.required ? "exclamationmark.triangle.fill" : "info.circle.fill"))
+                .font(.system(size: 16))
+                .foregroundStyle(perm.granted ? .green : (perm.required ? .orange : .secondary))
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(perm.title)
+                        .font(.subheadline.weight(.semibold))
+                    StatusPill(
+                        text: perm.granted ? "Granted" : (perm.required ? "Required • Missing" : "Optional"),
+                        color: perm.granted ? .green : (perm.required ? .orange : .secondary)
+                    )
+                }
+                Text(perm.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(perm.detail)
+                    .font(.caption2)
+                    .foregroundStyle(perm.granted ? Color.secondary : Color.orange)
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 6) {
+                if perm.can_request_directly && !perm.granted {
+                    Button("Request") {
+                        vm.runAction("request_permission", params: ["id": perm.id]) { _ in
+                            vm.refreshSetupStatus()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+
+                if perm.settings_url != nil {
+                    Button("Settings") {
+                        vm.runAction("open_permission_settings", params: ["id": perm.id]) { _ in
+                            vm.refreshSetupStatus()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// Renders an individual companion tool/driver row with Installed/Missing badge, 1-click Install/Download, and copyable CLI command.
+    private func dependencyRow(_ dep: DependencyStatusModel) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: dep.installed ? "checkmark.seal.fill" : (dep.required ? "exclamationmark.circle.fill" : "wrench.and.screwdriver.fill"))
+                    .font(.system(size: 16))
+                    .foregroundStyle(dep.installed ? .green : (dep.required ? .orange : .secondary))
+                    .padding(.top, 2)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(dep.name)
+                            .font(.subheadline.weight(.semibold))
+                        StatusPill(
+                            text: dep.installed ? "Installed" : (dep.required ? "Required • Missing" : "Optional • Not Installed"),
+                            color: dep.installed ? .green : (dep.required ? .orange : .secondary)
+                        )
+                        if let running = dep.running {
+                            StatusPill(
+                                text: running ? "Running" : "Stopped",
+                                color: running ? .cyan : .secondary
+                            )
+                        }
+                    }
+                    Text(dep.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let path = dep.detected_path, !path.isEmpty {
+                        Text("Detected: \(path)")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                Button(dep.installed ? "Reinstall / Guide" : "Install / Download") {
+                    vm.runAction("install_dependency", params: ["id": dep.id]) { _ in
+                        vm.refreshSetupStatus()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+
+            if !dep.install_command.isEmpty {
+                HStack(spacing: 8) {
+                    Text("\(dep.install_method):")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(dep.install_command)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color(nsColor: .textBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+                    Spacer()
+                    Button("Copy Command") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(dep.install_command, forType: .string)
+                        vm.showToast("success", "Copied install command to clipboard")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -2594,8 +3151,8 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         let hosting = NSHostingController(rootView: MainDashboardView(vm: IntegratorViewModel.shared))
         let win = NSWindow(contentViewController: hosting)
         win.title = "Integrator"
-        win.setContentSize(NSSize(width: 1240, height: 820))
-        win.minSize = NSSize(width: 960, height: 640)
+        win.setContentSize(NSSize(width: UiDefaults.defaultWindowWidth, height: UiDefaults.defaultWindowHeight))
+        win.minSize = NSSize(width: UiDefaults.minWindowWidth, height: UiDefaults.minWindowHeight)
         win.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden

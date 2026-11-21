@@ -201,6 +201,27 @@ pub const DEFAULT_REKEY_AGE_SECS: u64 = 3600;
 /// In-band payload magic identifying an explicit rekey control frame (`b"REKEY-V2"`).
 const REKEY_MAGIC_PAYLOAD: &[u8] = b"REKEY-V2";
 
+/// Maximum plaintext record payload size for `ServiceId::DisplayRpc` (64 KiB).
+pub const MAX_DISPLAY_RPC_FRAME_BYTES: usize = 64 * 1024;
+
+/// Maximum plaintext record payload size for `ServiceId::ClipboardTransfer` (2 MiB).
+pub const MAX_CLIPBOARD_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum plaintext record payload size for `ServiceId::Benchmark` (1 MiB).
+pub const MAX_BENCHMARK_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Maximum plaintext record payload size for `ServiceId::InputKvm` (128 KiB).
+pub const MAX_INPUT_KVM_FRAME_BYTES: usize = 128 * 1024;
+
+/// Maximum plaintext record payload size for `ServiceId::CameraStream` (2 MiB).
+pub const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// Extra grace period in milliseconds added when pruning `HELLO_REPLAY_CACHE` entries (60 seconds).
+const REPLAY_CACHE_PRUNE_GRACE_PERIOD_MS: u64 = 60_000;
+
+/// Upper cap in bytes for initial buffer pre-allocation when receiving chunked payloads (1 MiB).
+const INITIAL_CHUNKED_BUFFER_CAPACITY_LIMIT: usize = 1024 * 1024;
+
 /// Identifies the subsystem service requesting or hosting an authenticated TransportV2 session.
 ///
 /// Binds cryptographic handshakes to specific services to prevent cross-service replay attacks.
@@ -226,11 +247,11 @@ impl ServiceId {
     /// Exceeding this boundary triggers `TransportError::OversizedFrame`.
     pub fn max_plaintext_frame_bytes(self) -> usize {
         match self {
-            ServiceId::DisplayRpc => 64 * 1024,            // 64 KiB
-            ServiceId::ClipboardTransfer => 2 * 1024 * 1024, // 2 MiB (1 MiB chunk + metadata)
-            ServiceId::Benchmark => 1024 * 1024,           // 1 MiB
-            ServiceId::InputKvm => 128 * 1024,             // 128 KiB (input + drag preview icons)
-            ServiceId::CameraStream => 2 * 1024 * 1024,    // 2 MiB (720p NV12 frame + header)
+            ServiceId::DisplayRpc => MAX_DISPLAY_RPC_FRAME_BYTES,
+            ServiceId::ClipboardTransfer => MAX_CLIPBOARD_FRAME_BYTES,
+            ServiceId::Benchmark => MAX_BENCHMARK_FRAME_BYTES,
+            ServiceId::InputKvm => MAX_INPUT_KVM_FRAME_BYTES,
+            ServiceId::CameraStream => MAX_CAMERA_FRAME_BYTES,
         }
     }
 }
@@ -462,7 +483,7 @@ static HELLO_REPLAY_CACHE: OnceLock<Mutex<VecDeque<([u8; 16], [u8; 32], u64)>>> 
 fn prune_hello_replay_cache(guard: &mut VecDeque<([u8; 16], [u8; 32], u64)>, now_ms: u64) {
     let max_age = HANDSHAKE_TIMESTAMP_WINDOW_MS
         .saturating_mul(2)
-        .saturating_add(60_000);
+        .saturating_add(REPLAY_CACHE_PRUNE_GRACE_PERIOD_MS);
     guard.retain(|(_, _, ts)| now_ms.saturating_sub(*ts) <= max_age);
 }
 
@@ -1311,7 +1332,7 @@ where
             });
         }
 
-        let mut out = Vec::with_capacity(total_len.min(1024 * 1024));
+        let mut out = Vec::with_capacity(total_len.min(INITIAL_CHUNKED_BUFFER_CAPACITY_LIMIT));
         while out.len() < total_len {
             let chunk = self.recv_message().await?;
             if chunk.is_empty() || out.len().saturating_add(chunk.len()) > total_len {

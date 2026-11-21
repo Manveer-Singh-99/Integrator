@@ -60,6 +60,12 @@ import AppKit
 import Foundation
 import IOKit
 
+/// macOS Control Strip daemon bundle identifier probed to verify Touch Bar runtime presence.
+private let controlStripBundleId = "com.apple.controlstrip"
+
+/// macOS Finder bundle identifier scoped for intercepting remote file Cmd+V shortcuts.
+private let finderBundleId = "com.apple.finder"
+
 // MARK: - RPC Data Models
 struct GpuTelemetryData: Codable {
     let gpu_name: String
@@ -309,7 +315,22 @@ class GoopyLiquidGlassPillView: NSView {
 @objc public class TouchBarHudController: NSObject, NSTouchBarDelegate {
     public static let shared = TouchBarHudController()
 
-    private static let rpcPort: UInt16 = 58281
+    /// Fallback control RPC port used only if Rust has not yet pushed `config::CONTROL_PORT`.
+    private static let defaultControlPort: UInt16 = 58281
+    private var _rpcPort: UInt16 = TouchBarHudController.defaultControlPort
+    /// Active Integrator control RPC port configured dynamically from Rust `config::CONTROL_PORT`.
+    public var rpcPort: UInt16 {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _rpcPort
+        }
+        set {
+            stateLock.lock()
+            _rpcPort = newValue > 0 ? newValue : Self.defaultControlPort
+            stateLock.unlock()
+        }
+    }
     private let stateLock = NSLock()
 
     private var _isActive: Bool = false
@@ -377,7 +398,7 @@ class GoopyLiquidGlassPillView: NSView {
             (NSTouchBar.responds(to: presentSelLegacy) && class_getClassMethod(NSTouchBar.self, presentSelLegacy) != nil)
         guard hasModalApi else { return false }
 
-        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.controlstrip").isEmpty {
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: controlStripBundleId).isEmpty {
             return true
         }
 
@@ -721,7 +742,7 @@ class GoopyLiquidGlassPillView: NSView {
                 return
             }
 
-            guard let response = self.sendRpcRequest(host: host, port: Self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
+            guard let response = self.sendRpcRequest(host: host, port: self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
                 self.updateOfflineUi(statusText: "Peer Offline", expectedGeneration: gen)
                 return
             }
@@ -942,6 +963,11 @@ class GoopyLiquidGlassPillView: NSView {
 }
 
 // MARK: - C FFI Interface for Main App Integration
+@_cdecl("set_touchbar_rpc_port_in_app")
+public func set_touchbar_rpc_port_in_app(port: UInt16) {
+    TouchBarHudController.shared.rpcPort = port
+}
+
 @_cdecl("init_touchbar_in_app")
 public func init_touchbar_in_app(peerIpPtr: UnsafePointer<CChar>?) {
     let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil
@@ -1197,7 +1223,7 @@ public class PasteboardShortcutInterceptor: NSObject {
             let pasting = _isPasting
             lock.unlock()
 
-            if pending && !pasting && frontApp == "com.apple.finder" {
+            if pending && !pasting && frontApp == finderBundleId {
                 NSLog("🎯 [PasteboardShortcutInterceptor] Intercepting Cmd+V in Finder! Streaming remote files...")
                 triggerPaste()
                 return nil // Intercept & swallow event so Finder does not paste stale text clippings or beep!

@@ -7,8 +7,8 @@
  * ----------------------------------------------------------------------------
  * This file implements the native macOS video capture pipeline for Integrator's
  * Shared Camera subsystem (`camera` feature). Its sole mission is to interface
- * directly with macOS AVFoundation, capture raw video from the MacBook's built-in
- * FaceTime HD Camera at 720p30, convert and pack the native bi-planar CVPixelBuffers
+ * directly with macOS AVFoundation, capture raw video from the Mac's built-in
+ * FaceTime HD Camera, external USB webcam, or Continuity Camera at 720p30, convert and pack the native bi-planar CVPixelBuffers
  * into tightly contiguous NV12 format, and stream them into the Rust core via C FFI.
  *
  * 2. END-TO-END CROSS-PLATFORM ARCHITECTURAL FLOW
@@ -32,7 +32,7 @@
  * 4. Windows 11 Media Foundation Virtual Camera (Windows 11):
  *    - Received on Windows TCP :58287, forwarded via `integrator_win_vcam_push_nv12`.
  *    - Pushed into double-buffered ACL-hardened shared memory (`Global\IntegratorVCamShm_v1`).
- *    - Ingested by standalone COM DLL `integrator_vcam.dll` (`Integrator MacBook Camera`).
+ *    - Ingested by standalone COM DLL `integrator_vcam.dll` (`Integrator Mac Camera`).
  *    - Windows 11 Media Foundation FrameServer delivers live frames to any consumer (Teams, Zoom, OBS)
  *      without requiring third-party drivers or physical camera source wrapper attributes
  *      (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES` is omitted).
@@ -79,12 +79,27 @@ func integrator_on_mac_camera_frame(
     _ timestampUs: UInt64
 )
 
+/// Default horizontal capture resolution in pixels (720p HD).
+private let kDefaultCameraWidth: UInt32 = 1280
+
+/// Default vertical capture resolution in pixels (720p HD).
+private let kDefaultCameraHeight: UInt32 = 720
+
+/// Default capture frame rate in frames per second.
+private let kDefaultCameraFps: Int32 = 30
+
+/// Timeout in seconds while waiting for the macOS TCC camera authorization prompt.
+private let kCameraAuthTimeoutSec: Int = 30
+
 /// Singleton controller managing the macOS AVFoundation capture lifecycle and sample buffer delegate.
 private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    /// Callback signature invoked with each tightly-packed NV12 frame on the capture queue.
+    typealias FrameCallback = (UnsafePointer<UInt8>, UInt32, UInt32, UInt32, UInt64) -> Void
+
     /// Shared singleton instance accessible via C FFI functions.
     static let shared = MacCameraCaptureController()
 
-    /// Mutual exclusion lock guarding session reference and running state.
+    /// Mutual exclusion lock guarding session reference, capture geometry, and running state.
     private let lock = NSLock()
 
     /// Serial GCD queue executing video sample buffer delivery at interactive priority.
@@ -93,17 +108,23 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
     /// Active AVFoundation capture session managing input device and video data output.
     private var session: AVCaptureSession?
 
-    /// Reusable contiguous heap buffer holding tightly-packed NV12 frame bytes (1,382,400 bytes).
+    /// Reusable contiguous heap buffer holding tightly-packed NV12 frame bytes.
     private var packedBuffer = Data()
 
     /// Boolean flag indicating whether the capture session is logically active.
     private var running = false
 
-    /// Target horizontal resolution in pixels (1280 for 720p).
-    private let targetWidth: UInt32 = 1280
+    /// Active horizontal capture resolution in pixels.
+    private var targetWidth: UInt32 = kDefaultCameraWidth
 
-    /// Target vertical resolution in pixels (720 for 720p).
-    private let targetHeight: UInt32 = 720
+    /// Active vertical capture resolution in pixels.
+    private var targetHeight: UInt32 = kDefaultCameraHeight
+
+    /// Active capture frame rate in frames per second.
+    private var targetFps: Int32 = kDefaultCameraFps
+
+    /// Active frame consumer callback (defaults to the Rust C-ABI export).
+    private var frameCallback: FrameCallback = integrator_on_mac_camera_frame
 
     /// Returns the current macOS TCC camera permission state.
     ///
@@ -156,27 +177,87 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
             grantedResult = granted
             sem.signal()
         }
-        _ = sem.wait(timeout: .now() + .seconds(30))
+        _ = sem.wait(timeout: .now() + .seconds(kCameraAuthTimeoutSec))
         return grantedResult ? 2 : 1
     }
 
-    /// Configures and starts the AVFoundation camera capture session at 720p30 NV12.
+    /// Maps requested pixel dimensions to the closest matching `AVCaptureSession.Preset`.
+    private static func preferredSessionPreset(width: UInt32, height: UInt32) -> AVCaptureSession.Preset {
+        switch (width, height) {
+        case (1920, 1080):
+            return .hd1920x1080
+        case (640, 480):
+            return .vga640x480
+        default:
+            return .hd1280x720
+        }
+    }
+
+    /// Discovers the preferred video capture device across built-in Mac cameras, external USB webcams
+    /// (for Mac mini, Mac Studio, Mac Pro, or docked setups), and Continuity Camera devices.
+    private static func discoverPreferredCameraDevice() -> AVCaptureDevice? {
+        if let builtIn = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified) {
+            return builtIn
+        }
+        var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+        if #available(macOS 14.0, *) {
+            deviceTypes.append(.external)
+            deviceTypes.append(.continuityCamera)
+        } else {
+            deviceTypes.append(.externalUnknown)
+        }
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .video,
+            position: .unspecified
+        )
+        if let discovered = session.devices.first(where: { $0.isConnected && !$0.isSuspended }) ?? session.devices.first {
+            return discovered
+        }
+        return AVCaptureDevice.default(for: .video)
+    }
+
+    /// Returns `true` if at least one physical, external USB, or Continuity video capture device is present.
+    func hasCameraHardware() -> Bool {
+        return Self.discoverPreferredCameraDevice() != nil
+    }
+
+    /// Configures and starts the AVFoundation camera capture session with explicit geometry, frame rate, and callback.
     ///
+    /// - Parameters:
+    ///   - width: Desired horizontal resolution in pixels (defaults to `kDefaultCameraWidth`).
+    ///   - height: Desired vertical resolution in pixels (defaults to `kDefaultCameraHeight`).
+    ///   - fps: Desired capture frame rate in frames per second (defaults to `kDefaultCameraFps`).
+    ///   - callback: Frame delivery callback invoked with tightly packed NV12 bytes.
     /// - Returns:
     ///   - `0`: Successfully started.
     ///   - `-1`: Camera permission denied.
     ///   - `-2`: Bundle missing `NSCameraUsageDescription`.
-    ///   - `-3`: No built-in camera hardware detected.
+    ///   - `-3`: No camera hardware detected.
     ///   - `-4`: Unable to add camera device input to session.
     ///   - `-5`: Unable to add video data output to session.
     ///   - `-6`: Initialization exception.
-    func start() -> Int32 {
+    func startCapture(
+        width: UInt32 = kDefaultCameraWidth,
+        height: UInt32 = kDefaultCameraHeight,
+        fps: Int32 = kDefaultCameraFps,
+        callback: @escaping FrameCallback = integrator_on_mac_camera_frame
+    ) -> Int32 {
+        let resolvedWidth = width > 0 ? width : kDefaultCameraWidth
+        let resolvedHeight = height > 0 ? height : kDefaultCameraHeight
+        let resolvedFps = fps > 0 ? fps : kDefaultCameraFps
+
         lock.lock()
         if running, session?.isRunning == true {
             lock.unlock()
             return 0
         }
         lock.unlock()
+
+        // Verify that a built-in, external USB, or Continuity camera exists before prompting or starting
+        guard let device = Self.discoverPreferredCameraDevice() else {
+            return -3
+        }
 
         let auth = requestPermissionIfNeeded()
         if auth == -2 {
@@ -186,18 +267,14 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
             return -1
         }
 
-        // Discover built-in FaceTime HD camera or primary video capture device
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified)
-            ?? AVCaptureDevice.default(for: .video)
-        else {
-            return -3
-        }
-
         do {
             let input = try AVCaptureDeviceInput(device: device)
             let newSession = AVCaptureSession()
             newSession.beginConfiguration()
-            if newSession.canSetSessionPreset(.hd1280x720) {
+            let preset = Self.preferredSessionPreset(width: resolvedWidth, height: resolvedHeight)
+            if newSession.canSetSessionPreset(preset) {
+                newSession.sessionPreset = preset
+            } else if newSession.canSetSessionPreset(.hd1280x720) {
                 newSession.sessionPreset = .hd1280x720
             } else {
                 newSession.sessionPreset = .medium
@@ -223,15 +300,19 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
             }
             newSession.addOutput(output)
 
-            // Lock frame rate to 30 fps (min/max frame duration = 1/30s)
+            // Lock frame rate to target FPS (min/max frame duration = 1/fps)
             if let conn = output.connection(with: .video), conn.isVideoMinFrameDurationSupported {
-                conn.videoMinFrameDuration = CMTime(value: 1, timescale: 30)
-                conn.videoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+                conn.videoMinFrameDuration = CMTime(value: 1, timescale: resolvedFps)
+                conn.videoMaxFrameDuration = CMTime(value: 1, timescale: resolvedFps)
             }
             newSession.commitConfiguration()
 
-            let expectedBytes = Int(targetWidth * targetHeight * 3 / 2)
+            let expectedBytes = Int(resolvedWidth * resolvedHeight * 3 / 2)
             lock.lock()
+            self.targetWidth = resolvedWidth
+            self.targetHeight = resolvedHeight
+            self.targetFps = resolvedFps
+            self.frameCallback = callback
             if packedBuffer.count != expectedBytes {
                 packedBuffer = Data(count: expectedBytes)
             }
@@ -245,6 +326,16 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
             stop()
             return -6
         }
+    }
+
+    /// Starts AVFoundation capture using the default 720p30 configuration and Rust C-ABI callback.
+    func start() -> Int32 {
+        return startCapture(
+            width: kDefaultCameraWidth,
+            height: kDefaultCameraHeight,
+            fps: kDefaultCameraFps,
+            callback: integrator_on_mac_camera_frame
+        )
     }
 
     /// Stops the AVFoundation camera capture session and flushes pending capture queue work.
@@ -283,6 +374,9 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
     ) {
         lock.lock()
         let active = running
+        let expectedWidth = targetWidth
+        let expectedHeight = targetHeight
+        let callback = frameCallback
         lock.unlock()
         if !active { return }
 
@@ -294,7 +388,7 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        guard width == Int(targetWidth), height == Int(targetHeight) else { return }
+        guard width == Int(expectedWidth), height == Int(expectedHeight) else { return }
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
 
         // Lock pixel buffer base address for reading
@@ -355,7 +449,7 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
         // Dispatch into Rust core via C FFI
         packedBuffer.withUnsafeBytes { rawBuf in
             guard let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            integrator_on_mac_camera_frame(ptr, UInt32(totalBytes), targetWidth, targetHeight, tsUs)
+            callback(ptr, UInt32(totalBytes), expectedWidth, expectedHeight, tsUs)
         }
     }
 }
@@ -374,6 +468,12 @@ public func integrator_mac_camera_permission_state() -> Int32 {
 @_cdecl("integrator_mac_camera_has_usage_desc")
 public func integrator_mac_camera_has_usage_desc() -> Int32 {
     return MacCameraCaptureController.shared.hasUsageDescription() ? 1 : 0
+}
+
+/// Returns 1 if at least one video capture device (built-in, external USB, or Continuity) is present, or 0 if none.
+@_cdecl("integrator_mac_camera_has_hardware")
+public func integrator_mac_camera_has_hardware() -> Int32 {
+    return MacCameraCaptureController.shared.hasCameraHardware() ? 1 : 0
 }
 
 /// Starts 720p30 NV12 AVFoundation camera capture. Returns 0 on success, negative error code on failure.

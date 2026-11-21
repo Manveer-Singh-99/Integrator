@@ -1,6 +1,11 @@
 ﻿# Sync-IntegratorRename.ps1
-# Automates the migration and synchronization of the Windows PC (HP OMEN) to Integrator.
+# Automates the migration and synchronization of the Windows PC to Integrator.
 # Run this script when reconnecting the PC.
+
+param(
+    [string]$NewRemote = "https://github.com/Manveer-Singh-99/Integrator.git",
+    [string]$LegacyDirName = "mac-windows-usbc-bridge"
+)
 
 $ErrorActionPreference = "Stop"
 Write-Host "====================================================" -ForegroundColor Cyan
@@ -19,7 +24,6 @@ Set-Location $CurrentDir.FullName
 $CurrentRemote = git remote get-url origin 2>$null
 Write-Host "[*] Current Git origin: $CurrentRemote" -ForegroundColor Gray
 
-$NewRemote = "https://github.com/Manveer-Singh-99/Integrator.git"
 if ($CurrentRemote -ne $NewRemote) {
     Write-Host "[+] Updating Git remote origin to $NewRemote..." -ForegroundColor Green
     git remote set-url origin $NewRemote
@@ -43,7 +47,7 @@ if ($CurrentDirName -ne "Integrator") {
         Rename-Item -Path $CurrentDir.FullName -NewName "Integrator"
         
         # Create directory junction for backwards compatibility
-        $JunctionPath = Join-Path -Path $ParentPath -ChildPath "mac-windows-usbc-bridge"
+        $JunctionPath = Join-Path -Path $ParentPath -ChildPath $LegacyDirName
         if (-not (Test-Path $JunctionPath)) {
             Write-Host "[+] Creating directory junction for backwards compatibility: $JunctionPath -> Integrator" -ForegroundColor Green
             cmd.exe /c "mklink /J `"$JunctionPath`" `"$TargetDir`""
@@ -52,9 +56,9 @@ if ($CurrentDirName -ne "Integrator") {
     }
 } else {
     Write-Host "[✓] Folder already named 'Integrator'." -ForegroundColor Green
-    $JunctionPath = Join-Path -Path $ParentPath -ChildPath "mac-windows-usbc-bridge"
+    $JunctionPath = Join-Path -Path $ParentPath -ChildPath $LegacyDirName
     if (-not (Test-Path $JunctionPath)) {
-        Write-Host "[+] Creating backwards compatibility junction: mac-windows-usbc-bridge -> Integrator" -ForegroundColor Green
+        Write-Host "[+] Creating backwards compatibility junction: $LegacyDirName -> Integrator" -ForegroundColor Green
         cmd.exe /c "mklink /J `"$JunctionPath`" `"$TargetDir`""
     }
 }

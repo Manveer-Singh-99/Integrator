@@ -72,7 +72,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore};
 
-use crate::config::{CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT};
+use crate::config::{
+    CLIPBOARD_PORT, CONTROL_PORT, DISCOVERY_PORT, MAX_DISPLAY_FPS, MAX_DISPLAY_HEIGHT,
+    MAX_DISPLAY_WIDTH, SUNSHINE_DEFAULT_PORT,
+};
 use crate::system_info::{self, LinkTransport};
 use crate::trust;
 
@@ -111,6 +114,13 @@ const MAX_RECENT_SEEN: usize = 64;
 
 /// Upper limit on concurrent background TCP RTT probe tasks.
 const MAX_CONCURRENT_RTT_PROBES: usize = 8;
+
+/// Sentinel RTT value (in milliseconds) assigned to candidates without a measured latency
+/// so unmeasured paths sort strictly behind measured routes during peer selection.
+const UNMEASURED_RTT_SENTINEL_MS: f64 = 9999.0;
+
+/// Maximum timeout duration for an asynchronous TCP three-way handshake RTT probe.
+const TCP_RTT_PROBE_TIMEOUT: Duration = Duration::from_millis(450);
 
 /// Global file lock ensuring serialized access to `peer_history.json`.
 static HISTORY_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -265,9 +275,12 @@ pub struct DiscoveryBeacon {
     pub sender_name: String,
     /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
-    /// Hardware product model name (e.g. `"MacBookPro18,1"` or `"Dell XPS 15 9520"`).
+    /// Hardware product model name (e.g. `"MacBookPro18,1"`, `"Mac14,12"`, or `"Dell XPS 15 9520"`).
     #[serde(default)]
     pub hardware_model: String,
+    /// Detected chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    #[serde(default)]
+    pub form_factor: String,
     /// TCP service port for control handshakes and SPAKE2+ key exchange.
     pub control_port: u16,
     /// TCP service port for clipboard synchronization streams.
@@ -320,6 +333,8 @@ pub struct PeerCandidate {
     pub device_name: String,
     /// Remote hardware model identifier.
     pub hardware_model: String,
+    /// Remote hardware chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    pub form_factor: String,
     /// Width of remote display in physical pixels.
     pub display_width: u32,
     /// Height of remote display in physical pixels.
@@ -739,18 +754,29 @@ impl DiscoveryManager {
 
                             let mut list = candidates.write().await;
                             let now = Instant::now();
-                            list.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
+
+                            let os_clean = sanitize_display_text(&beacon.os, 64);
+                            let hw_model_clean = sanitize_display_text(&beacon.hardware_model, 128);
+                            let raw_ff = sanitize_display_text(&beacon.form_factor, 32);
+                            let form_factor = system_info::infer_peer_form_factor(
+                                &os_clean,
+                                &hw_model_clean,
+                                (!raw_ff.is_empty()).then_some(raw_ff.as_str()),
+                            )
+                            .as_str()
+                            .to_string();
 
                             let candidate = PeerCandidate {
                                 addr: SocketAddr::new(addr.ip(), valid_control_port),
                                 last_seen: now,
-                                os: sanitize_display_text(&beacon.os, 64),
+                                os: os_clean,
                                 device_id: dev_id,
                                 device_name: sender_name_clean,
-                                hardware_model: sanitize_display_text(&beacon.hardware_model, 128),
-                                display_width: beacon.display_width.clamp(0, 7680),
-                                display_height: beacon.display_height.clamp(0, 4320),
-                                display_fps: beacon.display_fps.clamp(0, 240),
+                                hardware_model: hw_model_clean,
+                                form_factor,
+                                display_width: beacon.display_width.clamp(0, MAX_DISPLAY_WIDTH),
+                                display_height: beacon.display_height.clamp(0, MAX_DISPLAY_HEIGHT),
+                                display_fps: beacon.display_fps.clamp(0, MAX_DISPLAY_FPS),
                                 share_name: sanitized_share,
                                 sunshine_name: beacon
                                     .sunshine_name
@@ -759,7 +785,7 @@ impl DiscoveryManager {
                                 sunshine_port: if beacon.sunshine_port >= 1024 {
                                     beacon.sunshine_port
                                 } else {
-                                    47989
+                                    SUNSHINE_DEFAULT_PORT
                                 },
                                 gpus: sanitized_gpus,
                                 transport,
@@ -771,29 +797,7 @@ impl DiscoveryManager {
                                 trusted,
                             };
 
-                            // Update existing candidate or insert new one with capacity bounds
-                            if let Some(existing) =
-                                list.iter_mut().find(|c| c.addr.ip() == addr.ip())
-                            {
-                                *existing = candidate;
-                            } else {
-                                if list.len() >= MAX_PEER_CANDIDATES {
-                                    // Evict oldest untrusted candidate, or oldest candidate overall
-                                    if let Some(evict_idx) = list
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, c)| !c.trusted)
-                                        .min_by_key(|(_, c)| c.last_seen)
-                                        .or_else(|| {
-                                            list.iter().enumerate().min_by_key(|(_, c)| c.last_seen)
-                                        })
-                                        .map(|(i, _)| i)
-                                    {
-                                        list.swap_remove(evict_idx);
-                                    }
-                                }
-                                list.push(candidate);
-                            }
+                            upsert_peer_candidate(&mut list, candidate, now);
 
                             // Re-evaluate best candidate route
                             let best = select_best_peer(&list).map(|c| c.addr.ip().to_string());
@@ -823,11 +827,22 @@ impl DiscoveryManager {
         // --------------------------------------------------------------------
         let broadcaster_socket = Arc::clone(&socket);
         let manual_ips_ref = Arc::clone(&self.manual_ips);
+        let candidates_for_unicast = Arc::clone(&self.candidates);
         let fallback_name = self.local_name.clone();
 
         tokio::spawn(async move {
             loop {
                 let manual_snapshot = manual_ips_ref.read().await.clone();
+                let active_candidate_ips: Vec<String> = {
+                    let guard = candidates_for_unicast.read().await;
+                    let now = Instant::now();
+                    guard
+                        .iter()
+                        .filter(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL)
+                        .take(16)
+                        .map(|c| c.addr.ip().to_string())
+                        .collect()
+                };
                 let fallback_clone = fallback_name.clone();
 
                 // Offload profile collection, beacon signing, and interface broadcast to blocking pool
@@ -896,6 +911,7 @@ impl DiscoveryManager {
                         sender_name,
                         os,
                         hardware_model,
+                        form_factor: profile.form_factor.as_str().to_string(),
                         control_port: CONTROL_PORT,
                         clipboard_port: CLIPBOARD_PORT,
                         display_width: profile.primary_display.width,
@@ -915,8 +931,13 @@ impl DiscoveryManager {
                     let mut seen: HashSet<String> = HashSet::new();
                     let hist = load_peer_history();
 
-                    // Accumulate manual IP overrides and recent peer history for unicast delivery
-                    for ip in manual_snapshot.iter().chain(hist.recent_ips.iter()) {
+                    // Accumulate manual IP overrides, active verified candidate IPs (for bidirectional
+                    // discovery on broadcast-isolated APs), and recent peer history for unicast delivery
+                    for ip in manual_snapshot
+                        .iter()
+                        .chain(active_candidate_ips.iter())
+                        .chain(hist.recent_ips.iter())
+                    {
                         if seen.insert(ip.clone()) {
                             unicast_targets.push(ip.clone());
                         }
@@ -1025,12 +1046,52 @@ fn broadcast_beacon_on_interface(
     let _ = sock.send_to(bytes, SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
 }
 
+/// Inserts or refreshes a verified `PeerCandidate` in the active candidate table.
+///
+/// # Multi-Homed & DHCP Lease Failover Rules
+/// 1. Prunes candidates older than [`PEER_CANDIDATE_TTL`].
+/// 2. If the same `device_id` was previously seen on the **exact same local interface** (`local_ip_used`)
+///    at a different source IP (e.g. DHCP lease change on hotspot reconnect `172.20.10.15` -> `172.20.10.7`),
+///    immediately replaces the stale candidate on that interface while preserving simultaneous routes
+///    on other interfaces (e.g. USB-C `10.99.99.2` + Wi-Fi/Hotspot `172.20.10.2`).
+/// 3. Enforces [`MAX_PEER_CANDIDATES`] capacity bounds.
+fn upsert_peer_candidate(list: &mut Vec<PeerCandidate>, candidate: PeerCandidate, now: Instant) {
+    list.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
+
+    // Evict stale DHCP address for the same device on the same local interface
+    if !candidate.device_id.is_empty() && candidate.local_ip_used.is_some() {
+        list.retain(|c| {
+            !(c.device_id == candidate.device_id
+                && c.local_ip_used == candidate.local_ip_used
+                && c.addr.ip() != candidate.addr.ip())
+        });
+    }
+
+    if let Some(existing) = list.iter_mut().find(|c| c.addr.ip() == candidate.addr.ip()) {
+        *existing = candidate;
+    } else {
+        if list.len() >= MAX_PEER_CANDIDATES {
+            if let Some(evict_idx) = list
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.trusted)
+                .min_by_key(|(_, c)| c.last_seen)
+                .or_else(|| list.iter().enumerate().min_by_key(|(_, c)| c.last_seen))
+                .map(|(i, _)| i)
+            {
+                list.swap_remove(evict_idx);
+            }
+        }
+        list.push(candidate);
+    }
+}
+
 /// Evaluates a collection of active peer candidates and selects the single best candidate route.
 ///
 /// # Priority Hierarchy:
 /// 1. **Trust Status**: Trusted (cryptographically paired) peers strictly take precedence over untrusted peers.
 /// 2. **Subnet Alignment**: Direct matching interface subnet beats routed or alien alias IPs.
-/// 3. **Physical Transport Medium**: Thunderbolt 4 / USB4 (`DirectUsb` / `Thunderbolt`) > Wired Ethernet > Wi-Fi.
+/// 3. **Physical Transport Medium**: Thunderbolt 4 / USB4 (`Thunderbolt`) > USB-C NCM (`DirectUsb`) > Wired Ethernet > Wi-Fi LAN > Mobile Hotspot > Unknown.
 /// 4. **Measured Latency**: Lower measured round-trip time (RTT in ms).
 /// 5. **Recency**: Most recently observed beacon timestamp.
 fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
@@ -1043,11 +1104,11 @@ fn select_best_peer(candidates: &[PeerCandidate]) -> Option<PeerCandidate> {
                 // 2. Directly on a matching local interface subnet (beats routed alias IPs)
                 .then_with(|| b.same_subnet.cmp(&a.same_subnet))
                 // 3. Physical / wired / faster transport first
-                .then_with(|| a.transport.cmp(&b.transport))
+                .then_with(|| a.transport.route_priority().cmp(&b.transport.route_priority()))
                 // 4. Lower measured RTT if available
                 .then_with(|| {
-                    let ar = a.rtt_ms.unwrap_or(9999.0);
-                    let br = b.rtt_ms.unwrap_or(9999.0);
+                    let ar = a.rtt_ms.unwrap_or(UNMEASURED_RTT_SENTINEL_MS);
+                    let br = b.rtt_ms.unwrap_or(UNMEASURED_RTT_SENTINEL_MS);
                     ar.partial_cmp(&br).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 // 5. More recently seen
@@ -1063,7 +1124,7 @@ fn is_own_local_ip(ip: &str) -> bool {
         .any(|iface| iface.ip == ip)
 }
 
-/// Measures TCP connection round-trip latency to `ip:port` with a 450ms timeout.
+/// Measures TCP connection round-trip latency to `ip:port` with a bounded probe timeout.
 ///
 /// Drops the TCP stream immediately upon completing the 3-way handshake.
 async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
@@ -1073,7 +1134,7 @@ async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
     let target = SocketAddr::new(parsed, port);
     let start = Instant::now();
     if let Ok(Ok(stream)) =
-        tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(target)).await
+        tokio::time::timeout(TCP_RTT_PROBE_TIMEOUT, TcpStream::connect(target)).await
     {
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         drop(stream);
@@ -1206,12 +1267,13 @@ mod tests {
             device_id: "peer1".into(),
             device_name: "PC".into(),
             hardware_model: "Laptop".into(),
+            form_factor: "laptop".into(),
             display_width: 1920,
             display_height: 1200,
             display_fps: 165,
             share_name: None,
             sunshine_name: None,
-            sunshine_port: 47989,
+            sunshine_port: SUNSHINE_DEFAULT_PORT,
             gpus: vec![],
             transport,
             link_speed_mbps: None,
@@ -1232,5 +1294,80 @@ mod tests {
 
         let chosen_eth = select_best_peer(&[wifi, stale_alias, eth]).unwrap();
         assert_eq!(chosen_eth.addr.ip().to_string(), "169.254.20.5");
+    }
+
+    #[test]
+    fn multi_topology_route_election_and_dhcp_lease_failover() {
+        let now = Instant::now();
+        let make_with_lip = |ip: &str,
+                             lip: &str,
+                             transport: LinkTransport,
+                             same_subnet: bool,
+                             rtt: f64| PeerCandidate {
+            addr: SocketAddr::new(ip.parse().unwrap(), CONTROL_PORT),
+            last_seen: now,
+            os: "windows".into(),
+            device_id: "peer-uuid-1".into(),
+            device_name: "Studio-PC".into(),
+            hardware_model: "Desktop".into(),
+            form_factor: "desktop".into(),
+            display_width: 2560,
+            display_height: 1440,
+            display_fps: 144,
+            share_name: Some("Shared".into()),
+            sunshine_name: Some("Studio-PC".into()),
+            sunshine_port: SUNSHINE_DEFAULT_PORT,
+            gpus: vec![],
+            transport,
+            link_speed_mbps: None,
+            link_description: transport.label().into(),
+            local_ip_used: Some(lip.into()),
+            same_subnet,
+            rtt_ms: Some(rtt),
+            trusted: true,
+        };
+
+        // 1. Multi-homed peer reachable simultaneously over USB-C Direct (10.99.99.1) and iPhone /28 Hotspot (172.20.10.15)
+        let mut table = Vec::new();
+        let hotspot_old = make_with_lip(
+            "172.20.10.15",
+            "172.20.10.2",
+            LinkTransport::Hotspot,
+            true,
+            4.5,
+        );
+        let usbc = make_with_lip(
+            "10.99.99.1",
+            "10.99.99.2",
+            LinkTransport::DirectUsb,
+            true,
+            0.4,
+        );
+        upsert_peer_candidate(&mut table, hotspot_old, now);
+        upsert_peer_candidate(&mut table, usbc, now);
+        assert_eq!(table.len(), 2, "both simultaneous links across distinct local interfaces must be kept");
+
+        // Direct USB-C cable strictly beats Mobile Hotspot
+        let best = select_best_peer(&table).unwrap();
+        assert_eq!(best.addr.ip().to_string(), "10.99.99.1");
+        assert_eq!(best.transport, LinkTransport::DirectUsb);
+
+        // 2. USB-C cable is unplugged (removed/expired) and peer reconnects to iPhone Hotspot with new DHCP lease 172.20.10.7
+        table.retain(|c| c.transport != LinkTransport::DirectUsb);
+        let hotspot_new = make_with_lip(
+            "172.20.10.7",
+            "172.20.10.2",
+            LinkTransport::Hotspot,
+            true,
+            3.8,
+        );
+        upsert_peer_candidate(&mut table, hotspot_new, now);
+
+        // Stale DHCP lease 172.20.10.15 on the same local interface (172.20.10.2) is replaced immediately
+        assert_eq!(table.len(), 1);
+        let failed_over = select_best_peer(&table).unwrap();
+        assert_eq!(failed_over.addr.ip().to_string(), "172.20.10.7");
+        assert_eq!(failed_over.transport, LinkTransport::Hotspot);
+        assert!(!failed_over.transport.is_direct_cable());
     }
 }

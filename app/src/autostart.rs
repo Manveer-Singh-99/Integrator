@@ -62,12 +62,36 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Canonical LaunchAgent bundle identifier for macOS launchd registration.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MAC_LAUNCH_LABEL: &str = "com.manveersingh.integrator";
+
+/// Standard system Applications directory on macOS.
+#[cfg(target_os = "macos")]
+const MAC_SYSTEM_APPLICATIONS_DIR: &str = "/Applications";
+
+/// Relative per-user Applications subdirectory under `$HOME` on macOS.
+#[cfg(target_os = "macos")]
+const MAC_USER_APPLICATIONS_SUBDIR: &str = "Applications";
+
+/// Canonical macOS `.app` bundle directory name for Integrator.
+#[cfg(target_os = "macos")]
+const MAC_APP_BUNDLE_NAME: &str = "Integrator.app";
+
+/// Relative executable directory inside a standard macOS `.app` bundle.
+#[cfg(target_os = "macos")]
+const MAC_APP_BUNDLE_MACOS_SUBDIR: &str = "Contents/MacOS";
+
+/// Ordered candidate executable names inside `Integrator.app/Contents/MacOS/`.
+#[cfg(target_os = "macos")]
+const MAC_APP_EXECUTABLE_NAMES: [&str; 2] = ["Integrator", "integrator"];
 
 /// Task Scheduler task name for elevated startup on Windows.
 #[cfg(target_os = "windows")]
 const WIN_TASK_NAME: &str = "IntegratorAutostart";
+
+/// Windows Task Scheduler `<Priority>` level (7 = below normal default for background services).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WIN_TASK_SCHEDULER_PRIORITY: u8 = 7;
 
 /// Legacy registry run key path used in older versions, cleaned up upon activation.
 #[cfg(target_os = "windows")]
@@ -187,7 +211,7 @@ pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.manveersingh.integrator</string>
+    <string>{MAC_LAUNCH_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{escaped}</string>
@@ -259,7 +283,7 @@ pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> 
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>{WIN_TASK_SCHEDULER_PRIORITY}</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -311,27 +335,30 @@ fn mac_plist_path() -> Result<PathBuf> {
 /// and user `~/Applications/Integrator.app` locations.
 #[cfg(target_os = "macos")]
 fn resolve_mac_app_executable() -> Result<PathBuf> {
+    let bundle_marker = format!(".app/{MAC_APP_BUNDLE_MACOS_SUBDIR}/");
     // Check if the current running executable is already inside an .app bundle
     if let Ok(exe) = std::env::current_exe() {
         let canonical = exe.canonicalize().unwrap_or(exe);
         let s = canonical.to_string_lossy();
-        if s.contains(".app/Contents/MacOS/") && canonical.is_file() {
+        if s.contains(&bundle_marker) && canonical.is_file() {
             return Ok(canonical);
         }
     }
 
-    // Inspect known installation paths
-    let mut candidates = vec![
-        PathBuf::from("/Applications/Integrator.app/Contents/MacOS/Integrator"),
-        PathBuf::from("/Applications/Integrator.app/Contents/MacOS/integrator"),
-    ];
+    // Inspect standard system and per-user .app bundle locations
+    let mut app_roots = vec![PathBuf::from(MAC_SYSTEM_APPLICATIONS_DIR)];
     if let Some(home) = home_dir() {
-        candidates.push(home.join("Applications/Integrator.app/Contents/MacOS/Integrator"));
-        candidates.push(home.join("Applications/Integrator.app/Contents/MacOS/integrator"));
+        app_roots.push(home.join(MAC_USER_APPLICATIONS_SUBDIR));
     }
-    for cand in candidates {
-        if cand.is_file() {
-            return Ok(cand);
+    for root in app_roots {
+        let macos_dir = root
+            .join(MAC_APP_BUNDLE_NAME)
+            .join(MAC_APP_BUNDLE_MACOS_SUBDIR);
+        for exe_name in MAC_APP_EXECUTABLE_NAMES {
+            let cand = macos_dir.join(exe_name);
+            if cand.is_file() {
+                return Ok(cand);
+            }
         }
     }
 
@@ -346,7 +373,7 @@ fn resolve_mac_app_executable() -> Result<PathBuf> {
 /// Retrieves the current POSIX numeric user ID by executing `/usr/bin/id -u`.
 #[cfg(target_os = "macos")]
 fn current_uid() -> Result<String> {
-    let out = Command::new("/usr/bin/id")
+    let out = Command::new(crate::config::MACOS_ID_BIN)
         .arg("-u")
         .output()
         .context("Failed to execute /usr/bin/id")?;
@@ -364,7 +391,7 @@ fn current_uid() -> Result<String> {
 #[cfg(target_os = "macos")]
 fn launchctl_bootout(uid: &str) {
     let service_target = format!("gui/{uid}/{MAC_LAUNCH_LABEL}");
-    let _ = Command::new("/bin/launchctl")
+    let _ = Command::new(crate::config::MACOS_LAUNCHCTL_BIN)
         .args(["bootout", &service_target])
         .output();
 }
@@ -395,7 +422,7 @@ fn set_enabled_macos(enabled: bool) -> Result<()> {
         let plist_str = plist_path
             .to_str()
             .context("LaunchAgent plist path is not valid UTF-8")?;
-        let out = Command::new("/bin/launchctl")
+        let out = Command::new(crate::config::MACOS_LAUNCHCTL_BIN)
             .args(["bootstrap", &domain, plist_str])
             .output()
             .context("Failed to invoke /bin/launchctl bootstrap")?;

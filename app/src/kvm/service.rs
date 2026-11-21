@@ -140,7 +140,11 @@ use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
 use crate::clipboard::ClipboardService;
-use crate::config::INPUT_PORT;
+use crate::config::{
+    CLIPBOARD_CACHE_DIR_NAME, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH,
+    DEFAULT_MACOS_DISPLAY_HEIGHT, DEFAULT_MACOS_DISPLAY_WIDTH, INPUT_PORT, MIN_KVM_DISPLAY_HEIGHT,
+    MIN_KVM_DISPLAY_WIDTH,
+};
 use crate::discovery::DiscoveryManager;
 use crate::features::FeatureManager;
 use crate::security::transport::{ServiceId, TransportReaderV2, TransportWriterV2, TRANSPORT_WIRE_MAGIC};
@@ -170,6 +174,51 @@ const RESERVED_CONTROL_SLOTS: usize = 128;
 
 /// Maximum simultaneous in-flight TCP accept handshakes permitted.
 const MAX_ACCEPT_HANDSHAKES: usize = 16;
+
+/// Timeout for reading the initial 4-byte `ITR2` magic prefix on accepted KVM TCP sockets (5 seconds).
+const WIRE_MAGIC_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for completing an incoming `TransportV2` KVM authentication handshake (10 seconds).
+const KVM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Backoff delay after a KVM TCP listener `accept()` failure before retrying (250 ms).
+const TCP_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Brief grace sleep allowing outbound `ReleaseAll` messages to flush before tearing down a session (25 ms).
+const TEARDOWN_SLEEP: Duration = Duration::from_millis(25);
+
+/// Polling interval while the `"input_kvm"` feature gate is disabled (400 ms).
+const DISABLED_FEATURE_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Number of unconnected connector ticks before the non-preferred peer initiates fallback dial (3 ticks).
+const UNCONNECTED_CONNECT_TICKS: u32 = 3;
+
+/// Outbound TCP + `TransportV2` connection timeout when dialing the peer KVM port (3 seconds).
+const KVM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Main connector and display-geometry refresh polling interval (1 second).
+const KVM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Inward cursor entry inset in pixels when remote control enters the local display (`24.0` px).
+const REMOTE_ENTRY_INSET_PX: f32 = 24.0;
+
+/// Inward cursor restoration inset in pixels when control returns across the peer edge (`16.0` px).
+const RETURN_ENTRY_INSET_PX: f32 = 16.0;
+
+/// Cooldown window after an edge crossing to prevent ping-pong boundary bounce (`180` ms).
+const EDGE_TRANSITION_COOLDOWN: Duration = Duration::from_millis(180);
+
+/// Edge proximity threshold in pixels for top/left display boundaries (`1.5` px).
+const EDGE_PROXIMITY_INSET_PX: f32 = 1.5;
+
+/// Edge proximity threshold in pixels for bottom/right display boundaries (`2.0` px).
+const EDGE_PROXIMITY_OUTSET_PX: f32 = 2.0;
+
+/// Minimum edge dwell delay in milliseconds enforced while dragging files across screens (`25` ms).
+const MIN_DRAG_HOP_DELAY_MS: u32 = 25;
+
+/// Maximum validity duration of an active edge dwell timer before resetting (`2` seconds).
+const MAX_EDGE_DWELL_VALIDITY: Duration = Duration::from_secs(2);
 
 /// Directive returned by OS hook ingestion routines instructing the OS driver how to handle the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,14 +355,14 @@ impl KvmService {
             local_rect: RwLock::new(ScreenRect {
                 x: 0.0,
                 y: 0.0,
-                width: 1440.0,
-                height: 900.0,
+                width: DEFAULT_MACOS_DISPLAY_WIDTH as f32,
+                height: DEFAULT_MACOS_DISPLAY_HEIGHT as f32,
             }),
             peer_rect: RwLock::new(ScreenRect {
                 x: 0.0,
                 y: 0.0,
-                width: 1920.0,
-                height: 1080.0,
+                width: DEFAULT_DISPLAY_WIDTH as f32,
+                height: DEFAULT_DISPLAY_HEIGHT as f32,
             }),
             connected_peer_ip: RwLock::new(None),
             peer_os: RwLock::new(None),
@@ -454,7 +503,7 @@ impl KvmService {
                             use tokio::io::AsyncReadExt;
                             let mut sock = socket;
                             let read_res = tokio::time::timeout(
-                                Duration::from_secs(5),
+                                WIRE_MAGIC_READ_TIMEOUT,
                                 sock.read_exact(&mut magic),
                             )
                             .await;
@@ -471,7 +520,7 @@ impl KvmService {
                                 return;
                             }
                             let auth_res = tokio::time::timeout(
-                                Duration::from_secs(10),
+                                KVM_HANDSHAKE_TIMEOUT,
                                 trust::accept_transport_from_stream(
                                     sock,
                                     peer_ip,
@@ -499,7 +548,7 @@ impl KvmService {
                             break;
                         }
                         warn!("KVM TCP accept error: {}", e);
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        tokio::time::sleep(TCP_ACCEPT_RETRY_DELAY).await;
                     }
                 }
             }
@@ -536,22 +585,62 @@ impl KvmService {
                     ) {
                         svc_loop.force_release_all(true);
                         if has_active_session {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            tokio::time::sleep(TEARDOWN_SLEEP).await;
                         }
                     }
                     if has_active_session {
                         svc_loop.teardown_active_session();
                     }
                     unconnected_ticks = 0;
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    tokio::time::sleep(DISABLED_FEATURE_POLL_INTERVAL).await;
                     continue;
                 }
 
-                let already_connected = svc_loop
+                let current_conn_ip = svc_loop
                     .connected_peer_ip
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
+                    .clone();
+
+                // Topology failover & upgrade when idle: if the active route IP expired (e.g. USB-C cable
+                // unplugged or DHCP lease changed on a hotspot) OR a higher-priority physical cable
+                // (Thunderbolt / USB-C Direct) became available while connected over Wi-Fi / Hotspot,
+                // cleanly tear down the idle session so the next tick connects over the best route.
+                let mut already_connected = current_conn_ip.is_some();
+                if let Some(ref cur_ip) = current_conn_ip {
+                    let is_idle = matches!(
+                        *svc_loop.role.lock().unwrap_or_else(|e| e.into_inner()),
+                        KvmRole::Idle
+                    );
+                    if is_idle {
+                        if let Some(best) = svc_loop.discovery.get_best_peer().await {
+                            let best_ip = best.addr.ip().to_string();
+                            if best.trusted && best_ip != *cur_ip {
+                                let all_peers = svc_loop.discovery.get_all_peers().await;
+                                let cur_peer = all_peers
+                                    .iter()
+                                    .find(|p| p.addr.ip().to_string() == *cur_ip);
+                                let should_switch = match cur_peer {
+                                    None => true,
+                                    Some(cp) => {
+                                        best.transport.route_priority()
+                                            < cp.transport.route_priority()
+                                    }
+                                };
+                                if should_switch {
+                                    info!(
+                                        "🔄 KVM switching topology route from {} to {} ({})",
+                                        cur_ip,
+                                        best_ip,
+                                        best.transport.label()
+                                    );
+                                    svc_loop.teardown_active_session();
+                                    already_connected = false;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if !already_connected {
                     if let Some(peer) = svc_loop.discovery.get_best_peer().await {
@@ -559,7 +648,9 @@ impl KvmService {
                             let peer_ip = peer.addr.ip().to_string();
                             {
                                 let mut w = svc_loop.peer_rect.write().unwrap_or_else(|e| e.into_inner());
-                                if peer.display_width >= 320 && peer.display_height >= 200 {
+                                if peer.display_width >= MIN_KVM_DISPLAY_WIDTH as u32
+                                    && peer.display_height >= MIN_KVM_DISPLAY_HEIGHT as u32
+                                {
                                     *w = ScreenRect {
                                         x: 0.0,
                                         y: 0.0,
@@ -575,7 +666,7 @@ impl KvmService {
 
                             let i_am_preferred_client = local_id < peer.device_id;
                             unconnected_ticks += 1;
-                            if (i_am_preferred_client || unconnected_ticks >= 3)
+                            if (i_am_preferred_client || unconnected_ticks >= UNCONNECTED_CONNECT_TICKS)
                                 && svc_loop
                                     .connect_in_flight
                                     .compare_exchange(
@@ -600,7 +691,7 @@ impl KvmService {
                                         &peer_ip,
                                         INPUT_PORT,
                                         ServiceId::InputKvm,
-                                        Duration::from_secs(3),
+                                        KVM_CONNECT_TIMEOUT,
                                     )
                                     .await
                                     {
@@ -625,7 +716,7 @@ impl KvmService {
                     unconnected_ticks = 0;
                 }
 
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(KVM_POLL_INTERVAL).await;
             }
         });
         self.active_tasks
@@ -645,8 +736,8 @@ impl KvmService {
         let rect = ScreenRect {
             x: 0.0,
             y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
+            width: DEFAULT_DISPLAY_WIDTH as f32,
+            height: DEFAULT_DISPLAY_HEIGHT as f32,
         };
         *self.local_rect.write().unwrap_or_else(|e| e.into_inner()) = rect;
     }
@@ -822,7 +913,9 @@ impl KvmService {
             let diff_os = !peer.os.eq_ignore_ascii_case(std::env::consts::OS);
             self.peer_diff_os.store(diff_os, Ordering::Relaxed);
             *self.peer_os.write().unwrap_or_else(|e| e.into_inner()) = Some(peer.os);
-            if peer.display_width >= 320 && peer.display_height >= 200 {
+            if peer.display_width >= MIN_KVM_DISPLAY_WIDTH as u32
+                && peer.display_height >= MIN_KVM_DISPLAY_HEIGHT as u32
+            {
                 *self.peer_rect.write().unwrap_or_else(|e| e.into_inner()) = ScreenRect {
                     x: 0.0,
                     y: 0.0,
@@ -1027,7 +1120,9 @@ impl KvmService {
 
         match msg {
             KvmWireMessage::ScreenGeometry { width, height } => {
-                if width >= 320 && height >= 200 {
+                if width >= MIN_KVM_DISPLAY_WIDTH as u32
+                    && height >= MIN_KVM_DISPLAY_HEIGHT as u32
+                {
                     *self.peer_rect.write().unwrap_or_else(|e| e.into_inner()) = ScreenRect {
                         x: 0.0,
                         y: 0.0,
@@ -1076,7 +1171,7 @@ impl KvmService {
                 self.cleanup_all_drag_stage_dirs();
 
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
-                let (ex, ey) = resolve_entry_point(local_rect, entry_edge, norm_pos, 24.0);
+                let (ex, ey) = resolve_entry_point(local_rect, entry_edge, norm_pos, REMOTE_ENTRY_INSET_PX);
 
                 let allow_drag = drag_offer.is_some() && self.features.is_enabled("dragdrop");
                 let offer_opt = if allow_drag { drag_offer } else { None };
@@ -1219,7 +1314,7 @@ impl KvmService {
                 }
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
                 let layout_cfg = self.get_layout();
-                let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, 16.0);
+                let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, RETURN_ENTRY_INSET_PX);
 
                 let old_drag_sid = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
@@ -1291,7 +1386,7 @@ impl KvmService {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .elapsed()
-                        >= Duration::from_millis(180);
+                        >= EDGE_TRANSITION_COOLDOWN;
 
                     if crossed && active_drag_session.is_none() && cooldown_elapsed {
                         let dead = cfg.dead_corners
@@ -1697,7 +1792,7 @@ impl KvmService {
                 .last_edge_transition
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if last.elapsed() < Duration::from_millis(180) {
+            if last.elapsed() < EDGE_TRANSITION_COOLDOWN {
                 return HookDecision::PassThrough;
             }
         }
@@ -1706,10 +1801,10 @@ impl KvmService {
         let rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
 
         let at_edge = match layout_cfg.peer_edge {
-            ScreenEdge::Left => x <= rect.x + 1.5,
-            ScreenEdge::Right => x >= rect.max_x() - 2.0,
-            ScreenEdge::Top => y <= rect.y + 1.5,
-            ScreenEdge::Bottom => y >= rect.max_y() - 2.0,
+            ScreenEdge::Left => x <= rect.x + EDGE_PROXIMITY_INSET_PX,
+            ScreenEdge::Right => x >= rect.max_x() - EDGE_PROXIMITY_OUTSET_PX,
+            ScreenEdge::Top => y <= rect.y + EDGE_PROXIMITY_INSET_PX,
+            ScreenEdge::Bottom => y >= rect.max_y() - EDGE_PROXIMITY_OUTSET_PX,
         };
 
         if !at_edge {
@@ -1723,7 +1818,7 @@ impl KvmService {
         }
 
         let effective_delay_ms = if left_button_held && self.features.is_enabled("dragdrop") {
-            layout_cfg.hop_delay_ms.max(25)
+            layout_cfg.hop_delay_ms.max(MIN_DRAG_HOP_DELAY_MS)
         } else {
             layout_cfg.hop_delay_ms
         };
@@ -1733,7 +1828,7 @@ impl KvmService {
             match *dwell {
                 Some((e, started))
                     if e == layout_cfg.peer_edge
-                        && now.duration_since(started) <= Duration::from_secs(2) =>
+                        && now.duration_since(started) <= MAX_EDGE_DWELL_VALIDITY =>
                 {
                     if now.duration_since(started)
                         < Duration::from_millis(effective_delay_ms as u64)
@@ -2017,7 +2112,7 @@ impl KvmService {
         let home = crate::system_info::user_home_dir();
         let dest_dir = match drop_pref {
             "desktop" => home.join("Desktop"),
-            "cache" => crate::system_info::app_data_dir().join("clipboard_cache"),
+            "cache" => crate::system_info::app_data_dir().join(CLIPBOARD_CACHE_DIR_NAME),
             _ => home.join("Downloads"),
         };
         Self::commit_staged_to_dest_dir(top_paths, &dest_dir)?;

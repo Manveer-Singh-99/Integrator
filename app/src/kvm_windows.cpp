@@ -95,6 +95,39 @@
 
 static const ULONG_PTR kIntegratorEventTag = 0x494E5447ULL; // "INTG"
 
+/// Default fallback X coordinate in virtual-desktop pixels used when parking the hidden cursor.
+static constexpr int32_t kDefaultParkX = 400;
+
+/// Default fallback Y coordinate in virtual-desktop pixels used when parking the hidden cursor.
+static constexpr int32_t kDefaultParkY = 300;
+
+/// Corner exclusion margin in pixels keeping the invisible edge probe clear of screen corners.
+static constexpr int kCornerGuardMarginPx = 36;
+
+/// Thickness in pixels of the invisible topmost screen-edge OLE drag probe window.
+static constexpr int kEdgeWindowWidthPx = 4;
+
+/// Standard Win32 `WHEEL_DELTA` units per physical mouse wheel notch.
+static constexpr double kWheelDeltaDivisor = 120.0;
+
+/// Normalized scroll lines emitted per Win32 mouse wheel detent.
+static constexpr double kWheelLinesPerNotch = 3.0;
+
+/// Scaling factor converting normalized KVM scroll units into Win32 `SendInput` wheel delta units.
+static constexpr double kInjectScrollScale = 40.0;
+
+/// Maximum absolute Win32 scroll delta permitted per injected scroll event.
+static constexpr double kMaxScrollDelta = 60000.0;
+
+/// Maximum normalized coordinate value expected by `SendInput` with `MOUSEEVENTF_ABSOLUTE`.
+static constexpr double kWin32AbsoluteCoordMax = 65535.0;
+
+/// Timeout in milliseconds waiting for hook and OLE STA worker threads to complete startup.
+static constexpr DWORD kThreadStartTimeoutMs = 2000;
+
+/// Timeout in milliseconds waiting for hook and OLE STA worker threads to exit on teardown.
+static constexpr DWORD kThreadShutdownTimeoutMs = 1500;
+
 typedef int32_t (*KvmWinEventCallback)(
     int32_t kind,
     double a,
@@ -143,8 +176,8 @@ static uint32_t swallowed_mod_bit_for_vk(DWORD vk) {
     }
 }
 
-static std::atomic<int32_t> g_park_x{400};
-static std::atomic<int32_t> g_park_y{300};
+static std::atomic<int32_t> g_park_x{kDefaultParkX};
+static std::atomic<int32_t> g_park_y{kDefaultParkY};
 static std::atomic<bool> g_park_pending{false};
 static std::atomic<int32_t> g_edge_mode{0}; // 0=Left, 1=Right, 2=Top, 3=Bottom
 
@@ -285,33 +318,33 @@ static void position_edge_window(HWND hwnd) {
         vw = GetSystemMetrics(SM_CXSCREEN);
         vh = GetSystemMetrics(SM_CYSCREEN);
     }
-    int guard = 36;
+    int guard = kCornerGuardMarginPx;
     int edge = g_edge_mode.load();
-    int x = vx, y = vy, w = 4, h = vh;
+    int x = vx, y = vy, w = kEdgeWindowWidthPx, h = vh;
     switch (edge) {
     case 0: // Left
         x = vx;
         y = vy + guard;
-        w = 4;
+        w = kEdgeWindowWidthPx;
         h = (vh > guard * 2) ? (vh - guard * 2) : vh;
         break;
     case 1: // Right
-        x = vx + vw - 4;
+        x = vx + vw - kEdgeWindowWidthPx;
         y = vy + guard;
-        w = 4;
+        w = kEdgeWindowWidthPx;
         h = (vh > guard * 2) ? (vh - guard * 2) : vh;
         break;
     case 2: // Top
         x = vx + guard;
         y = vy;
         w = (vw > guard * 2) ? (vw - guard * 2) : vw;
-        h = 4;
+        h = kEdgeWindowWidthPx;
         break;
     case 3: // Bottom
         x = vx + guard;
-        y = vy + vh - 4;
+        y = vy + vh - kEdgeWindowWidthPx;
         w = (vw > guard * 2) ? (vw - guard * 2) : vw;
-        h = 4;
+        h = kEdgeWindowWidthPx;
         break;
     default:
         break;
@@ -546,13 +579,13 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
                 break;
             case WM_MOUSEWHEEL: {
                 SHORT delta = static_cast<SHORT>(HIWORD(ms->mouseData));
-                double dy = static_cast<double>(delta) / 120.0 * 3.0;
+                double dy = static_cast<double>(delta) / kWheelDeltaDivisor * kWheelLinesPerNotch;
                 decision = cb(3, 0.0, dy, 0.0, 0.0, read_current_modifiers());
                 break;
             }
             case WM_MOUSEHWHEEL: {
                 SHORT delta = static_cast<SHORT>(HIWORD(ms->mouseData));
-                double dx = static_cast<double>(delta) / 120.0 * 3.0;
+                double dx = static_cast<double>(delta) / kWheelDeltaDivisor * kWheelLinesPerNotch;
                 decision = cb(3, dx, 0.0, 0.0, 0.0, read_current_modifiers());
                 break;
             }
@@ -884,7 +917,7 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     HWND edge_hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         ewc.lpszClassName, L"", WS_POPUP,
-        0, 0, 4, 100, nullptr, nullptr, hinst, nullptr
+        0, 0, kEdgeWindowWidthPx, 100, nullptr, nullptr, hinst, nullptr
     );
     EdgeDropTarget* drop_target = nullptr;
     if (edge_hw) {
@@ -1014,7 +1047,7 @@ bool integrator_kvm_win_start_hooks(
         if (th) {
             g_hook_thread_id.store(tid);
             g_hook_thread = th;
-            if (hs->ev) WaitForSingleObject(hs->ev, 2000);
+            if (hs->ev) WaitForSingleObject(hs->ev, kThreadStartTimeoutMs);
             hs->release();
         } else {
             hs->release();
@@ -1029,7 +1062,7 @@ bool integrator_kvm_win_start_hooks(
         if (th2) {
             g_ole_thread_id.store(tid2);
             g_ole_thread = th2;
-            if (hs2->ev) WaitForSingleObject(hs2->ev, 2000);
+            if (hs2->ev) WaitForSingleObject(hs2->ev, kThreadStartTimeoutMs);
             hs2->release();
         } else {
             hs2->release();
@@ -1052,7 +1085,7 @@ void integrator_kvm_win_stop_hooks() {
         PostThreadMessageW(htid, WM_QUIT, 0, 0);
     }
     if (g_hook_thread) {
-        WaitForSingleObject(g_hook_thread, 1500);
+        WaitForSingleObject(g_hook_thread, kThreadShutdownTimeoutMs);
         CloseHandle(g_hook_thread);
         g_hook_thread = nullptr;
     }
@@ -1062,7 +1095,7 @@ void integrator_kvm_win_stop_hooks() {
         PostThreadMessageW(otid, WM_QUIT, 0, 0);
     }
     if (g_ole_thread) {
-        WaitForSingleObject(g_ole_thread, 1500);
+        WaitForSingleObject(g_ole_thread, kThreadShutdownTimeoutMs);
         CloseHandle(g_ole_thread);
         g_ole_thread = nullptr;
     }
@@ -1197,8 +1230,8 @@ void integrator_kvm_win_inject_mouse_move(int32_t abs_x, int32_t abs_y) {
 
     int32_t cx = std::max(vx, std::min(vx + vw - 1, abs_x));
     int32_t cy = std::max(vy, std::min(vy + vh - 1, abs_y));
-    LONG norm_x = static_cast<LONG>(((static_cast<double>(cx - vx) * 65535.0) / static_cast<double>(vw - 1)));
-    LONG norm_y = static_cast<LONG>(((static_cast<double>(cy - vy) * 65535.0) / static_cast<double>(vh - 1)));
+    LONG norm_x = static_cast<LONG>(((static_cast<double>(cx - vx) * kWin32AbsoluteCoordMax) / static_cast<double>(vw - 1)));
+    LONG norm_y = static_cast<LONG>(((static_cast<double>(cy - vy) * kWin32AbsoluteCoordMax) / static_cast<double>(vh - 1)));
 
     INPUT inp = {};
     inp.type = INPUT_MOUSE;
@@ -1241,7 +1274,7 @@ void integrator_kvm_win_inject_mouse_button(int32_t button, bool pressed) {
 
 void integrator_kvm_win_inject_scroll(double dx, double dy) {
     if (std::isfinite(dy) && dy != 0.0) {
-        double scaled = std::max(-60000.0, std::min(60000.0, dy * 40.0));
+        double scaled = std::max(-kMaxScrollDelta, std::min(kMaxScrollDelta, dy * kInjectScrollScale));
         int32_t delta = static_cast<int32_t>(std::lround(scaled));
         if (delta != 0) {
             INPUT inp = {};
@@ -1253,7 +1286,7 @@ void integrator_kvm_win_inject_scroll(double dx, double dy) {
         }
     }
     if (std::isfinite(dx) && dx != 0.0) {
-        double scaled = std::max(-60000.0, std::min(60000.0, dx * 40.0));
+        double scaled = std::max(-kMaxScrollDelta, std::min(kMaxScrollDelta, dx * kInjectScrollScale));
         int32_t delta = static_cast<int32_t>(std::lround(scaled));
         if (delta != 0) {
             INPUT inp = {};

@@ -178,6 +178,24 @@ pub const AUDIO_FLAG_PCM_FRAME: u16 = 0x0001;
 /// Datagram header flag indicating an authenticated zero-payload keepalive packet (0x0002).
 pub const AUDIO_FLAG_KEEPALIVE: u16 = 0x0002;
 
+/// Width in packets of the RFC 6479 bitmask anti-replay sliding window (64 packets).
+pub const REPLAY_WINDOW_SIZE: u64 = 64;
+
+/// Minimum permitted PCM audio sample rate in Hz during UDP session negotiation (8 kHz).
+pub const MIN_AUDIO_SAMPLE_RATE: u32 = 8_000;
+
+/// Maximum permitted PCM audio sample rate in Hz during UDP session negotiation (192 kHz).
+pub const MAX_AUDIO_SAMPLE_RATE: u32 = 192_000;
+
+/// Minimum permitted PCM audio channel count during UDP session negotiation (mono).
+pub const MIN_AUDIO_CHANNELS: u8 = 1;
+
+/// Maximum permitted PCM audio channel count during UDP session negotiation (7.1 surround).
+pub const MAX_AUDIO_CHANNELS: u8 = 8;
+
+/// Supported PCM bit depths per sample during UDP audio session negotiation (16, 24, or 32 bits).
+pub const SUPPORTED_AUDIO_BIT_DEPTHS: [u8; 3] = [16, 24, 32];
+
 /// Error enumeration representing failures during UDP audio datagram parsing, verification, or session management.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioUdpError {
@@ -355,7 +373,7 @@ impl ReplayWindow64 {
             return Ok(());
         }
         let offset = self.highest_seq - pkt_seq;
-        if offset >= 64 {
+        if offset >= REPLAY_WINDOW_SIZE {
             return Err(AudioUdpError::PacketTooOld {
                 pkt_seq,
                 highest_seq: self.highest_seq,
@@ -378,7 +396,7 @@ impl ReplayWindow64 {
         }
         if pkt_seq > self.highest_seq {
             let shift = pkt_seq - self.highest_seq;
-            if shift >= 64 {
+            if shift >= REPLAY_WINDOW_SIZE {
                 self.bitmap = 1;
             } else {
                 self.bitmap = (self.bitmap << shift) | 1;
@@ -386,7 +404,7 @@ impl ReplayWindow64 {
             self.highest_seq = pkt_seq;
         } else {
             let offset = self.highest_seq - pkt_seq;
-            if offset < 64 {
+            if offset < REPLAY_WINDOW_SIZE {
                 self.bitmap |= 1u64 << offset;
             }
         }
@@ -703,15 +721,15 @@ impl AudioSessionRegistry {
                 "sender_nonce must be non-zero",
             ));
         }
-        if !(8_000..=192_000).contains(&sample_rate) {
+        if !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&sample_rate) {
             return Err(AudioUdpError::InvalidHandshakeParam(
                 "sample_rate must be 8000..=192000",
             ));
         }
-        if !(1..=8).contains(&channels) {
+        if !(MIN_AUDIO_CHANNELS..=MAX_AUDIO_CHANNELS).contains(&channels) {
             return Err(AudioUdpError::InvalidHandshakeParam("channels must be 1..=8"));
         }
-        if !matches!(bit_depth, 16 | 24 | 32) {
+        if !SUPPORTED_AUDIO_BIT_DEPTHS.contains(&bit_depth) {
             return Err(AudioUdpError::InvalidHandshakeParam(
                 "bit_depth must be 16, 24, or 32",
             ));

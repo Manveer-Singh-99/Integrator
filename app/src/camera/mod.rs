@@ -19,7 +19,7 @@
 //!   forwards raw NV12 frames via C-ABI FFI (`camera_windows.cpp`) into an ACL-hardened double-buffered
 //!   shared memory region (`Global\IntegratorVCamShm_v1`). This memory feeds `integrator_vcam.dll`, a
 //!   standalone Media Foundation FrameServer COM component (`CLSID_IntegratorVCamActivate`) registered
-//!   under the friendly name **"Integrator MacBook Camera"**.
+//!   under the friendly name **"Integrator Mac Camera"**.
 //!
 //! ## 2. Architectural Linkages & Cross-Platform Flow
 //!
@@ -59,7 +59,7 @@
 //! │         ▼ (IMF2DBuffer2 / Lock2DSize row-copy)                         │
 //! │  Windows 11 Media Foundation FrameServer (`integrator_vcam.dll`)       │
 //! │  CLSID: {8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}                        │
-//! │  Friendly Name: "Integrator MacBook Camera"                            │
+//! │  Friendly Name: "Integrator Mac Camera"                                │
 //! │         │                                                              │
 //! │         ▼                                                              │
 //! │  Target Consumer Apps (Microsoft Teams, Zoom, OBS, Windows Camera)    │
@@ -120,20 +120,23 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 use tracing::{error, info};
 
-use crate::config::CAMERA_PORT;
+use crate::config::{
+    CAMERA_PORT, DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_FRIENDLY_NAME, DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
+};
 use crate::discovery::DiscoveryManager;
 use crate::features::FeatureManager;
 use crate::security::transport::ServiceId;
 use crate::trust;
 
 /// Captured frame width in pixels (720p standard high definition).
-pub const CAMERA_WIDTH: u32 = 1280;
+pub const CAMERA_WIDTH: u32 = DEFAULT_CAMERA_WIDTH;
 
 /// Captured frame height in pixels (720p standard high definition).
-pub const CAMERA_HEIGHT: u32 = 720;
+pub const CAMERA_HEIGHT: u32 = DEFAULT_CAMERA_HEIGHT;
 
 /// Target camera capture and streaming frame rate in frames per second (fps).
-pub const CAMERA_FPS: u32 = 30;
+pub const CAMERA_FPS: u32 = DEFAULT_CAMERA_FPS;
 
 /// Total payload byte size for an uncompressed 1280x720 NV12 frame.
 ///
@@ -166,9 +169,32 @@ pub const PIXEL_FMT_NV12: u8 = 1;
 /// when the camera is paused or idling without transferring full uncompressed video frames.
 pub const FLAG_STANDBY_KEEPALIVE: u8 = 0x01;
 
+/// Maximum timeout duration when establishing an outbound encrypted camera stream connection.
+#[cfg(target_os = "macos")]
+const CAMERA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum timeout duration for transmitting a single encoded NV12 camera frame over the transport.
+#[cfg(target_os = "macos")]
+const CAMERA_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum number of concurrent unauthenticated TCP connections allowed on the camera port.
 #[cfg(target_os = "windows")]
 const MAX_PRE_AUTH_CAMERA_CONNS: usize = 8;
+
+/// Serde default helper providing the canonical virtual camera TCP streaming port.
+fn default_camera_port() -> u16 {
+    CAMERA_PORT
+}
+
+/// Serde default helper providing the canonical friendly virtual camera device name.
+fn default_camera_device_name() -> String {
+    DEFAULT_CAMERA_FRIENDLY_NAME.to_string()
+}
+
+/// Serde default helper indicating camera hardware availability when deserializing legacy status payloads.
+fn default_camera_available() -> bool {
+    true
+}
 
 /// Diagnostic telemetry and status report for the Camera subsystem.
 ///
@@ -177,9 +203,12 @@ const MAX_PRE_AUTH_CAMERA_CONNS: usize = 8;
 pub struct CameraStatus {
     /// Whether the local platform supports camera operations (true on macOS and Windows 11).
     pub supported: bool,
+    /// Whether a video capture source (built-in, USB webcam, or Continuity Camera on Mac; Virtual Camera on Windows) is available.
+    #[serde(default = "default_camera_available")]
+    pub camera_available: bool,
     /// Whether the camera capture or virtual camera publication loop is currently active.
     pub active: bool,
-    /// Operating role of this machine: `"MacBook Camera Sender"` or `"Windows 11 Virtual Webcam"`.
+    /// Operating role of this machine: `"Mac Camera Sender"` or `"Windows 11 Virtual Webcam"`.
     pub role: String,
     /// Human-readable operational state label (e.g., `"Streaming 720p30"`, `"Standby"`, `"Error"`).
     pub state: String,
@@ -195,6 +224,12 @@ pub struct CameraStatus {
     pub frames_transferred: u64,
     /// Optional error description from the most recent failure, if any.
     pub last_error: Option<String>,
+    /// TCP streaming port carrying encrypted camera frames (defaults to [`CAMERA_PORT`]).
+    #[serde(default = "default_camera_port")]
+    pub port: u16,
+    /// Friendly device name exposed for the shared virtual camera (defaults to [`DEFAULT_CAMERA_FRIENDLY_NAME`]).
+    #[serde(default = "default_camera_device_name")]
+    pub device_name: String,
 }
 
 /// Parsed, zero-copy camera frame received over the network transport.
@@ -381,6 +416,7 @@ fn global_frame_slot() -> &'static Arc<LatestFrameSlot> {
 extern "C" {
     fn integrator_mac_camera_permission_state() -> i32;
     fn integrator_mac_camera_has_usage_desc() -> i32;
+    fn integrator_mac_camera_has_hardware() -> i32;
     fn integrator_mac_camera_start() -> i32;
     fn integrator_mac_camera_stop();
     fn integrator_mac_camera_is_running() -> i32;
@@ -615,8 +651,11 @@ impl CameraService {
                 Ok(()) => {
                     self.active.store(true, Ordering::Relaxed);
                     self.set_state("Virtual Camera Active", None);
-                    info!("📷 Virtual camera 'Integrator MacBook Camera' active");
-                    return Ok("Windows Virtual Camera 'Integrator MacBook Camera' started".into());
+                    info!("📷 Virtual camera '{}' active", DEFAULT_CAMERA_FRIENDLY_NAME);
+                    return Ok(format!(
+                        "Windows Virtual Camera '{}' started",
+                        DEFAULT_CAMERA_FRIENDLY_NAME
+                    ));
                 }
                 Err(e) => {
                     self.active.store(false, Ordering::Relaxed);
@@ -639,13 +678,25 @@ impl CameraService {
                 .map_err(|e| e.to_string())?;
             if rc != 0 {
                 self.active.store(false, Ordering::SeqCst);
-                let msg = match rc {
-                    -2 => "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
-                    -1 => "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
-                    -3 => "No MacBook camera hardware detected".to_string(),
-                    _ => format!("Failed to initialize AVFoundation camera capture (code {})", rc),
+                let (state_lbl, msg) = match rc {
+                    -2 => (
+                        "Permission Needed",
+                        "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
+                    ),
+                    -1 => (
+                        "Permission Needed",
+                        "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
+                    ),
+                    -3 => (
+                        "No Camera Detected",
+                        "No Mac camera hardware detected (connect a USB webcam or Continuity Camera)".to_string(),
+                    ),
+                    _ => (
+                        "Error",
+                        format!("Failed to initialize AVFoundation camera capture (code {})", rc),
+                    ),
                 };
-                self.set_state("Permission Needed", Some(msg.clone()));
+                self.set_state(state_lbl, Some(msg.clone()));
                 return Err(msg);
             }
 
@@ -655,7 +706,7 @@ impl CameraService {
                 svc.run_mac_sender_loop().await;
             });
             info!("📷 Mac camera capture started (720p30 NV12)");
-            return Ok("Streaming MacBook Camera (720p30) to Windows Virtual Camera".into());
+            return Ok("Streaming Mac Camera (720p30) to Windows Virtual Camera".into());
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -678,7 +729,7 @@ impl CameraService {
                 &peer_ip,
                 CAMERA_PORT,
                 ServiceId::CameraStream,
-                Duration::from_secs(3),
+                CAMERA_CONNECT_TIMEOUT,
             )
             .await
             {
@@ -694,7 +745,7 @@ impl CameraService {
             while self.active.load(Ordering::Relaxed) && self.features.is_enabled("camera") {
                 if let Some(frame_bytes) = slot.take() {
                     if let Err(e) = tokio::time::timeout(
-                        Duration::from_secs(2),
+                        CAMERA_FRAME_SEND_TIMEOUT,
                         session.send_message(&frame_bytes),
                     )
                     .await
@@ -780,21 +831,29 @@ impl CameraService {
         let active = self.active.load(Ordering::Relaxed);
         let enabled = self.features.is_enabled("camera");
         #[cfg(target_os = "macos")]
-        let permission_granted = unsafe { integrator_mac_camera_permission_state() == 2 && integrator_mac_camera_has_usage_desc() == 1 };
+        let (permission_granted, camera_available) = unsafe {
+            (
+                integrator_mac_camera_permission_state() == 2
+                    && integrator_mac_camera_has_usage_desc() == 1,
+                integrator_mac_camera_has_hardware() != 0,
+            )
+        };
         #[cfg(target_os = "windows")]
-        let permission_granted = true;
+        let (permission_granted, camera_available) = (true, true);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let permission_granted = false;
+        let (permission_granted, camera_available) = (false, false);
 
         let role = if cfg!(target_os = "macos") {
-            "MacBook Camera Sender"
+            "Mac Camera Sender"
         } else if cfg!(target_os = "windows") {
             "Windows 11 Virtual Webcam"
         } else {
             "Unsupported"
         };
 
-        let state = if !enabled {
+        let state = if !camera_available && !active {
+            "No Camera Detected".to_string()
+        } else if !enabled {
             "Disabled".to_string()
         } else {
             self.state_label
@@ -805,6 +864,7 @@ impl CameraService {
 
         CameraStatus {
             supported: cfg!(any(target_os = "macos", target_os = "windows")),
+            camera_available,
             active,
             role: role.to_string(),
             state,
@@ -814,6 +874,8 @@ impl CameraService {
             fps: CAMERA_FPS,
             frames_transferred: self.frames_transferred.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|e| e.clone()),
+            port: CAMERA_PORT,
+            device_name: DEFAULT_CAMERA_FRIENDLY_NAME.to_string(),
         }
     }
 }
@@ -824,13 +886,21 @@ mod tests {
 
     #[test]
     fn encode_and_decode_valid_nv12_frame_roundtrip() {
+        assert_eq!(NV12_FRAME_BYTES, 1280 * 720 * 3 / 2);
         let payload = vec![0x7Au8; NV12_FRAME_BYTES];
-        let pkt = encode_camera_frame(1280, 720, PIXEL_FMT_NV12, 0, 1_234_567, &payload)
-            .expect("valid frame");
+        let pkt = encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            0,
+            1_234_567,
+            &payload,
+        )
+        .expect("valid frame");
         assert_eq!(pkt.len(), CAMERA_FRAME_HEADER_LEN + NV12_FRAME_BYTES);
         let decoded = decode_camera_frame(&pkt).expect("decode succeeds");
-        assert_eq!(decoded.width, 1280);
-        assert_eq!(decoded.height, 720);
+        assert_eq!(decoded.width, CAMERA_WIDTH as u16);
+        assert_eq!(decoded.height, CAMERA_HEIGHT as u16);
         assert_eq!(decoded.pix_fmt, PIXEL_FMT_NV12);
         assert_eq!(decoded.timestamp_us, 1_234_567);
         assert_eq!(decoded.payload.len(), NV12_FRAME_BYTES);
@@ -845,15 +915,59 @@ mod tests {
         assert!(decode_camera_frame(&bad).is_err());
 
         let oversized = vec![0u8; NV12_FRAME_BYTES + 1];
-        assert!(encode_camera_frame(1280, 720, PIXEL_FMT_NV12, 0, 0, &oversized).is_err());
+        assert!(encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            0,
+            0,
+            &oversized,
+        )
+        .is_err());
     }
 
     #[test]
     fn keepalive_frame_encodes_and_decodes_with_empty_payload() {
-        let pkt = encode_camera_frame(1280, 720, PIXEL_FMT_NV12, FLAG_STANDBY_KEEPALIVE, 42, &[])
-            .expect("keepalive frame");
+        let pkt = encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            FLAG_STANDBY_KEEPALIVE,
+            42,
+            &[],
+        )
+        .expect("keepalive frame");
         let dec = decode_camera_frame(&pkt).expect("decode keepalive");
         assert_eq!(dec.flags, FLAG_STANDBY_KEEPALIVE);
         assert!(dec.payload.is_empty());
+    }
+
+    #[test]
+    fn camera_status_serde_defaults_preserve_backward_compatibility() {
+        let legacy_json = r#"{
+            "supported": true,
+            "active": false,
+            "role": "MacBook Camera Sender",
+            "state": "Standby",
+            "permission_granted": true,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "frames_transferred": 0,
+            "last_error": null
+        }"#;
+        let parsed: CameraStatus =
+            serde_json::from_str(legacy_json).expect("legacy CameraStatus JSON should deserialize");
+        assert!(parsed.camera_available);
+        assert_eq!(parsed.port, CAMERA_PORT);
+        assert_eq!(parsed.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
+        assert_eq!(parsed.device_name, "Integrator Mac Camera");
+
+        let serialized = serde_json::to_string(&parsed).expect("CameraStatus should serialize");
+        let roundtrip: CameraStatus =
+            serde_json::from_str(&serialized).expect("CameraStatus should roundtrip");
+        assert!(roundtrip.camera_available);
+        assert_eq!(roundtrip.port, CAMERA_PORT);
+        assert_eq!(roundtrip.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
     }
 }

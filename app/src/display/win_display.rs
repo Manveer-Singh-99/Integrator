@@ -55,14 +55,18 @@
 //! - **Non-Destructive Registry Updates**: Existing user preferences (`AutoHDREnable`, `SwapEffectUpgradeEnable`)
 //!   in `UserGpuPreferences` are preserved during GPU routing updates.
 
-use crate::system_info;
+use crate::{config, system_info};
 use anyhow::{Context, Result};
+#[cfg(target_os = "windows")]
+use std::io::Write;
+#[cfg(target_os = "windows")]
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "windows")]
 use std::time::Duration;
 #[allow(unused_imports)]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Spawns a dedicated thread to wait on and reap an exiting child process, preventing zombies.
 ///
@@ -81,14 +85,120 @@ fn reap_child(mut child: Child, label: &'static str) {
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Windows Registry path for Moonlight host pairing slots.
+/// Maximum curl execution timeout in seconds for local Sunshine REST API control requests.
 #[cfg(target_os = "windows")]
+const SUNSHINE_API_TIMEOUT_SECS: &str = "2";
+
+/// Canonical Windows image filename for the Moonlight client process.
+#[cfg(target_os = "windows")]
+const MOONLIGHT_WINDOWS_IMAGE_NAME: &str = "Moonlight.exe";
+
+/// Canonical Windows image filename for the Sunshine host process.
+#[cfg(target_os = "windows")]
+const SUNSHINE_WINDOWS_IMAGE_NAME: &str = "sunshine.exe";
+
+/// Maximum number of `tasklist` polling attempts when waiting for Moonlight to terminate.
+#[cfg(target_os = "windows")]
+const MOONLIGHT_STOP_POLL_ATTEMPTS: usize = 8;
+
+/// Interval between `tasklist` polling checks during Moonlight termination.
+#[cfg(target_os = "windows")]
+const MOONLIGHT_STOP_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Environment variables searched when locating legacy Windows Moonlight installations.
+#[cfg(target_os = "windows")]
+const WINDOWS_MOONLIGHT_LEGACY_ENV_KEYS: [&str; 4] = [
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "LOCALAPPDATA",
+];
+
+/// Relative paths checked under standard installation roots for legacy Moonlight binaries.
+#[cfg(target_os = "windows")]
+const WINDOWS_MOONLIGHT_LEGACY_REL_PATHS: [&str; 2] = [
+    r"Moonlight Game Streaming\Moonlight.exe",
+    r"Programs\Moonlight Game Streaming\Moonlight.exe",
+];
+
+/// Protected Program Files environment variables searched for `VddCtl.exe`.
+#[cfg(target_os = "windows")]
+const WINDOWS_PROGRAM_FILES_ENV_KEYS: [&str; 3] =
+    ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"];
+
+/// Windows Registry path for Moonlight host pairing slots.
+#[cfg(any(target_os = "windows", test))]
 const MOONLIGHT_HOSTS_REG_KEY: &str =
     r"HKCU\Software\Moonlight Game Streaming Project\Moonlight\hosts";
 
 /// Windows Registry path for per-application DirectX GPU preferences.
 #[cfg(target_os = "windows")]
 const DIRECTX_GPU_PREFS_KEY: &str = r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences";
+
+/// DirectX `UserGpuPreferences` token key prefix.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_PREF_PREFIX: &str = "GpuPreference=";
+
+/// DirectX `UserGpuPreferences` token selecting OS automatic GPU assignment.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_PREF_AUTO: &str = "GpuPreference=0;";
+
+/// DirectX `UserGpuPreferences` token forcing integrated / power-saving GPU execution.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_PREF_POWER_SAVING: &str = "GpuPreference=1;";
+
+/// DirectX `UserGpuPreferences` token forcing discrete / high-performance GPU execution.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_PREF_HIGH_PERF: &str = "GpuPreference=2;";
+
+/// Numeric DirectX preference code representing integrated / power-saving GPU selection.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_CODE_INTEGRATED: u8 = 1;
+
+/// Numeric DirectX preference code representing discrete / high-performance GPU selection.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_CODE_DISCRETE: u8 = 2;
+
+/// Numeric DirectX preference code representing specific high-performance GPU selection on Windows 11.
+#[cfg(any(target_os = "windows", test))]
+const DIRECTX_GPU_CODE_SPECIFIC_HIGH_PERF: u8 = 4;
+
+/// Vendor marker associated with synthetic [`config::DEFAULT_SYSTEM_GPU_NAME`] placeholder entries.
+#[cfg(any(target_os = "windows", test))]
+const DEFAULT_SYSTEM_GPU_VENDOR: &str = "System";
+
+/// Lowest unprivileged TCP port permitted for Sunshine streaming port overrides.
+#[cfg(target_os = "windows")]
+const MIN_UNPRIVILEGED_PORT: u16 = 1024;
+
+/// Sanitizes an optional configuration identifier (service name, scheduled task name, or VDD slot),
+/// falling back to `default` if unset or containing unsafe characters.
+#[cfg(target_os = "windows")]
+fn resolve_windows_identifier(custom: Option<&str>, default: &'static str) -> String {
+    if let Some(raw) = custom {
+        if !raw.chars().any(|c| c.is_control()) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.starts_with('/') {
+                return trimmed.to_string();
+            }
+        }
+    }
+    default.to_string()
+}
+
+/// Resolves the primary and secondary Sunshine HTTPS administration web ports from
+/// `sunshine.conf` and user preferences.
+#[cfg(target_os = "windows")]
+fn resolve_windows_sunshine_web_ports(prefs: &system_info::AppPathPreferences) -> (u16, u16) {
+    let (_, primary_base_port, _) = system_info::read_sunshine_config_info();
+    let primary_web = primary_base_port.saturating_add(config::SUNSHINE_WEB_PORT_OFFSET);
+    let secondary_base = prefs
+        .sunshine_secondary_port
+        .filter(|&p| p >= MIN_UNPRIVILEGED_PORT)
+        .unwrap_or(config::SUNSHINE_SECONDARY_PORT);
+    let secondary_web = secondary_base.saturating_add(config::SUNSHINE_WEB_PORT_OFFSET);
+    (primary_web, secondary_web)
+}
 
 /// Manager providing Windows native display creation, VDD PnP control, and Moonlight client execution.
 pub struct WinDisplayManager;
@@ -147,17 +257,22 @@ impl WinDisplayManager {
         }
 
         // 3. Build CLI arguments
-        let w = (width.clamp(800, 7680)) & !1;
-        let h = (height.clamp(600, 4320)) & !1;
+        let app_name = system_info::resolve_moonlight_app_name();
+        let w = width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH) & !1;
+        let h = height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT) & !1;
         let res_arg = format!("{}x{}", w, h);
-        let fps_arg = fps.clamp(30, 240).to_string();
-        let bitrate_arg = bitrate_kbps.clamp(5000, 500000).to_string();
+        let fps_arg = fps
+            .clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS)
+            .to_string();
+        let bitrate_arg = bitrate_kbps
+            .clamp(config::MIN_BITRATE_KBPS, config::MAX_BITRATE_KBPS)
+            .to_string();
 
         let mut cmd = Command::new(&exe);
         cmd.args([
             "stream",
             &target,
-            "Desktop",
+            &app_name,
             "--resolution",
             &res_arg,
             "--fps",
@@ -202,7 +317,7 @@ impl WinDisplayManager {
             let image_name = Self::find_moonlight_exe()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .filter(|n| !n.is_empty() && !n.starts_with('/'))
-                .unwrap_or_else(|| "Moonlight.exe".to_string());
+                .unwrap_or_else(|| MOONLIGHT_WINDOWS_IMAGE_NAME.to_string());
 
             let _ = hidden_cmd(&taskkill)
                 .args(["/F", "/IM", &image_name])
@@ -210,19 +325,20 @@ impl WinDisplayManager {
                 .stderr(Stdio::null())
                 .status();
 
-            if !image_name.eq_ignore_ascii_case("Moonlight.exe") {
+            if !image_name.eq_ignore_ascii_case(MOONLIGHT_WINDOWS_IMAGE_NAME) {
                 let _ = hidden_cmd(&taskkill)
-                    .args(["/F", "/IM", "Moonlight.exe"])
+                    .args(["/F", "/IM", MOONLIGHT_WINDOWS_IMAGE_NAME])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
             }
 
-            for _ in 0..8 {
-                if !is_image_running(&image_name) && !is_image_running("Moonlight.exe") {
+            for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
+                if !is_image_running(&image_name) && !is_image_running(MOONLIGHT_WINDOWS_IMAGE_NAME)
+                {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
             }
         }
         info!("Terminated Moonlight.exe on Windows");
@@ -233,7 +349,8 @@ impl WinDisplayManager {
     pub fn enable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+            let prefs = system_info::load_path_preferences();
+            let ps_exe = system_info::system32_exe(config::POWERSHELL_SYSTEM32_REL_PATH);
             let schtasks = system_info::system32_exe("schtasks.exe");
 
             // 1. Discover virtual display PnP devices dynamically and enable if not already OK
@@ -276,45 +393,59 @@ impl WinDisplayManager {
             }
 
             // 2. Ensure Sunshine host service, secondary task, or binary is running
-            ensure_sunshine_running()?;
+            ensure_sunshine_running(&prefs)?;
 
             // Clear any lingering stream sessions on Sunshine web APIs to guarantee clean connection state
-            Self::call_sunshine_api(48990, "/api/apps/close");
-            Self::call_sunshine_api(47990, "/api/apps/close");
+            let (primary_web_port, secondary_web_port) = resolve_windows_sunshine_web_ports(&prefs);
+            Self::call_sunshine_api(secondary_web_port, config::SUNSHINE_API_CLOSE_PATH);
+            if primary_web_port != secondary_web_port {
+                Self::call_sunshine_api(primary_web_port, config::SUNSHINE_API_CLOSE_PATH);
+            }
 
-            // 3. Attach virtual display slot 1 via VddCtl.exe if present, else optional marker
+            // 3. Attach configured virtual display slot via VddCtl.exe if present, else optional marker
+            let vdd_slot =
+                resolve_windows_identifier(prefs.vdd_slot.as_deref(), config::VDD_DEFAULT_SLOT);
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 let status = hidden_cmd(&vdd_ctl)
-                    .args(["join", "1"])
+                    .args(["join", &vdd_slot])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
                     .with_context(|| format!("Failed to invoke {}", vdd_ctl.display()))?;
                 if !status.success() {
                     anyhow::bail!(
-                        "{} join 1 exited with status {}",
+                        "{} join {} exited with status {}",
                         vdd_ctl.display(),
+                        vdd_slot,
                         status
                     );
                 }
-                info!("Attached virtual display slot 1 via {}", vdd_ctl.display());
+                info!(
+                    "Attached virtual display slot {} via {}",
+                    vdd_slot,
+                    vdd_ctl.display()
+                );
             } else if !vdd_devices.is_empty() {
                 system_info::atomic_write_private(
-                    &system_info::app_data_dir().join("win_vdd.active"),
-                    b"1",
+                    &system_info::app_data_dir().join(config::WIN_VDD_ACTIVE_MARKER),
+                    vdd_slot.as_bytes(),
                 )?;
             }
 
             // 4. Start dynamic watcher only if that scheduled task exists
-            if scheduled_task_exists("VddDynamicWatcher") {
+            let watcher_task = resolve_windows_identifier(
+                prefs.vdd_watcher_task_name.as_deref(),
+                config::VDD_DYNAMIC_WATCHER_TASK,
+            );
+            if scheduled_task_exists(&watcher_task) {
                 let status = hidden_cmd(&schtasks)
-                    .args(["/Run", "/TN", "VddDynamicWatcher"])
+                    .args(["/Run", "/TN", &watcher_task])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
                 if let Ok(s) = status {
                     if !s.success() {
-                        warn!("Scheduled task VddDynamicWatcher exited with {}", s);
+                        warn!("Scheduled task {} exited with {}", watcher_task, s);
                     }
                 }
             }
@@ -325,23 +456,48 @@ impl WinDisplayManager {
 
     /// Dispatches an administrative POST request to the local Sunshine REST API.
     ///
-    /// Executes native Windows `curl.exe` with a 2-second timeout and default administrative credentials (`admin:alpine`).
-    /// Used to clear lingering streaming sessions (`/api/apps/close`) and reset display topology
-    /// persistence (`/api/reset-display-device-persistence`).
+    /// Resolves credentials dynamically via [`system_info::resolve_sunshine_api_credentials`]
+    /// and pipes them to `curl.exe -K -` over `stdin` so secrets never appear on process `argv`.
+    /// Skips execution cleanly if no credentials are configured.
     ///
     /// # Arguments
-    /// - `web_port`: Sunshine web administration port (e.g. 47990 or 48990).
-    /// - `path`: API endpoint path (e.g. `"/api/apps/close"`).
+    /// - `web_port`: Sunshine web administration port (e.g. [`config::SUNSHINE_DEFAULT_WEB_PORT`]).
+    /// - `path`: API endpoint path (e.g. [`config::SUNSHINE_API_CLOSE_PATH`]).
     pub fn call_sunshine_api(web_port: u16, path: &str) {
         #[cfg(target_os = "windows")]
         {
+            let Some((user, pass)) = system_info::resolve_sunshine_api_credentials() else {
+                debug!(
+                    "Skipping Windows Sunshine API POST to {}:{} (no Sunshine API credentials configured)",
+                    web_port, path
+                );
+                return;
+            };
             let curl_exe = system_info::system32_exe("curl.exe");
-            let url = format!("https://127.0.0.1:{}{}", web_port, path);
-            let _ = hidden_cmd(&curl_exe)
-                .args(["-s", "-k", "-m", "2", "-u", "admin:alpine", "-X", "POST", &url])
+            let url = format!("https://{}:{}{}", Ipv4Addr::LOCALHOST, web_port, path);
+            let auth_cfg = system_info::format_curl_basic_auth_config(&user, &pass);
+            if let Ok(mut child) = hidden_cmd(&curl_exe)
+                .args([
+                    "-s",
+                    "-k",
+                    "-m",
+                    SUNSHINE_API_TIMEOUT_SECS,
+                    "-K",
+                    "-",
+                    "-X",
+                    "POST",
+                    &url,
+                ])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(auth_cfg.as_bytes());
+                }
+                let _ = child.wait();
+            }
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -353,28 +509,51 @@ impl WinDisplayManager {
     pub fn disable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let _ = std::fs::remove_file(system_info::app_data_dir().join("win_vdd.active"));
+            let prefs = system_info::load_path_preferences();
+            let _ = std::fs::remove_file(
+                system_info::app_data_dir().join(config::WIN_VDD_ACTIVE_MARKER),
+            );
 
             // Gracefully terminate any active streaming sessions and clear device persistence
-            Self::call_sunshine_api(48990, "/api/apps/close");
-            Self::call_sunshine_api(48990, "/api/reset-display-device-persistence");
-            Self::call_sunshine_api(47990, "/api/apps/close");
-            Self::call_sunshine_api(47990, "/api/reset-display-device-persistence");
+            let (primary_web_port, secondary_web_port) = resolve_windows_sunshine_web_ports(&prefs);
+            Self::call_sunshine_api(secondary_web_port, config::SUNSHINE_API_CLOSE_PATH);
+            Self::call_sunshine_api(
+                secondary_web_port,
+                config::SUNSHINE_API_RESET_PERSISTENCE_PATH,
+            );
+            if primary_web_port != secondary_web_port {
+                Self::call_sunshine_api(primary_web_port, config::SUNSHINE_API_CLOSE_PATH);
+                Self::call_sunshine_api(
+                    primary_web_port,
+                    config::SUNSHINE_API_RESET_PERSISTENCE_PATH,
+                );
+            }
 
+            let vdd_slot =
+                resolve_windows_identifier(prefs.vdd_slot.as_deref(), config::VDD_DEFAULT_SLOT);
             let mut first_err: Option<anyhow::Error> = None;
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 match hidden_cmd(&vdd_ctl)
-                    .args(["leave", "1"])
+                    .args(["leave", &vdd_slot])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
                 {
                     Ok(s) if s.success() => {
-                        info!("Detached virtual display slot 1 via {}", vdd_ctl.display());
+                        info!(
+                            "Detached virtual display slot {} via {}",
+                            vdd_slot,
+                            vdd_ctl.display()
+                        );
                     }
                     Ok(s) => {
                         first_err.get_or_insert_with(|| {
-                            anyhow::anyhow!("{} leave 1 exited with {}", vdd_ctl.display(), s)
+                            anyhow::anyhow!(
+                                "{} leave {} exited with {}",
+                                vdd_ctl.display(),
+                                vdd_slot,
+                                s
+                            )
                         });
                     }
                     Err(e) => {
@@ -383,10 +562,10 @@ impl WinDisplayManager {
                 }
 
                 if let Some(dir) = vdd_ctl.parent() {
-                    let slot1 = dir.join("slot1.active");
-                    if slot1.exists() {
-                        if let Err(e) = std::fs::remove_file(&slot1) {
-                            warn!("Could not remove {}: {}", slot1.display(), e);
+                    let slot_marker = dir.join(config::VDD_SLOT1_ACTIVE_MARKER);
+                    if slot_marker.exists() {
+                        if let Err(e) = std::fs::remove_file(&slot_marker) {
+                            warn!("Could not remove {}: {}", slot_marker.display(), e);
                         }
                     }
                 }
@@ -395,7 +574,7 @@ impl WinDisplayManager {
             if let Some(err) = first_err {
                 return Err(err);
             }
-            info!("Disabled virtual display slot 1 on Windows");
+            info!("Disabled virtual display slot {} on Windows", vdd_slot);
             Ok(())
         }
         #[cfg(not(target_os = "windows"))]
@@ -411,12 +590,15 @@ impl WinDisplayManager {
         {
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 if let Some(dir) = vdd_ctl.parent() {
-                    if dir.join("slot1.active").exists() {
+                    if dir.join(config::VDD_SLOT1_ACTIVE_MARKER).exists() {
                         return true;
                     }
                 }
             }
-            if system_info::app_data_dir().join("win_vdd.active").exists() {
+            if system_info::app_data_dir()
+                .join(config::WIN_VDD_ACTIVE_MARKER)
+                .exists()
+            {
                 return true;
             }
         }
@@ -529,18 +711,10 @@ fn hidden_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// Scans standard Program Files and Local AppData paths for legacy Moonlight installations.
 #[cfg(target_os = "windows")]
 fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
-    for env_key in [
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramW6432",
-        "LOCALAPPDATA",
-    ] {
+    for env_key in WINDOWS_MOONLIGHT_LEGACY_ENV_KEYS {
         if let Ok(base) = std::env::var(env_key) {
             let base_path = PathBuf::from(base);
-            for rel in [
-                r"Moonlight Game Streaming\Moonlight.exe",
-                r"Programs\Moonlight Game Streaming\Moonlight.exe",
-            ] {
+            for rel in WINDOWS_MOONLIGHT_LEGACY_REL_PATHS {
                 let candidate = base_path.join(rel);
                 if candidate.is_file() {
                     return Some(candidate);
@@ -555,22 +729,20 @@ fn find_moonlight_legacy_dir_windows() -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 fn find_vdd_ctl() -> Option<PathBuf> {
     // 1. Dedicated VirtualDisplayDriver root installation directory
-    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-    let primary = PathBuf::from(&sys_drive).join(r"VirtualDisplayDriver\VddCtl.exe");
+    let sys_drive = system_info::windows_system_drive();
+    let primary = PathBuf::from(&sys_drive).join(config::VDD_CTL_REL_PATH);
     if primary.is_file() {
         return Some(primary);
     }
 
     // 2. Protected Program Files locations
-    for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+    for env_key in WINDOWS_PROGRAM_FILES_ENV_KEYS {
         if let Ok(base) = std::env::var(env_key) {
             let trimmed = base.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let candidate = PathBuf::from(trimmed)
-                .join("VirtualDisplayDriver")
-                .join("VddCtl.exe");
+            let candidate = PathBuf::from(trimmed).join(config::VDD_CTL_REL_PATH);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -591,11 +763,11 @@ fn scheduled_task_exists(task_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Checks whether `SunshineService` is running via `sc.exe query`.
+/// Checks whether the configured Sunshine Windows Service is running via `sc.exe query`.
 #[cfg(target_os = "windows")]
-fn is_sunshine_service_active() -> bool {
+fn is_sunshine_service_active(service_name: &str) -> bool {
     if let Ok(out) = hidden_cmd(&system_info::system32_exe("sc.exe"))
-        .args(["query", "SunshineService"])
+        .args(["query", service_name])
         .output()
     {
         if out.status.success() {
@@ -625,37 +797,45 @@ fn is_image_running(image_name: &str) -> bool {
 /// Checks whether `sunshine.exe` process is active.
 #[cfg(target_os = "windows")]
 fn is_sunshine_process_running() -> bool {
-    is_image_running("sunshine.exe")
+    is_image_running(SUNSHINE_WINDOWS_IMAGE_NAME)
 }
 
 /// Ensures that Sunshine is active by checking service status, scheduled task, or starting the binary.
 #[cfg(target_os = "windows")]
-fn ensure_sunshine_running() -> Result<()> {
+fn ensure_sunshine_running(prefs: &system_info::AppPathPreferences) -> Result<()> {
     let sc_exe = system_info::system32_exe("sc.exe");
     let schtasks = system_info::system32_exe("schtasks.exe");
+    let service_name = resolve_windows_identifier(
+        prefs.sunshine_service_name.as_deref(),
+        config::SUNSHINE_SERVICE_NAME,
+    );
+    let secondary_task = resolve_windows_identifier(
+        prefs.sunshine_secondary_task_name.as_deref(),
+        config::SUNSHINE_SECONDARY_TASK_NAME,
+    );
 
     let svc_started = hidden_cmd(&sc_exe)
-        .args(["start", "SunshineService"])
+        .args(["start", &service_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if scheduled_task_exists("SunshineSecondary") {
+    if scheduled_task_exists(&secondary_task) {
         let status = hidden_cmd(&schtasks)
-            .args(["/Run", "/TN", "SunshineSecondary"])
+            .args(["/Run", "/TN", &secondary_task])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .context("Failed to launch SunshineSecondary scheduled task")?;
+            .with_context(|| format!("Failed to launch {} scheduled task", secondary_task))?;
         if !status.success() {
-            anyhow::bail!("Scheduled task SunshineSecondary exited with {}", status);
+            anyhow::bail!("Scheduled task {} exited with {}", secondary_task, status);
         }
         return Ok(());
     }
 
-    if svc_started || is_sunshine_service_active() || is_sunshine_process_running() {
+    if svc_started || is_sunshine_service_active(&service_name) || is_sunshine_process_running() {
         return Ok(());
     }
 
@@ -675,13 +855,18 @@ fn ensure_sunshine_running() -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("Neither SunshineSecondary task, SunshineService, nor sunshine.exe binary found")
+    anyhow::bail!(
+        "Neither {} task, {}, nor {} binary found",
+        secondary_task,
+        service_name,
+        SUNSHINE_WINDOWS_IMAGE_NAME
+    )
 }
 
 /// Enumerates display adapters using PowerShell `Get-PnpDevice -Class Display` and parses virtual adapters.
 #[cfg(target_os = "windows")]
 fn discover_vdd_pnp_devices() -> Vec<VddPnpDevice> {
-    let ps_exe = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    let ps_exe = system_info::system32_exe(config::POWERSHELL_SYSTEM32_REL_PATH);
     let ps_script = "Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.InstanceId -replace '[\\r\\n\\|]',' ')|$(($_.FriendlyName) -replace '[\\r\\n\\|]',' ')|$(($_.Name) -replace '[\\r\\n\\|]',' ')|$($_.Status -replace '[\\r\\n\\|]',' ')\" }";
     let Ok(out) = hidden_cmd(&ps_exe)
         .args([
@@ -722,10 +907,15 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         return mac_ip.to_string();
     };
 
-    if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
-        let local_changed = slot.localaddress != mac_ip;
-        let manual_changed = (!slot.manualaddress.is_empty() && slot.manualaddress != mac_ip)
-            || (local_changed && slot.manualaddress != mac_ip);
+    let clean_ip = mac_ip.trim();
+    if !clean_ip.is_empty() && system_info::is_valid_ipv4(clean_ip) {
+        let local_changed = slot.localaddress != clean_ip;
+        let manual_changed = (!slot.manualaddress.is_empty() && slot.manualaddress != clean_ip)
+            || (local_changed && slot.manualaddress != clean_ip);
+        let hname_trimmed = slot.hostname.trim();
+        let hname_is_stale_ip = !hname_trimmed.is_empty()
+            && system_info::is_valid_ipv4(hname_trimmed)
+            && hname_trimmed != clean_ip;
 
         if local_changed {
             let _ = hidden_cmd(&reg_exe)
@@ -737,7 +927,7 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
                     "/t",
                     "REG_SZ",
                     "/d",
-                    mac_ip,
+                    clean_ip,
                     "/f",
                 ])
                 .stdout(Stdio::null())
@@ -754,40 +944,45 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
                     "/t",
                     "REG_SZ",
                     "/d",
-                    mac_ip,
+                    clean_ip,
                     "/f",
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
         }
-        if local_changed || manual_changed {
+        if hname_is_stale_ip {
+            let _ = hidden_cmd(&reg_exe)
+                .args([
+                    "add",
+                    &slot.reg_key,
+                    "/v",
+                    "hostname",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    clean_ip,
+                    "/f",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if local_changed || manual_changed || hname_is_stale_ip {
             info!(
                 "Refreshed Moonlight registry slot '{}' ({}) IP -> {}",
                 slot.reg_key,
                 if slot.hostname.is_empty() {
-                    mac_ip
+                    clean_ip
                 } else {
                     &slot.hostname
                 },
-                mac_ip
+                clean_ip
             );
         }
     }
 
-    let hname = slot.hostname.trim();
-    if !hname.is_empty() && !hname.starts_with('-') && !hname.chars().any(|c| c.is_control()) {
-        hname.to_string()
-    } else if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
-        mac_ip.to_string()
-    } else {
-        let uuid = slot.uuid.trim();
-        if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
-            uuid.to_string()
-        } else {
-            mac_ip.to_string()
-        }
-    }
+    resolve_win_moonlight_launch_target(slot, clean_ip)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -925,7 +1120,7 @@ fn extract_reg_sz_value_data(reg_output: &str) -> Option<String> {
 fn parse_user_gpu_preference_value(raw: &str) -> Option<u8> {
     for part in raw.split([';', ' ', '\t', '\r', '\n']) {
         let token = part.trim();
-        if let Some(val) = token.strip_prefix("GpuPreference=") {
+        if let Some(val) = token.strip_prefix(DIRECTX_GPU_PREF_PREFIX) {
             if let Ok(code) = val.trim().parse::<u8>() {
                 return Some(code);
             }
@@ -947,7 +1142,7 @@ fn merge_user_gpu_preference_value(existing_raw: Option<&str>, new_pref: &str) -
             if part.is_empty() {
                 continue;
             }
-            if part.starts_with("GpuPreference=") {
+            if part.starts_with(DIRECTX_GPU_PREF_PREFIX) {
                 if !replaced {
                     parts.push(new_token.to_string());
                     replaced = true;
@@ -981,7 +1176,6 @@ fn parse_reg_u16(raw: &str) -> Option<u16> {
 fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
     let mut slots: Vec<MoonlightHostSlot> = Vec::new();
     let mut current_slot_idx: Option<usize> = None;
-    let hosts_reg_base = r"HKCU\Software\Moonlight Game Streaming Project\Moonlight\hosts";
 
     for line in output.lines() {
         let trimmed_end = line.trim_end();
@@ -995,7 +1189,7 @@ fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
                 let after = &trimmed_end[pos + r"\moonlight\hosts".len()..];
                 if let Some(sub) = after.strip_prefix('\\') {
                     if !sub.is_empty() && !sub.contains('\\') {
-                        let reg_key = format!(r"{}\{}", hosts_reg_base, sub);
+                        let reg_key = format!(r"{}\{}", MOONLIGHT_HOSTS_REG_KEY, sub);
                         if let Some(idx) = slots.iter().position(|s| s.reg_key == reg_key) {
                             current_slot_idx = Some(idx);
                         } else {
@@ -1042,6 +1236,44 @@ fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
     slots
 }
 
+/// Normalizes a Moonlight/Sunshine hostname by stripping whitespace, trailing dots, and `.local` mDNS suffixes.
+#[cfg(any(target_os = "windows", test))]
+fn normalize_moonlight_hostname(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix(".local") {
+        stripped.trim().to_string()
+    } else {
+        lower
+    }
+}
+
+/// Resolves the CLI target identifier to pass to `Moonlight.exe stream <target> <app>` for a matched slot,
+/// avoiding stale IPv4 strings stored in `slot.hostname` from a previous topology and avoiding slow UUID WoL timeouts.
+#[cfg(any(target_os = "windows", test))]
+fn resolve_win_moonlight_launch_target(slot: &MoonlightHostSlot, mac_ip: &str) -> String {
+    let clean_ip = mac_ip.trim();
+    let hname = slot.hostname.trim();
+    let hname_is_stale_ip =
+        !hname.is_empty() && system_info::is_valid_ipv4(hname) && hname != clean_ip;
+    if !hname.is_empty()
+        && !hname_is_stale_ip
+        && !hname.starts_with('-')
+        && !hname.chars().any(|c| c.is_control())
+    {
+        hname.to_string()
+    } else if !clean_ip.is_empty() && system_info::is_valid_ipv4(clean_ip) {
+        clean_ip.to_string()
+    } else {
+        let uuid = slot.uuid.trim();
+        if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
+            uuid.to_string()
+        } else {
+            clean_ip.to_string()
+        }
+    }
+}
+
 /// Non-destructively selects the best matching Moonlight host slot based on IP, port, and hostname scoring.
 #[cfg(any(target_os = "windows", test))]
 fn select_moonlight_host_slot<'a>(
@@ -1050,15 +1282,30 @@ fn select_moonlight_host_slot<'a>(
     port: u16,
     host_name: &str,
 ) -> Option<&'a MoonlightHostSlot> {
+    let clean_ip = mac_ip.trim();
+    let wanted_host_norm = normalize_moonlight_hostname(host_name);
     let mut best: Option<&'a MoonlightHostSlot> = None;
     let mut best_score: u8 = 0;
+    let mut raw_ip_port_candidates: Vec<&'a MoonlightHostSlot> = Vec::new();
 
     for slot in slots {
-        let ip_match = !mac_ip.is_empty()
-            && (slot.localaddress == mac_ip
-                || slot.manualaddress == mac_ip
-                || slot.remoteaddress == mac_ip);
-        let name_match = !host_name.is_empty() && slot.hostname.eq_ignore_ascii_case(host_name);
+        let ip_match = !clean_ip.is_empty()
+            && (slot.localaddress == clean_ip
+                || slot.manualaddress == clean_ip
+                || slot.remoteaddress == clean_ip);
+        let slot_host_norm = normalize_moonlight_hostname(&slot.hostname);
+        let name_match = !wanted_host_norm.is_empty()
+            && !slot_host_norm.is_empty()
+            && slot_host_norm == wanted_host_norm;
+
+        let port_ok_or_empty = port == 0 || slot.ports.is_empty() || slot.ports.contains(&port);
+        if port_ok_or_empty
+            && (slot.hostname.trim().is_empty()
+                || system_info::is_valid_ipv4(slot.hostname.trim()))
+        {
+            raw_ip_port_candidates.push(slot);
+        }
+
         if !ip_match && !name_match {
             continue;
         }
@@ -1092,6 +1339,10 @@ fn select_moonlight_host_slot<'a>(
             best_score = score;
             best = Some(slot);
         }
+    }
+
+    if best.is_none() && raw_ip_port_candidates.len() == 1 {
+        return Some(raw_ip_port_candidates[0]);
     }
 
     best
@@ -1192,7 +1443,7 @@ struct ResolvedGpuTarget {
     reg_pref: &'static str,
 }
 
-/// Identifies GPU vendor ("nvidia", "amd", "intel") from vendor and device name strings.
+/// Identifies GPU vendor ("nvidia", "amd", "intel", "qualcomm") from vendor and device name strings.
 #[cfg(any(target_os = "windows", test))]
 fn vendor_key(vendor: &str, name: &str) -> Option<String> {
     let combined = format!("{} {}", vendor, name).to_ascii_lowercase();
@@ -1203,7 +1454,7 @@ fn vendor_key(vendor: &str, name: &str) -> Option<String> {
         || combined.contains("quadro")
     {
         Some("nvidia".to_string())
-    } else if combined.contains("amd") || combined.contains("radeon") {
+    } else if combined.contains("amd") || combined.contains("radeon") || combined.contains("firepro") {
         Some("amd".to_string())
     } else if combined.contains("intel")
         || combined.contains("arc")
@@ -1211,6 +1462,11 @@ fn vendor_key(vendor: &str, name: &str) -> Option<String> {
         || combined.contains("uhd")
     {
         Some("intel".to_string())
+    } else if combined.contains("qualcomm")
+        || combined.contains("adreno")
+        || combined.contains("snapdragon")
+    {
+        Some("qualcomm".to_string())
     } else {
         None
     }
@@ -1232,17 +1488,17 @@ fn encoder_for_gpu(vendor: &str, name: &str) -> Option<&'static str> {
 fn gpu_label_for_preference(pref_code: u8, gpus: &[system_info::GpuDeviceInfo]) -> String {
     let real_gpus: Vec<&system_info::GpuDeviceInfo> = gpus
         .iter()
-        .filter(|g| !(g.vendor == "System" && g.name == "Default System GPU"))
+        .filter(|g| !(g.vendor == DEFAULT_SYSTEM_GPU_VENDOR && g.name == config::DEFAULT_SYSTEM_GPU_NAME))
         .collect();
     match pref_code {
-        2 | 4 => real_gpus
+        DIRECTX_GPU_CODE_DISCRETE | DIRECTX_GPU_CODE_SPECIFIC_HIGH_PERF => real_gpus
             .iter()
             .copied()
             .filter(|g| g.is_discrete)
             .max_by_key(|g| g.vram_mb.unwrap_or(0))
             .and_then(|g| vendor_key(&g.vendor, &g.name))
             .unwrap_or_else(|| "discrete".to_string()),
-        1 => real_gpus
+        DIRECTX_GPU_CODE_INTEGRATED => real_gpus
             .iter()
             .copied()
             .find(|g| !g.is_discrete)
@@ -1257,7 +1513,7 @@ fn gpu_label_for_preference(pref_code: u8, gpus: &[system_info::GpuDeviceInfo]) 
 fn resolve_label_from_adapter(adapter: &str, gpus: &[system_info::GpuDeviceInfo]) -> String {
     let adapter_lower = adapter.to_ascii_lowercase();
     if let Some(matched) = gpus.iter().find(|g| {
-        !(g.vendor == "System" && g.name == "Default System GPU")
+        !(g.vendor == DEFAULT_SYSTEM_GPU_VENDOR && g.name == config::DEFAULT_SYSTEM_GPU_NAME)
             && (g.name.eq_ignore_ascii_case(adapter)
                 || g.name.to_ascii_lowercase().contains(&adapter_lower)
                 || adapter_lower.contains(&g.name.to_ascii_lowercase()))
@@ -1283,13 +1539,13 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
             is_auto: true,
             adapter_name: None,
             encoder: None,
-            reg_pref: "GpuPreference=0;",
+            reg_pref: DIRECTX_GPU_PREF_AUTO,
         };
     }
 
     let real_gpus: Vec<&system_info::GpuDeviceInfo> = gpus
         .iter()
-        .filter(|g| !(g.vendor == "System" && g.name == "Default System GPU"))
+        .filter(|g| !(g.vendor == DEFAULT_SYSTEM_GPU_VENDOR && g.name == config::DEFAULT_SYSTEM_GPU_NAME))
         .collect();
 
     match lower.as_str() {
@@ -1304,14 +1560,14 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                     is_auto: false,
                     adapter_name: Some(gpu.name.clone()),
                     encoder: encoder_for_gpu(&gpu.vendor, &gpu.name),
-                    reg_pref: "GpuPreference=2;",
+                    reg_pref: DIRECTX_GPU_PREF_HIGH_PERF,
                 }
             } else {
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: None,
                     encoder: None,
-                    reg_pref: "GpuPreference=2;",
+                    reg_pref: DIRECTX_GPU_PREF_HIGH_PERF,
                 }
             }
         }
@@ -1321,22 +1577,23 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                     is_auto: false,
                     adapter_name: Some(gpu.name.clone()),
                     encoder: encoder_for_gpu(&gpu.vendor, &gpu.name),
-                    reg_pref: "GpuPreference=1;",
+                    reg_pref: DIRECTX_GPU_PREF_POWER_SAVING,
                 }
             } else {
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: None,
                     encoder: None,
-                    reg_pref: "GpuPreference=1;",
+                    reg_pref: DIRECTX_GPU_PREF_POWER_SAVING,
                 }
             }
         }
-        "nvidia" | "amd" | "intel" => {
+        "nvidia" | "amd" | "intel" | "qualcomm" | "adreno" => {
+            let target_vendor = if lower == "adreno" { "qualcomm" } else { lower.as_str() };
             let matched = real_gpus
                 .iter()
                 .copied()
-                .filter(|g| vendor_key(&g.vendor, &g.name).as_deref() == Some(lower.as_str()))
+                .filter(|g| vendor_key(&g.vendor, &g.name).as_deref() == Some(target_vendor))
                 .max_by_key(|g| (g.is_discrete, g.vram_mb.unwrap_or(0)));
 
             if let Some(gpu) = matched {
@@ -1345,20 +1602,20 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                     adapter_name: Some(gpu.name.clone()),
                     encoder: encoder_for_gpu(&gpu.vendor, &gpu.name),
                     reg_pref: if gpu.is_discrete {
-                        "GpuPreference=2;"
+                        DIRECTX_GPU_PREF_HIGH_PERF
                     } else {
-                        "GpuPreference=1;"
+                        DIRECTX_GPU_PREF_POWER_SAVING
                     },
                 }
             } else {
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: None,
-                    encoder: encoder_for_gpu(&lower, &lower),
-                    reg_pref: if lower == "intel" {
-                        "GpuPreference=1;"
+                    encoder: encoder_for_gpu(target_vendor, target_vendor),
+                    reg_pref: if target_vendor == "intel" || target_vendor == "qualcomm" {
+                        DIRECTX_GPU_PREF_POWER_SAVING
                     } else {
-                        "GpuPreference=2;"
+                        DIRECTX_GPU_PREF_HIGH_PERF
                     },
                 }
             }
@@ -1387,9 +1644,9 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                     adapter_name: Some(gpu.name.clone()),
                     encoder: encoder_for_gpu(&gpu.vendor, &gpu.name),
                     reg_pref: if gpu.is_discrete {
-                        "GpuPreference=2;"
+                        DIRECTX_GPU_PREF_HIGH_PERF
                     } else {
-                        "GpuPreference=1;"
+                        DIRECTX_GPU_PREF_POWER_SAVING
                     },
                 }
             } else {
@@ -1397,17 +1654,21 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                 let looks_integrated = lower.contains("uhd")
                     || lower.contains("iris")
                     || lower.contains("integrated")
+                    || lower.contains("adreno")
+                    || lower.contains("qualcomm")
+                    || lower.contains("radeon(tm) graphics")
                     || (lower.contains("intel")
                         && !lower.contains("arc a")
-                        && !lower.contains("arc b"));
+                        && !lower.contains("arc b")
+                        && !lower.contains("arc pro"));
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: Some(trimmed.to_string()),
                     encoder: enc,
                     reg_pref: if looks_integrated {
-                        "GpuPreference=1;"
+                        DIRECTX_GPU_PREF_POWER_SAVING
                     } else {
-                        "GpuPreference=2;"
+                        DIRECTX_GPU_PREF_HIGH_PERF
                     },
                 }
             }
@@ -1526,8 +1787,29 @@ HKEY_CURRENT_USER\Software\Moonlight Game Streaming Project\Moonlight\hosts\12
         let s1 = select_moonlight_host_slot(&slots, "10.0.0.5", 47989, "Workstation-A").unwrap();
         assert_eq!(s1.uuid, "uuid-slot-10");
 
+        // Matches across .local mDNS suffix and topology transitions (USB-C, TB, PC Hotspot, Phone Hotspot, LAN)
+        for topo_ip in ["10.99.99.2", "169.254.10.2", "192.168.137.2", "172.20.10.2", "192.168.1.10"] {
+            let matched = select_moonlight_host_slot(&slots, topo_ip, 47989, "Workstation-A.local").unwrap();
+            assert_eq!(matched.uuid, "uuid-slot-10");
+            assert_eq!(resolve_win_moonlight_launch_target(matched, topo_ip), "Workstation-A");
+        }
+
         let s2 = select_moonlight_host_slot(&slots, "192.168.1.25", 48989, "").unwrap();
         assert_eq!(s2.uuid, "uuid-slot-12");
+
+        // Slot originally paired with raw IPv4 in hostname ("10.99.99.2") never returns stale IP after switching to Phone Hotspot ("172.20.10.2")
+        let raw_ip_slot = MoonlightHostSlot {
+            reg_key: r"HKCU\Software\Moonlight\hosts\1".into(),
+            hostname: "10.99.99.2".into(),
+            uuid: "uuid-raw".into(),
+            localaddress: "10.99.99.2".into(),
+            manualaddress: "10.99.99.2".into(),
+            remoteaddress: String::new(),
+            ports: vec![47989],
+        };
+        let single_slots = vec![raw_ip_slot];
+        let matched_raw = select_moonlight_host_slot(&single_slots, "172.20.10.2", 47989, "MacBook-Pro").unwrap();
+        assert_eq!(resolve_win_moonlight_launch_target(matched_raw, "172.20.10.2"), "172.20.10.2");
 
         // Unmatched host should return None (non-destructive)
         assert!(select_moonlight_host_slot(&slots, "172.16.0.99", 47989, "Unknown").is_none());

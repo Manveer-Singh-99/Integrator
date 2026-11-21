@@ -7,6 +7,15 @@ using System.Threading;
 using System.Windows.Forms;
 
 class WinClipFiles {
+    /// <summary>Maximum clipboard open/access retry attempts under transient Windows clipboard lock contention.</summary>
+    private const int MAX_CLIPBOARD_RETRIES = 5;
+
+    /// <summary>Backoff sleep duration in milliseconds between clipboard read retry attempts.</summary>
+    private const int READ_RETRY_SLEEP_MS = 20;
+
+    /// <summary>Backoff sleep duration in milliseconds between clipboard write retry attempts.</summary>
+    private const int WRITE_RETRY_SLEEP_MS = 25;
+
     static bool IsSafeExistingPath(string path) {
         if (string.IsNullOrEmpty(path) || path.IndexOf('\0') >= 0) return false;
         try {
@@ -57,7 +66,7 @@ class WinClipFiles {
         if (mode == "read") {
             bool useNul = args.Length >= 2 && (args[1] == "--nul" || args[1] == "-0");
             Exception lastErr = null;
-            for (int attempt = 0; attempt < 5; attempt++) {
+            for (int attempt = 0; attempt < MAX_CLIPBOARD_RETRIES; attempt++) {
                 try {
                     if (!Clipboard.ContainsFileDropList()) {
                         return 0;
@@ -86,7 +95,7 @@ class WinClipFiles {
                     return 0;
                 } catch (Exception ex) {
                     lastErr = ex;
-                    Thread.Sleep(20);
+                    Thread.Sleep(READ_RETRY_SLEEP_MS);
                 }
             }
             Console.Error.WriteLine("win_clip_files read failed: " + (lastErr != null ? lastErr.Message : "unknown error"));
@@ -115,13 +124,13 @@ class WinClipFiles {
             }
 
             Exception lastErr = null;
-            for (int attempt = 0; attempt < 5; attempt++) {
+            for (int attempt = 0; attempt < MAX_CLIPBOARD_RETRIES; attempt++) {
                 try {
                     Clipboard.SetFileDropList(sc);
                     return 0;
                 } catch (Exception ex) {
                     lastErr = ex;
-                    Thread.Sleep(25);
+                    Thread.Sleep(WRITE_RETRY_SLEEP_MS);
                 }
             }
             Console.Error.WriteLine("win_clip_files write failed: " + (lastErr != null ? lastErr.Message : "unknown error"));
