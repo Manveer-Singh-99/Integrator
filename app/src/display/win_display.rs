@@ -775,13 +775,15 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         }
     }
 
-    let uuid = slot.uuid.trim();
-    if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
-        uuid.to_string()
+    let hname = slot.hostname.trim();
+    if !hname.is_empty() && !hname.starts_with('-') && !hname.chars().any(|c| c.is_control()) {
+        hname.to_string()
+    } else if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
+        mac_ip.to_string()
     } else {
-        let hname = slot.hostname.trim();
-        if !hname.is_empty() && !hname.starts_with('-') && !hname.chars().any(|c| c.is_control()) {
-            hname.to_string()
+        let uuid = slot.uuid.trim();
+        if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
+            uuid.to_string()
         } else {
             mac_ip.to_string()
         }

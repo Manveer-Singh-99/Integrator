@@ -630,16 +630,19 @@ fn resolve_or_refresh_mac_moonlight_slot(
         }
     }
 
-    // Prefer UUID if stored so Moonlight binds deterministically when multiple entries exist
-    if let Some(uuid) = props.get(&format!("hosts.{}.uuid", idx)) {
-        let trimmed = uuid.trim();
+    // Prefer hostname or direct route IP so Moonlight connects immediately without UUID WoL timeout delays
+    if let Some(hname) = props.get(&format!("hosts.{}.hostname", idx)) {
+        let trimmed = hname.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.chars().any(|c| c.is_control())
         {
             return Some(trimmed.to_string());
         }
     }
+    if !pc_ip.trim().is_empty() && system_info::is_valid_ipv4(pc_ip) {
+        return Some(pc_ip.trim().to_string());
+    }
     props
-        .get(&format!("hosts.{}.hostname", idx))
+        .get(&format!("hosts.{}.uuid", idx))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_control()))
         .or_else(|| Some(pc_ip.to_string()))
