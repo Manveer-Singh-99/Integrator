@@ -149,6 +149,14 @@
                                 </StackPanel>
                             </Border>
 
+                            <Button x:Name="SetupAssistantBtn" Click="SetupBtn_Click" Padding="10,5" AutomationProperties.Name="Open Setup and Permissions Assistant">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Ellipse x:Name="SetupBtnDot" Width="7" Height="7" Fill="#20B85A" />
+                                    <FontIcon Glyph="&#xEA18;" FontSize="12" />
+                                    <TextBlock x:Name="SetupBtnText" Text="Setup &amp; Permissions" FontSize="12" />
+                                </StackPanel>
+                            </Button>
+
                             <Button Click="RefreshBtn_Click" Padding="10,5" AutomationProperties.Name="Refresh status">
                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                     <FontIcon Glyph="&#xE72C;" FontSize="12" />

@@ -664,6 +664,9 @@ pub struct AppPathPreferences {
     /// Custom path to the `sunshine` executable binary.
     #[serde(default)]
     pub sunshine_binary_path: Option<String>,
+    /// User preference suppressing the automatic Setup & Permissions Assistant prompt on app launch.
+    #[serde(default)]
+    pub suppress_launch_setup_prompt: bool,
 }
 
 impl fmt::Debug for AppPathPreferences {
@@ -700,6 +703,10 @@ impl fmt::Debug for AppPathPreferences {
             )
             .field("firewall_extra_subnets", &self.firewall_extra_subnets)
             .field("sunshine_binary_path", &self.sunshine_binary_path)
+            .field(
+                "suppress_launch_setup_prompt",
+                &self.suppress_launch_setup_prompt,
+            )
             .finish()
     }
 }

@@ -701,6 +701,81 @@ namespace IntegratorUI
     }
 
     /// <summary>
+    /// Operating system permission audit status item returned inside SetupHealthSnapshotModel.
+    /// </summary>
+    internal sealed class PermissionStatusModel
+    {
+        /// <summary>Canonical permission identifier (e.g., "firewall", "network_profile", "camera_privacy", "smb_server", "admin_elevation").</summary>
+        [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        /// <summary>Human-readable permission title.</summary>
+        [JsonPropertyName("title")] public string Title { get; set; } = string.Empty;
+        /// <summary>Explanation of why Integrator uses this permission.</summary>
+        [JsonPropertyName("description")] public string Description { get; set; } = string.Empty;
+        /// <summary>True if permission or prerequisite is currently satisfied.</summary>
+        [JsonPropertyName("granted")] public bool Granted { get; set; }
+        /// <summary>True if missing this permission triggers the launch Setup Assistant prompt.</summary>
+        [JsonPropertyName("required")] public bool Required { get; set; }
+        /// <summary>True if Integrator can trigger an automated or UAC-elevated fix directly.</summary>
+        [JsonPropertyName("can_request_directly")] public bool CanRequestDirectly { get; set; }
+        /// <summary>Optional Windows Settings (ms-settings:) deep-link URI.</summary>
+        [JsonPropertyName("settings_url")] public string? SettingsUrl { get; set; }
+        /// <summary>Diagnostic status detail string.</summary>
+        [JsonPropertyName("detail")] public string Detail { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Companion streaming tool or driver dependency status item returned inside SetupHealthSnapshotModel.
+    /// </summary>
+    internal sealed class DependencyStatusModel
+    {
+        /// <summary>Canonical dependency identifier ("sunshine", "moonlight", "vdd", "usb_ncm", "vcam").</summary>
+        [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        /// <summary>Human-readable dependency name.</summary>
+        [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+        /// <summary>Explanation of which subsystem relies on this tool or driver.</summary>
+        [JsonPropertyName("description")] public string Description { get; set; } = string.Empty;
+        /// <summary>True if detected as installed on the local machine.</summary>
+        [JsonPropertyName("installed")] public bool Installed { get; set; }
+        /// <summary>Optional runtime flag indicating whether the service or process is currently active.</summary>
+        [JsonPropertyName("running")] public bool? Running { get; set; }
+        /// <summary>True if required for core streaming functionality.</summary>
+        [JsonPropertyName("required")] public bool Required { get; set; }
+        /// <summary>Detected binary, DLL, or PnP device path if found.</summary>
+        [JsonPropertyName("detected_path")] public string? DetectedPath { get; set; }
+        /// <summary>Primary installation method label (e.g., "WinGet", "Elevated PowerShell Installer").</summary>
+        [JsonPropertyName("install_method")] public string InstallMethod { get; set; } = string.Empty;
+        /// <summary>Copyable CLI installation command.</summary>
+        [JsonPropertyName("install_command")] public string InstallCommand { get; set; } = string.Empty;
+        /// <summary>Official fallback download or guide URL.</summary>
+        [JsonPropertyName("download_url")] public string DownloadUrl { get; set; } = string.Empty;
+        /// <summary>True if 1-click guided installation is supported.</summary>
+        [JsonPropertyName("can_auto_install")] public bool CanAutoInstall { get; set; }
+    }
+
+    /// <summary>
+    /// Aggregate cross-platform OS permissions and companion dependencies health snapshot.
+    /// </summary>
+    internal sealed class SetupHealthSnapshotModel
+    {
+        /// <summary>Operating system identifier ("windows", "macos").</summary>
+        [JsonPropertyName("os")] public string Os { get; set; } = string.Empty;
+        /// <summary>True if process holds Administrator privileges.</summary>
+        [JsonPropertyName("is_elevated")] public bool IsElevated { get; set; }
+        /// <summary>True if at least one required permission or required dependency is missing.</summary>
+        [JsonPropertyName("needs_attention")] public bool NeedsAttention { get; set; }
+        /// <summary>Number of missing required OS permissions.</summary>
+        [JsonPropertyName("missing_required_permissions")] public int MissingRequiredPermissions { get; set; }
+        /// <summary>Number of missing required companion dependencies.</summary>
+        [JsonPropertyName("missing_required_dependencies")] public int MissingRequiredDependencies { get; set; }
+        /// <summary>User-persisted flag suppressing automatic Setup dialog presentation on launch.</summary>
+        [JsonPropertyName("suppress_launch_prompt")] public bool SuppressLaunchPrompt { get; set; }
+        /// <summary>Audited OS permissions list.</summary>
+        [JsonPropertyName("permissions")] public List<PermissionStatusModel> Permissions { get; set; } = new();
+        /// <summary>Audited companion dependencies list.</summary>
+        [JsonPropertyName("dependencies")] public List<DependencyStatusModel> Dependencies { get; set; } = new();
+    }
+
+    /// <summary>
     /// Results of an active live network throughput benchmark test.
     /// </summary>
     internal sealed class SpeedTestResultModel
@@ -866,6 +941,8 @@ namespace IntegratorUI
 
         /// <summary>True if configured to launch automatically at Windows logon.</summary>
         [JsonPropertyName("autostart_enabled")] public bool AutostartEnabled { get; set; }
+        /// <summary>Cross-platform OS permissions and companion dependencies setup health snapshot.</summary>
+        [JsonPropertyName("setup_status")] public SetupHealthSnapshotModel? SetupStatus { get; set; }
         /// <summary>Recent log entries emitted by the core.</summary>
         [JsonPropertyName("recent_logs")] public List<LogEntryModel> RecentLogs { get; set; } = new();
     }

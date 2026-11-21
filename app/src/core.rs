@@ -365,9 +365,12 @@ pub struct BridgeStatus {
     /// Keystore pairing PIN and trusted peer list.
     pub trust: TrustSnapshotInfo,
 
-    // Autostart & Diagnostic Logs
+    // Autostart, Setup Health & Diagnostic Logs
     /// `true` if OS login autostart is registered.
     pub autostart_enabled: bool,
+    /// Cross-platform OS permissions and companion dependencies setup health snapshot.
+    #[serde(default)]
+    pub setup_status: crate::setup::SetupHealthSnapshot,
     /// Recent diagnostic log lines from the in-memory ring buffer.
     pub recent_logs: Vec<LogEntry>,
 }
@@ -840,6 +843,27 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                 Ok(())
             })
         })()),
+        "setup" => Some((|| {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            match subcmd {
+                "status" | "table" => {
+                    crate::setup::invalidate_setup_cache();
+                    let snap = crate::setup::collect_setup_health_snapshot(false, false);
+                    print!("{}", crate::setup::format_setup_cli_table(&snap));
+                    Ok(())
+                }
+                "json" | "--json" => {
+                    crate::setup::invalidate_setup_cache();
+                    let snap = crate::setup::collect_setup_health_snapshot(false, false);
+                    println!("{}", serde_json::to_string_pretty(&snap)?);
+                    Ok(())
+                }
+                _ => anyhow::bail!(
+                    "Unknown setup subcommand: {}. Use `integrator setup` or `integrator setup status`.",
+                    subcmd
+                ),
+            }
+        })()),
         _ => None,
     }
 }
@@ -886,7 +910,7 @@ fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
 
 /// Formats a slice of numeric TCP/UDP ports into a comma-separated `netsh` `localport=` value.
 #[cfg(any(target_os = "windows", test))]
-fn format_firewall_ports(ports: &[u16]) -> String {
+pub(crate) fn format_firewall_ports(ports: &[u16]) -> String {
     ports
         .iter()
         .map(u16::to_string)
@@ -994,7 +1018,7 @@ fn build_windows_firewall_remote_scopes_from(
 /// [`config::IPV4_LINK_LOCAL_CIDR`], currently active local IPv4 adapter subnets, and validated
 /// `AppPathPreferences.firewall_extra_subnets`.
 #[cfg(any(target_os = "windows", test))]
-fn build_windows_firewall_remote_scopes() -> String {
+pub(crate) fn build_windows_firewall_remote_scopes() -> String {
     let interfaces = system_info::list_local_ipv4_interfaces();
     let prefs = system_info::load_path_preferences();
     build_windows_firewall_remote_scopes_from(&interfaces, &prefs.firewall_extra_subnets)
@@ -1005,7 +1029,7 @@ fn build_windows_firewall_remote_scopes() -> String {
 /// Ensures direct Thunderbolt/USB4, USB-C NCM, Ethernet, and Mobile Hotspot interfaces
 /// permit inbound traffic on Integrator TCP/UDP/SMB ports even if assigned to Public network profiles.
 #[cfg(target_os = "windows")]
-fn ensure_windows_firewall_rules() {
+pub(crate) fn ensure_windows_firewall_rules() {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1330,6 +1354,8 @@ impl IntegratorCore {
 
         let feature_flags = self.features.get_flags();
         let truetone_enabled = feature_flags.truetone;
+        let camera_enabled = feature_flags.camera;
+        let has_peer_discovered = best.is_some() || !all_peers.is_empty();
         let (
             storage_status,
             preferred_peer_share,
@@ -1338,6 +1364,7 @@ impl IntegratorCore {
             (enc_gpu, dec_gpu),
             als,
             (trust_cfg, pending_peers),
+            setup_status,
         ) = tokio::task::spawn_blocking({
             let bip = best_ip.clone();
             let bsh = best_share.clone();
@@ -1362,7 +1389,11 @@ impl IntegratorCore {
                     }
                 };
                 let trust_snap = trust::get_trust_snapshot();
-                (st, pref, local_folder, auto, gpus, als, trust_snap)
+                let setup_snap = crate::setup::collect_setup_health_snapshot(
+                    camera_enabled,
+                    has_peer_discovered,
+                );
+                (st, pref, local_folder, auto, gpus, als, trust_snap, setup_snap)
             }
         })
         .await
@@ -1397,6 +1428,7 @@ impl IntegratorCore {
                     },
                     Vec::new(),
                 ),
+                crate::setup::SetupHealthSnapshot::default(),
             )
         });
 
@@ -1547,6 +1579,7 @@ impl IntegratorCore {
             },
 
             autostart_enabled,
+            setup_status,
             recent_logs: get_recent_logs(),
         }
     }
@@ -2178,6 +2211,83 @@ impl IntegratorCore {
                         "Paired with {} ({}) [SAS: {}]",
                         creds.hostname, tip, sas_6
                     )))
+                }
+                "get_setup_status" => {
+                    let cam_enabled = self.features.is_enabled("camera");
+                    let has_peers = !self.discovery.get_all_peers().await.is_empty();
+                    let snap = tokio::task::spawn_blocking(move || {
+                        crate::setup::invalidate_setup_cache();
+                        crate::setup::collect_setup_health_snapshot(cam_enabled, has_peers)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    Ok(serde_json::to_value(snap).map_err(|e| e.to_string())?)
+                }
+                "request_permission" => {
+                    #[derive(Deserialize)]
+                    struct PermArgs {
+                        id: String,
+                    }
+                    let args: PermArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let msg = tokio::task::spawn_blocking(move || {
+                        crate::setup::request_permission(&args.id)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(msg))
+                }
+                "request_all_missing_permissions" => {
+                    let cam_enabled = self.features.is_enabled("camera");
+                    let has_peers = !self.discovery.get_all_peers().await.is_empty();
+                    let msg = tokio::task::spawn_blocking(move || {
+                        crate::setup::request_all_missing_permissions(cam_enabled, has_peers)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(msg))
+                }
+                "open_permission_settings" => {
+                    #[derive(Deserialize)]
+                    struct OpenPermArgs {
+                        id: String,
+                    }
+                    let args: OpenPermArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let msg = tokio::task::spawn_blocking(move || {
+                        crate::setup::open_permission_settings(&args.id)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(msg))
+                }
+                "install_dependency" => {
+                    #[derive(Deserialize)]
+                    struct DepArgs {
+                        id: String,
+                    }
+                    let args: DepArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let msg = tokio::task::spawn_blocking(move || {
+                        crate::setup::install_dependency(&args.id)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(msg))
+                }
+                "set_suppress_launch_setup_prompt" => {
+                    #[derive(Deserialize)]
+                    struct SuppressArgs {
+                        suppress: bool,
+                    }
+                    let args: SuppressArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let saved = tokio::task::spawn_blocking(move || {
+                        crate::setup::set_suppress_launch_setup_prompt(args.suppress)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(saved))
                 }
                 _ => Err(format!("Unknown native command: {}", method)),
             }

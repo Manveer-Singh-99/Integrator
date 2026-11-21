@@ -88,6 +88,7 @@ fn main() {
             "src/ambient_light.swift",
             "src/kvm_macos.swift",
             "src/camera_macos.swift",
+            "src/permissions_macos.swift",
             "ui-macos/IntegratorApp.swift",
             "-o",
             &lib_path,
@@ -160,6 +161,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/ambient_light.swift");
         println!("cargo:rerun-if-changed=src/kvm_macos.swift");
         println!("cargo:rerun-if-changed=src/camera_macos.swift");
+        println!("cargo:rerun-if-changed=src/permissions_macos.swift");
         println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
@@ -195,6 +197,7 @@ fn main() {
         }
 
         println!("cargo:rustc-link-lib=static=virtualdisplay");
+        println!("cargo:rustc-link-lib=framework=ApplicationServices");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");

@@ -165,6 +165,10 @@ namespace IntegratorUI
         private string? _lastRenderedLogsKey;
         /// <summary>Cached theme mode to detect dark/light theme transitions for log text brushes.</summary>
         private ElementTheme _lastRenderedTheme = ElementTheme.Default;
+        /// <summary>Guard flag ensuring the automatic launch setup prompt is evaluated at most once per app launch.</summary>
+        private bool _didShowLaunchSetupPrompt;
+        /// <summary>Reentrancy guard preventing overlapping Setup Assistant ContentDialog instances.</summary>
+        private bool _isSetupDialogOpen;
 
         /// <summary>
         /// Resolves the platform default public shared directory label dynamically from OS environment
@@ -706,6 +710,31 @@ namespace IntegratorUI
                 SetPillStyle(AutostartPill, AutostartPillDot, s.AutostartEnabled
                     ? Color.FromArgb(255, 32, 184, 90)
                     : Color.FromArgb(255, 136, 136, 136));
+
+                // Setup & Permissions Header Badge + One-Time Launch Prompt
+                bool setupNeedsAttention = s.SetupStatus?.NeedsAttention == true;
+                if (SetupBtnDot != null)
+                {
+                    SetupBtnDot.Fill = new SolidColorBrush(setupNeedsAttention
+                        ? Color.FromArgb(255, 232, 158, 27)
+                        : Color.FromArgb(255, 32, 184, 90));
+                }
+                if (SetupBtnText != null)
+                {
+                    int missingCount = (s.SetupStatus?.MissingRequiredPermissions ?? 0)
+                                     + (s.SetupStatus?.MissingRequiredDependencies ?? 0);
+                    SetupBtnText.Text = setupNeedsAttention && missingCount > 0
+                        ? $"Setup & Permissions ({missingCount})"
+                        : "Setup & Permissions";
+                }
+                if (!_didShowLaunchSetupPrompt)
+                {
+                    _didShowLaunchSetupPrompt = true;
+                    if (s.SetupStatus?.NeedsAttention == true && !s.SetupStatus.SuppressLaunchPrompt && !_isHiddenToTray)
+                    {
+                        DispatcherQueue.TryEnqueue(() => _ = ShowSetupAssistantDialogAsync());
+                    }
+                }
 
                 // Card 12: Logs
                 RebuildLogsPanel(s.RecentLogs);
@@ -1396,6 +1425,10 @@ namespace IntegratorUI
         /// </summary>
         private void RefreshBtn_Click(object sender, RoutedEventArgs e) => _ = RefreshStatusAsync();
         /// <summary>
+        /// Opens the Setup, Drivers &amp; Permissions Assistant dialog when clicked from the top toolbar.
+        /// </summary>
+        private void SetupBtn_Click(object sender, RoutedEventArgs e) => _ = ShowSetupAssistantDialogAsync();
+        /// <summary>
         /// Opens the local clipboard file staging and cache folder in Windows File Explorer.
         /// </summary>
         private void OpenCacheBtn_Click(object sender, RoutedEventArgs e) => RunInvoke("open_cache_folder", refreshAfter: false);
@@ -1828,6 +1861,349 @@ namespace IntegratorUI
                     card.Background = cardBg;
                     card.BorderBrush = cardBorder;
                 }
+            }
+        }
+
+        // MARK: - Permissions & Setup Assistant Dialog
+
+        /// <summary>
+        /// Presents the WinUI 3 ContentDialog for the Permissions &amp; Setup Assistant, allowing 1-click
+        /// remediation of Windows Defender Firewall rules, Network Profile category, Camera Privacy, SMB Server,
+        /// and guided installation for Sunshine, Moonlight, Virtual Display Driver, USB-C NCM Bridge, and Virtual Camera.
+        /// </summary>
+        private async Task ShowSetupAssistantDialogAsync()
+        {
+            if (_isSetupDialogOpen || _disposedForExit || RootGrid?.XamlRoot == null) return;
+            _isSetupDialogOpen = true;
+            try
+            {
+                var freshRes = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                SetupHealthSnapshotModel snap = (freshRes.Ok && freshRes.Data != null)
+                    ? freshRes.Data
+                    : (_status?.SetupStatus ?? new SetupHealthSnapshotModel());
+                if (_status != null)
+                {
+                    _status.SetupStatus = snap;
+                }
+
+                var hostContainer = new StackPanel { Spacing = 12, MinWidth = 540, MaxWidth = 640 };
+
+                void RebuildDialogContent(SetupHealthSnapshotModel current)
+                {
+                    hostContainer.Children.Clear();
+
+                    // Summary Banner + Action Bar
+                    var topRow = new Grid { ColumnSpacing = 8 };
+                    topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                    string summaryMsg = current.NeedsAttention
+                        ? $"{current.MissingRequiredPermissions} required permission(s) and {current.MissingRequiredDependencies} required tool(s) need attention."
+                        : "All required Windows permissions and streaming tools are ready.";
+                    var summaryText = new TextBlock
+                    {
+                        Text = summaryMsg,
+                        FontSize = 12,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = new SolidColorBrush(current.NeedsAttention
+                            ? Color.FromArgb(255, 232, 158, 27)
+                            : Color.FromArgb(255, 32, 184, 90)),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        TextWrapping = TextWrapping.Wrap
+                    };
+                    Grid.SetColumn(summaryText, 0);
+                    topRow.Children.Add(summaryText);
+
+                    var fixAllBtn = new Button
+                    {
+                        Content = "Fix All Missing",
+                        Padding = new Thickness(10, 4, 10, 4),
+                        FontSize = 11,
+                        IsEnabled = current.MissingRequiredPermissions > 0
+                    };
+                    fixAllBtn.Click += async (_, _) =>
+                    {
+                        fixAllBtn.IsEnabled = false;
+                        var r = await Task.Run(() => CoreBridge.Invoke<string>("request_all_missing_permissions"));
+                        if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
+                        else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
+                        var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                        if (refreshed.Ok && refreshed.Data != null)
+                        {
+                            RebuildDialogContent(refreshed.Data);
+                            await RefreshStatusAsync();
+                        }
+                    };
+                    Grid.SetColumn(fixAllBtn, 1);
+                    topRow.Children.Add(fixAllBtn);
+
+                    var refreshBtn = new Button
+                    {
+                        Content = "Refresh",
+                        Padding = new Thickness(10, 4, 10, 4),
+                        FontSize = 11
+                    };
+                    refreshBtn.Click += async (_, _) =>
+                    {
+                        refreshBtn.IsEnabled = false;
+                        var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                        if (refreshed.Ok && refreshed.Data != null)
+                        {
+                            RebuildDialogContent(refreshed.Data);
+                            await RefreshStatusAsync();
+                        }
+                    };
+                    Grid.SetColumn(refreshBtn, 2);
+                    topRow.Children.Add(refreshBtn);
+                    hostContainer.Children.Add(topRow);
+
+                    // Section 1: Windows Permissions
+                    hostContainer.Children.Add(new TextBlock
+                    {
+                        Text = "Windows Security & Privacy Permissions",
+                        FontSize = 13,
+                        FontWeight = FontWeights.SemiBold,
+                        Margin = new Thickness(0, 4, 0, 0)
+                    });
+
+                    foreach (var perm in current.Permissions)
+                    {
+                        string permId = perm.Id;
+                        var card = new Border
+                        {
+                            Padding = new Thickness(10, 8, 10, 8),
+                            CornerRadius = new CornerRadius(8),
+                            Background = (Brush)Application.Current.Resources["CardBackgroundFillColorSecondaryBrush"],
+                            BorderBrush = (Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+                            BorderThickness = new Thickness(1)
+                        };
+                        var rowGrid = new Grid { ColumnSpacing = 10 };
+                        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                        var infoStack = new StackPanel { Spacing = 2 };
+                        string badgeLabel = perm.Granted ? "[OK]" : (perm.Required ? "[REQUIRED • MISSING]" : "[ADVISORY]");
+                        var titleBlock = new TextBlock
+                        {
+                            Text = $"{badgeLabel}  {perm.Title}",
+                            FontSize = 12,
+                            FontWeight = FontWeights.SemiBold,
+                            Foreground = new SolidColorBrush(perm.Granted
+                                ? Color.FromArgb(255, 32, 184, 90)
+                                : (perm.Required ? Color.FromArgb(255, 232, 158, 27) : Color.FromArgb(255, 24, 180, 212))),
+                            TextWrapping = TextWrapping.Wrap
+                        };
+                        infoStack.Children.Add(titleBlock);
+                        infoStack.Children.Add(new TextBlock
+                        {
+                            Text = perm.Description,
+                            FontSize = 11,
+                            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                            TextWrapping = TextWrapping.Wrap
+                        });
+                        infoStack.Children.Add(new TextBlock
+                        {
+                            Text = perm.Detail,
+                            FontSize = 11,
+                            Foreground = (Brush)Application.Current.Resources["TextFillColorTertiaryBrush"],
+                            TextWrapping = TextWrapping.Wrap
+                        });
+                        Grid.SetColumn(infoStack, 0);
+                        rowGrid.Children.Add(infoStack);
+
+                        var btnPanel = new StackPanel
+                        {
+                            Orientation = Orientation.Horizontal,
+                            Spacing = 6,
+                            VerticalAlignment = VerticalAlignment.Center
+                        };
+                        if (perm.CanRequestDirectly && !perm.Granted)
+                        {
+                            var fixBtn = new Button
+                            {
+                                Content = "Fix / Request",
+                                Padding = new Thickness(10, 4, 10, 4),
+                                FontSize = 11
+                            };
+                            fixBtn.Click += async (_, _) =>
+                            {
+                                fixBtn.IsEnabled = false;
+                                var r = await Task.Run(() => CoreBridge.Invoke<string>("request_permission", new { id = permId }));
+                                if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
+                                else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
+                                var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                                if (refreshed.Ok && refreshed.Data != null)
+                                {
+                                    RebuildDialogContent(refreshed.Data);
+                                    await RefreshStatusAsync();
+                                }
+                            };
+                            btnPanel.Children.Add(fixBtn);
+                        }
+                        if (!string.IsNullOrWhiteSpace(perm.SettingsUrl))
+                        {
+                            var settingsBtn = new Button
+                            {
+                                Content = "Open Settings",
+                                Padding = new Thickness(10, 4, 10, 4),
+                                FontSize = 11
+                            };
+                            settingsBtn.Click += async (_, _) =>
+                            {
+                                var r = await Task.Run(() => CoreBridge.Invoke<string>("open_permission_settings", new { id = permId }));
+                                if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
+                            };
+                            btnPanel.Children.Add(settingsBtn);
+                        }
+                        Grid.SetColumn(btnPanel, 1);
+                        rowGrid.Children.Add(btnPanel);
+                        card.Child = rowGrid;
+                        hostContainer.Children.Add(card);
+                    }
+
+                    // Section 2: Companion Drivers & Streaming Tools
+                    hostContainer.Children.Add(new TextBlock
+                    {
+                        Text = "Drivers & Companion Streaming Tools",
+                        FontSize = 13,
+                        FontWeight = FontWeights.SemiBold,
+                        Margin = new Thickness(0, 6, 0, 0)
+                    });
+
+                    foreach (var dep in current.Dependencies)
+                    {
+                        string depId = dep.Id;
+                        var card = new Border
+                        {
+                            Padding = new Thickness(10, 8, 10, 8),
+                            CornerRadius = new CornerRadius(8),
+                            Background = (Brush)Application.Current.Resources["CardBackgroundFillColorSecondaryBrush"],
+                            BorderBrush = (Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+                            BorderThickness = new Thickness(1)
+                        };
+                        var rowGrid = new Grid { ColumnSpacing = 10 };
+                        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                        var infoStack = new StackPanel { Spacing = 2 };
+                        string badgeLabel = dep.Installed
+                            ? (dep.Running == true ? "[INSTALLED • RUNNING]" : "[INSTALLED]")
+                            : (dep.Required ? "[REQUIRED • MISSING]" : "[OPTIONAL]");
+                        infoStack.Children.Add(new TextBlock
+                        {
+                            Text = $"{badgeLabel}  {dep.Name}",
+                            FontSize = 12,
+                            FontWeight = FontWeights.SemiBold,
+                            Foreground = new SolidColorBrush(dep.Installed
+                                ? Color.FromArgb(255, 32, 184, 90)
+                                : (dep.Required ? Color.FromArgb(255, 232, 158, 27) : Color.FromArgb(255, 136, 136, 136))),
+                            TextWrapping = TextWrapping.Wrap
+                        });
+                        infoStack.Children.Add(new TextBlock
+                        {
+                            Text = dep.Description,
+                            FontSize = 11,
+                            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+                            TextWrapping = TextWrapping.Wrap
+                        });
+                        if (!string.IsNullOrWhiteSpace(dep.DetectedPath))
+                        {
+                            infoStack.Children.Add(new TextBlock
+                            {
+                                Text = $"Detected: {dep.DetectedPath}",
+                                FontSize = 10,
+                                FontFamily = new FontFamily("Consolas"),
+                                Foreground = (Brush)Application.Current.Resources["TextFillColorTertiaryBrush"],
+                                TextTrimming = TextTrimming.CharacterEllipsis
+                            });
+                        }
+                        if (!string.IsNullOrWhiteSpace(dep.InstallCommand))
+                        {
+                            infoStack.Children.Add(new TextBlock
+                            {
+                                Text = $"{dep.InstallMethod}: {dep.InstallCommand}",
+                                FontSize = 10,
+                                FontFamily = new FontFamily("Consolas"),
+                                Foreground = (Brush)Application.Current.Resources["TextFillColorTertiaryBrush"],
+                                IsTextSelectionEnabled = true,
+                                TextWrapping = TextWrapping.Wrap
+                            });
+                        }
+                        Grid.SetColumn(infoStack, 0);
+                        rowGrid.Children.Add(infoStack);
+
+                        var installBtn = new Button
+                        {
+                            Content = dep.Installed ? "Reinstall / Guide" : "Install / Download",
+                            Padding = new Thickness(10, 4, 10, 4),
+                            FontSize = 11,
+                            VerticalAlignment = VerticalAlignment.Center
+                        };
+                        installBtn.Click += async (_, _) =>
+                        {
+                            installBtn.IsEnabled = false;
+                            var r = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = depId }));
+                            if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
+                            else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
+                            var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                            if (refreshed.Ok && refreshed.Data != null)
+                            {
+                                RebuildDialogContent(refreshed.Data);
+                                await RefreshStatusAsync();
+                            }
+                        };
+                        Grid.SetColumn(installBtn, 1);
+                        rowGrid.Children.Add(installBtn);
+
+                        card.Child = rowGrid;
+                        hostContainer.Children.Add(card);
+                    }
+
+                    // Suppress on Launch CheckBox
+                    var suppressChk = new CheckBox
+                    {
+                        Content = "Don't prompt automatically on launch",
+                        IsChecked = current.SuppressLaunchPrompt,
+                        FontSize = 12,
+                        Margin = new Thickness(0, 6, 0, 0)
+                    };
+                    suppressChk.Click += async (_, _) =>
+                    {
+                        bool suppress = suppressChk.IsChecked == true;
+                        await Task.Run(() => CoreBridge.Invoke<bool>("set_suppress_launch_setup_prompt", new { suppress }));
+                        await RefreshStatusAsync();
+                    };
+                    hostContainer.Children.Add(suppressChk);
+                }
+
+                RebuildDialogContent(snap);
+
+                var scrollViewer = new ScrollViewer
+                {
+                    MaxHeight = 520,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                    Content = hostContainer
+                };
+
+                var dlg = new ContentDialog
+                {
+                    Title = "Permissions & Setup Assistant",
+                    Content = scrollViewer,
+                    CloseButtonText = "Done",
+                    DefaultButton = ContentDialogButton.Close,
+                    XamlRoot = RootGrid.XamlRoot
+                };
+
+                await dlg.ShowAsync();
+            }
+            catch
+            {
+            }
+            finally
+            {
+                _isSetupDialogOpen = false;
             }
         }
     }
