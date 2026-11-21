@@ -107,6 +107,10 @@ pub struct DisplayController {
 impl DisplayController {
     /// Instantiates a new [`DisplayController`] tied to discovery and feature managers.
     pub fn new(discovery: DiscoveryManager, features: Arc<FeatureManager>) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = WinDisplayManager::disable_vdd_device();
+        }
         Self {
             discovery,
             features,
@@ -503,8 +507,7 @@ impl DisplayController {
             let Ok(_tx) = self.transition_lock.try_lock() else {
                 return Ok("Display transition already in progress...".into());
             };
-            let is_running =
-                *self.host_active.read().await || WinDisplayManager::is_vdd_active();
+            let is_running = *self.host_active.read().await;
             if is_running {
                 self.stop_pc_to_mac_locked().await?;
                 Ok("Stopped PC-to-Mac extended display".into())
@@ -607,6 +610,13 @@ impl DisplayController {
         } else {
             (w, h)
         };
+
+        // Ensure Sunshine REST API has cleared any lingering stream before client connects
+        let api_port = active_port + 1;
+        let _ = tokio::task::spawn_blocking(move || {
+            WinDisplayManager::call_sunshine_api(api_port, "/api/apps/close");
+        })
+        .await;
 
         // 3. Send RPC to peer to launch Moonlight client
         let rpc = DisplayRpcRequest::StartMoonlight {

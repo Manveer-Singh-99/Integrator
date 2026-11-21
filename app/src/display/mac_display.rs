@@ -314,8 +314,28 @@ impl MacDisplayManager {
         Ok(())
     }
 
+    /// Dispatches an administrative POST request to the local Sunshine REST API on macOS.
+    ///
+    /// Executes `/usr/bin/curl` with a 2-second timeout and default administrative credentials (`admin:alpine`).
+    ///
+    /// # Arguments
+    /// - `web_port`: Sunshine web administration port (e.g. 47990).
+    /// - `path`: API endpoint path (e.g. `"/api/apps/close"`).
+    pub fn call_sunshine_api(web_port: u16, path: &str) {
+        let url = format!("https://127.0.0.1:{}{}", web_port, path);
+        let _ = Command::new("/usr/bin/curl")
+            .args(["-s", "-k", "-m", "2", "-u", "admin:alpine", "-X", "POST", &url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     /// Stops any running Sunshine server processes on macOS.
     pub fn stop_sunshine() -> Result<()> {
+        Self::call_sunshine_api(47990, "/api/apps/close");
+        Self::call_sunshine_api(47990, "/api/reset-display-device-persistence");
+
         let is_running = || {
             ["Sunshine", "sunshine"].iter().any(|proc_name| {
                 Command::new("/usr/bin/pgrep")

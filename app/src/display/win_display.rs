@@ -278,6 +278,10 @@ impl WinDisplayManager {
             // 2. Ensure Sunshine host service, secondary task, or binary is running
             ensure_sunshine_running()?;
 
+            // Clear any lingering stream sessions on Sunshine web APIs to guarantee clean connection state
+            Self::call_sunshine_api(48990, "/api/apps/close");
+            Self::call_sunshine_api(47990, "/api/apps/close");
+
             // 3. Attach virtual display slot 1 via VddCtl.exe if present, else optional marker
             if let Some(vdd_ctl) = find_vdd_ctl() {
                 let status = hidden_cmd(&vdd_ctl)
@@ -319,11 +323,43 @@ impl WinDisplayManager {
         Ok(())
     }
 
+    /// Dispatches an administrative POST request to the local Sunshine REST API.
+    ///
+    /// Executes native Windows `curl.exe` with a 2-second timeout and default administrative credentials (`admin:alpine`).
+    /// Used to clear lingering streaming sessions (`/api/apps/close`) and reset display topology
+    /// persistence (`/api/reset-display-device-persistence`).
+    ///
+    /// # Arguments
+    /// - `web_port`: Sunshine web administration port (e.g. 47990 or 48990).
+    /// - `path`: API endpoint path (e.g. `"/api/apps/close"`).
+    pub fn call_sunshine_api(web_port: u16, path: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            let curl_exe = system_info::system32_exe("curl.exe");
+            let url = format!("https://127.0.0.1:{}{}", web_port, path);
+            let _ = hidden_cmd(&curl_exe)
+                .args(["-s", "-k", "-m", "2", "-u", "admin:alpine", "-X", "POST", &url])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (web_port, path);
+        }
+    }
+
     /// Gracefully detaches/disables discovered Virtual Display Driver slots and adapters.
     pub fn disable_vdd_device() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             let _ = std::fs::remove_file(system_info::app_data_dir().join("win_vdd.active"));
+
+            // Gracefully terminate any active streaming sessions and clear device persistence
+            Self::call_sunshine_api(48990, "/api/apps/close");
+            Self::call_sunshine_api(48990, "/api/reset-display-device-persistence");
+            Self::call_sunshine_api(47990, "/api/apps/close");
+            Self::call_sunshine_api(47990, "/api/reset-display-device-persistence");
 
             let mut first_err: Option<anyhow::Error> = None;
             if let Some(vdd_ctl) = find_vdd_ctl() {
