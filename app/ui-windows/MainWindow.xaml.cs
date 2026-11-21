@@ -81,9 +81,44 @@ namespace IntegratorUI
     /// </summary>
     public sealed partial class MainWindow : Window
     {
+        /// <summary>Fallback primary display work area width in physical pixels when DisplayArea is unavailable.</summary>
+        private const int FallbackWorkAreaWidthPx = 1920;
+        /// <summary>Fallback primary display work area height in physical pixels when DisplayArea is unavailable.</summary>
+        private const int FallbackWorkAreaHeightPx = 1080;
+        /// <summary>Default target window width in DIPs at 100% DPI scaling.</summary>
+        private const int DefaultWindowWidthDip = 1240;
+        /// <summary>Default target window height in DIPs at 100% DPI scaling.</summary>
+        private const int DefaultWindowHeightDip = 820;
+        /// <summary>Minimum allowed dashboard window width in physical pixels.</summary>
+        private const int MinWindowWidthPx = 800;
+        /// <summary>Minimum allowed dashboard window height in physical pixels.</summary>
+        private const int MinWindowHeightPx = 600;
+        /// <summary>Desktop work-area inset margin in physical pixels reserved around the initial window.</summary>
+        private const int WorkAreaMarginPx = 48;
+        /// <summary>Cards grid width threshold in DIPs at which the layout switches from 1 to 2 columns.</summary>
+        private const double TwoColumnBreakpointDip = 740.0;
+        /// <summary>Auto-dismiss duration in seconds for ephemeral toast notifications.</summary>
+        private const int ToastDismissSeconds = 4;
+        /// <summary>Periodic interval in seconds for polling get_bridge_status from the native core.</summary>
+        private const int StatusPollIntervalSeconds = 2;
+        /// <summary>Fallback local workstation label shown in the desk schematic when hostname is unavailable.</summary>
+        private const string DefaultLocalHostname = "This PC";
+        /// <summary>Fallback remote peer label shown in the desk schematic when peer hostname is unavailable.</summary>
+        private const string DefaultPeerHostname = "Peer Mac";
+        /// <summary>Maximum visible character prefix length for truncated device identifiers.</summary>
+        private const int DeviceIdPreviewLength = 14;
+        /// <summary>Maximum number of local network interfaces summarized in the Route Telemetry card.</summary>
+        private const int MaxDisplayedInterfaces = 3;
+        /// <summary>CIE D65 neutral fallback Correlated Color Temperature in Kelvin.</summary>
+        private const uint DefaultAmbientCctKelvin = 6500;
+        /// <summary>Maximum input length permitted in the per-peer pairing PIN input field.</summary>
+        private const int PairingPinMaxInputLength = 12;
+        /// <summary>Maximum number of trailing log entries rendered in the live logs panel.</summary>
+        private const int MaxRenderedLogLines = 60;
+
         /// <summary>Reference to the parent WinUI application instance.</summary>
         private readonly App _app;
-        /// <summary>Repeating 2.0-second timer polling the Rust core bridge status.</summary>
+        /// <summary>Repeating status polling timer querying the Rust core bridge status.</summary>
         private readonly DispatcherTimer _pollTimer;
         /// <summary>Timer for auto-dismissing ephemeral toast notifications.</summary>
         private readonly DispatcherTimer _toastTimer;
@@ -132,6 +167,22 @@ namespace IntegratorUI
         private ElementTheme _lastRenderedTheme = ElementTheme.Default;
 
         /// <summary>
+        /// Resolves the platform default public shared directory label dynamically from OS environment
+        /// and Windows Known Folder APIs without hardcoding a drive letter.
+        /// </summary>
+        private static string GetDefaultSharedFolderLabel()
+        {
+            string? publicDir = Environment.GetEnvironmentVariable("PUBLIC");
+            if (string.IsNullOrWhiteSpace(publicDir))
+            {
+                publicDir = Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments);
+            }
+            return string.IsNullOrWhiteSpace(publicDir)
+                ? "Default (Public)"
+                : $"Default ({publicDir})";
+        }
+
+        /// <summary>
         /// Initializes the main dashboard window, configures high-DPI sizing and titlebar chrome,
         /// registers system backdrop (Mica or Windows 10 Acrylic fallback), and starts the status polling timer.
         /// </summary>
@@ -142,6 +193,18 @@ namespace IntegratorUI
             _app = app;
             _isHiddenToTray = startHidden;
             InitializeComponent();
+
+            AudioPillText.Text = string.Format(
+                CultureInfo.InvariantCulture,
+                "UDP :{0}",
+                AudioRoutingStatusModel.DefaultAudioPort);
+            CameraSummaryText.Text = string.Format(
+                CultureInfo.InvariantCulture,
+                "Exposes '{0}' ({1}p{2}) via encrypted TCP :{3} when enabled on Mac and PC.",
+                CameraStatusModel.DefaultCameraDeviceName,
+                CameraStatusModel.DefaultCameraHeight,
+                CameraStatusModel.DefaultCameraFps,
+                CameraStatusModel.DefaultCameraPort);
 
             _allCards = new[]
             {
@@ -166,14 +229,14 @@ namespace IntegratorUI
                 }
             };
 
-            _toastTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+            _toastTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(ToastDismissSeconds) };
             _toastTimer.Tick += (_, _) =>
             {
                 _toastTimer.Stop();
                 ToastBanner.Visibility = Visibility.Collapsed;
             };
 
-            _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(StatusPollIntervalSeconds) };
             _pollTimer.Tick += (_, _) => _ = RefreshStatusAsync();
             if (!startHidden)
             {
@@ -204,9 +267,9 @@ namespace IntegratorUI
             double scale = dpi > 0 ? dpi / 96.0 : 1.0;
 
             var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary)?.WorkArea
-                ?? new RectInt32(0, 0, 1920, 1080);
-            int targetW = Math.Min((int)(1240 * scale), Math.Max(800, area.Width - 48));
-            int targetH = Math.Min((int)(820 * scale), Math.Max(600, area.Height - 48));
+                ?? new RectInt32(0, 0, FallbackWorkAreaWidthPx, FallbackWorkAreaHeightPx);
+            int targetW = Math.Min((int)(DefaultWindowWidthDip * scale), Math.Max(MinWindowWidthPx, area.Width - WorkAreaMarginPx));
+            int targetH = Math.Min((int)(DefaultWindowHeightDip * scale), Math.Max(MinWindowHeightPx, area.Height - WorkAreaMarginPx));
             AppWindow.Resize(new SizeInt32(targetW, targetH));
             try
             {
@@ -389,7 +452,7 @@ namespace IntegratorUI
                     safeHw,
                     s.PrimaryDisplay.Width,
                     s.PrimaryDisplay.Height,
-                    safeDevId.Length > 14 ? safeDevId[..14] : safeDevId);
+                    safeDevId.Length > DeviceIdPreviewLength ? safeDevId[..DeviceIdPreviewLength] : safeDevId);
 
                 if (s.PeerConnected)
                 {
@@ -535,7 +598,7 @@ namespace IntegratorUI
                     ? string.Format(CultureInfo.InvariantCulture, "{0:0.0} ms", s.RttMs.Value)
                     : "--";
                 InterfacesText.Text = s.LocalInterfaces.Count > 0
-                    ? "Interfaces: " + string.Join(", ", s.LocalInterfaces.Take(3).Select(i => i.Name + " (" + i.Ip + ")"))
+                    ? "Interfaces: " + string.Join(", ", s.LocalInterfaces.Take(MaxDisplayedInterfaces).Select(i => i.Name + " (" + i.Ip + ")"))
                     : "Interfaces: scanning...";
                 BtnSpeedTest.IsEnabled = f.Benchmark && !_speedTestRunning;
                 ToolTipService.SetToolTip(BtnSpeedTest, f.Benchmark ? null : "Live speed benchmark is disabled in feature flags.");
@@ -555,7 +618,7 @@ namespace IntegratorUI
 
                 LocalSharedFolderInput.Text = !string.IsNullOrWhiteSpace(s.LocalSharedFolder)
                     ? s.LocalSharedFolder
-                    : @"Default (C:\Users\Public)";
+                    : GetDefaultSharedFolderLabel();
                 BtnOpenInExplorer.Visibility = s.StorageMounted ? Visibility.Visible : Visibility.Collapsed;
 
                 if (!_preferredShareDirty && PreferredShareInput.FocusState == FocusState.Unfocused)
@@ -573,7 +636,7 @@ namespace IntegratorUI
                 // Card 8: True Tone
                 SwitchTrueTone.IsOn = f.Truetone;
                 TrueTonePillText.Text = s.AmbientSupported
-                    ? string.Format(CultureInfo.InvariantCulture, "{0:0} lux • {1}K", s.AmbientLux ?? 0f, s.AmbientCct ?? 6500)
+                    ? string.Format(CultureInfo.InvariantCulture, "{0:0} lux • {1}K", s.AmbientLux ?? 0f, s.AmbientCct ?? DefaultAmbientCctKelvin)
                     : "Manual";
                 SetPillStyle(TrueTonePill, TrueTonePillDot, f.Truetone
                     ? Color.FromArgb(255, 232, 192, 27)
@@ -593,6 +656,8 @@ namespace IntegratorUI
 
                 // Card 10: Audio
                 SwitchAudio.IsOn = f.Audio;
+                ushort audioPort = s.AudioStatus.Port > 0 ? s.AudioStatus.Port : AudioRoutingStatusModel.DefaultAudioPort;
+                AudioPillText.Text = string.Format(CultureInfo.InvariantCulture, "UDP :{0}", audioPort);
                 AudioTopologyText.Text = string.IsNullOrWhiteSpace(s.AudioStatus.Topology)
                     ? "Authenticated ChaCha20-Poly1305 spatial UDP audio sink ready."
                     : s.AudioStatus.Topology;
@@ -601,6 +666,13 @@ namespace IntegratorUI
                 // Card 10B: Mac -> PC Shared Camera
                 SwitchCamera.IsOn = f.Camera;
                 var cam = s.CameraStatus;
+                uint camWidth = cam.Width > 0 ? cam.Width : CameraStatusModel.DefaultCameraWidth;
+                uint camHeight = cam.Height > 0 ? cam.Height : CameraStatusModel.DefaultCameraHeight;
+                uint camFps = cam.Fps > 0 ? cam.Fps : CameraStatusModel.DefaultCameraFps;
+                ushort camPort = cam.Port > 0 ? cam.Port : CameraStatusModel.DefaultCameraPort;
+                string camDeviceName = string.IsNullOrWhiteSpace(cam.DeviceName)
+                    ? CameraStatusModel.DefaultCameraDeviceName
+                    : cam.DeviceName;
                 CameraPillText.Text = string.IsNullOrWhiteSpace(cam.State) ? (cam.Active ? "Active" : "Disabled") : cam.State;
                 SetPillStyle(CameraPill, CameraPillDot, cam.Active
                     ? Color.FromArgb(255, 32, 184, 90)
@@ -613,12 +685,15 @@ namespace IntegratorUI
                 {
                     CameraSummaryText.Text = string.Format(
                         CultureInfo.InvariantCulture,
-                        "{0} • {1}x{2}@{3}fps • {4} frames received (TCP :58287)",
-                        cam.Role, cam.Width, cam.Height, cam.Fps, cam.FramesTransferred);
+                        "{0} • {1}x{2}@{3}fps • {4} frames received (TCP :{5})",
+                        cam.Role, camWidth, camHeight, camFps, cam.FramesTransferred, camPort);
                 }
                 else
                 {
-                    CameraSummaryText.Text = "Exposes 'Integrator MacBook Camera' (720p30) via encrypted TCP :58287 when enabled on Mac and PC.";
+                    CameraSummaryText.Text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "Exposes '{0}' ({1}p{2}) via encrypted TCP :{3} when enabled on Mac and PC.",
+                        camDeviceName, camHeight, camFps, camPort);
                 }
                 BtnToggleCamera.Content = cam.Active ? "Stop Virtual Camera" : "Enable Virtual Camera";
 
@@ -824,8 +899,8 @@ namespace IntegratorUI
         private void RebuildDeskSchematic(BridgeStatusModel s)
         {
             DeskSchematicHost.Children.Clear();
-            string localName = string.IsNullOrWhiteSpace(s.Hostname) ? "This PC" : s.Hostname;
-            string peerName = s.PeerName ?? "Peer Mac";
+            string localName = string.IsNullOrWhiteSpace(s.Hostname) ? DefaultLocalHostname : s.Hostname;
+            string peerName = s.PeerName ?? DefaultPeerHostname;
 
             Border localTile = CreateMonitorTile(localName, accent: true);
             Border peerTile = CreateMonitorTile(peerName, accent: false);
@@ -1043,7 +1118,7 @@ namespace IntegratorUI
                     var pinBox = new TextBox
                     {
                         Width = 86,
-                        MaxLength = 12,
+                        MaxLength = PairingPinMaxInputLength,
                         PlaceholderText = "6-digit PIN",
                         Text = _pinInputs.TryGetValue(ip, out string? existing) ? existing : ""
                     };
@@ -1091,7 +1166,7 @@ namespace IntegratorUI
 
                 var lbl = new TextBlock
                 {
-                    Text = $"Blocked Peer ({(devId.Length > 14 ? devId[..14] : devId)})",
+                    Text = $"Blocked Peer ({(devId.Length > DeviceIdPreviewLength ? devId[..DeviceIdPreviewLength] : devId)})",
                     FontSize = 11,
                     Foreground = new SolidColorBrush(Color.FromArgb(255, 220, 53, 69)),
                     VerticalAlignment = VerticalAlignment.Center,
@@ -1116,7 +1191,7 @@ namespace IntegratorUI
         private void RebuildLogsPanel(List<LogEntryModel> logs)
         {
             var safeLogs = logs ?? new List<LogEntryModel>();
-            var tail = safeLogs.Count > 60 ? safeLogs.Skip(safeLogs.Count - 60).ToList() : safeLogs;
+            var tail = safeLogs.Count > MaxRenderedLogLines ? safeLogs.Skip(safeLogs.Count - MaxRenderedLogLines).ToList() : safeLogs;
             LogsCountText.Text = tail.Count + " lines";
 
             string logsKey = string.Join("\n", tail.Select(e => $"{e.TsMs}:{e.Level}:{e.Message}"));
@@ -1228,7 +1303,7 @@ namespace IntegratorUI
         /// </summary>
         private void RebuildCardsGrid(bool force)
         {
-            int cols = CardsGrid.ActualWidth >= 740 ? 2 : 1;
+            int cols = CardsGrid.ActualWidth >= TwoColumnBreakpointDip ? 2 : 1;
             if (!force && cols == _currentGridColumns) return;
             _currentGridColumns = cols;
 

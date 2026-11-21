@@ -100,12 +100,49 @@ DEFINE_GUID(PROFILE_Legacy,
 DEFINE_GUID(PROFILE_HighFrameRate,
     0x566e6113, 0x8c35, 0x48e7, 0xb8, 0x9f, 0xd2, 0x3f, 0xdc, 0x12, 0x19, 0xdc);
 
-/// Writes trace log lines to public directory for debugging FrameServer activation.
+/// Determines whether diagnostic VCAM trace logging is enabled.
+///
+/// Tracing is active automatically in `_DEBUG` builds and opt-in via the
+/// `INTEGRATOR_VCAM_TRACE=1` environment variable in release builds.
+static bool IsVCamTraceEnabled() {
+#ifdef _DEBUG
+    return true;
+#else
+    static volatile LONG s_traceState = -1;
+    LONG state = InterlockedCompareExchange(&s_traceState, -1, -1);
+    if (state == -1) {
+        char envVal[16] = {};
+        DWORD n = GetEnvironmentVariableA("INTEGRATOR_VCAM_TRACE", envVal, sizeof(envVal));
+        LONG resolved = (n > 0 && n < sizeof(envVal) && std::strcmp(envVal, "1") == 0) ? 1 : 0;
+        InterlockedCompareExchange(&s_traceState, resolved, -1);
+        state = resolved;
+    }
+    return state == 1;
+#endif
+}
+
+/// Writes diagnostic trace lines to Win32 debug output and `%TEMP%\integrator_vcam_trace.log`
+/// when debug or `INTEGRATOR_VCAM_TRACE=1` tracing is active.
 static void LogTrace(const char* msg) {
-    FILE* f = fopen("C:\\Users\\Public\\vcam_trace.log", "a");
+    if (!IsVCamTraceEnabled()) return;
+
+    char line[512] = {};
+    std::snprintf(line, sizeof(line), "[IntegratorVCam PID %lu] %s\n",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        msg ? msg : "");
+    OutputDebugStringA(line);
+
+    char tempDir[MAX_PATH] = {};
+    DWORD len = GetTempPathA(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) return;
+
+    char logPath[MAX_PATH] = {};
+    const char* sep = (tempDir[len - 1] == '\\' || tempDir[len - 1] == '/') ? "" : "\\";
+    std::snprintf(logPath, sizeof(logPath), "%s%sintegrator_vcam_trace.log", tempDir, sep);
+    FILE* f = std::fopen(logPath, "a");
     if (f) {
-        fprintf(f, "[PID %lu] %s\n", GetCurrentProcessId(), msg);
-        fclose(f);
+        std::fputs(line, f);
+        std::fclose(f);
     }
 }
 
@@ -117,14 +154,32 @@ constexpr uint32_t kShmMagic = 0x4D435649;
 /// Shared memory layout version number.
 constexpr uint32_t kShmVersion = 1;
 
-/// Video frame width in pixels (1280).
+/// Default video frame width in pixels (1280).
 constexpr uint32_t kWidth = 1280;
 
-/// Video frame height in pixels (720).
+/// Default video frame height in pixels (720).
 constexpr uint32_t kHeight = 720;
 
-/// Total raw byte size of one 720p NV12 video frame (1,382,400 bytes).
+/// Total raw byte size of one default 720p NV12 video frame (1,382,400 bytes).
 constexpr uint32_t kFrameBytes = kWidth * kHeight * 3 / 2;
+
+/// Target video stream frame rate in frames per second.
+constexpr uint32_t kTargetFps = 30;
+
+/// Frame pacing event wait interval in milliseconds (~33 ms at 30 fps).
+constexpr DWORD kFrameIntervalMs = 1000 / kTargetFps;
+
+/// Single video sample duration in Media Foundation 100-nanosecond units (333,333 at 30 fps).
+constexpr LONGLONG kSampleDuration100ns = 10000000LL / kTargetFps;
+
+/// Nominal uncompressed NV12 average bitrate in bits per second.
+constexpr uint32_t kAvgBitrate = kFrameBytes * 8 * kTargetFps;
+
+/// Dark neutral grey Y (luma) byte value used for standby frames.
+constexpr uint8_t kStandbyLumaY = 22;
+
+/// Neutral chroma (Cb/Cr) byte value used for standby frames.
+constexpr uint8_t kStandbyChromaUV = 128;
 
 #pragma pack(push, 1)
 /// Double-buffered shared memory structure mapped read-only by the virtual camera DLL.
@@ -172,7 +227,7 @@ private:
     CRITICAL_SECTION& m_cs;
 };
 
-/// Fills the output sample buffer with a dark neutral grey standby NV12 frame (Y=22, UV=128).
+/// Fills the output sample buffer with a dark neutral grey standby NV12 frame.
 ///
 /// Respects output buffer row stride (pitch) to prevent display skew or memory corruptions.
 ///
@@ -180,32 +235,41 @@ private:
 ///   - dst: Destination buffer base pointer.
 ///   - stride: Bytes per row (pitch) reported by `IMF2DBuffer2::Lock2DSize`.
 ///   - bufLen: Total locked buffer length in bytes.
-void FillStandbyNV12(uint8_t* dst, uint32_t stride, uint32_t bufLen) {
-    uint32_t ySize = kWidth * kHeight;
+///   - width: Active frame width in pixels (defaults to `kWidth`).
+///   - height: Active frame height in pixels (defaults to `kHeight`).
+void FillStandbyNV12(
+    uint8_t* dst,
+    uint32_t stride,
+    uint32_t bufLen,
+    uint32_t width = kWidth,
+    uint32_t height = kHeight
+) {
+    uint32_t ySize = width * height;
+    uint32_t totalBytes = ySize + (ySize / 2);
     // Fast path: contiguous buffer without stride padding
-    if (stride == kWidth && bufLen >= kFrameBytes) {
-        memset(dst, 22, ySize);
-        memset(dst + ySize, 128, ySize / 2);
+    if (stride == width && bufLen >= totalBytes) {
+        std::memset(dst, kStandbyLumaY, ySize);
+        std::memset(dst + ySize, kStandbyChromaUV, ySize / 2);
         return;
     }
     // Stride-aware Y plane fill
-    for (uint32_t r = 0; r < kHeight; ++r) {
-        if ((r + 1) * stride <= bufLen) {
-            memset(dst + static_cast<size_t>(r) * stride, 22, kWidth);
+    for (uint32_t r = 0; r < height; ++r) {
+        if ((static_cast<size_t>(r) + 1) * stride <= bufLen) {
+            std::memset(dst + static_cast<size_t>(r) * stride, kStandbyLumaY, width);
         }
     }
     // Stride-aware UV plane fill
-    uint8_t* uvBase = dst + static_cast<size_t>(kHeight) * stride;
-    uint32_t uvRows = kHeight / 2;
+    uint8_t* uvBase = dst + static_cast<size_t>(height) * stride;
+    uint32_t uvRows = height / 2;
     for (uint32_t r = 0; r < uvRows; ++r) {
-        size_t offset = static_cast<size_t>(kHeight + r) * stride;
-        if (offset + kWidth <= bufLen) {
-            memset(uvBase + static_cast<size_t>(r) * stride, 128, kWidth);
+        size_t offset = static_cast<size_t>(height + r) * stride;
+        if (offset + width <= bufLen) {
+            std::memset(uvBase + static_cast<size_t>(r) * stride, kStandbyChromaUV, width);
         }
     }
 }
 
-/// Copies an uncompressed 720p NV12 frame from shared memory into a destination Media Foundation buffer.
+/// Copies an uncompressed NV12 frame from shared memory into a destination Media Foundation buffer.
 ///
 /// Unpacks rows row-by-row into the destination buffer according to the destination row pitch.
 ///
@@ -213,27 +277,37 @@ void FillStandbyNV12(uint8_t* dst, uint32_t stride, uint32_t bufLen) {
 ///   - dst: Destination buffer base pointer.
 ///   - dstStride: Row stride (pitch) of destination buffer in bytes.
 ///   - dstLen: Total locked length of destination buffer.
-///   - src: Source contiguous NV12 frame buffer (1,382,400 bytes).
-void CopyNV12ToOutput(uint8_t* dst, uint32_t dstStride, uint32_t dstLen, const uint8_t* src) {
-    const uint32_t yBytes = kWidth * kHeight;
+///   - src: Source contiguous NV12 frame buffer.
+///   - width: Active frame width in pixels (defaults to `kWidth`).
+///   - height: Active frame height in pixels (defaults to `kHeight`).
+void CopyNV12ToOutput(
+    uint8_t* dst,
+    uint32_t dstStride,
+    uint32_t dstLen,
+    const uint8_t* src,
+    uint32_t width = kWidth,
+    uint32_t height = kHeight
+) {
+    const uint32_t yBytes = width * height;
+    const uint32_t frameBytes = yBytes + (yBytes / 2);
     // Fast path: destination pitch matches source width
-    if (dstStride == kWidth && dstLen >= kFrameBytes) {
-        memcpy(dst, src, kFrameBytes);
+    if (dstStride == width && dstLen >= frameBytes) {
+        std::memcpy(dst, src, frameBytes);
         return;
     }
     // Row-by-row copy for Plane 0 (Y / Luma)
-    for (uint32_t r = 0; r < kHeight; ++r) {
-        if (static_cast<size_t>(r) * dstStride + kWidth <= dstLen) {
-            memcpy(dst + static_cast<size_t>(r) * dstStride, src + static_cast<size_t>(r) * kWidth, kWidth);
+    for (uint32_t r = 0; r < height; ++r) {
+        if (static_cast<size_t>(r) * dstStride + width <= dstLen) {
+            std::memcpy(dst + static_cast<size_t>(r) * dstStride, src + static_cast<size_t>(r) * width, width);
         }
     }
     // Row-by-row copy for Plane 1 (CbCr / Chroma)
     const uint8_t* uvSrc = src + yBytes;
-    uint8_t* uvDst = dst + static_cast<size_t>(kHeight) * dstStride;
-    for (uint32_t r = 0; r < kHeight / 2; ++r) {
-        size_t outEnd = static_cast<size_t>(kHeight + r) * dstStride + kWidth;
+    uint8_t* uvDst = dst + static_cast<size_t>(height) * dstStride;
+    for (uint32_t r = 0; r < height / 2; ++r) {
+        size_t outEnd = static_cast<size_t>(height + r) * dstStride + width;
         if (outEnd <= dstLen) {
-            memcpy(uvDst + static_cast<size_t>(r) * dstStride, uvSrc + static_cast<size_t>(r) * kWidth, kWidth);
+            std::memcpy(uvDst + static_cast<size_t>(r) * dstStride, uvSrc + static_cast<size_t>(r) * width, width);
         }
     }
 }
@@ -288,9 +362,9 @@ public:
         mediaType->SetUINT32(MF_MT_DEFAULT_STRIDE, kWidth);
         mediaType->SetUINT32(MF_MT_SAMPLE_SIZE, kFrameBytes);
         MFSetAttributeSize(mediaType, MF_MT_FRAME_SIZE, kWidth, kHeight);
-        MFSetAttributeRatio(mediaType, MF_MT_FRAME_RATE, 30, 1);
+        MFSetAttributeRatio(mediaType, MF_MT_FRAME_RATE, kTargetFps, 1);
         MFSetAttributeRatio(mediaType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        mediaType->SetUINT32(MF_MT_AVG_BITRATE, kFrameBytes * 8 * 30);
+        mediaType->SetUINT32(MF_MT_AVG_BITRATE, kAvgBitrate);
 
         // Configure FrameServer stream attributes
         hr = MFCreateAttributes(&m_attributes, 8);
@@ -417,9 +491,9 @@ public:
             waitEvt = m_frameEvt;
         }
         if (waitEvt) {
-            WaitForSingleObject(waitEvt, 33);
+            WaitForSingleObject(waitEvt, kFrameIntervalMs);
         } else {
-            Sleep(33);
+            Sleep(kFrameIntervalMs);
         }
 
         CriticalLockGuard lock(m_cs);
@@ -453,6 +527,7 @@ public:
                 pitch = static_cast<LONG>(kWidth);
             }
 
+            uint32_t outputFrameBytes = kFrameBytes;
             if (SUCCEEDED(hr) && dstPtr && pitch >= static_cast<LONG>(kWidth)) {
                 bool copiedLive = false;
                 // Verify publisher heartbeat and sequence freshness
@@ -461,14 +536,35 @@ public:
                     LONG64 seq1 = m_shm->seq;
                     MemoryBarrier();
                     LONG slot = m_shm->active_slot & 1;
-                    CopyNV12ToOutput(dstPtr, static_cast<uint32_t>(pitch), lockedLen, m_shm->slots[slot]);
-                    MemoryBarrier();
-                    m_lastSeq = seq1;
-                    copiedLive = true;
+
+                    // Read active geometry from shared memory when valid (even dimensions fitting slot),
+                    // falling back safely to compile-time defaults (`kWidth` x `kHeight`).
+                    uint32_t activeW = kWidth;
+                    uint32_t activeH = kHeight;
+                    uint32_t shmW = m_shm->width;
+                    uint32_t shmH = m_shm->height;
+                    if (shmW > 0 && shmH > 0 &&
+                        (shmW & 1u) == 0 && (shmH & 1u) == 0 &&
+                        shmW <= kWidth && shmH <= kHeight) {
+                        uint64_t expectedBytes = static_cast<uint64_t>(shmW) * static_cast<uint64_t>(shmH) * 3ULL / 2ULL;
+                        if (expectedBytes <= kFrameBytes &&
+                            (m_shm->frame_bytes == 0 || m_shm->frame_bytes == expectedBytes)) {
+                            activeW = shmW;
+                            activeH = shmH;
+                            outputFrameBytes = static_cast<uint32_t>(expectedBytes);
+                        }
+                    }
+
+                    if (pitch >= static_cast<LONG>(activeW)) {
+                        CopyNV12ToOutput(dstPtr, static_cast<uint32_t>(pitch), lockedLen, m_shm->slots[slot], activeW, activeH);
+                        MemoryBarrier();
+                        m_lastSeq = seq1;
+                        copiedLive = true;
+                    }
                 }
                 // Fallback to clean standby frame if stream is idling or host is disconnected
                 if (!copiedLive) {
-                    FillStandbyNV12(dstPtr, static_cast<uint32_t>(pitch), lockedLen);
+                    FillStandbyNV12(dstPtr, static_cast<uint32_t>(pitch), lockedLen, kWidth, kHeight);
                 }
             }
 
@@ -477,14 +573,14 @@ public:
                 buf2d->Release();
             } else {
                 buffer->Unlock();
-                buffer->SetCurrentLength(kFrameBytes);
+                buffer->SetCurrentLength(outputFrameBytes);
             }
             buffer->Release();
         }
 
-        // Set sample timestamps and 30fps duration (333,333 in 100ns units = 33.33ms)
+        // Set sample timestamps and target frame duration in 100ns units
         sample->SetSampleTime(MFGetSystemTime());
-        sample->SetSampleDuration(333333);
+        sample->SetSampleDuration(kSampleDuration100ns);
         if (pToken) {
             sample->SetUnknown(MFSampleExtension_Token, pToken);
         }

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Builds a Universal (arm64 Apple Silicon + x86_64 Intel, macOS 12.0+) Integrator.app bundle.
-# Default output: app/target/bundle/Integrator.app (pass --install to also install to /Applications).
+# Default output: app/target/bundle/Integrator.app (pass --install to also install into INSTALL_DIR).
+#
+# Configurable environment variables:
+#   MACOSX_DEPLOYMENT_TARGET  Minimum supported macOS version        (default: 12.0)
+#   INSTALL_DIR               Destination directory for --install    (default: /Applications)
+#   APP_BUNDLE_ID             CFBundleIdentifier written to plist    (default: com.manveersingh.integrator)
 
 set -euo pipefail
 
@@ -8,6 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/app"
 DEPLOY_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+INSTALL_DIR="${INSTALL_DIR:-/Applications}"
+APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.manveersingh.integrator}"
 OUT_BUNDLE="$APP_DIR/target/bundle/Integrator.app"
 INSTALL_TO_APPS=0
 
@@ -66,7 +73,7 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 	<key>CFBundleExecutable</key>
 	<string>integrator</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.manveersingh.integrator</string>
+	<string>${APP_BUNDLE_ID}</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -103,7 +110,8 @@ ditto "$OUT_BUNDLE" "$SCRIPT_DIR/build/Integrator.app"
 echo "Mirrored to: $SCRIPT_DIR/build/Integrator.app"
 
 if [ "$INSTALL_TO_APPS" -eq 1 ]; then
-    echo "Installing to /Applications/Integrator.app (note: ad-hoc re-sign may require re-enabling Accessibility permission)..."
-    rm -rf /Applications/Integrator.app
-    ditto "$OUT_BUNDLE" /Applications/Integrator.app
+    echo "Installing to ${INSTALL_DIR}/Integrator.app (note: ad-hoc re-sign may require re-enabling Accessibility permission)..."
+    mkdir -p "$INSTALL_DIR"
+    rm -rf "${INSTALL_DIR}/Integrator.app"
+    ditto "$OUT_BUNDLE" "${INSTALL_DIR}/Integrator.app"
 fi

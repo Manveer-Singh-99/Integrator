@@ -83,6 +83,13 @@ namespace IntegratorUI
         private const int ID_CACHE = 1004;
         private const int ID_QUIT = 1005;
 
+        /// <summary>Fallback small tray icon width and height in pixels when GetSystemMetrics returns <= 0.</summary>
+        private const int DEFAULT_ICON_DIMENSION = 16;
+        /// <summary>Win32 MAKEINTRESOURCE string identifier for the standard IDI_APPLICATION icon.</summary>
+        private const string IDI_APPLICATION = "#32512";
+        /// <summary>Application-defined notification icon identifier passed to Shell_NotifyIconW.</summary>
+        private const uint TRAY_ICON_UID = 1;
+
         private readonly Action _onShowWindow;
         private readonly Action _onQuit;
         private IntPtr _hInst;
@@ -251,8 +258,8 @@ namespace IntegratorUI
 
             int cx = GetSystemMetrics(SM_CXSMICON);
             int cy = GetSystemMetrics(SM_CYSMICON);
-            if (cx <= 0) cx = 16;
-            if (cy <= 0) cy = 16;
+            if (cx <= 0) cx = DEFAULT_ICON_DIMENSION;
+            if (cy <= 0) cy = DEFAULT_ICON_DIMENSION;
 
             string iconPath = Path.Combine(AppContext.BaseDirectory, "icon.ico");
             if (File.Exists(iconPath))
@@ -263,7 +270,7 @@ namespace IntegratorUI
             if (_hIcon == IntPtr.Zero)
             {
                 // Standard application icon fallback (IDI_APPLICATION requires hInst = IntPtr.Zero + LR_SHARED).
-                _hIcon = LoadImageW(IntPtr.Zero, "#32512", IMAGE_ICON, cx, cy, LR_DEFAULTSIZE | LR_SHARED);
+                _hIcon = LoadImageW(IntPtr.Zero, IDI_APPLICATION, IMAGE_ICON, cx, cy, LR_DEFAULTSIZE | LR_SHARED);
                 _ownsIcon = false;
             }
 
@@ -281,7 +288,7 @@ namespace IntegratorUI
             {
                 cbSize = (uint)Marshal.SizeOf<NOTIFYICONDATAW>(),
                 hWnd = _hwnd,
-                uID = 1,
+                uID = TRAY_ICON_UID,
                 uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
                 uCallbackMessage = WM_TRAYICON,
                 hIcon = _hIcon,
@@ -395,7 +402,7 @@ namespace IntegratorUI
                 {
                     cbSize = (uint)Marshal.SizeOf<NOTIFYICONDATAW>(),
                     hWnd = _hwnd,
-                    uID = 1,
+                    uID = TRAY_ICON_UID,
                     szTip = string.Empty,
                     szInfo = string.Empty,
                     szInfoTitle = string.Empty

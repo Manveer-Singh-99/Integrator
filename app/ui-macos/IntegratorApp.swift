@@ -306,6 +306,57 @@ struct StorageStatusModel: Codable, Hashable {
     var message: String
 }
 
+// MARK: - UI Default Constants
+
+/// Centralized fallback constants and UI timing/sizing parameters for the macOS dashboard.
+private enum UiDefaults {
+    /// Fallback UDP transport port displayed for spatial audio when omitted by core status.
+    static let defaultAudioPort: UInt16 = 58284
+    /// Fallback TCP transport port displayed for shared camera streaming when omitted by core status.
+    static let defaultCameraPort: UInt16 = 58287
+    /// Fallback shared camera frame width in pixels.
+    static let defaultCameraWidth: UInt32 = 1280
+    /// Fallback shared camera frame height in pixels.
+    static let defaultCameraHeight: UInt32 = 720
+    /// Fallback shared camera frame rate in FPS.
+    static let defaultCameraFps: UInt32 = 30
+    /// Fallback Windows virtual camera friendly name when omitted by core status.
+    static let defaultCameraDeviceName: String = "Integrator MacBook Camera"
+    /// Placeholder system GPU name filtered from explicit discrete/integrated GPU pickers.
+    static let defaultSystemGpuName: String = "Default System GPU"
+    /// Fallback remote peer hostname displayed in the desk layout schematic.
+    static let defaultPeerHostname: String = "Peer PC"
+    /// Fallback local workstation hostname displayed in the desk layout schematic.
+    static let defaultLocalHostname: String = "This Mac"
+    /// Interval in seconds between periodic `get_bridge_status` polls while dashboard is visible.
+    static let statusPollIntervalSec: TimeInterval = 2.0
+    /// Auto-dismiss duration in seconds for ephemeral toast notification banners.
+    static let toastDismissDelaySec: TimeInterval = 4.0
+    /// Exact character length required for SPAKE2 pairing PIN codes.
+    static let pairingPinLength: Int = 6
+    /// Visible prefix length for truncated peer device identifiers in trust cards.
+    static let deviceIdPreviewLength: Int = 12
+    /// Default CIE D65 neutral Correlated Color Temperature in Kelvin.
+    static let defaultTrueToneCct: Double = 6500
+    /// Initial dashboard window width in points.
+    static let defaultWindowWidth: CGFloat = 1240
+    /// Initial dashboard window height in points.
+    static let defaultWindowHeight: CGFloat = 820
+    /// Minimum resizable dashboard window width in points.
+    static let minWindowWidth: CGFloat = 960
+    /// Minimum resizable dashboard window height in points.
+    static let minWindowHeight: CGFloat = 640
+
+    /// Dynamically resolves the macOS user shared Public directory display label via `FileManager`.
+    static var defaultSharedPublicFolderLabel: String {
+        if let url = FileManager.default.urls(for: .sharedPublicDirectory, in: .userDomainMask).first {
+            let abbreviated = (url.path as NSString).abbreviatingWithTildeInPath
+            return "Default (\(abbreviated))"
+        }
+        return "Default (Public)"
+    }
+}
+
 /// Status of the low-latency authenticated UDP spatial audio stream.
 struct AudioRoutingStatusModel: Codable, Hashable {
     /// Human-readable description of active audio topology (e.g., "Mac -> PC Stereo").
@@ -318,13 +369,15 @@ struct AudioRoutingStatusModel: Codable, Hashable {
     var bit_depth: UInt8
     /// True if the audio capture or playback stream is actively running.
     var is_active: Bool
+    /// Active UDP transport port bound for spatial audio streaming.
+    var port: UInt16?
 }
 
 /// Telemetry and state of the Mac -> PC shared virtual camera pipeline.
 struct CameraStatusModel: Codable, Hashable {
     /// True if camera capture hardware is supported and present.
     var supported: Bool
-    /// True if the camera stream is actively transmitting frames over TCP :58287.
+    /// True if the camera stream is actively transmitting frames.
     var active: Bool
     /// Operational role: "sender" (macOS) or "receiver" (Windows Virtual Camera).
     var role: String
@@ -342,6 +395,10 @@ struct CameraStatusModel: Codable, Hashable {
     var frames_transferred: UInt64
     /// Last error encountered during capture, encoding, or transmission.
     var last_error: String?
+    /// Active encrypted TCP transport port bound for virtual camera streaming.
+    var port: UInt16?
+    /// Friendly device name exposed by the Windows virtual camera.
+    var device_name: String?
 }
 
 /// Boolean feature flags controlling active subsystem daemons in Rust core.
@@ -674,7 +731,7 @@ final class IntegratorViewModel: ObservableObject {
     /// User configured local shared folder path.
     @Published var localSharedFolder: String = ""
     /// True Tone Correlated Color Temperature calibration slider value (Kelvin).
-    @Published var trueToneCct: Double = 6500
+    @Published var trueToneCct: Double = UiDefaults.defaultTrueToneCct
     /// True Tone chromatic compensation factor slider value.
     @Published var trueToneComp: Double = 1.0
 
@@ -708,7 +765,7 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
-    /// Repeating 2.0-second timer polling the Rust core bridge status.
+    /// Repeating status polling timer querying the Rust core bridge status.
     private var pollTimer: Timer? = nil
     /// Flag indicating whether background polling is paused (e.g., window hidden or minimized).
     private var isPollingPaused: Bool = false
@@ -743,11 +800,11 @@ final class IntegratorViewModel: ObservableObject {
         pollTimer = nil
     }
 
-    /// Internal scheduler configuring a repeating 2.0-second main-thread timer.
+    /// Internal scheduler configuring a repeating main-thread status timer.
     private func schedulePollTimer() {
         pollTimer?.invalidate()
         guard !isPollingPaused else { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: UiDefaults.statusPollIntervalSec, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, !self.isPollingPaused else { return }
                 self.refresh()
@@ -755,7 +812,7 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
-    /// Displays an ephemeral toast banner for 4.0 seconds.
+    /// Displays an ephemeral toast banner for the configured toast duration.
     ///
     /// - Parameters:
     ///   - kind: Style type ("success", "error", or "info").
@@ -763,8 +820,8 @@ final class IntegratorViewModel: ObservableObject {
     func showToast(_ kind: String, _ msg: String) {
         toast = ToastBanner(kind: kind, message: msg)
         let capturedId = toast?.id
-        // Auto-dismiss the toast banner after exactly 4.0 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+        // Auto-dismiss the toast banner after the configured toast delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + UiDefaults.toastDismissDelaySec) { [weak self] in
             if self?.toast?.id == capturedId {
                 self?.toast = nil
             }
@@ -800,7 +857,7 @@ final class IntegratorViewModel: ObservableObject {
         var options: [(tag: String, label: String)] = [("auto", "Auto (Recommended)")]
         var usedTags: Set<String> = ["auto"]
         for g in gpus {
-            if g.vendor == "System" && g.name == "Default System GPU" {
+            if g.vendor == "System" && g.name == UiDefaults.defaultSystemGpuName {
                 continue
             }
             let baseTag = gpuVendorTag(for: g)
@@ -1753,8 +1810,8 @@ struct MainDashboardView: View {
     /// Visual 2D monitor arrangement schematic reflecting relative workstation positions.
     private var deskMonitorSchematic: some View {
         let edge = vm.kvmLayout.peer_edge
-        let peerName = s?.peer_name ?? "Peer PC"
-        let localName = s?.hostname ?? "This Mac"
+        let peerName = s?.peer_name ?? UiDefaults.defaultPeerHostname
+        let localName = s?.hostname ?? UiDefaults.defaultLocalHostname
         let localBox = monitorTile(localName, accent: true)
         let peerBox = monitorTile(peerName, accent: false)
 
@@ -1988,7 +2045,7 @@ struct MainDashboardView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
-                            .disabled(pinDraft.count != 6)
+                            .disabled(pinDraft.count != UiDefaults.pairingPinLength)
 
                             Button("Block") {
                                 vm.pairPinInputs.removeValue(forKey: peer.ip)
@@ -2024,7 +2081,7 @@ struct MainDashboardView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(tp.hostname) (Pinned Key)")
                             .font(.subheadline.weight(.semibold))
-                        Text("ID: \(String(tp.device_id.prefix(12)))… • \(tp.last_ip)")
+                        Text("ID: \(String(tp.device_id.prefix(UiDefaults.deviceIdPreviewLength)))… • \(tp.last_ip)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -2049,7 +2106,7 @@ struct MainDashboardView: View {
                 !(s?.discovered_peers ?? []).contains(where: { $0.device_id == bid && $0.blocked })
             } ?? [], id: \.self) { blockedId in
                 HStack(spacing: 8) {
-                    Text("Blocked Device: \(String(blockedId.prefix(12)))…")
+                    Text("Blocked Device: \(String(blockedId.prefix(UiDefaults.deviceIdPreviewLength)))…")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -2149,7 +2206,7 @@ struct MainDashboardView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Text(vm.localSharedFolder.isEmpty ? (s?.local_shared_folder ?? "Default (~/Public)") : vm.localSharedFolder)
+                    Text(vm.localSharedFolder.isEmpty ? (s?.local_shared_folder ?? UiDefaults.defaultSharedPublicFolderLabel) : vm.localSharedFolder)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -2233,7 +2290,7 @@ struct MainDashboardView: View {
                 icon: "sun.max",
                 title: "True Tone & Chromatic Sync",
                 pillText: s?.ambient_supported == true
-                    ? String(format: "%.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? 6500)
+                    ? String(format: "%.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct))
                     : "Manual",
                 pillColor: flags.truetone ? .yellow : .secondary,
                 toggleBinding: Binding(
@@ -2304,11 +2361,15 @@ struct MainDashboardView: View {
 
     /// Card 10: Low-latency spatial audio UDP routing and test chime playback.
     private var audioCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let audioPort: UInt16 = {
+            if let p = s?.audio_status.port, p > 0 { return p }
+            return UiDefaults.defaultAudioPort
+        }()
+        return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "speaker.wave.3",
                 title: "Dynamic Audio Routing",
-                pillText: "UDP :58284",
+                pillText: "UDP :\(audioPort)",
                 pillColor: flags.audio ? .green : .secondary,
                 toggleBinding: Binding(
                     get: { flags.audio },
@@ -2332,11 +2393,24 @@ struct MainDashboardView: View {
 
     // MARK: - Card 10B: Mac -> PC Shared Camera
 
-    /// Card 10B: Mac AVFoundation 720p30 camera capture and encrypted TCP transmission to Windows virtual camera.
+    /// Card 10B: Mac AVFoundation camera capture and encrypted TCP transmission to Windows virtual camera.
     private var cameraCard: some View {
         let camEnabled = flags.camera ?? false
         let cam = s?.camera_status
         let camActive = cam?.active == true
+        let camWidth = (cam?.width ?? 0) > 0 ? (cam?.width ?? UiDefaults.defaultCameraWidth) : UiDefaults.defaultCameraWidth
+        let camHeight = (cam?.height ?? 0) > 0 ? (cam?.height ?? UiDefaults.defaultCameraHeight) : UiDefaults.defaultCameraHeight
+        let camFps = (cam?.fps ?? 0) > 0 ? (cam?.fps ?? UiDefaults.defaultCameraFps) : UiDefaults.defaultCameraFps
+        let camPort: UInt16 = {
+            if let p = cam?.port, p > 0 { return p }
+            return UiDefaults.defaultCameraPort
+        }()
+        let camDeviceName: String = {
+            if let name = cam?.device_name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return name
+            }
+            return UiDefaults.defaultCameraDeviceName
+        }()
         return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "video.fill",
@@ -2354,11 +2428,11 @@ struct MainDashboardView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else if camActive {
-                Text("\(cam?.width ?? 1280)×\(cam?.height ?? 720) @ \(cam?.fps ?? 30)fps • \(cam?.frames_transferred ?? 0) frames sent over TCP :58287")
+                Text("\(camWidth)×\(camHeight) @ \(camFps)fps • \(cam?.frames_transferred ?? 0) frames sent over TCP :\(camPort)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else {
-                Text("Streams your MacBook camera (720p30) into Windows 'Integrator MacBook Camera' (TCP :58287).")
+                Text("Streams your MacBook camera (\(camHeight)p\(camFps)) into Windows '\(camDeviceName)' (TCP :\(camPort)).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2594,8 +2668,8 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         let hosting = NSHostingController(rootView: MainDashboardView(vm: IntegratorViewModel.shared))
         let win = NSWindow(contentViewController: hosting)
         win.title = "Integrator"
-        win.setContentSize(NSSize(width: 1240, height: 820))
-        win.minSize = NSSize(width: 960, height: 640)
+        win.setContentSize(NSSize(width: UiDefaults.defaultWindowWidth, height: UiDefaults.defaultWindowHeight))
+        win.minSize = NSSize(width: UiDefaults.minWindowWidth, height: UiDefaults.minWindowHeight)
         win.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden

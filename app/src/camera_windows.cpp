@@ -74,11 +74,14 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfvirtualcamera.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 #include <shlwapi.h>
 #include <cstdio>
 #include <cstdint>
@@ -101,6 +104,15 @@ constexpr uint32_t kHeight = 720;
 
 /// Total byte size of one 1280x720 NV12 frame (1,382,400 bytes).
 constexpr uint32_t kFrameBytes = kWidth * kHeight * 3 / 2;
+
+/// Dark neutral grey Y (luma) byte value used for initial standby frames.
+constexpr uint8_t kStandbyLumaY = 22;
+
+/// Neutral chroma (Cb/Cr) byte value used for initial standby frames.
+constexpr uint8_t kStandbyChromaUV = 128;
+
+/// Application subdirectory name created inside Program Files for COM DLL registration.
+constexpr wchar_t kAppSubdirName[] = L"Integrator";
 
 #pragma pack(push, 1)
 /// Double-buffered shared memory header and slot storage layout.
@@ -136,8 +148,27 @@ struct SharedVCamMemory {
 /// CLSID string of the virtual camera activate COM class.
 constexpr wchar_t kClsidStr[] = L"{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}";
 
-/// User-facing friendly display name shown in Windows Device Manager and camera selection menus.
+/// Default user-facing friendly display name shown in Windows Device Manager and camera menus.
 constexpr wchar_t kFriendlyName[] = L"Integrator MacBook Camera";
+
+/// Resolves the active virtual camera friendly name, allowing an `INTEGRATOR_CAMERA_NAME`
+/// environment variable override while falling back safely to [`kFriendlyName`].
+void ResolveFriendlyCameraName(wchar_t* outBuf, DWORD capChars) {
+    if (!outBuf || capChars == 0) return;
+    DWORD len = GetEnvironmentVariableW(L"INTEGRATOR_CAMERA_NAME", outBuf, capChars);
+    if (len > 0 && len < capChars) {
+        // Trim leading/trailing whitespace check: fall back if blank.
+        bool hasNonSpace = false;
+        for (DWORD i = 0; i < len; ++i) {
+            if (outBuf[i] != L' ' && outBuf[i] != L'\t' && outBuf[i] != L'\r' && outBuf[i] != L'\n') {
+                hasNonSpace = true;
+                break;
+            }
+        }
+        if (hasNonSpace) return;
+    }
+    _snwprintf_s(outBuf, capChars, _TRUNCATE, L"%s", kFriendlyName);
+}
 
 /// Mutex protecting global virtual camera state transitions.
 std::mutex g_lock;
@@ -231,12 +262,17 @@ bool InstallAndRegisterVCamDll(wchar_t* installedPathOut, DWORD capChars, char* 
     }
 
     wchar_t progFiles[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"ProgramFiles", progFiles, MAX_PATH) == 0) {
-        wcscpy_s(progFiles, L"C:\\Program Files");
+    PWSTR knownPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &knownPath)) && knownPath) {
+        _snwprintf_s(progFiles, MAX_PATH, _TRUNCATE, L"%s", knownPath);
+        CoTaskMemFree(knownPath);
+    } else if (GetEnvironmentVariableW(L"ProgramFiles", progFiles, MAX_PATH) == 0) {
+        WriteErr(errBuf, errCap, "Failed to resolve Program Files folder path");
+        return false;
     }
 
     wchar_t installDir[MAX_PATH] = {};
-    _snwprintf_s(installDir, MAX_PATH, _TRUNCATE, L"%s\\Integrator", progFiles);
+    _snwprintf_s(installDir, MAX_PATH, _TRUNCATE, L"%s\\%s", progFiles, kAppSubdirName);
     CreateDirectoryW(installDir, nullptr);
 
     _snwprintf_s(installedPathOut, capChars, _TRUNCATE, L"%s\\integrator_vcam.dll", installDir);
@@ -251,6 +287,8 @@ bool InstallAndRegisterVCamDll(wchar_t* installedPathOut, DWORD capChars, char* 
     GrantServiceReadExecuteAcl(installedPathOut);
 
     // Register CLSID in HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}
+    wchar_t friendlyName[128] = {};
+    ResolveFriendlyCameraName(friendlyName, 128);
     wchar_t regPath[256] = {};
     _snwprintf_s(regPath, 256, _TRUNCATE, L"SOFTWARE\\Classes\\CLSID\\%s", kClsidStr);
     HKEY hKey = nullptr;
@@ -259,8 +297,8 @@ bool InstallAndRegisterVCamDll(wchar_t* installedPathOut, DWORD capChars, char* 
         WriteErr(errBuf, errCap, "Failed to register CLSID in HKLM (run as Administrator)");
         return false;
     }
-    RegSetValueExW(hKey, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(kFriendlyName),
-                   static_cast<DWORD>((wcslen(kFriendlyName) + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hKey, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(friendlyName),
+                   static_cast<DWORD>((wcslen(friendlyName) + 1) * sizeof(wchar_t)));
 
     HKEY hInproc = nullptr;
     rc = RegCreateKeyExW(hKey, L"InprocServer32", 0, nullptr, 0, KEY_WRITE, nullptr, &hInproc, nullptr);
@@ -335,9 +373,9 @@ bool EnsureSharedObjects(char* errBuf, int32_t errCap) {
         g_shm->frame_bytes = kFrameBytes;
         g_shm->active_slot = 0;
         g_shm->seq = 0;
-        // Initialize standby NV12 frame (Y=22 dark neutral grey, UV=128 chroma neutral)
-        std::memset(g_shm->slots[0], 22, kWidth * kHeight);
-        std::memset(g_shm->slots[0] + kWidth * kHeight, 128, (kWidth * kHeight) / 2);
+        // Initialize standby NV12 frame (dark neutral grey luma, neutral chroma)
+        std::memset(g_shm->slots[0], kStandbyLumaY, kWidth * kHeight);
+        std::memset(g_shm->slots[0] + kWidth * kHeight, kStandbyChromaUV, (kWidth * kHeight) / 2);
         std::memcpy(g_shm->slots[1], g_shm->slots[0], kFrameBytes);
     }
 
@@ -407,12 +445,15 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
         return -3;
     }
 
+    wchar_t friendlyName[128] = {};
+    ResolveFriendlyCameraName(friendlyName, 128);
+
     // Register standalone software camera source (zero physical camera source wrapper attributes)
     HRESULT hr = pfnCreateVCam(
         MFVirtualCameraType_SoftwareCameraSource,
         MFVirtualCameraLifetime_Session,
         MFVirtualCameraAccess_AllUsers,
-        kFriendlyName,
+        friendlyName,
         kClsidStr,
         nullptr,
         0,
@@ -422,7 +463,7 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
             MFVirtualCameraType_SoftwareCameraSource,
             MFVirtualCameraLifetime_Session,
             MFVirtualCameraAccess_CurrentUser,
-            kFriendlyName,
+            friendlyName,
             kClsidStr,
             nullptr,
             0,

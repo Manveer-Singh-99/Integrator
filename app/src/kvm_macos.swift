@@ -82,6 +82,30 @@ import IOKit.hid
 /// Allows the CGEventTap to immediately distinguish injected events from physical user inputs.
 private let kIntegratorEventTag: Int64 = 0x494E5447
 
+/// Default fallback X coordinate in Quartz points used when parking the hidden cursor.
+private let kDefaultParkX: Double = 400.0
+
+/// Default fallback Y coordinate in Quartz points used when parking the hidden cursor.
+private let kDefaultParkY: Double = 300.0
+
+/// Conversion scale factor between Quartz pixel scroll deltas and normalized KVM scroll units.
+private let kScrollWheelScaleFactor: Double = 12.0
+
+/// Maximum absolute pixel scroll delta permitted per injected Quartz scroll wheel event.
+private let kMaxScrollDelta: Double = 4000.0
+
+/// Synchronous main-thread timeout in milliseconds when probing `NSPasteboard(name: .drag)`.
+private let kDragProbeTimeoutMs: Int = 120
+
+/// Synchronous main-thread timeout in milliseconds when rendering a dragged file's PNG icon.
+private let kIconGenTimeoutMs: Int = 80
+
+/// Watchdog timeout in milliseconds after which an unstarted native drag capture window auto-dismisses.
+private let kDragWatchdogTimeoutMs: Int = 600
+
+/// Startup handshake timeout in seconds while waiting for the `CGEventTap` thread to initialize.
+private let kTapStartupTimeoutSec: Int = 2
+
 /// C-ABI callback signatures implemented in Rust (`app/src/kvm/macos_backend.rs`).
 ///
 /// Event kinds:
@@ -146,8 +170,8 @@ private var gCursorHidden: Bool = false
 private var gDragChangeCountAtDown: Int = -1
 
 // Cursor parking coordinates
-private var gParkX: Double = 400.0
-private var gParkY: Double = 300.0
+private var gParkX: Double = kDefaultParkX
+private var gParkY: Double = kDefaultParkY
 private var gControllingEnteredAt: Double = 0.0
 
 // Remote modifier key latch state tracking
@@ -297,8 +321,8 @@ public func integrator_kvm_macos_set_controlling(
     restoreX: Double,
     restoreY: Double
 ) {
-    let px = parkX.isFinite ? parkX : 400.0
-    let py = parkY.isFinite ? parkY : 300.0
+    let px = parkX.isFinite ? parkX : kDefaultParkX
+    let py = parkY.isFinite ? parkY : kDefaultParkY
     let rx = restoreX.isFinite ? restoreX : px
     let ry = restoreY.isFinite ? restoreY : py
 
@@ -415,7 +439,7 @@ public func integrator_kvm_macos_probe_drag_paths() -> UnsafeMutablePointer<CCha
         work()
     } else {
         DispatchQueue.main.async(execute: work)
-        _ = sem.wait(timeout: .now() + .milliseconds(120))
+        _ = sem.wait(timeout: .now() + .milliseconds(kDragProbeTimeoutMs))
     }
     guard let s = resultBox.get() else { return nil }
     return strdup(s)
@@ -465,7 +489,7 @@ public func integrator_kvm_macos_icon_png_b64(pathPtr: UnsafePointer<CChar>?) ->
         work()
     } else {
         DispatchQueue.main.async(execute: work)
-        _ = sem.wait(timeout: .now() + .milliseconds(80))
+        _ = sem.wait(timeout: .now() + .milliseconds(kIconGenTimeoutMs))
     }
     guard let out = resultBox.get() else { return nil }
     return strdup(out)
@@ -522,8 +546,8 @@ public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Boo
 /// Injects synthetic scroll wheel deltas into Quartz.
 @_cdecl("integrator_kvm_macos_inject_scroll")
 public func integrator_kvm_macos_inject_scroll(dx: Double, dy: Double) {
-    let safeDx = dx.isFinite ? Swift.max(-4000.0, Swift.min(4000.0, dx * 12.0)) : 0.0
-    let safeDy = dy.isFinite ? Swift.max(-4000.0, Swift.min(4000.0, dy * 12.0)) : 0.0
+    let safeDx = dx.isFinite ? Swift.max(-kMaxScrollDelta, Swift.min(kMaxScrollDelta, dx * kScrollWheelScaleFactor)) : 0.0
+    let safeDy = dy.isFinite ? Swift.max(-kMaxScrollDelta, Swift.min(kMaxScrollDelta, dy * kScrollWheelScaleFactor)) : 0.0
     let pxY = Int32(safeDy.rounded())
     let pxX = Int32(safeDx.rounded())
     if pxX == 0 && pxY == 0 { return }
@@ -876,7 +900,7 @@ public func integrator_kvm_macos_begin_native_drag(
             }
         }
         view.watchdogWorkItem = watchdog
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(600), execute: watchdog)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(kDragWatchdogTimeoutMs), execute: watchdog)
 
         DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(16)) {
             let src = CGEventSource(stateID: .hidSystemState)
@@ -973,8 +997,8 @@ private func handleTapEvent(
         decision = cb(2, 2.0, 0.0, Double(loc.x), Double(loc.y), mask)
 
     case .scrollWheel:
-        let dy = Double(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)) / 12.0
-        let dx = Double(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)) / 12.0
+        let dy = Double(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)) / kScrollWheelScaleFactor
+        let dx = Double(event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)) / kScrollWheelScaleFactor
         decision = cb(3, dx, dy, 0.0, 0.0, mask)
 
     case .keyDown:
@@ -1125,7 +1149,7 @@ public func integrator_kvm_macos_start_tap(
     gStateLock.unlock()
     thread.start()
 
-    _ = sem.wait(timeout: .now() + .seconds(2))
+    _ = sem.wait(timeout: .now() + .seconds(kTapStartupTimeoutSec))
     let started = startResult.get() ?? false
     if !started {
         gStateLock.lock()
