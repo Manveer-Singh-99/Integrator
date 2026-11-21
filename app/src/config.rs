@@ -572,3 +572,189 @@ pub const MACOS_NETWORKSETUP_BIN: &str = "/usr/sbin/networksetup";
 /// Qualified path to macOS `ifconfig` network interface utility (SIP-protected).
 #[allow(dead_code)]
 pub const MACOS_IFCONFIG_BIN: &str = "/sbin/ifconfig";
+
+/// Qualified path to macOS `/bin/bash` shell interpreter (SIP-protected).
+#[allow(dead_code)]
+pub const MACOS_BASH_BIN: &str = "/bin/bash";
+
+// ============================================================================
+// Setup, Drivers & OS Permissions Assistant Constants
+// ============================================================================
+
+/// Default Homebrew binary location on Apple Silicon Macs (`/opt/homebrew/bin/brew`).
+#[allow(dead_code)]
+pub const MACOS_BREW_APPLE_SILICON_BIN: &str = "/opt/homebrew/bin/brew";
+
+/// Default Homebrew binary location on Intel Macs (`/usr/local/bin/brew`).
+#[allow(dead_code)]
+pub const MACOS_BREW_INTEL_BIN: &str = "/usr/local/bin/brew";
+
+/// macOS LaunchDaemon plist path for the event-driven Apple USB-C NCM direct-link watchdog.
+#[allow(dead_code)]
+pub const MACOS_USBNCM_PLIST_PATH: &str = "/Library/LaunchDaemons/com.integrator.usbncm.plist";
+
+/// macOS privileged helper script path for the Apple USB-C NCM direct-link watchdog.
+#[allow(dead_code)]
+pub const MACOS_USBNCM_WATCHDOG_PATH: &str =
+    "/Library/PrivilegedHelperTools/apple-usb-ncm-watchdog.sh";
+
+/// Relative repository path to the macOS USB-C NCM LaunchDaemon installer script.
+#[allow(dead_code)]
+pub const MACOS_INSTALL_SCRIPT_REL_PATH: &str = "macos/install-macos.sh";
+
+/// Windows Task Scheduler task name for the Apple USB-C NCM WinTun bridge service.
+#[allow(dead_code)]
+pub const WINDOWS_USBNCM_TASK_NAME: &str = "AppleUsbNcmBridge";
+
+/// Subdirectory under `%ProgramData%` where the Windows Apple USB-C NCM bridge & `wintun.dll` reside.
+#[allow(dead_code)]
+pub const WINDOWS_USBNCM_PROGRAMDATA_SUBDIR: &str = "AppleUsbNcm";
+
+/// Filename of the signed WinTun userspace tunnel library deployed by `Install-AppleUsbNcm.ps1`.
+#[allow(dead_code)]
+pub const WINDOWS_WINTUN_DLL_FILENAME: &str = "wintun.dll";
+
+/// Relative repository path to the Windows Apple USB-C NCM installer PowerShell script.
+#[allow(dead_code)]
+pub const WINDOWS_INSTALL_USBNCM_REL_PATH: &str = r"windows\Install-AppleUsbNcm.ps1";
+
+/// Windows COM CLSID for the standalone Media Foundation Virtual Camera (`integrator_vcam.dll`).
+#[allow(dead_code)]
+pub const WINDOWS_VCAM_CLSID: &str = "{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}";
+
+/// Windows Registry HKCR key path verifying registration of the Virtual Camera COM class.
+#[allow(dead_code)]
+pub const WINDOWS_VCAM_HKCR_CLSID_KEY: &str =
+    r"HKCR\CLSID\{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}";
+
+/// Windows Registry HKLM key path verifying system-wide registration of the Virtual Camera COM class.
+#[allow(dead_code)]
+pub const WINDOWS_VCAM_HKLM_CLSID_KEY: &str =
+    r"HKLM\SOFTWARE\Classes\CLSID\{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}";
+
+/// Filename of the compiled Windows 11 Media Foundation FrameServer COM DLL.
+#[allow(dead_code)]
+pub const WINDOWS_VCAM_DLL_FILENAME: &str = "integrator_vcam.dll";
+
+/// Subdirectory under `%ProgramFiles%` where Integrator binaries and `integrator_vcam.dll` reside.
+#[allow(dead_code)]
+pub const WINDOWS_INTEGRATOR_INSTALL_SUBDIR: &str = "Integrator";
+
+/// Windows Registry key storing per-user webcam privacy consent policy.
+#[allow(dead_code)]
+pub const WINDOWS_CAMERA_CONSENT_REG_KEY: &str =
+    r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
+
+/// Windows Service name for the SMB File Server (`LanmanServer`).
+#[allow(dead_code)]
+pub const WINDOWS_LANMAN_SERVER_SERVICE: &str = "LanmanServer";
+
+/// Windows Defender Firewall rule name for core Integrator TCP services.
+#[allow(dead_code)]
+pub const WIN_FW_RULE_CORE_TCP: &str = "Integrator Core (TCP)";
+
+/// Windows Defender Firewall rule name for core Integrator UDP services.
+#[allow(dead_code)]
+pub const WIN_FW_RULE_CORE_UDP: &str = "Integrator Core (UDP)";
+
+/// Windows Defender Firewall rule name for inbound SMB file sharing.
+#[allow(dead_code)]
+pub const WIN_FW_RULE_SMB_TCP: &str = "Integrator SMB File Sharing (TCP)";
+
+/// macOS System Settings deep link opening Privacy & Security -> Accessibility.
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_ACCESSIBILITY_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// macOS System Settings deep link opening Privacy & Security -> Input Monitoring.
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_INPUT_MONITORING_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent";
+
+/// macOS System Settings deep link opening Privacy & Security -> Screen Recording.
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_SCREEN_RECORDING_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+
+/// macOS System Settings deep link opening Privacy & Security -> Camera.
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_CAMERA_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
+
+/// macOS System Settings deep link opening Privacy & Security -> Local Network.
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_LOCAL_NETWORK_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
+
+/// macOS System Settings deep link opening General -> Sharing (File Sharing).
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_FILE_SHARING_URL: &str =
+    "x-apple.systempreferences:com.apple.Sharing-Settings.extension";
+
+/// Windows Settings URI opening Windows Security / Defender Firewall.
+#[allow(dead_code)]
+pub const WINDOWS_SETTINGS_FIREWALL_URL: &str = "ms-settings:windowsdefender";
+
+/// Windows Settings URI opening Network & Internet status and profile settings.
+#[allow(dead_code)]
+pub const WINDOWS_SETTINGS_NETWORK_STATUS_URL: &str = "ms-settings:network-status";
+
+/// Windows Settings URI opening Privacy & Security -> Camera settings.
+#[allow(dead_code)]
+pub const WINDOWS_SETTINGS_CAMERA_PRIVACY_URL: &str = "ms-settings:privacy-webcam";
+
+/// Windows Settings URI opening Advanced network sharing settings.
+#[allow(dead_code)]
+pub const WINDOWS_SETTINGS_ADVANCED_SHARING_URL: &str = "ms-settings:network-advancedsettings";
+
+/// Official GitHub releases URL for LizardByte Sunshine streaming host.
+#[allow(dead_code)]
+pub const SUNSHINE_DOWNLOAD_URL: &str = "https://github.com/LizardByte/Sunshine/releases/latest";
+
+/// Official GitHub releases URL for Moonlight Game Streaming client.
+#[allow(dead_code)]
+pub const MOONLIGHT_DOWNLOAD_URL: &str =
+    "https://github.com/moonlight-stream/moonlight-qt/releases/latest";
+
+/// Official GitHub releases URL for the Windows Virtual Display Driver (IddSampleDriver / MTT VDD).
+#[allow(dead_code)]
+pub const VDD_DOWNLOAD_URL: &str =
+    "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/latest";
+
+/// Official download and documentation URL for the WinTun userspace tunnel driver used by USB-C NCM.
+#[allow(dead_code)]
+pub const USBNCM_GUIDE_URL: &str = "https://www.wintun.net/";
+
+/// Homebrew Cask identifier for LizardByte Sunshine on macOS.
+#[allow(dead_code)]
+pub const BREW_CASK_SUNSHINE: &str = "lizardbyte/homebrew/sunshine";
+
+/// Homebrew Cask identifier for Moonlight client on macOS.
+#[allow(dead_code)]
+pub const BREW_CASK_MOONLIGHT: &str = "moonlight";
+
+/// Guided CLI command to install Sunshine via Homebrew on macOS.
+#[allow(dead_code)]
+pub const BREW_INSTALL_SUNSHINE_CMD: &str = "brew install --cask lizardbyte/homebrew/sunshine";
+
+/// Guided CLI command to install Moonlight via Homebrew on macOS.
+#[allow(dead_code)]
+pub const BREW_INSTALL_MOONLIGHT_CMD: &str = "brew install --cask moonlight";
+
+/// WinGet package identifier for LizardByte Sunshine on Windows.
+#[allow(dead_code)]
+pub const WINGET_PACKAGE_SUNSHINE: &str = "LizardByte.Sunshine";
+
+/// WinGet package identifier for Moonlight client on Windows.
+#[allow(dead_code)]
+pub const WINGET_PACKAGE_MOONLIGHT: &str = "MoonlightGameStreamingProject.Moonlight";
+
+/// Guided CLI command to install Sunshine via WinGet on Windows.
+#[allow(dead_code)]
+pub const WINGET_INSTALL_SUNSHINE_CMD: &str =
+    "winget install --id LizardByte.Sunshine -e --accept-source-agreements --accept-package-agreements";
+
+/// Guided CLI command to install Moonlight via WinGet on Windows.
+#[allow(dead_code)]
+pub const WINGET_INSTALL_MOONLIGHT_CMD: &str =
+    "winget install --id MoonlightGameStreamingProject.Moonlight -e --accept-source-agreements --accept-package-agreements";

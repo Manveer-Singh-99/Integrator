@@ -106,6 +106,9 @@ pub(crate) mod kvm;
 /// Cryptographic security layer implementing SPAKE2+, X25519, ChaCha20-Poly1305, and replay protection.
 pub(crate) mod security;
 
+/// Cross-platform OS permissions audit, launch prompting, and guided companion dependency installer.
+pub(crate) mod setup;
+
 /// Local filesystem persistence for device keys, trusted peers, and application configurations.
 pub(crate) mod storage;
 
