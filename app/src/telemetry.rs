@@ -190,8 +190,8 @@ fn find_trusted_nvidia_smi() -> Option<PathBuf> {
     if let Ok(sys_root) = std::env::var("SystemRoot") {
         candidates.push(PathBuf::from(sys_root).join("System32").join("nvidia-smi.exe"));
     }
-    // Check fallback C:\Windows\System32\nvidia-smi.exe
-    candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe"));
+    // Check dynamically resolved Windows System32 directory via GetSystemDirectoryW / %SystemRoot%
+    candidates.push(crate::system_info::system32_exe("nvidia-smi.exe"));
 
     // Check %ProgramFiles%\NVIDIA Corporation\NVSMI\nvidia-smi.exe
     if let Ok(pf) = std::env::var("ProgramFiles") {

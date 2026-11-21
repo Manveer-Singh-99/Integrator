@@ -96,6 +96,15 @@ const BENCH_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum allowable wall-clock duration for an entire benchmark session on the server.
 const MAX_BENCH_SESSION_DURATION: Duration = Duration::from_secs(45);
 
+/// Overall wall-clock timeout deadline enforced by the benchmark client for an entire speed test run.
+const BENCHMARK_CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Maximum timeout duration for establishing the authenticated TCP benchmark session.
+const BENCHMARK_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Number of sequential ping echo probes averaged to compute mean RTT latency.
+const BENCHMARK_PING_SAMPLE_COUNT: u64 = 5;
+
 /// Comprehensive results from a completed network throughput and latency benchmark test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedTestResult {
@@ -353,22 +362,22 @@ impl BenchmarkClient {
         if !features.is_enabled("benchmark") {
             anyhow::bail!("Speed benchmark is disabled in feature settings.");
         }
-        tokio::time::timeout(Duration::from_secs(20), async move {
+        tokio::time::timeout(BENCHMARK_CLIENT_TIMEOUT, async move {
             // Connect and establish mutual cryptographic authentication on TELEMETRY_PORT
             let mut session = trust::connect_transport_to_ip(
                 peer_ip,
                 TELEMETRY_PORT,
                 ServiceId::Benchmark,
-                Duration::from_secs(4),
+                BENCHMARK_CONNECT_TIMEOUT,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to establish authenticated benchmark session with {}: {}", peer_ip, e))?;
 
             // --------------------------------------------------------------------
-            // Phase 1: Latency Test (Ping x 5 samples)
+            // Phase 1: Latency Test (Ping x BENCHMARK_PING_SAMPLE_COUNT samples)
             // --------------------------------------------------------------------
             let mut latencies = Vec::new();
-            for seq in 1u64..=5 {
+            for seq in 1u64..=BENCHMARK_PING_SAMPLE_COUNT {
                 let start = Instant::now();
                 let mut cmd = [0u8; 9];
                 cmd[0] = MODE_PING;
@@ -505,7 +514,12 @@ impl BenchmarkClient {
             Ok(result)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Speed benchmark timed out after 20 seconds"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Speed benchmark timed out after {} seconds",
+                BENCHMARK_CLIENT_TIMEOUT.as_secs()
+            )
+        })?
     }
 }
 

@@ -71,6 +71,9 @@
 //! - **LUT Ramp Clamping**: Color temperature is clamped to `[2500, 9000] K` and multipliers are
 //!   clamped to `[0.4, 1.5]`, preventing display blackout or severe tinting.
 
+use crate::config::{
+    D65_CCT_KELVIN, MAX_CCT_KELVIN, MAX_GAMMA_COMP_FACTOR, MIN_CCT_KELVIN, MIN_GAMMA_COMP_FACTOR,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +110,7 @@ pub fn read_ambient_light() -> AmbientLightData {
         } else {
             AmbientLightData {
                 lux: 0.0,
-                cct_kelvin: 6500,
+                cct_kelvin: D65_CCT_KELVIN,
                 supported: false,
                 updated_at_secs: 0,
             }
@@ -118,7 +121,7 @@ pub fn read_ambient_light() -> AmbientLightData {
     {
         AmbientLightData {
             lux: 0.0,
-            cct_kelvin: 6500,
+            cct_kelvin: D65_CCT_KELVIN,
             supported: false,
             updated_at_secs: 0,
         }
@@ -130,11 +133,11 @@ pub fn read_ambient_light() -> AmbientLightData {
 #[allow(dead_code)]
 pub fn calculate_bradford_multipliers(cct_kelvin: u32, gamma_comp: f32) -> (f32, f32, f32) {
     let safe_gamma = if gamma_comp.is_finite() {
-        gamma_comp.clamp(0.5, 1.5)
+        gamma_comp.clamp(MIN_GAMMA_COMP_FACTOR, MAX_GAMMA_COMP_FACTOR)
     } else {
         1.0
     };
-    let t = cct_kelvin.clamp(2500, 9000) as f32;
+    let t = cct_kelvin.clamp(MIN_CCT_KELVIN, MAX_CCT_KELVIN) as f32;
 
     // CIE Daylight (D-illuminant) for >= 4000K so 6500K aligns with D65; Kang 2002 Planckian below 4000K.
     let inv_t = 1000.0 / t;
@@ -319,12 +322,12 @@ mod tests {
     #[test]
     fn bradford_handles_nan_inf_and_preserves_finite_bounds() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0, 0.0] {
-            let (r, g, b) = calculate_bradford_multipliers(6500, bad);
+            let (r, g, b) = calculate_bradford_multipliers(D65_CCT_KELVIN, bad);
             assert!(r.is_finite() && (0.4..=1.5).contains(&r));
             assert!(g.is_finite() && (0.4..=1.5).contains(&g));
             assert!(b.is_finite() && (0.4..=1.5).contains(&b));
         }
-        let (r65, g65, b65) = calculate_bradford_multipliers(6500, 1.0);
+        let (r65, g65, b65) = calculate_bradford_multipliers(D65_CCT_KELVIN, 1.0);
         assert!((r65 - 1.0).abs() < 0.05 && (g65 - 1.0).abs() < 0.05 && (b65 - 1.0).abs() < 0.05);
     }
 }

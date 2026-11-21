@@ -96,6 +96,18 @@ use tracing::{info, warn};
 /// Bounded capacity for the unauthenticated in-memory discovered peer UI cache (64 entries).
 const MAX_DISCOVERED_PENDING_PEERS: usize = 64;
 
+/// TCP connection timeout when initiating an outbound SPAKE2 pairing session.
+const PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// End-to-end handshake timeout for both client and server sides of RFC 9382 SPAKE2 pairing.
+const SPAKE2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Handshake timeout for both client and server sides of authenticated `TransportSessionV2`.
+const TRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Maximum permitted clock skew (in milliseconds) for UDP discovery beacon freshness validation (±60s).
+const DISCOVERY_BEACON_MAX_SKEW_MS: u64 = 60_000;
+
 /// Serialized representation of a trusted peer record stored in the trust configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPeerRecord {
@@ -518,7 +530,7 @@ pub async fn pair_with_remote_peer_v2(
     }
 
     let addr = SocketAddr::new(ip_addr, port);
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+    let mut stream = tokio::time::timeout(PAIRING_CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| format!("Timed out connecting to {} for pairing", addr))?
         .map_err(|e| format!("Failed to connect to {} for pairing: {}", addr, e))?;
@@ -529,7 +541,7 @@ pub async fn pair_with_remote_peer_v2(
     let via_cable = system_info::is_direct_cable_route(&canon_ip);
 
     let (creds, sas) = tokio::time::timeout(
-        Duration::from_secs(12),
+        SPAKE2_HANDSHAKE_TIMEOUT,
         run_client_pairing_with_shared_keystore(
             &mut stream,
             global_keystore(),
@@ -560,7 +572,7 @@ pub async fn handle_incoming_pairing_stream_v2(
     let rt = runtime_state();
 
     let (creds, sas) = tokio::time::timeout(
-        Duration::from_secs(12),
+        SPAKE2_HANDSHAKE_TIMEOUT,
         handle_server_pairing_with_shared_locks(
             stream,
             already_read_magic,
@@ -606,7 +618,7 @@ pub async fn connect_transport_to_ip(
     let _ = stream.set_nodelay(true);
 
     let session = tokio::time::timeout(
-        Duration::from_secs(6),
+        TRANSPORT_HANDSHAKE_TIMEOUT,
         TransportSessionV2::connect_client_with_shared_keystore(
             stream,
             global_keystore(),
@@ -632,7 +644,7 @@ pub async fn accept_transport_from_stream(
     let allow_loopback = peer_ip.is_loopback();
 
     let session = tokio::time::timeout(
-        Duration::from_secs(6),
+        TRANSPORT_HANDSHAKE_TIMEOUT,
         TransportSessionV2::accept_server_with_shared_keystore(
             stream,
             already_read_magic,
@@ -725,7 +737,7 @@ pub fn verify_discovery_beacon_v2(
     }
 
     let now_ms = security::unix_epoch_millis();
-    if timestamp_ms == 0 || now_ms.abs_diff(timestamp_ms) > 60_000 {
+    if timestamp_ms == 0 || now_ms.abs_diff(timestamp_ms) > DISCOVERY_BEACON_MAX_SKEW_MS {
         return false;
     }
 
@@ -894,7 +906,7 @@ pub fn verify_discovery_beacon_v2_full(
     }
 
     let now_ms = security::unix_epoch_millis();
-    if timestamp_ms == 0 || now_ms.abs_diff(timestamp_ms) > 60_000 {
+    if timestamp_ms == 0 || now_ms.abs_diff(timestamp_ms) > DISCOVERY_BEACON_MAX_SKEW_MS {
         return false;
     }
 
