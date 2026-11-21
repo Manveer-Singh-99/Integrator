@@ -135,6 +135,18 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Maximum length of sanitized platform identifier strings (16 characters).
 pub const MAX_PLATFORM_LEN: usize = 16;
 
+/// Maximum character length of wire error descriptions transmitted in `PairErrorWireMsg` (120 chars).
+const MAX_WIRE_ERROR_MESSAGE_LEN: usize = 120;
+
+/// Maximum exponential backoff shift exponent for consecutive per-IP lockouts (`2^4 = 16x`, 960 seconds).
+const MAX_LOCKOUT_BACKOFF_EXPONENT: u32 = 4;
+
+/// Minimum numeric value for generated 6-digit pairing PINs (`100_000`..=`999_999`).
+const MIN_PIN_VALUE: u32 = 100_000;
+
+/// Fallback device or platform label when sanitized peer metadata is empty.
+const DEFAULT_UNKNOWN_DEVICE_NAME: &str = "Unknown";
+
 /// Wire message type discriminator byte for `IPR2` frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -345,7 +357,7 @@ impl PairingError {
         PairErrorWireMsg {
             code,
             retry_after_secs: retry,
-            message: self.to_string().chars().take(120).collect(),
+            message: self.to_string().chars().take(MAX_WIRE_ERROR_MESSAGE_LEN).collect(),
         }
     }
 }
@@ -530,7 +542,7 @@ impl PairingCoordinatorV2 {
         }
         entry.init_attempts = entry.init_attempts.saturating_add(1);
         if entry.init_attempts > MAX_PAIR_INIT_PER_IP_PER_WINDOW {
-            let exp = entry.consecutive_lockouts.min(4);
+            let exp = entry.consecutive_lockouts.min(MAX_LOCKOUT_BACKOFF_EXPONENT);
             let lockout_secs = BASE_IP_LOCKOUT_SECS.saturating_mul(1u64 << exp);
             entry.locked_until = now_secs.saturating_add(lockout_secs);
             entry.consecutive_lockouts = entry.consecutive_lockouts.saturating_add(1);
@@ -553,7 +565,7 @@ impl PairingCoordinatorV2 {
 
         entry.failures = entry.failures.saturating_add(1);
         if entry.failures >= MAX_FAILED_ATTEMPTS_PER_IP {
-            let exp = entry.consecutive_lockouts.min(4);
+            let exp = entry.consecutive_lockouts.min(MAX_LOCKOUT_BACKOFF_EXPONENT);
             let lockout_secs = BASE_IP_LOCKOUT_SECS.saturating_mul(1u64 << exp);
             entry.locked_until = now_secs.saturating_add(lockout_secs);
             entry.consecutive_lockouts = entry.consecutive_lockouts.saturating_add(1);
@@ -1582,7 +1594,7 @@ pub fn generate_unbiased_6digit_pin() -> String {
         let buf = csprng_array::<4>();
         let candidate = u32::from_le_bytes(buf);
         if candidate < MAX_UNBIASED {
-            let pin = 100_000 + (candidate % RANGE);
+            let pin = MIN_PIN_VALUE + (candidate % RANGE);
             return format!("{:06}", pin);
         }
     }
@@ -1590,7 +1602,7 @@ pub fn generate_unbiased_6digit_pin() -> String {
 
 /// Checks whether `pin` is exactly 6 ASCII digits (`0`..=`9`).
 pub fn is_valid_6digit_pin(pin: &str) -> bool {
-    pin.len() == 6 && pin.chars().all(|c| c.is_ascii_digit())
+    pin.len() == crate::config::PAIRING_PIN_LENGTH && pin.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Identifies Unicode bidirectional control characters used in visual spoofing attacks.
@@ -1615,7 +1627,7 @@ fn sanitize_label(input: &str, max_len: usize) -> String {
         .collect();
     let trimmed = filtered.trim();
     if trimmed.is_empty() {
-        "Unknown".to_string()
+        DEFAULT_UNKNOWN_DEVICE_NAME.to_string()
     } else {
         trimmed.to_string()
     }

@@ -108,6 +108,47 @@ const KEYSTORE_META_MAC_SALT: &[u8] = b"integrator-keystore-v2-meta-salt";
 /// HKDF info string for deriving the whole-file metadata MAC key.
 const KEYSTORE_META_MAC_INFO: &[u8] = b"integrator-keystore-v2-meta-mac";
 
+/// Candidate Linux/Unix machine-ID file paths checked in order when deriving fallback KEK salt.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg_attr(test, allow(dead_code))]
+const LINUX_MACHINE_ID_PATHS: &[&str] = &["/etc/machine-id", "/var/lib/dbus/machine-id"];
+
+/// macOS Keychain Services generic-password service identifier for the v2 master KEK.
+#[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
+const MACOS_KEYCHAIN_SERVICE: &str = "com.integrator.security.keystore.v2";
+
+/// Canonical filename of the encrypted v2 peer trust keystore.
+const KEYSTORE_FILENAME_V2: &str = "trusted_peers_v2.json";
+
+/// Filename of the deprecated v1 peer trust file quarantined on upgrade.
+const LEGACY_KEYSTORE_V1_FILENAME: &str = "trusted_peers.json";
+
+/// Hidden `.integrator` user configuration directory name for keystore storage and legacy quarantine.
+const LEGACY_INTEGRATOR_DIR_NAME: &str = ".integrator";
+
+/// Replacement file extension applied when quarantining deprecated v1 trust files.
+const LEGACY_V1_QUARANTINE_EXT: &str = "json.v1.deprecated.bak";
+
+/// Filename of the mode-`0600` CSPRNG seed used for hardware/UID-bound KEK derivation on Unix/macOS.
+#[cfg(not(target_os = "windows"))]
+#[cfg_attr(test, allow(dead_code))]
+const MASTER_KEK_SEED_FILENAME: &str = ".master_kek_v2.seed";
+
+/// Filename of the DPAPI-protected master KEK blob on Windows.
+#[cfg(target_os = "windows")]
+#[cfg_attr(test, allow(dead_code))]
+const MASTER_KEK_DPAPI_FILENAME: &str = "master_kek_v2.dpapi";
+
+/// Initial read buffer capacity ceiling in bytes when reading keystore files (64 KiB).
+const KEYSTORE_FILE_READ_CHUNK_LIMIT: u64 = 65536;
+
+/// Number of CSPRNG bytes appended as hex entropy to atomic temporary filenames (6 bytes).
+const TEMP_FILENAME_ENTROPY_BYTES: usize = 6;
+
+/// Lowercase sentinel hostname excluded from duplicate-hostname pinning conflict checks.
+const UNKNOWN_HOSTNAME_SENTINEL: &str = "unknown";
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Errors encountered during keystore initialization, cryptographic wrapping, or identity pinning checks.
@@ -378,7 +419,7 @@ impl KeystoreV2 {
         let quarantined = quarantine_legacy_v1_files(&storage_dir);
 
         let kek = provider.load_or_create_kek(&storage_dir)?;
-        let keystore_path = storage_dir.join("trusted_peers_v2.json");
+        let keystore_path = storage_dir.join(KEYSTORE_FILENAME_V2);
 
         if keystore_path.exists() {
             Self::load_existing(storage_dir, keystore_path, kek, quarantined)
@@ -566,7 +607,7 @@ impl KeystoreV2 {
             }
             let clean_host = rec.hostname.trim().to_string();
             let host_lower = clean_host.to_ascii_lowercase();
-            if !host_lower.is_empty() && host_lower != "unknown" {
+            if !host_lower.is_empty() && host_lower != UNKNOWN_HOSTNAME_SENTINEL {
                 if seen_hostnames.contains(&host_lower) {
                     return Err(KeystoreError::CorruptKeystore(format!(
                         "duplicate pinned hostname '{}' in keystore",
@@ -719,7 +760,7 @@ impl KeystoreV2 {
         }
 
         let trimmed_host = hostname.trim();
-        if !trimmed_host.is_empty() && !trimmed_host.eq_ignore_ascii_case("unknown") {
+        if !trimmed_host.is_empty() && !trimmed_host.eq_ignore_ascii_case(UNKNOWN_HOSTNAME_SENTINEL) {
             for existing in self.peers.values() {
                 if existing.hostname.trim().eq_ignore_ascii_case(trimmed_host)
                     && !bool::from(existing.ed25519_pubkey.ct_eq(peer_ed25519_pk))
@@ -1152,7 +1193,9 @@ pub fn try_default_keystore_dir() -> Result<PathBuf, KeystoreError> {
         if let Ok(user_profile) = std::env::var("USERPROFILE") {
             let trimmed = user_profile.trim();
             if !trimmed.is_empty() {
-                return Ok(PathBuf::from(trimmed).join(".integrator").join("security"));
+                return Ok(PathBuf::from(trimmed)
+                    .join(LEGACY_INTEGRATOR_DIR_NAME)
+                    .join("security"));
             }
         }
         Err(KeystoreError::IoFailure(
@@ -1164,7 +1207,9 @@ pub fn try_default_keystore_dir() -> Result<PathBuf, KeystoreError> {
         if let Ok(home) = std::env::var("HOME") {
             let trimmed = home.trim();
             if !trimmed.is_empty() {
-                return Ok(PathBuf::from(trimmed).join(".integrator").join("security"));
+                return Ok(PathBuf::from(trimmed)
+                    .join(LEGACY_INTEGRATOR_DIR_NAME)
+                    .join("security"));
             }
         }
         Err(KeystoreError::IoFailure(
@@ -1230,7 +1275,7 @@ fn read_secure_bytes(path: &Path) -> Result<Vec<u8>, KeystoreError> {
     let file = opts
         .open(path)
         .map_err(|e| KeystoreError::IoFailure(format!("open {}: {}", path.display(), e)))?;
-    let mut buf = Vec::with_capacity(meta.len().min(65536) as usize);
+    let mut buf = Vec::with_capacity(meta.len().min(KEYSTORE_FILE_READ_CHUNK_LIMIT) as usize);
     let mut limited = file.take(MAX_KEYSTORE_FILE_BYTES + 1);
     limited
         .read_to_end(&mut buf)
@@ -1310,7 +1355,7 @@ fn ensure_secure_directory(dir: &Path) -> Result<(), KeystoreError> {
 /// and renaming it over `target`.
 fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result<(), KeystoreError> {
     ensure_secure_directory(dir)?;
-    let mut rnd = [0u8; 6];
+    let mut rnd = [0u8; TEMP_FILENAME_ENTROPY_BYTES];
     super::try_csprng_fill(&mut rnd)
         .map_err(|e| KeystoreError::OsKeystoreFailure(format!("CSPRNG failed: {}", e)))?;
     let tmp_name = format!(
@@ -1385,9 +1430,9 @@ fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result
 /// or `~/.usbc_clipboard_cache/trusted_peers.json` by renaming it to `.v1.deprecated.bak`.
 pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
     let mut candidate_paths = Vec::new();
-    candidate_paths.push(storage_dir.join("trusted_peers.json"));
+    candidate_paths.push(storage_dir.join(LEGACY_KEYSTORE_V1_FILENAME));
     if let Some(parent) = storage_dir.parent() {
-        candidate_paths.push(parent.join("trusted_peers.json"));
+        candidate_paths.push(parent.join(LEGACY_KEYSTORE_V1_FILENAME));
     }
 
     // Only inspect global home directory paths when operating on the default keystore directory.
@@ -1397,8 +1442,14 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
             let trimmed = profile.trim();
             if !trimmed.is_empty() {
                 let p = PathBuf::from(trimmed);
-                candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
-                candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+                candidate_paths.push(
+                    p.join(crate::config::APP_DATA_DIR_NAME)
+                        .join(LEGACY_KEYSTORE_V1_FILENAME),
+                );
+                candidate_paths.push(
+                    p.join(LEGACY_INTEGRATOR_DIR_NAME)
+                        .join(LEGACY_KEYSTORE_V1_FILENAME),
+                );
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -1406,8 +1457,14 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
             let trimmed = home.trim();
             if !trimmed.is_empty() {
                 let p = PathBuf::from(trimmed);
-                candidate_paths.push(p.join(".usbc_clipboard_cache").join("trusted_peers.json"));
-                candidate_paths.push(p.join(".integrator").join("trusted_peers.json"));
+                candidate_paths.push(
+                    p.join(crate::config::APP_DATA_DIR_NAME)
+                        .join(LEGACY_KEYSTORE_V1_FILENAME),
+                );
+                candidate_paths.push(
+                    p.join(LEGACY_INTEGRATOR_DIR_NAME)
+                        .join(LEGACY_KEYSTORE_V1_FILENAME),
+                );
             }
         }
     }
@@ -1420,7 +1477,7 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
         if meta.file_type().is_symlink() || !meta.is_file() {
             continue;
         }
-        let bak_path = legacy_path.with_extension("json.v1.deprecated.bak");
+        let bak_path = legacy_path.with_extension(LEGACY_V1_QUARANTINE_EXT);
         match fs::rename(&legacy_path, &bak_path) {
             Ok(()) => {
                 #[cfg(unix)]
@@ -1564,7 +1621,7 @@ fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
     }
 
     // CLI fallback via `/usr/sbin/ioreg` if IOKit direct symbols fail
-    if let Ok(out) = std::process::Command::new("/usr/sbin/ioreg")
+    if let Ok(out) = std::process::Command::new(crate::config::MACOS_IOREG_BIN)
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
     {
@@ -1612,7 +1669,7 @@ fn macos_hw_bound_load_or_create_kek(
 
     ensure_secure_directory(storage_dir)?;
 
-    let seed_path = storage_dir.join(".master_kek_v2.seed");
+    let seed_path = storage_dir.join(MASTER_KEK_SEED_FILENAME);
     let mut seed = Zeroizing::new(Vec::new());
 
     match fs::symlink_metadata(&seed_path) {
@@ -1747,11 +1804,11 @@ fn macos_keychain_load_or_create_kek(
 
     // Fast path: once a hardware+UID-bound sealed KEK seed exists, derive K_kek directly
     // without touching login.keychain-db so rebuilds/ad-hoc runs never trigger password dialogs.
-    if storage_dir.join(".master_kek_v2.seed").is_file() {
+    if storage_dir.join(MASTER_KEK_SEED_FILENAME).is_file() {
         return macos_hw_bound_load_or_create_kek(storage_dir);
     }
 
-    let service = CFString::new("com.integrator.security.keystore.v2");
+    let service = CFString::new(MACOS_KEYCHAIN_SERVICE);
     // Scope the account name by storage_dir hash so custom paths don't collide.
     let account_hash = super::hex_encode(&super::sha256_digest(
         storage_dir.to_string_lossy().as_bytes(),
@@ -1843,7 +1900,7 @@ fn windows_dpapi_load_or_create_kek(
     }
 
     ensure_secure_directory(storage_dir)?;
-    let dpapi_path = storage_dir.join("master_kek_v2.dpapi");
+    let dpapi_path = storage_dir.join(MASTER_KEK_DPAPI_FILENAME);
 
     let mut entropy_vec = DPAPI_ENTROPY.to_vec();
     let entropy_len = u32::try_from(entropy_vec.len())
@@ -1978,7 +2035,7 @@ fn unix_fallback_load_or_create_kek(
     use sha2::Sha256;
 
     ensure_secure_directory(storage_dir)?;
-    let key_file = storage_dir.join(".master_kek_v2.seed");
+    let key_file = storage_dir.join(MASTER_KEK_SEED_FILENAME);
 
     let raw_seed: Zeroizing<[u8; 32]> = match fs::symlink_metadata(&key_file) {
         Ok(_) => {
@@ -2012,8 +2069,13 @@ fn unix_fallback_load_or_create_kek(
 
     // Combine the 0600 random seed with local machine/user identity via HKDF-SHA256.
     let mut salt_data = Vec::from(&b"integrator-unix-kek-salt-v2"[..]);
-    if let Ok(mid) = fs::read("/etc/machine-id") {
-        salt_data.extend_from_slice(&mid);
+    for path in LINUX_MACHINE_ID_PATHS {
+        if let Ok(mid) = fs::read(path) {
+            if !mid.is_empty() {
+                salt_data.extend_from_slice(&mid);
+                break;
+            }
+        }
     }
     #[cfg(unix)]
     {

@@ -92,6 +92,16 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_CACHE_WALK_DEPTH: usize = 64;
 const MACOS_INITIAL_READ_CAP: usize = 64 * 1024;
 const MACOS_RETRY_READ_CAP: usize = 2 * 1024 * 1024;
+/// Default maximum retention age in days for cached clipboard files (3 days).
+const DEFAULT_CACHE_MAX_AGE_DAYS: u64 = 3;
+/// Default maximum cumulative disk budget in bytes for cached clipboard files (10 GiB).
+const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Fallback macOS file-clipboard helper binary name.
+#[cfg(target_os = "macos")]
+const MACOS_CLIP_HELPER_BIN: &str = "macos_clip_files";
+/// Fallback Windows file-clipboard helper binary name.
+#[cfg(target_os = "windows")]
+const WIN_CLIP_HELPER_BIN: &str = "win_clip_files.exe";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -126,7 +136,7 @@ fn ensure_private_cache_dir(base_dir: &Path) -> Result<PathBuf> {
         }
     }
 
-    let cache_dir = base_dir.join("clipboard_cache");
+    let cache_dir = base_dir.join(crate::config::CLIPBOARD_CACHE_DIR_NAME);
     match std::fs::symlink_metadata(&cache_dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -237,7 +247,7 @@ impl FileClipboardHelper {
             cache_dir,
             last_prune: Mutex::new(Instant::now()),
         };
-        helper.prune_cache(3, 10 * 1024 * 1024 * 1024);
+        helper.prune_cache(DEFAULT_CACHE_MAX_AGE_DAYS, DEFAULT_CACHE_MAX_BYTES);
         Ok(helper)
     }
 
@@ -259,7 +269,7 @@ impl FileClipboardHelper {
             }
         };
         if should_prune {
-            self.prune_cache(3, 10 * 1024 * 1024 * 1024);
+            self.prune_cache(DEFAULT_CACHE_MAX_AGE_DAYS, DEFAULT_CACHE_MAX_BYTES);
         }
     }
 
@@ -272,14 +282,14 @@ impl FileClipboardHelper {
         let name = name_os.to_string_lossy().to_ascii_lowercase();
         const EXACT_PROTECTED: &[&str] = &[
             "security",
-            "clipboard_cache",
+            crate::config::CLIPBOARD_CACHE_DIR_NAME,
             "trusted_peers.json",
             "trusted_peers_v2.json",
             "trust_config.json",
             "peer_history.json",
             "features.json",
-            "app_config.json",
-            "kvm_layout.json",
+            crate::config::APP_CONFIG_FILENAME,
+            crate::config::KVM_LAYOUT_FILE,
             "active_mount.json",
             ".master_kek_v2.seed",
         ];
@@ -295,7 +305,7 @@ impl FileClipboardHelper {
             "kvm_layout.json.",
             "active_mount.json.",
             ".master_kek",
-            "sunshine_adapter_override",
+            crate::config::SUNSHINE_ADAPTER_OVERRIDE_PREFIX,
         ];
         PREFIX_PROTECTED.iter().any(|p| name.starts_with(p))
     }
@@ -416,7 +426,7 @@ impl FileClipboardHelper {
                 }
             }
 
-            if let Some(helper) = Self::find_helper("macos_clip_files") {
+            if let Some(helper) = Self::find_helper(MACOS_CLIP_HELPER_BIN) {
                 match Command::new(&helper).args(["read", "--nul"]).output() {
                     Ok(output) if output.status.success() => {
                         return parse_nul_paths(&output.stdout);
@@ -451,7 +461,7 @@ impl FileClipboardHelper {
                 }
             }
 
-            if let Some(helper) = Self::find_helper("win_clip_files.exe") {
+            if let Some(helper) = Self::find_helper(WIN_CLIP_HELPER_BIN) {
                 let mut cmd = Command::new(&helper);
                 cmd.args(["read", "--nul"]).creation_flags(CREATE_NO_WINDOW);
                 match cmd.output() {
@@ -489,7 +499,7 @@ impl FileClipboardHelper {
                 return Ok(());
             }
 
-            let helper = Self::find_helper("macos_clip_files").context(
+            let helper = Self::find_helper(MACOS_CLIP_HELPER_BIN).context(
                 "macos_clip_files helper not found and in-process NSPasteboard write failed",
             )?;
             let mut child = Command::new(helper)
@@ -523,7 +533,7 @@ impl FileClipboardHelper {
 
             if let Err(err) = win32::write_cf_hdrop_files(files) {
                 warn!("Native Win32 CF_HDROP write error: {}, trying fallback...", err);
-                let helper = Self::find_helper("win_clip_files.exe").context(
+                let helper = Self::find_helper(WIN_CLIP_HELPER_BIN).context(
                     "Win32 CF_HDROP clipboard write failed and win_clip_files.exe fallback not found",
                 )?;
                 let mut child = Command::new(helper)
@@ -576,6 +586,10 @@ mod win32 {
     const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
     const MAX_DROP_ITEMS_INSPECT: usize = MAX_TRANSFER_FILES * 4;
     const MAX_EXTENDED_PATH_CHARS: u32 = 32_768;
+    /// Maximum retry attempts when acquiring the Win32 clipboard lock via `OpenClipboard`.
+    const OPEN_CLIPBOARD_RETRIES: usize = 8;
+    /// Backoff sleep between consecutive failed `OpenClipboard` attempts (20 ms).
+    const OPEN_CLIPBOARD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
     #[repr(C)]
     struct DropFiles {
@@ -684,11 +698,11 @@ mod win32 {
     }
 
     fn open_clipboard_with_retry(hwnd: *mut c_void) -> Result<ClipboardGuard> {
-        for _ in 0..8 {
+        for _ in 0..OPEN_CLIPBOARD_RETRIES {
             if unsafe { OpenClipboard(hwnd) } != 0 {
                 return Ok(ClipboardGuard);
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(OPEN_CLIPBOARD_RETRY_INTERVAL);
         }
         Err(std::io::Error::last_os_error()).context("OpenClipboard failed after retries")
     }
