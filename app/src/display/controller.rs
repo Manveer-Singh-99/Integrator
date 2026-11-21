@@ -68,7 +68,7 @@
 //! - **Dynamic Bitrate Clamping**: Stream bitrates are strictly clamped between 5,000 and 500,000 kbps,
 //!   and display geometries are clamped to even integer dimensions within 800x600 to 7680x4320.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
@@ -76,7 +76,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::config::CONTROL_PORT;
+use crate::config::{self, CONTROL_PORT};
 use crate::discovery::{DiscoveryManager, PeerCandidate};
 use crate::features::FeatureManager;
 use crate::system_info;
@@ -84,6 +84,113 @@ use crate::trust;
 use super::mac_display::MacDisplayManager;
 use super::protocol::{required_feature_for_rpc, DisplayRpcRequest, DisplayRpcResponse};
 use super::win_display::WinDisplayManager;
+
+/// Single-attempt TCP connect timeout when probing Sunshine or peer port readiness.
+const TCP_PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Polling interval between TCP port readiness probe attempts.
+const TCP_PORT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Settling delay after instantiating a macOS virtual display before configuring Sunshine output.
+const VIRTUAL_DISPLAY_SETTLE_DELAY: Duration = Duration::from_millis(400);
+
+/// Maximum wait duration for macOS Sunshine to bind its configured listen port.
+const MAC_SUNSHINE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum polling iterations (at [`TCP_PORT_POLL_INTERVAL`]) waiting for Windows Sunshine readiness (~8s).
+const WIN_SUNSHINE_READY_MAX_ATTEMPTS: usize = 40;
+
+/// Initial polling attempts reserved for a secondary Sunshine instance to come online before accepting primary.
+const WIN_SUNSHINE_PRIMARY_GRACE_ATTEMPTS: usize = 3;
+
+/// Per-port wait timeout when probing remote Sunshine fallback ports during `StartMoonlight`.
+const REMOTE_PORT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Transport handshake connect timeout for outbound Display RPC requests.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Socket write timeout for outbound Display RPC requests.
+const RPC_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Socket read timeout awaiting remote Display RPC responses.
+const RPC_RECV_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum permitted size in bytes for an inbound Display RPC response payload (1 MiB).
+const MAX_RPC_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Lowest unprivileged TCP/UDP port accepted for remote Sunshine streaming targets.
+const MIN_UNPRIVILEGED_PORT: u16 = 1024;
+
+/// Fallback display host label used on macOS when hostname resolution fails.
+const FALLBACK_MAC_HOST_NAME: &str = "Mac";
+
+/// Fallback display host label used on Windows when hostname resolution fails.
+const FALLBACK_WINDOWS_HOST_NAME: &str = "Windows";
+
+/// Maximum permitted ambient illuminance in Lux for `SyncTrueTone` wire validation.
+const TRUETONE_MAX_LUX: f32 = 200_000.0;
+
+/// Minimum permitted color temperature in Kelvin for `SyncTrueTone` wire validation.
+const TRUETONE_MIN_WIRE_CCT: u32 = 1000;
+
+/// Maximum permitted color temperature in Kelvin for `SyncTrueTone` wire validation.
+const TRUETONE_MAX_WIRE_CCT: u32 = 15_000;
+
+/// Minimum permitted gamma compensation factor for `SyncTrueTone` wire validation.
+const TRUETONE_MIN_WIRE_GAMMA: f32 = 0.2;
+
+/// Maximum permitted gamma compensation factor for `SyncTrueTone` wire validation.
+const TRUETONE_MAX_WIRE_GAMMA: f32 = 3.0;
+
+/// Resolves the secondary Sunshine port from preferences, falling back to [`config::SUNSHINE_SECONDARY_PORT`].
+fn resolve_secondary_sunshine_port(prefs: &system_info::AppPathPreferences) -> u16 {
+    prefs
+        .sunshine_secondary_port
+        .filter(|&p| p >= MIN_UNPRIVILEGED_PORT)
+        .unwrap_or(config::SUNSHINE_SECONDARY_PORT)
+}
+
+/// Resolves the secondary Sunshine configuration filename from preferences, rejecting path traversal.
+fn resolve_secondary_sunshine_conf_name(prefs: &system_info::AppPathPreferences) -> String {
+    if let Some(ref custom) = prefs.sunshine_secondary_conf_name {
+        if !custom.chars().any(|c| c.is_control()) {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty()
+                && !trimmed.contains('/')
+                && !trimmed.contains('\\')
+                && !trimmed.contains("..")
+            {
+                return trimmed.to_string();
+            }
+        }
+    }
+    config::SUNSHINE_SECONDARY_CONF_NAME.to_string()
+}
+
+/// Clamps PC-to-Mac stream dimensions against configured VDD maximums (or matches secondary slot max).
+fn resolve_vdd_stream_dimensions(
+    w: u32,
+    h: u32,
+    active_port: u16,
+    secondary_port: u16,
+    prefs: &system_info::AppPathPreferences,
+) -> (u32, u32) {
+    let max_w = prefs
+        .vdd_max_width
+        .unwrap_or(config::VDD_DEFAULT_MAX_WIDTH)
+        .clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH)
+        & !1;
+    let max_h = prefs
+        .vdd_max_height
+        .unwrap_or(config::VDD_DEFAULT_MAX_HEIGHT)
+        .clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT)
+        & !1;
+    if active_port == secondary_port || w > max_w || h > max_h {
+        (max_w, max_h)
+    } else {
+        (w, h)
+    }
+}
 
 /// Stateful controller managing extended display sessions, bitrate calculations, and RPC routing.
 #[derive(Clone)]
@@ -142,11 +249,11 @@ impl DisplayController {
         }
     }
 
-    /// Checks whether a TCP port is currently open and accepting connections with a 250ms timeout.
+    /// Checks whether a TCP port is currently open and accepting connections within [`TCP_PORT_PROBE_TIMEOUT`].
     async fn is_tcp_port_open(ip: &str, port: u16) -> bool {
         let addr = Self::format_socket_target(ip, port);
         matches!(
-            tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(&addr)).await,
+            tokio::time::timeout(TCP_PORT_PROBE_TIMEOUT, TcpStream::connect(&addr)).await,
             Ok(Ok(_))
         )
     }
@@ -158,56 +265,81 @@ impl DisplayController {
             if Self::is_tcp_port_open(ip, port).await {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(TCP_PORT_POLL_INTERVAL).await;
         }
         false
     }
 
-    /// Calculates the optimal streaming bitrate in kilobits per second based on link transport and refresh rate.
-    ///
-    /// Bitrate Matrix:
-    /// - Direct Thunderbolt / USB4 cable: 100 Mbps (standard) / 150 Mbps (120Hz+ high-framerate).
-    /// - 2.5GbE+ Ethernet: 100 Mbps / 150 Mbps.
-    /// - Gigabit Ethernet: 65 Mbps / 85 Mbps.
-    /// - Wi-Fi: 35 Mbps adaptive to avoid airtime congestion.
-    fn compute_optimal_bitrate_kbps(peer: &PeerCandidate, fps: u32) -> u32 {
-        let high_fps = fps >= 120;
-        if peer.transport.is_direct_cable() {
-            return if high_fps { 150_000 } else { 100_000 };
+    /// Calculates the adaptive streaming bitrate in kilobits per second from link transport,
+    /// reported link speed, and refresh rate using canonical [`config`] ladder bounds.
+    fn compute_adaptive_bitrate_kbps(
+        transport: system_info::LinkTransport,
+        link_speed_mbps: Option<u32>,
+        fps: u32,
+        override_kbps: Option<u32>,
+    ) -> u32 {
+        if let Some(custom_kbps) = override_kbps.filter(|&b| b > 0) {
+            return custom_kbps.clamp(config::MIN_BITRATE_KBPS, config::MAX_BITRATE_KBPS);
         }
-        match peer.link_speed_mbps {
-            Some(mbps) if mbps >= 2500 => {
+        let high_fps = fps >= config::HIGH_FPS_THRESHOLD;
+        if transport.is_direct_cable() {
+            return if high_fps {
+                config::BITRATE_DIRECT_CABLE_HIGH_FPS_KBPS
+            } else {
+                config::BITRATE_DIRECT_CABLE_STANDARD_KBPS
+            };
+        }
+        match link_speed_mbps {
+            Some(mbps) if mbps >= config::LINK_SPEED_2500M_THRESHOLD_MBPS => {
                 if high_fps {
-                    150_000
+                    config::BITRATE_2500M_HIGH_FPS_KBPS
                 } else {
-                    100_000
+                    config::BITRATE_2500M_STANDARD_KBPS
                 }
             }
-            Some(mbps) if mbps >= 1000 => {
+            Some(mbps) if mbps >= config::LINK_SPEED_1000M_THRESHOLD_MBPS => {
                 if high_fps {
-                    85_000
+                    config::BITRATE_1000M_HIGH_FPS_KBPS
                 } else {
-                    65_000
+                    config::BITRATE_1000M_STANDARD_KBPS
                 }
             }
-            Some(mbps) if mbps > 0 => (mbps.saturating_mul(350)).clamp(15_000, 55_000),
-            _ => match peer.transport {
+            Some(mbps) if mbps > 0 => mbps
+                .saturating_mul(config::BITRATE_SUB_GIG_MBPS_MULTIPLIER)
+                .clamp(
+                    config::BITRATE_SUB_GIG_MIN_KBPS,
+                    config::BITRATE_SUB_GIG_MAX_KBPS,
+                ),
+            _ => match transport {
                 system_info::LinkTransport::Ethernet => {
                     if high_fps {
-                        80_000
+                        config::BITRATE_ETH_FALLBACK_HIGH_FPS_KBPS
                     } else {
-                        60_000
+                        config::BITRATE_ETH_FALLBACK_STANDARD_KBPS
                     }
                 }
-                system_info::LinkTransport::Wifi => 35_000,
-                _ => 60_000,
+                system_info::LinkTransport::Wifi => config::BITRATE_WIFI_FALLBACK_KBPS,
+                _ => config::BITRATE_UNKNOWN_FALLBACK_KBPS,
             },
         }
     }
 
+    /// Calculates the optimal streaming bitrate in kilobits per second based on user override,
+    /// link transport, link speed, and refresh rate.
+    fn compute_optimal_bitrate_kbps(peer: &PeerCandidate, fps: u32) -> u32 {
+        let prefs = system_info::load_path_preferences();
+        Self::compute_adaptive_bitrate_kbps(
+            peer.transport,
+            peer.link_speed_mbps,
+            fps,
+            prefs.display_bitrate_override_kbps,
+        )
+    }
+
     /// Resolves the target peer's real display `(width, height, fps)` and hostname,
     /// querying `GetHardwareProfile` over RPC if beacon fields are incomplete,
-    /// clamping refresh rate to `30..=240`, and falling back to the local primary display.
+    /// clamping refresh rate to [`config::MIN_DISPLAY_FPS`]..=[`config::MAX_DISPLAY_FPS`],
+    /// and falling back to the local primary display.
     async fn resolve_peer_display_and_host(&self, peer: &PeerCandidate) -> (u32, u32, u32, String) {
         let peer_ip = peer.addr.ip().to_string();
         let mut width = peer.display_width;
@@ -235,26 +367,37 @@ impl DisplayController {
         let local_disp = tokio::task::spawn_blocking(system_info::get_primary_display_info)
             .await
             .unwrap_or(system_info::PrimaryDisplayInfo {
-                width: 1920,
-                height: 1080,
-                fps: 60,
+                width: config::DEFAULT_DISPLAY_WIDTH,
+                height: config::DEFAULT_DISPLAY_HEIGHT,
+                fps: config::DEFAULT_DISPLAY_FPS,
                 scale_factor: 1.0,
             });
         // Ensure even dimensions required by video encoders (width & !1, height & !1)
-        let final_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680) & !1;
-        let final_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320) & !1;
+        let final_w = (if width > 0 { width } else { local_disp.width })
+            .clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH)
+            & !1;
+        let final_h = (if height > 0 { height } else { local_disp.height })
+            .clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT)
+            & !1;
         let raw_fps = if fps > 0 { fps } else { local_disp.fps };
-        let final_fps = (if raw_fps > 0 { raw_fps } else { 60 }).clamp(30, 240);
+        let final_fps = (if raw_fps > 0 {
+            raw_fps
+        } else {
+            config::DEFAULT_DISPLAY_FPS
+        })
+        .clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS);
         let final_hostname = if hostname.is_empty() { peer_ip } else { hostname };
 
         (final_w, final_h, final_fps, final_hostname)
     }
 
-    /// Reads optional custom sunshine server name from secondary `sunshine_mac2.conf`.
+    /// Reads optional custom sunshine server name from the configured secondary Sunshine config file.
     fn read_secondary_sunshine_name() -> Option<String> {
+        let prefs = system_info::load_path_preferences();
+        let secondary_conf_name = resolve_secondary_sunshine_conf_name(&prefs);
         let conf_path = system_info::find_sunshine_conf()?
             .parent()?
-            .join("sunshine_mac2.conf");
+            .join(secondary_conf_name);
         let content = std::fs::read_to_string(conf_path).ok()?;
         for line in content.lines() {
             let t = line.trim();
@@ -367,7 +510,7 @@ impl DisplayController {
         let disp_id = tokio::task::spawn_blocking(move || MacDisplayManager::start_virtual_display(w, h, fps))
             .await
             .context("Virtual display task panicked")??;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(VIRTUAL_DISPLAY_SETTLE_DELAY).await;
         if let Err(e) = tokio::task::spawn_blocking(move || MacDisplayManager::configure_sunshine_output(disp_id))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)))
@@ -388,21 +531,22 @@ impl DisplayController {
         let (my_sunshine_name, my_sunshine_port, _) =
             tokio::task::spawn_blocking(system_info::read_sunshine_config_info)
                 .await
-                .unwrap_or((None, 47989, None));
+                .unwrap_or((None, config::SUNSHINE_DEFAULT_PORT, None));
         info!("Waiting for Sunshine server on port {}...", my_sunshine_port);
-        if !MacDisplayManager::wait_for_sunshine_ready(Duration::from_secs(10)).await {
+        if !MacDisplayManager::wait_for_sunshine_ready(MAC_SUNSHINE_READY_TIMEOUT).await {
             let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_virtual_display).await;
             let _ = tokio::task::spawn_blocking(MacDisplayManager::stop_sunshine).await;
             self.clear_host_state().await;
             anyhow::bail!(
-                "Mac Sunshine server failed to listen on port {} within 10s (check Screen Recording permission for Sunshine.app and ~/Library/Logs/sunshine.log)",
-                my_sunshine_port
+                "Mac Sunshine server failed to listen on port {} within {}s (check Screen Recording permission for Sunshine.app and ~/Library/Logs/sunshine.log)",
+                my_sunshine_port,
+                MAC_SUNSHINE_READY_TIMEOUT.as_secs()
             );
         }
 
         let fallback_host = tokio::task::spawn_blocking(system_info::get_hostname)
             .await
-            .unwrap_or_else(|_| "Mac".to_string());
+            .unwrap_or_else(|_| FALLBACK_MAC_HOST_NAME.to_string());
         let host_name = my_sunshine_name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(fallback_host);
@@ -556,38 +700,48 @@ impl DisplayController {
             .await
             .context("VDD enable task panicked")??;
 
-        // 2. Wait for local Sunshine on configured port (or port 48989 if a secondary instance is open)
+        // 2. Wait for local Sunshine on configured port (or configured secondary port if open)
+        let prefs = tokio::task::spawn_blocking(system_info::load_path_preferences)
+            .await
+            .unwrap_or_default();
+        let secondary_port = resolve_secondary_sunshine_port(&prefs);
+        let loopback = Ipv4Addr::LOCALHOST.to_string();
         let (my_sunshine_name, configured_port, _) =
             tokio::task::spawn_blocking(system_info::read_sunshine_config_info)
                 .await
-                .unwrap_or((None, 47989, None));
+                .unwrap_or((None, config::SUNSHINE_DEFAULT_PORT, None));
         let mut active_port = configured_port;
         let mut ready = false;
-        for attempt in 0..40 {
-            if configured_port != 48989 && Self::is_tcp_port_open("127.0.0.1", 48989).await {
-                active_port = 48989;
+        for attempt in 0..WIN_SUNSHINE_READY_MAX_ATTEMPTS {
+            if configured_port != secondary_port
+                && Self::is_tcp_port_open(&loopback, secondary_port).await
+            {
+                active_port = secondary_port;
                 ready = true;
                 break;
             }
-            if Self::is_tcp_port_open("127.0.0.1", configured_port).await
-                && (attempt >= 3 || configured_port == 48989)
+            if Self::is_tcp_port_open(&loopback, configured_port).await
+                && (attempt >= WIN_SUNSHINE_PRIMARY_GRACE_ATTEMPTS
+                    || configured_port == secondary_port)
             {
                 active_port = configured_port;
                 ready = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(TCP_PORT_POLL_INTERVAL).await;
         }
         if !ready {
             let _ = tokio::task::spawn_blocking(WinDisplayManager::disable_vdd_device).await;
             self.clear_host_state().await;
             anyhow::bail!(
-                "Windows Sunshine server failed to listen on port {} (or secondary 48989) within 8s",
-                configured_port
+                "Windows Sunshine server failed to listen on port {} (or secondary {}) within {}s",
+                configured_port,
+                secondary_port,
+                (TCP_PORT_POLL_INTERVAL * WIN_SUNSHINE_READY_MAX_ATTEMPTS as u32).as_secs()
             );
         }
 
-        let secondary_name = if active_port == 48989 {
+        let secondary_name = if active_port == secondary_port {
             tokio::task::spawn_blocking(Self::read_secondary_sunshine_name)
                 .await
                 .ok()
@@ -597,24 +751,21 @@ impl DisplayController {
         };
         let fallback_host = tokio::task::spawn_blocking(system_info::get_hostname)
             .await
-            .unwrap_or_else(|_| "Windows".to_string());
+            .unwrap_or_else(|_| FALLBACK_WINDOWS_HOST_NAME.to_string());
         let host_name = secondary_name
             .or(my_sunshine_name)
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(fallback_host);
         let bitrate_kbps = Self::compute_optimal_bitrate_kbps(&peer, fps);
 
-        // Clamp display dimensions for secondary Mac slot to match VDD slot 1 native 2560x1600
-        let (stream_w, stream_h) = if active_port == 48989 || w > 2560 || h > 1600 {
-            (2560, 1600)
-        } else {
-            (w, h)
-        };
+        // Clamp display dimensions against configured VDD maximums (or secondary slot max)
+        let (stream_w, stream_h) =
+            resolve_vdd_stream_dimensions(w, h, active_port, secondary_port, &prefs);
 
         // Ensure Sunshine REST API has cleared any lingering stream before client connects
-        let api_port = active_port + 1;
+        let api_port = active_port.saturating_add(config::SUNSHINE_WEB_PORT_OFFSET);
         let _ = tokio::task::spawn_blocking(move || {
-            WinDisplayManager::call_sunshine_api(api_port, "/api/apps/close");
+            WinDisplayManager::call_sunshine_api(api_port, config::SUNSHINE_API_CLOSE_PATH);
         })
         .await;
 
@@ -793,7 +944,7 @@ impl DisplayController {
                         .base_response(false, "Missing or invalid host_ip in StartMoonlight request")
                         .await;
                 }
-                if host_port > 0 && host_port < 1024 {
+                if host_port > 0 && host_port < MIN_UNPRIVILEGED_PORT {
                     return self
                         .base_response(false, "Rejected StartMoonlight: invalid privileged host_port")
                         .await;
@@ -801,30 +952,37 @@ impl DisplayController {
 
                 info!("Handling StartMoonlight RPC from host {}", effective_host_ip);
 
-                let port = if host_port >= 1024 {
+                let prefs = tokio::task::spawn_blocking(system_info::load_path_preferences)
+                    .await
+                    .unwrap_or_default();
+                let secondary_port = resolve_secondary_sunshine_port(&prefs);
+
+                let port = if host_port >= MIN_UNPRIVILEGED_PORT {
                     host_port
-                } else if Self::is_tcp_port_open(&effective_host_ip, 47989).await {
-                    47989
-                } else if Self::is_tcp_port_open(&effective_host_ip, 48989).await {
-                    48989
+                } else if Self::is_tcp_port_open(&effective_host_ip, config::SUNSHINE_DEFAULT_PORT)
+                    .await
+                {
+                    config::SUNSHINE_DEFAULT_PORT
+                } else if Self::is_tcp_port_open(&effective_host_ip, secondary_port).await {
+                    secondary_port
                 } else if Self::wait_for_tcp_port(
                     &effective_host_ip,
-                    47989,
-                    Duration::from_secs(2),
+                    config::SUNSHINE_DEFAULT_PORT,
+                    REMOTE_PORT_WAIT_TIMEOUT,
                 )
                 .await
                 {
-                    47989
+                    config::SUNSHINE_DEFAULT_PORT
                 } else if Self::wait_for_tcp_port(
                     &effective_host_ip,
-                    48989,
-                    Duration::from_secs(2),
+                    secondary_port,
+                    REMOTE_PORT_WAIT_TIMEOUT,
                 )
                 .await
                 {
-                    48989
+                    secondary_port
                 } else {
-                    47989
+                    config::SUNSHINE_DEFAULT_PORT
                 };
 
                 let effective_host_name = if !host_name.trim().is_empty() {
@@ -847,19 +1005,28 @@ impl DisplayController {
                 let local_disp = tokio::task::spawn_blocking(system_info::get_primary_display_info)
                     .await
                     .unwrap_or(system_info::PrimaryDisplayInfo {
-                        width: 1920,
-                        height: 1080,
-                        fps: 60,
+                        width: config::DEFAULT_DISPLAY_WIDTH,
+                        height: config::DEFAULT_DISPLAY_HEIGHT,
+                        fps: config::DEFAULT_DISPLAY_FPS,
                         scale_factor: 1.0,
                     });
-                let eff_w = (if width > 0 { width } else { local_disp.width }).clamp(800, 7680) & !1;
-                let eff_h = (if height > 0 { height } else { local_disp.height }).clamp(600, 4320) & !1;
+                let eff_w = (if width > 0 { width } else { local_disp.width })
+                    .clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH)
+                    & !1;
+                let eff_h = (if height > 0 { height } else { local_disp.height })
+                    .clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT)
+                    & !1;
                 let raw_fps = if fps > 0 { fps } else { local_disp.fps };
-                let eff_fps = (if raw_fps > 0 { raw_fps } else { 60 }).clamp(30, 240);
-                let eff_bitrate = if bitrate_kbps > 0 {
-                    bitrate_kbps.clamp(5_000, 500_000)
+                let eff_fps = (if raw_fps > 0 {
+                    raw_fps
                 } else {
-                    100_000
+                    config::DEFAULT_DISPLAY_FPS
+                })
+                .clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS);
+                let eff_bitrate = if bitrate_kbps > 0 {
+                    bitrate_kbps.clamp(config::MIN_BITRATE_KBPS, config::MAX_BITRATE_KBPS)
+                } else {
+                    config::DEFAULT_BITRATE_KBPS
                 };
 
                 let host_ip_arg = effective_host_ip.clone();
@@ -1016,10 +1183,10 @@ impl DisplayController {
                 gamma_comp,
             } => {
                 if !lux.is_finite()
-                    || !(0.0..=200_000.0).contains(&lux)
-                    || !(1000..=15_000).contains(&cct)
+                    || !(0.0..=TRUETONE_MAX_LUX).contains(&lux)
+                    || !(TRUETONE_MIN_WIRE_CCT..=TRUETONE_MAX_WIRE_CCT).contains(&cct)
                     || !gamma_comp.is_finite()
-                    || !(0.2..=3.0).contains(&gamma_comp)
+                    || !(TRUETONE_MIN_WIRE_GAMMA..=TRUETONE_MAX_WIRE_GAMMA).contains(&gamma_comp)
                 {
                     return self
                         .base_response(false, "Rejected SyncTrueTone: out-of-range calibration values")
@@ -1172,9 +1339,17 @@ impl DisplayController {
                         .base_response(false, "Invalid peer IP address for pairing")
                         .await;
                 }
-                if trimmed_pin.len() != 6 || !trimmed_pin.bytes().all(|b| b.is_ascii_digit()) {
+                if trimmed_pin.len() != config::PAIRING_PIN_LENGTH
+                    || !trimmed_pin.bytes().all(|b| b.is_ascii_digit())
+                {
                     return self
-                        .base_response(false, "Pairing PIN must be a 6-digit number")
+                        .base_response(
+                            false,
+                            format!(
+                                "Pairing PIN must be a {}-digit number",
+                                config::PAIRING_PIN_LENGTH
+                            ),
+                        )
                         .await;
                 }
                 match trust::pair_with_remote_peer_v2(trimmed_ip, CONTROL_PORT, trimmed_pin).await {
@@ -1286,23 +1461,23 @@ impl DisplayController {
             peer_ip,
             CONTROL_PORT,
             crate::security::transport::ServiceId::DisplayRpc,
-            Duration::from_secs(4),
+            RPC_CONNECT_TIMEOUT,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to establish TransportV2 session to {}: {}", addr, e))?;
 
         let payload = serde_json::to_vec(req)?;
-        tokio::time::timeout(Duration::from_secs(10), session.send_message(&payload))
+        tokio::time::timeout(RPC_SEND_TIMEOUT, session.send_message(&payload))
             .await
             .with_context(|| format!("Timed out sending RPC request to {}", addr))?
             .map_err(|e| anyhow::anyhow!("TransportV2 send error to {}: {}", addr, e))?;
 
-        let plain_resp = tokio::time::timeout(Duration::from_secs(15), session.recv_message())
+        let plain_resp = tokio::time::timeout(RPC_RECV_TIMEOUT, session.recv_message())
             .await
             .with_context(|| format!("Timed out waiting for RPC response from {}", addr))?
             .map_err(|e| anyhow::anyhow!("TransportV2 receive error from {}: {}", addr, e))?;
 
-        if plain_resp.is_empty() || plain_resp.len() > 1_048_576 {
+        if plain_resp.is_empty() || plain_resp.len() > MAX_RPC_RESPONSE_BYTES {
             anyhow::bail!(
                 "Invalid RPC response size {} bytes from {}",
                 plain_resp.len(),
@@ -1392,12 +1567,102 @@ mod tests {
     #[test]
     fn format_socket_target_supports_ipv4_and_ipv6() {
         assert_eq!(
-            DisplayController::format_socket_target("10.0.0.2", 58281),
-            "10.0.0.2:58281"
+            DisplayController::format_socket_target("10.0.0.2", CONTROL_PORT),
+            format!("10.0.0.2:{}", CONTROL_PORT)
         );
         assert_eq!(
-            DisplayController::format_socket_target("fe80::1", 58281),
-            "[fe80::1]:58281"
+            DisplayController::format_socket_target("fe80::1", CONTROL_PORT),
+            format!("[fe80::1]:{}", CONTROL_PORT)
+        );
+    }
+
+    #[test]
+    fn resolve_vdd_stream_dimensions_respects_prefs_and_secondary_slot() {
+        let defaults = system_info::AppPathPreferences::default();
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                1920,
+                1080,
+                config::SUNSHINE_DEFAULT_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (1920, 1080)
+        );
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                3840,
+                2160,
+                config::SUNSHINE_DEFAULT_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (config::VDD_DEFAULT_MAX_WIDTH, config::VDD_DEFAULT_MAX_HEIGHT)
+        );
+        let custom = system_info::AppPathPreferences {
+            vdd_max_width: Some(3840),
+            vdd_max_height: Some(2160),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                3456,
+                2234,
+                config::SUNSHINE_DEFAULT_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &custom
+            ),
+            (3840, 2160)
+        );
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                1920,
+                1080,
+                config::SUNSHINE_SECONDARY_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &custom
+            ),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
+    fn adaptive_bitrate_ladder_and_override_clamping() {
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Thunderbolt,
+                Some(20_000),
+                120,
+                None
+            ),
+            config::BITRATE_DIRECT_CABLE_HIGH_FPS_KBPS
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Wifi,
+                None,
+                60,
+                None
+            ),
+            config::BITRATE_WIFI_FALLBACK_KBPS
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Wifi,
+                None,
+                60,
+                Some(120_000)
+            ),
+            120_000
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Wifi,
+                None,
+                60,
+                Some(999_999)
+            ),
+            config::MAX_BITRATE_KBPS
         );
     }
 }

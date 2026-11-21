@@ -1,5 +1,51 @@
+//! # Native Build Script (`build.rs`)
+//!
+//! ## 1. Module Purpose & Scope
+//! Compiles and links platform-native Swift, Objective-C, and C++ static libraries and helper
+//! binaries required by `integrator_core` on macOS and Windows 11.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**: Cargo build pipeline (`cargo build`, `cargo test`).
+//! - **Downstream Callees**: `swiftc`, `xcrun`, `clang`, `ar` on macOS; MSVC (`cc` crate) on Windows.
+//! - **Cross-Platform Flow**: Emits platform-gated static archives (`libtouchbar.a`,
+//!   `libvirtualdisplay.a`, `kvm_windows`) and standalone helpers (`macos_clip_files`,
+//!   `integrator_vcam.dll`).
+//!
+//! ## 3. Threading & Concurrency Model
+//! Single-threaded synchronous build script executed by Cargo before crate compilation.
+//!
+//! ## 4. Security & Safety Invariants
+//! All build artifacts are emitted strictly under Cargo's `OUT_DIR` or profile target directory;
+//! Swift rpath resolution queries `xcrun --show-sdk-path` dynamically with a safe system fallback.
+
 use std::path::PathBuf;
 use std::process::Command;
+
+/// Default minimum macOS deployment target used when `MACOSX_DEPLOYMENT_TARGET` is unset.
+const DEFAULT_MACOS_DEPLOYMENT_TARGET: &str = "12.0";
+
+/// Fallback runtime dyld rpath for macOS system Swift libraries when SDK resolution is unavailable.
+const FALLBACK_MACOS_SWIFT_RPATH: &str = "/usr/lib/swift";
+
+/// Relative path to Swift libraries inside a resolved macOS SDK bundle.
+const MACOS_SDK_SWIFT_LIB_REL_PATH: &str = "usr/lib/swift";
+
+/// Resolves the macOS SDK Swift library path dynamically via `xcrun --show-sdk-path`,
+/// falling back to [`FALLBACK_MACOS_SWIFT_RPATH`] if the SDK query fails.
+fn resolve_macos_swift_rpath() -> String {
+    if let Ok(output) = Command::new("xcrun").args(["--show-sdk-path"]).output() {
+        if output.status.success() {
+            let sdk_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !sdk_path.is_empty() {
+                let sdk_swift = PathBuf::from(sdk_path).join(MACOS_SDK_SWIFT_LIB_REL_PATH);
+                if sdk_swift.is_dir() {
+                    return sdk_swift.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    FALLBACK_MACOS_SWIFT_RPATH.to_string()
+}
 
 fn main() {
     for env_key in [
@@ -19,8 +65,8 @@ fn main() {
     if target_os == "macos" {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        let deploy_target =
-            std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".to_string());
+        let deploy_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+            .unwrap_or_else(|_| DEFAULT_MACOS_DEPLOYMENT_TARGET.to_string());
 
         let (swift_arch, clang_arch) = match target_arch.as_str() {
             "aarch64" => ("arm64", "arm64"),
@@ -100,7 +146,14 @@ fn main() {
                 }
             }
         }
-        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+        let swift_rpath = resolve_macos_swift_rpath();
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", swift_rpath);
+        if swift_rpath != FALLBACK_MACOS_SWIFT_RPATH {
+            println!(
+                "cargo:rustc-link-arg=-Wl,-rpath,{}",
+                FALLBACK_MACOS_SWIFT_RPATH
+            );
+        }
         println!("cargo:rustc-link-search=native={}", out_dir);
         println!("cargo:rustc-link-lib=static=touchbar");
         println!("cargo:rerun-if-changed=src/touchbar_hud.swift");

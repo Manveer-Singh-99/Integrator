@@ -51,7 +51,7 @@
 //!   from local loopback for emergency teardown (`StopAll` / `StopMoonlight`).
 
 use anyhow::{Context, Result};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -86,6 +86,9 @@ const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Timeout allowed for interactive SPAKE2 mutual pairing handshakes.
 const PAIRING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Backoff delay after a transient TCP `accept` error to prevent tight CPU spin loops.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+
 /// Display Control RPC server managing incoming TCP sockets on port [`CONTROL_PORT`].
 pub struct DisplayServer {
     /// Reference to the central [`DisplayController`] executing parsed RPC actions.
@@ -105,7 +108,7 @@ impl DisplayServer {
 
     /// Binds the TCP listener to `0.0.0.0:CONTROL_PORT` and spawns the connection accept loop.
     pub async fn start(&self) -> Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", CONTROL_PORT)).await?;
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))).await?;
         info!("🖥️ Display Control RPC Server active on port {}", CONTROL_PORT);
 
         let ctrl = self.controller.clone();
@@ -140,7 +143,7 @@ impl DisplayServer {
                     }
                     Err(e) => {
                         error!("Display control TCP listener error: {}", e);
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     }
                 }
             }
