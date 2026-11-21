@@ -596,11 +596,51 @@ impl KvmService {
                     continue;
                 }
 
-                let already_connected = svc_loop
+                let current_conn_ip = svc_loop
                     .connected_peer_ip
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
+                    .clone();
+
+                // Topology failover & upgrade when idle: if the active route IP expired (e.g. USB-C cable
+                // unplugged or DHCP lease changed on a hotspot) OR a higher-priority physical cable
+                // (Thunderbolt / USB-C Direct) became available while connected over Wi-Fi / Hotspot,
+                // cleanly tear down the idle session so the next tick connects over the best route.
+                let mut already_connected = current_conn_ip.is_some();
+                if let Some(ref cur_ip) = current_conn_ip {
+                    let is_idle = matches!(
+                        *svc_loop.role.lock().unwrap_or_else(|e| e.into_inner()),
+                        KvmRole::Idle
+                    );
+                    if is_idle {
+                        if let Some(best) = svc_loop.discovery.get_best_peer().await {
+                            let best_ip = best.addr.ip().to_string();
+                            if best.trusted && best_ip != *cur_ip {
+                                let all_peers = svc_loop.discovery.get_all_peers().await;
+                                let cur_peer = all_peers
+                                    .iter()
+                                    .find(|p| p.addr.ip().to_string() == *cur_ip);
+                                let should_switch = match cur_peer {
+                                    None => true,
+                                    Some(cp) => {
+                                        best.transport.route_priority()
+                                            < cp.transport.route_priority()
+                                    }
+                                };
+                                if should_switch {
+                                    info!(
+                                        "🔄 KVM switching topology route from {} to {} ({})",
+                                        cur_ip,
+                                        best_ip,
+                                        best.transport.label()
+                                    );
+                                    svc_loop.teardown_active_session();
+                                    already_connected = false;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if !already_connected {
                     if let Some(peer) = svc_loop.discovery.get_best_peer().await {
