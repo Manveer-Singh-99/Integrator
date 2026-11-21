@@ -103,7 +103,7 @@
                                 <TextBlock x:Name="SidebarPeerName" Text="Searching for peer…"
                                            FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <TextBlock x:Name="SidebarLinkDesc" Text="Searching Ethernet / TB / USB-C / Wi-Fi"
+                            <TextBlock x:Name="SidebarLinkDesc" Text="Searching USB-C / TB / Ethernet / Wi-Fi / Hotspot"
                                        FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                        TextTrimming="CharacterEllipsis" />
                             <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2,0,0">
@@ -506,7 +506,7 @@
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <TextBox x:Name="ManualIpInput" Grid.Column="0" MaxLength="64"
-                                             PlaceholderText="Manual peer IP (e.g. 10.99.99.2)"
+                                             PlaceholderText="Manual peer IP (e.g. 192.168.1.50 or 172.20.10.2)"
                                              AutomationProperties.Name="Manual peer IP address" />
                                     <Button Grid.Column="1" Content="Add IP" Click="AddManualIp_Click" />
                                 </Grid>
@@ -517,7 +517,7 @@
 
                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                     <FontIcon Glyph="&#xE72E;" FontSize="11" Foreground="#20B85A" />
-                                    <TextBlock Text="SPAKE2 + Ed25519 Mutual Auth Enforced on USB-C &amp; LAN (v1.0 Locked)"
+                                    <TextBlock Text="SPAKE2 + Ed25519 Mutual Auth Enforced Across All Links (v1.0 Locked)"
                                                FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
                                 </StackPanel>
                             </StackPanel>

@@ -894,7 +894,7 @@ fn format_firewall_ports(ports: &[u16]) -> String {
         .join(",")
 }
 
-/// Computes the canonical IPv4 network CIDR (e.g. `192.168.1.0/24`) for an active local interface.
+/// Computes the canonical IPv4 network CIDR (e.g. `192.168.1.0/24`, `172.20.10.0/28`) for an active local interface.
 #[cfg(any(target_os = "windows", test))]
 fn interface_to_cidr(iface: &system_info::LocalInterfaceInfo) -> Option<String> {
     let ip = iface.ip.trim().parse::<Ipv4Addr>().ok()?;
@@ -902,44 +902,17 @@ fn interface_to_cidr(iface: &system_info::LocalInterfaceInfo) -> Option<String> 
         return None;
     }
 
-    let mask_u = if let Ok(mask) = iface.netmask.trim().parse::<Ipv4Addr>() {
-        let m = u32::from(mask);
-        if m != 0 {
-            m
-        } else if (1..=32).contains(&iface.cidr_prefix) {
-            if iface.cidr_prefix == 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - iface.cidr_prefix as u32)
-            }
+    let mask = if let Ok(parsed_mask) = iface.netmask.trim().parse::<Ipv4Addr>() {
+        if system_info::is_valid_contiguous_netmask(parsed_mask) {
+            parsed_mask
         } else {
-            return None;
-        }
-    } else if (1..=32).contains(&iface.cidr_prefix) {
-        if iface.cidr_prefix == 32 {
-            u32::MAX
-        } else {
-            u32::MAX << (32 - iface.cidr_prefix as u32)
+            system_info::prefix_to_mask(iface.cidr_prefix)?
         }
     } else {
-        return None;
+        system_info::prefix_to_mask(iface.cidr_prefix)?
     };
 
-    let prefix = mask_u.leading_ones();
-    if prefix == 0 || prefix > 32 {
-        return None;
-    }
-    let canonical_mask = if prefix == 32 {
-        u32::MAX
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    if mask_u != canonical_mask {
-        return None;
-    }
-
-    let network = Ipv4Addr::from(u32::from(ip) & canonical_mask);
-    Some(format!("{}/{}", network, prefix))
+    system_info::compute_network_cidr(ip, mask)
 }
 
 /// Validates and normalizes an extra Windows firewall remote scope entry (IPv4 CIDR or host IP).
@@ -980,8 +953,8 @@ fn validate_firewall_scope_entry(raw: &str) -> Option<String> {
 }
 
 /// Pure helper building the deduplicated comma-separated Windows Defender Firewall `remoteip=`
-/// string from `LocalSubnet`, [`config::IPV4_LINK_LOCAL_CIDR`], active adapter network CIDRs,
-/// and validated user-configured extra subnets.
+/// string from `LocalSubnet`, [`config::IPV4_LINK_LOCAL_CIDR`], active physical/hotspot adapter
+/// network CIDRs (excluding VPN/WSL/Docker/VM virtual switches), and validated user-configured extra subnets.
 #[cfg(any(target_os = "windows", test))]
 fn build_windows_firewall_remote_scopes_from(
     interfaces: &[system_info::LocalInterfaceInfo],
@@ -998,6 +971,11 @@ fn build_windows_firewall_remote_scopes_from(
     push_unique(config::IPV4_LINK_LOCAL_CIDR.to_string());
 
     for iface in interfaces {
+        if iface.transport == system_info::LinkTransport::Unknown
+            || system_info::is_excluded_virtual_interface(&iface.name, &iface.friendly_name)
+        {
+            continue;
+        }
         if let Some(cidr) = interface_to_cidr(iface) {
             push_unique(cidr);
         }
@@ -1065,8 +1043,9 @@ fn ensure_windows_firewall_rules() {
 
     let scopes_match = |txt: &str| {
         remote_scopes.split(',').all(|scope| {
-            let token = scope.split('/').next().unwrap_or(scope).to_ascii_lowercase();
-            txt.contains(&token)
+            let lower_scope = scope.to_ascii_lowercase();
+            let ip_token = lower_scope.split('/').next().unwrap_or(&lower_scope);
+            txt.contains(&lower_scope) || txt.contains(ip_token)
         })
     };
 
@@ -2332,6 +2311,28 @@ mod tests {
                 description: "Wi-Fi".into(),
             },
             system_info::LocalInterfaceInfo {
+                name: "Wi-Fi 2".into(),
+                friendly_name: "iPhone Personal Hotspot".into(),
+                ip: "172.20.10.7".into(),
+                netmask: "255.255.255.240".into(),
+                broadcast: "172.20.10.15".into(),
+                cidr_prefix: 28,
+                transport: system_info::LinkTransport::Hotspot,
+                link_speed_mbps: Some(866),
+                description: "Mobile Hotspot".into(),
+            },
+            system_info::LocalInterfaceInfo {
+                name: "Local Area Connection* 10".into(),
+                friendly_name: "Microsoft Wi-Fi Direct Virtual Adapter".into(),
+                ip: "192.168.137.1".into(),
+                netmask: "255.255.255.0".into(),
+                broadcast: "192.168.137.255".into(),
+                cidr_prefix: 24,
+                transport: system_info::LinkTransport::Hotspot,
+                link_speed_mbps: Some(866),
+                description: "Mobile Hotspot".into(),
+            },
+            system_info::LocalInterfaceInfo {
                 name: "Thunderbolt".into(),
                 friendly_name: "Thunderbolt Bridge".into(),
                 ip: "169.254.10.2".into(),
@@ -2341,6 +2342,29 @@ mod tests {
                 transport: system_info::LinkTransport::Thunderbolt,
                 link_speed_mbps: None,
                 description: "Thunderbolt".into(),
+            },
+            // Virtual / VPN interfaces that MUST be excluded from firewall scope generation
+            system_info::LocalInterfaceInfo {
+                name: "vEthernet (WSL)".into(),
+                friendly_name: "Hyper-V Virtual Ethernet Adapter".into(),
+                ip: "172.28.16.1".into(),
+                netmask: "255.255.240.0".into(),
+                broadcast: "172.28.31.255".into(),
+                cidr_prefix: 20,
+                transport: system_info::LinkTransport::Ethernet,
+                link_speed_mbps: Some(10000),
+                description: "WSL".into(),
+            },
+            system_info::LocalInterfaceInfo {
+                name: "Tailscale".into(),
+                friendly_name: "Tailscale Tunnel".into(),
+                ip: "100.101.102.103".into(),
+                netmask: "255.192.0.0".into(),
+                broadcast: "100.127.255.255".into(),
+                cidr_prefix: 10,
+                transport: system_info::LinkTransport::Unknown,
+                link_speed_mbps: None,
+                description: "Tailscale".into(),
             },
         ];
 
@@ -2357,10 +2381,12 @@ mod tests {
         assert_eq!(
             scopes,
             format!(
-                "LocalSubnet,{},10.99.99.0/24,192.168.48.0/22,172.20.10.0/24,10.10.10.7",
+                "LocalSubnet,{},10.99.99.0/24,192.168.48.0/22,172.20.10.0/28,192.168.137.0/24,172.20.10.0/24,10.10.10.7",
                 config::IPV4_LINK_LOCAL_CIDR
             )
         );
+        assert!(!scopes.contains("172.28.16.0/20"), "WSL vEthernet subnet must be excluded");
+        assert!(!scopes.contains("100.64.0.0/10"), "Tailscale VPN subnet must be excluded");
 
         let live_scopes = build_windows_firewall_remote_scopes();
         assert!(live_scopes.starts_with(&format!("LocalSubnet,{}", config::IPV4_LINK_LOCAL_CIDR)));

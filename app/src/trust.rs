@@ -658,8 +658,21 @@ pub async fn accept_transport_from_stream(
     .map_err(|e| format!("TransportV2 server handshake rejected from {}: {}", peer_ip, e))?;
 
     if !peer_ip.is_loopback() {
-        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        let _ = ks.update_peer_last_ip(session.peer_device_id_hex(), &peer_ip.to_string());
+        let ip_str = peer_ip.to_string();
+        let dev_id = session.peer_device_id_hex().to_string();
+        {
+            let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.update_peer_last_ip(&dev_id, &ip_str);
+        }
+        let rt = runtime_state();
+        let mut hints = rt
+            .ip_to_device_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(&ip_str) {
+            hints.clear();
+        }
+        hints.insert(ip_str, dev_id);
     }
 
     Ok(session)

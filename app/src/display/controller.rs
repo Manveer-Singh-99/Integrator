@@ -291,6 +291,17 @@ impl DisplayController {
 
     /// Calculates the adaptive streaming bitrate in kilobits per second from link transport,
     /// reported link speed, and refresh rate using canonical [`config`] ladder bounds.
+    ///
+    /// # Topology Adaptation
+    /// 1. **Direct Cable (`DirectUsb` / `Thunderbolt`)**: Full 100 Mbps (60Hz) / 150 Mbps (120Hz+) point-to-point tier.
+    /// 2. **Mobile Hotspot (`Hotspot`)**: Derates nominal 802.11 PHY link speeds (`866 Mbps`, `1200 Mbps`) by
+    ///    [`config::BITRATE_HOTSPOT_PHY_MBPS_MULTIPLIER`] and caps at [`config::BITRATE_HOTSPOT_STANDARD_KBPS`] (20 Mbps)
+    ///    or [`config::BITRATE_HOTSPOT_HIGH_FPS_KBPS`] (25 Mbps) to prevent bufferbloat and packet drops over
+    ///    PC Mobile Hotspots (`Wi-Fi Direct` / ICS) and iPhone / Android Personal Hotspots.
+    /// 3. **Wi-Fi LAN (`Wifi`)**: Derates half-duplex 802.11 PHY rates by [`config::BITRATE_WIFI_PHY_MBPS_MULTIPLIER`]
+    ///    and caps at [`config::BITRATE_WIFI_MAX_STANDARD_KBPS`] (45 Mbps) or [`config::BITRATE_WIFI_MAX_HIGH_FPS_KBPS`]
+    ///    (55 Mbps) so high nominal PHY link speeds (`866 Mbps` / `1200 Mbps`) never jump into wired 1GbE/2.5GbE tiers.
+    /// 4. **Wired Ethernet (`Ethernet`)**: Uses full-duplex 2.5GbE (`100–150 Mbps`), 1GbE (`65–85 Mbps`), or sub-gigabit ladders.
     fn compute_adaptive_bitrate_kbps(
         transport: system_info::LinkTransport,
         link_speed_mbps: Option<u32>,
@@ -308,37 +319,65 @@ impl DisplayController {
                 config::BITRATE_DIRECT_CABLE_STANDARD_KBPS
             };
         }
-        match link_speed_mbps {
-            Some(mbps) if mbps >= config::LINK_SPEED_2500M_THRESHOLD_MBPS => {
-                if high_fps {
-                    config::BITRATE_2500M_HIGH_FPS_KBPS
+
+        match transport {
+            system_info::LinkTransport::Hotspot => {
+                let cap = if high_fps {
+                    config::BITRATE_HOTSPOT_HIGH_FPS_KBPS
                 } else {
-                    config::BITRATE_2500M_STANDARD_KBPS
+                    config::BITRATE_HOTSPOT_STANDARD_KBPS
+                };
+                match link_speed_mbps {
+                    Some(mbps) if mbps > 0 => mbps
+                        .saturating_mul(config::BITRATE_HOTSPOT_PHY_MBPS_MULTIPLIER)
+                        .clamp(config::BITRATE_HOTSPOT_MIN_KBPS, cap),
+                    _ => cap,
                 }
             }
-            Some(mbps) if mbps >= config::LINK_SPEED_1000M_THRESHOLD_MBPS => {
-                if high_fps {
-                    config::BITRATE_1000M_HIGH_FPS_KBPS
+            system_info::LinkTransport::Wifi => {
+                let cap = if high_fps {
+                    config::BITRATE_WIFI_MAX_HIGH_FPS_KBPS
                 } else {
-                    config::BITRATE_1000M_STANDARD_KBPS
+                    config::BITRATE_WIFI_MAX_STANDARD_KBPS
+                };
+                match link_speed_mbps {
+                    Some(mbps) if mbps > 0 => mbps
+                        .saturating_mul(config::BITRATE_WIFI_PHY_MBPS_MULTIPLIER)
+                        .clamp(config::BITRATE_SUB_GIG_MIN_KBPS, cap),
+                    _ => config::BITRATE_WIFI_FALLBACK_KBPS,
                 }
             }
-            Some(mbps) if mbps > 0 => mbps
-                .saturating_mul(config::BITRATE_SUB_GIG_MBPS_MULTIPLIER)
-                .clamp(
-                    config::BITRATE_SUB_GIG_MIN_KBPS,
-                    config::BITRATE_SUB_GIG_MAX_KBPS,
-                ),
-            _ => match transport {
-                system_info::LinkTransport::Ethernet => {
+            _ => match link_speed_mbps {
+                Some(mbps) if mbps >= config::LINK_SPEED_2500M_THRESHOLD_MBPS => {
                     if high_fps {
-                        config::BITRATE_ETH_FALLBACK_HIGH_FPS_KBPS
+                        config::BITRATE_2500M_HIGH_FPS_KBPS
                     } else {
-                        config::BITRATE_ETH_FALLBACK_STANDARD_KBPS
+                        config::BITRATE_2500M_STANDARD_KBPS
                     }
                 }
-                system_info::LinkTransport::Wifi => config::BITRATE_WIFI_FALLBACK_KBPS,
-                _ => config::BITRATE_UNKNOWN_FALLBACK_KBPS,
+                Some(mbps) if mbps >= config::LINK_SPEED_1000M_THRESHOLD_MBPS => {
+                    if high_fps {
+                        config::BITRATE_1000M_HIGH_FPS_KBPS
+                    } else {
+                        config::BITRATE_1000M_STANDARD_KBPS
+                    }
+                }
+                Some(mbps) if mbps > 0 => mbps
+                    .saturating_mul(config::BITRATE_SUB_GIG_MBPS_MULTIPLIER)
+                    .clamp(
+                        config::BITRATE_SUB_GIG_MIN_KBPS,
+                        config::BITRATE_SUB_GIG_MAX_KBPS,
+                    ),
+                _ => match transport {
+                    system_info::LinkTransport::Ethernet => {
+                        if high_fps {
+                            config::BITRATE_ETH_FALLBACK_HIGH_FPS_KBPS
+                        } else {
+                            config::BITRATE_ETH_FALLBACK_STANDARD_KBPS
+                        }
+                    }
+                    _ => config::BITRATE_UNKNOWN_FALLBACK_KBPS,
+                },
             },
         }
     }
@@ -1728,6 +1767,44 @@ mod tests {
                 Some(999_999)
             ),
             config::MAX_BITRATE_KBPS
+        );
+        // Nominal 866 Mbps / 1200 Mbps 802.11 PHY rate on Wi-Fi or Hotspot is derated and capped
+        // instead of jumping into wired 1GbE (65-85 Mbps) tiers
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Wifi,
+                Some(866),
+                60,
+                None
+            ),
+            43_300
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Wifi,
+                Some(1200),
+                60,
+                None
+            ),
+            config::BITRATE_WIFI_MAX_STANDARD_KBPS
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Hotspot,
+                Some(866),
+                60,
+                None
+            ),
+            config::BITRATE_HOTSPOT_STANDARD_KBPS
+        );
+        assert_eq!(
+            DisplayController::compute_adaptive_bitrate_kbps(
+                system_info::LinkTransport::Hotspot,
+                None,
+                120,
+                None
+            ),
+            config::BITRATE_HOTSPOT_HIGH_FPS_KBPS
         );
     }
 }

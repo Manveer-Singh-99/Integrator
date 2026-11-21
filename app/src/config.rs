@@ -359,6 +359,35 @@ pub const BITRATE_ETH_FALLBACK_HIGH_FPS_KBPS: u32 = 80_000;
 #[allow(dead_code)]
 pub const BITRATE_WIFI_FALLBACK_KBPS: u32 = 35_000;
 
+/// Multiplier converting nominal 802.11 Wi-Fi PHY link speed (Mbps) to sustainable low-jitter video bitrate (kbps).
+/// Accounts for half-duplex CSMA/CA airtime overhead (e.g. 866 Mbps PHY -> 43.3 Mbps stream).
+#[allow(dead_code)]
+pub const BITRATE_WIFI_PHY_MBPS_MULTIPLIER: u32 = 50;
+
+/// Maximum streaming bitrate for 802.11 Wi-Fi LAN at standard (<120Hz) refresh rates (45 Mbps).
+#[allow(dead_code)]
+pub const BITRATE_WIFI_MAX_STANDARD_KBPS: u32 = 45_000;
+
+/// Maximum streaming bitrate for 802.11 Wi-Fi LAN at high (>=120Hz) refresh rates (55 Mbps).
+#[allow(dead_code)]
+pub const BITRATE_WIFI_MAX_HIGH_FPS_KBPS: u32 = 55_000;
+
+/// Multiplier converting nominal Mobile Hotspot PHY link speed (Mbps) to sustainable video bitrate (kbps).
+#[allow(dead_code)]
+pub const BITRATE_HOTSPOT_PHY_MBPS_MULTIPLIER: u32 = 30;
+
+/// Minimum streaming bitrate floor for Mobile Hotspot links (10 Mbps).
+#[allow(dead_code)]
+pub const BITRATE_HOTSPOT_MIN_KBPS: u32 = 10_000;
+
+/// Target streaming bitrate cap for Mobile Hotspot links (PC Hotspot / Phone Hotspot) at standard (<120Hz) refresh rates (20 Mbps).
+#[allow(dead_code)]
+pub const BITRATE_HOTSPOT_STANDARD_KBPS: u32 = 20_000;
+
+/// Target streaming bitrate cap for Mobile Hotspot links (PC Hotspot / Phone Hotspot) at high (>=120Hz) refresh rates (25 Mbps).
+#[allow(dead_code)]
+pub const BITRATE_HOTSPOT_HIGH_FPS_KBPS: u32 = 25_000;
+
 /// Generic fallback bitrate when both transport and link speed are unknown (60 Mbps).
 #[allow(dead_code)]
 pub const BITRATE_UNKNOWN_FALLBACK_KBPS: u32 = 60_000;

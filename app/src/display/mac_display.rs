@@ -607,33 +607,44 @@ impl MacDisplayManager {
     }
 }
 
-/// Inspects existing paired Moonlight hosts in [`config::MOONLIGHT_MACOS_PREFS_DOMAIN`] preferences
-/// and refreshes ONLY the slot that genuinely matches `host_name` / `pc_ip` & `port`.
+/// Normalizes a Moonlight/Sunshine hostname by stripping whitespace, trailing dots, and `.local` mDNS suffixes.
+fn normalize_moonlight_hostname(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix(".local") {
+        stripped.trim().to_string()
+    } else {
+        lower
+    }
+}
+
+/// Parses `defaults read com.moonlight-stream.Moonlight` text output and selects the best matching
+/// host slot `(slot_index, launch_target, hostname_needs_ip_refresh)` for `(pc_ip, port, host_name)`.
 ///
-/// Guarantees that existing user configurations and other gaming PC pairings remain completely untouched.
-fn resolve_or_refresh_mac_moonlight_slot(
+/// # Topology Switching Guarantees
+/// - Matches hostnames case-insensitively across `.local` mDNS suffixes when switching between
+///   USB-C (`10.99.99.x`), Thunderbolt (`169.254.x.x`), PC Hotspot (`192.168.137.x`),
+///   Phone Hotspot (`172.20.10.x`), and Normal LAN (`192.168.1.x`).
+/// - If a user originally paired the single matching-port host by raw IPv4 address (so `hosts.N.hostname`
+///   holds an older topology IP like `"10.99.99.1"`), matches that slot as a fallback and flags
+///   `hostname_needs_ip_refresh = true` so `resolve_or_refresh_mac_moonlight_slot` updates `hostname`
+///   and returns `pc_ip` instead of a stale IP or a slow UUID WoL lookup.
+fn parse_and_select_mac_moonlight_slot(
+    defaults_output: &str,
     pc_ip: &str,
     port: u16,
     host_name: &str,
-) -> Option<String> {
-    if !system_info::is_valid_ipv4(pc_ip) {
+) -> Option<(usize, String, bool)> {
+    let clean_ip = pc_ip.trim();
+    if !system_info::is_valid_ipv4(clean_ip) {
         return None;
     }
 
-    let out = Command::new(config::MACOS_DEFAULTS_BIN)
-        .args(["read", config::MOONLIGHT_MACOS_PREFS_DOMAIN])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut size: usize = 0;
     let mut indices = std::collections::BTreeSet::new();
     let mut props: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    for line in text.lines() {
+    for line in defaults_output.lines() {
         let trimmed = line.trim().trim_end_matches(';');
         if let Some((k, v)) = trimmed.split_once('=') {
             let key = k.trim().trim_matches('"').to_string();
@@ -643,7 +654,9 @@ fn resolve_or_refresh_mac_moonlight_slot(
             } else if let Some(rest) = key.strip_prefix("hosts.") {
                 if let Some((idx_str, _)) = rest.split_once('.') {
                     if let Ok(idx) = idx_str.parse::<usize>() {
-                        indices.insert(idx);
+                        if idx > 0 {
+                            indices.insert(idx);
+                        }
                     }
                 }
                 props.insert(key, val);
@@ -660,9 +673,12 @@ fn resolve_or_refresh_mac_moonlight_slot(
 
     let wanted_port = port.to_string();
     let default_port_str = config::SUNSHINE_DEFAULT_PORT.to_string();
+    let wanted_host_norm = normalize_moonlight_hostname(host_name);
     let mut best_slot: Option<usize> = None;
+    let mut best_score: u8 = 0;
+    let mut raw_ip_port_candidates: Vec<usize> = Vec::new();
 
-    for idx in indices {
+    for &idx in &indices {
         let h_name = props
             .get(&format!("hosts.{}.hostname", idx))
             .map(String::as_str)
@@ -675,9 +691,14 @@ fn resolve_or_refresh_mac_moonlight_slot(
             .get(&format!("hosts.{}.manualaddress", idx))
             .map(String::as_str)
             .unwrap_or("");
+        let h_remote_ip = props
+            .get(&format!("hosts.{}.remoteaddress", idx))
+            .map(String::as_str)
+            .unwrap_or("");
         let h_local_port = props
             .get(&format!("hosts.{}.localport", idx))
             .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or(default_port_str.as_str());
         let h_manual_port = props
             .get(&format!("hosts.{}.manualport", idx))
@@ -688,28 +709,94 @@ fn resolve_or_refresh_mac_moonlight_slot(
             .map(String::as_str)
             .unwrap_or("");
 
-        let ip_match = h_local_ip == pc_ip || h_manual_ip == pc_ip;
-        let name_match =
-            !host_name.is_empty() && h_name.eq_ignore_ascii_case(host_name);
+        let ip_match = h_local_ip == clean_ip || h_manual_ip == clean_ip || h_remote_ip == clean_ip;
+        let slot_host_norm = normalize_moonlight_hostname(h_name);
+        let name_match = !wanted_host_norm.is_empty()
+            && !slot_host_norm.is_empty()
+            && slot_host_norm == wanted_host_norm;
         let port_match = h_local_port == wanted_port
             || h_manual_port == wanted_port
             || h_http_port == wanted_port;
 
-        if name_match && port_match {
-            best_slot = Some(idx);
-            break;
+        if port_match && (h_name.trim().is_empty() || system_info::is_valid_ipv4(h_name.trim())) {
+            raw_ip_port_candidates.push(idx);
         }
-        if ip_match && port_match && best_slot.is_none() {
-            best_slot = Some(idx);
-        }
-        if name_match && best_slot.is_none() {
+
+        let score = if name_match && port_match {
+            5
+        } else if ip_match && port_match {
+            4
+        } else if name_match {
+            2
+        } else if ip_match {
+            1
+        } else {
+            0
+        };
+
+        if score > best_score {
+            best_score = score;
             best_slot = Some(idx);
         }
     }
 
+    if best_slot.is_none() && raw_ip_port_candidates.len() == 1 {
+        best_slot = Some(raw_ip_port_candidates[0]);
+    }
+
     let idx = best_slot?;
-    // Update the matched slot's active direct route IP so USB-C/Wi-Fi switching works seamlessly
-    for field in ["localaddress", "manualaddress"] {
+    let raw_hname = props
+        .get(&format!("hosts.{}.hostname", idx))
+        .map(|s| s.trim())
+        .unwrap_or("");
+    let hname_is_stale_ip =
+        !raw_hname.is_empty() && system_info::is_valid_ipv4(raw_hname) && raw_hname != clean_ip;
+
+    let launch_target = if !raw_hname.is_empty()
+        && !hname_is_stale_ip
+        && !raw_hname.starts_with('-')
+        && !raw_hname.chars().any(|c| c.is_control())
+    {
+        raw_hname.to_string()
+    } else {
+        clean_ip.to_string()
+    };
+
+    Some((idx, launch_target, hname_is_stale_ip))
+}
+
+/// Inspects existing paired Moonlight hosts in [`config::MOONLIGHT_MACOS_PREFS_DOMAIN`] preferences
+/// and refreshes ONLY the slot that genuinely matches `host_name` / `pc_ip` & `port`.
+///
+/// Guarantees that existing user configurations and other gaming PC pairings remain completely untouched.
+fn resolve_or_refresh_mac_moonlight_slot(
+    pc_ip: &str,
+    port: u16,
+    host_name: &str,
+) -> Option<String> {
+    let clean_ip = pc_ip.trim();
+    if !system_info::is_valid_ipv4(clean_ip) {
+        return None;
+    }
+
+    let out = Command::new(config::MACOS_DEFAULTS_BIN)
+        .args(["read", config::MOONLIGHT_MACOS_PREFS_DOMAIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (idx, launch_target, hname_is_stale_ip) =
+        parse_and_select_mac_moonlight_slot(&text, clean_ip, port, host_name)?;
+
+    // Update the matched slot's active route IP across USB-C, Thunderbolt, Hotspot, and LAN transitions
+    let mut fields = vec!["localaddress", "manualaddress"];
+    if hname_is_stale_ip {
+        fields.push("hostname");
+    }
+    for field in fields {
         let key = format!("hosts.{}.{}", idx, field);
         match Command::new(config::MACOS_DEFAULTS_BIN)
             .args([
@@ -717,7 +804,7 @@ fn resolve_or_refresh_mac_moonlight_slot(
                 config::MOONLIGHT_MACOS_PREFS_DOMAIN,
                 &key,
                 "-string",
-                pc_ip,
+                clean_ip,
             ])
             .status()
         {
@@ -727,22 +814,7 @@ fn resolve_or_refresh_mac_moonlight_slot(
         }
     }
 
-    // Prefer hostname or direct route IP so Moonlight connects immediately without UUID WoL timeout delays
-    if let Some(hname) = props.get(&format!("hosts.{}.hostname", idx)) {
-        let trimmed = hname.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.chars().any(|c| c.is_control())
-        {
-            return Some(trimmed.to_string());
-        }
-    }
-    if !pc_ip.trim().is_empty() && system_info::is_valid_ipv4(pc_ip) {
-        return Some(pc_ip.trim().to_string());
-    }
-    props
-        .get(&format!("hosts.{}.uuid", idx))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_control()))
-        .or_else(|| Some(pc_ip.to_string()))
+    Some(launch_target)
 }
 
 #[cfg(test)]
@@ -757,5 +829,52 @@ mod tests {
             updated,
             "# output_name = 99\noutput_name_secondary = 2\nport = 47989\noutput_name = 42\n"
         );
+    }
+
+    #[test]
+    fn mac_moonlight_slot_resolves_across_all_five_topologies_without_stale_ip() {
+        // Slot 1 paired via mDNS (.local) on LAN 192.168.1.50; switches to USB-C, Thunderbolt, PC Hotspot, and Phone Hotspot
+        let prefs_mdns = r#"
+{
+    "hosts.size" = 1;
+    "hosts.1.hostname" = "Studio-PC.local";
+    "hosts.1.localaddress" = "192.168.1.50";
+    "hosts.1.manualaddress" = "192.168.1.50";
+    "hosts.1.localport" = 47989;
+    "hosts.1.uuid" = "uuid-studio-pc";
+}
+"#;
+        for new_ip in [
+            "10.99.99.1",
+            "169.254.10.1",
+            "192.168.137.1",
+            "172.20.10.7",
+            "192.168.1.50",
+        ] {
+            let (idx, target, stale_ip) =
+                parse_and_select_mac_moonlight_slot(prefs_mdns, new_ip, 47989, "Studio-PC")
+                    .expect("should match slot across topology transition");
+            assert_eq!(idx, 1);
+            assert_eq!(target, "Studio-PC.local");
+            assert!(!stale_ip);
+        }
+
+        // Slot originally paired by raw USB-C IP ("10.99.99.1" stored in hostname) switching to iPhone Hotspot "172.20.10.7"
+        let prefs_raw_ip = r#"
+{
+    "hosts.size" = 1;
+    "hosts.1.hostname" = "10.99.99.1";
+    "hosts.1.localaddress" = "10.99.99.1";
+    "hosts.1.manualaddress" = "10.99.99.1";
+    "hosts.1.localport" = 47989;
+    "hosts.1.uuid" = "uuid-raw-ip";
+}
+"#;
+        let (idx, target, stale_ip) =
+            parse_and_select_mac_moonlight_slot(prefs_raw_ip, "172.20.10.7", 47989, "Studio-PC")
+                .expect("single raw-IP slot should match on topology switch");
+        assert_eq!(idx, 1);
+        assert_eq!(target, "172.20.10.7", "must never return stale IP 10.99.99.1");
+        assert!(stale_ip);
     }
 }

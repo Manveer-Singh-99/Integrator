@@ -349,7 +349,7 @@ impl StorageManager {
             share_hint.and_then(|s| validate_smb_share_name(s).ok())
         });
 
-        // Fast-path: check if target is already mounted
+        // Fast-path: check if target is already mounted at this exact peer IP
         if let Some(existing) = detect_active_mount_matching(Some(clean_ip), requested_share.as_deref()) {
             return Ok(StorageStatus {
                 is_mounted: true,
@@ -362,6 +362,21 @@ impl StorageManager {
                 remote_share: existing.remote_share,
                 message: format!("Shared drive already mounted at {}", existing.mount_path),
             });
+        }
+
+        // Topology transition cleanup: if a stale Integrator mount exists from an older topology IP
+        // (e.g. switching from USB-C 10.99.99.x to Phone Hotspot 172.20.10.x or LAN 192.168.1.x),
+        // unmount the stale route first so /Volumes/<share> or the drive mapping does not collide.
+        if let Some(stale) = detect_active_mount(None) {
+            if !stale.peer_ip.is_empty() && !stale.peer_ip.eq_ignore_ascii_case(clean_ip) {
+                tracing::info!(
+                    "Unmounting stale SMB share from previous topology IP {} at {} before mounting {}",
+                    stale.peer_ip,
+                    stale.mount_path,
+                    clean_ip
+                );
+                let _ = Self::unmount();
+            }
         }
 
         let target_share = resolve_remote_share(clean_ip, share_hint);
@@ -515,8 +530,22 @@ impl StorageManager {
                 .output();
             let mut ok = diskutil_out.map(|o| o.status.success()).unwrap_or(false);
             if !ok {
+                ok = Command::new(MACOS_DISKUTIL_BIN)
+                    .args(["unmount", "force", &rec.mount_path])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+            }
+            if !ok {
                 ok = Command::new(MACOS_UMOUNT_BIN)
                     .arg(&rec.mount_path)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+            }
+            if !ok {
+                ok = Command::new(MACOS_UMOUNT_BIN)
+                    .args(["-f", &rec.mount_path])
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false);
@@ -926,8 +955,8 @@ fn parse_windows_net_use_line(line: &str) -> Option<(Option<String>, String, Str
     ))
 }
 
-/// Parses a macOS `mount` command source string (e.g., `//user@10.0.0.2/Share%20Name`) into (IP, ShareName).
-#[cfg(target_os = "macos")]
+/// Parses a macOS `mount` command source string (e.g., `//user@172.20.10.7/Share%20Name`) into `(IP, ShareName)`.
+#[cfg(any(target_os = "macos", test))]
 fn parse_smbfs_source(src: &str) -> (String, String) {
     let cleaned = src.trim().trim_start_matches('/');
     let after_at = cleaned.rsplit_once('@').map(|(_, r)| r).unwrap_or(cleaned);
@@ -941,7 +970,7 @@ fn parse_smbfs_source(src: &str) -> (String, String) {
 }
 
 /// Percent-encodes path segments for inclusion in macOS `smb://` URLs.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn percent_encode_path_segment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
@@ -956,7 +985,7 @@ fn percent_encode_path_segment(input: &str) -> String {
 }
 
 /// Decodes percent-encoded hex sequences from macOS mount table entries.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1047,17 +1076,33 @@ Workspace Drive                                 Disk    Shared SSD
 
     #[test]
     fn windows_net_use_parser_handles_spaced_shares_and_skips_ipc() {
-        assert!(parse_windows_net_use_line(
-            r"OK                     \\10.0.0.2\IPC$              Microsoft Windows Network"
-        )
-        .is_none());
-        let parsed = parse_windows_net_use_line(
-            r"OK           Z:        \\10.0.0.2\Shared Public Folder  Microsoft Windows Network",
-        )
-        .unwrap();
-        assert_eq!(parsed.0.as_deref(), Some("Z:"));
-        assert_eq!(parsed.1, "10.0.0.2");
-        assert_eq!(parsed.2, "Shared Public Folder");
+        for topo_ip in [
+            "10.99.99.1",
+            "169.254.10.1",
+            "192.168.137.1",
+            "172.20.10.7",
+            "192.168.1.50",
+        ] {
+            assert!(parse_windows_net_use_line(&format!(
+                r"OK                     \\{}\IPC$              Microsoft Windows Network",
+                topo_ip
+            ))
+            .is_none());
+            let parsed = parse_windows_net_use_line(&format!(
+                r"OK           Z:        \\{}\Shared Public Folder  Microsoft Windows Network",
+                topo_ip
+            ))
+            .unwrap();
+            assert_eq!(parsed.0.as_deref(), Some("Z:"));
+            assert_eq!(parsed.1, topo_ip);
+            assert_eq!(parsed.2, "Shared Public Folder");
+
+            let encoded = percent_encode_path_segment("Shared Public Folder");
+            let mac_src = format!("//guest@{}:445/{}", topo_ip, encoded);
+            let (mac_ip, mac_share) = parse_smbfs_source(&mac_src);
+            assert_eq!(mac_ip, topo_ip);
+            assert_eq!(mac_share, "Shared Public Folder");
+        }
     }
 
     #[test]

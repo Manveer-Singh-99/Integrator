@@ -1549,7 +1549,7 @@ struct MainDashboardView: View {
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                 }
-                Text(s?.link_description ?? "Awaiting Ethernet / TB / USB-C / Wi-Fi beacon")
+                Text(s?.link_description ?? "Awaiting USB-C / TB / Ethernet / Wi-Fi / Hotspot beacon")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -2047,7 +2047,7 @@ struct MainDashboardView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("Manual Peer IPv4 (e.g. 10.99.99.1)", text: $vm.manualIpInput)
+                TextField("Manual Peer IPv4 (e.g. 192.168.1.50 or 172.20.10.2)", text: $vm.manualIpInput)
                     .textFieldStyle(.roundedBorder)
                 Button("Add IP") {
                     let ip = vm.manualIpInput.trimmingCharacters(in: .whitespaces)
@@ -2202,7 +2202,7 @@ struct MainDashboardView: View {
                 .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             }
 
-            Label("SPAKE2 + Ed25519 Mutual Auth Enforced on USB-C & LAN (v1.0 Locked)", systemImage: "checkmark.seal.fill")
+            Label("SPAKE2 + Ed25519 Mutual Auth Enforced Across All Links (v1.0 Locked)", systemImage: "checkmark.seal.fill")
                 .font(.caption2)
                 .foregroundStyle(.green)
         }

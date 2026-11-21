@@ -907,10 +907,15 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         return mac_ip.to_string();
     };
 
-    if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
-        let local_changed = slot.localaddress != mac_ip;
-        let manual_changed = (!slot.manualaddress.is_empty() && slot.manualaddress != mac_ip)
-            || (local_changed && slot.manualaddress != mac_ip);
+    let clean_ip = mac_ip.trim();
+    if !clean_ip.is_empty() && system_info::is_valid_ipv4(clean_ip) {
+        let local_changed = slot.localaddress != clean_ip;
+        let manual_changed = (!slot.manualaddress.is_empty() && slot.manualaddress != clean_ip)
+            || (local_changed && slot.manualaddress != clean_ip);
+        let hname_trimmed = slot.hostname.trim();
+        let hname_is_stale_ip = !hname_trimmed.is_empty()
+            && system_info::is_valid_ipv4(hname_trimmed)
+            && hname_trimmed != clean_ip;
 
         if local_changed {
             let _ = hidden_cmd(&reg_exe)
@@ -922,7 +927,7 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
                     "/t",
                     "REG_SZ",
                     "/d",
-                    mac_ip,
+                    clean_ip,
                     "/f",
                 ])
                 .stdout(Stdio::null())
@@ -939,40 +944,45 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
                     "/t",
                     "REG_SZ",
                     "/d",
-                    mac_ip,
+                    clean_ip,
                     "/f",
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
         }
-        if local_changed || manual_changed {
+        if hname_is_stale_ip {
+            let _ = hidden_cmd(&reg_exe)
+                .args([
+                    "add",
+                    &slot.reg_key,
+                    "/v",
+                    "hostname",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    clean_ip,
+                    "/f",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if local_changed || manual_changed || hname_is_stale_ip {
             info!(
                 "Refreshed Moonlight registry slot '{}' ({}) IP -> {}",
                 slot.reg_key,
                 if slot.hostname.is_empty() {
-                    mac_ip
+                    clean_ip
                 } else {
                     &slot.hostname
                 },
-                mac_ip
+                clean_ip
             );
         }
     }
 
-    let hname = slot.hostname.trim();
-    if !hname.is_empty() && !hname.starts_with('-') && !hname.chars().any(|c| c.is_control()) {
-        hname.to_string()
-    } else if !mac_ip.is_empty() && system_info::is_valid_ipv4(mac_ip) {
-        mac_ip.to_string()
-    } else {
-        let uuid = slot.uuid.trim();
-        if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
-            uuid.to_string()
-        } else {
-            mac_ip.to_string()
-        }
-    }
+    resolve_win_moonlight_launch_target(slot, clean_ip)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1226,6 +1236,44 @@ fn parse_moonlight_hosts_reg(output: &str) -> Vec<MoonlightHostSlot> {
     slots
 }
 
+/// Normalizes a Moonlight/Sunshine hostname by stripping whitespace, trailing dots, and `.local` mDNS suffixes.
+#[cfg(any(target_os = "windows", test))]
+fn normalize_moonlight_hostname(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix(".local") {
+        stripped.trim().to_string()
+    } else {
+        lower
+    }
+}
+
+/// Resolves the CLI target identifier to pass to `Moonlight.exe stream <target> <app>` for a matched slot,
+/// avoiding stale IPv4 strings stored in `slot.hostname` from a previous topology and avoiding slow UUID WoL timeouts.
+#[cfg(any(target_os = "windows", test))]
+fn resolve_win_moonlight_launch_target(slot: &MoonlightHostSlot, mac_ip: &str) -> String {
+    let clean_ip = mac_ip.trim();
+    let hname = slot.hostname.trim();
+    let hname_is_stale_ip =
+        !hname.is_empty() && system_info::is_valid_ipv4(hname) && hname != clean_ip;
+    if !hname.is_empty()
+        && !hname_is_stale_ip
+        && !hname.starts_with('-')
+        && !hname.chars().any(|c| c.is_control())
+    {
+        hname.to_string()
+    } else if !clean_ip.is_empty() && system_info::is_valid_ipv4(clean_ip) {
+        clean_ip.to_string()
+    } else {
+        let uuid = slot.uuid.trim();
+        if !uuid.is_empty() && !uuid.starts_with('-') && !uuid.chars().any(|c| c.is_control()) {
+            uuid.to_string()
+        } else {
+            clean_ip.to_string()
+        }
+    }
+}
+
 /// Non-destructively selects the best matching Moonlight host slot based on IP, port, and hostname scoring.
 #[cfg(any(target_os = "windows", test))]
 fn select_moonlight_host_slot<'a>(
@@ -1234,15 +1282,30 @@ fn select_moonlight_host_slot<'a>(
     port: u16,
     host_name: &str,
 ) -> Option<&'a MoonlightHostSlot> {
+    let clean_ip = mac_ip.trim();
+    let wanted_host_norm = normalize_moonlight_hostname(host_name);
     let mut best: Option<&'a MoonlightHostSlot> = None;
     let mut best_score: u8 = 0;
+    let mut raw_ip_port_candidates: Vec<&'a MoonlightHostSlot> = Vec::new();
 
     for slot in slots {
-        let ip_match = !mac_ip.is_empty()
-            && (slot.localaddress == mac_ip
-                || slot.manualaddress == mac_ip
-                || slot.remoteaddress == mac_ip);
-        let name_match = !host_name.is_empty() && slot.hostname.eq_ignore_ascii_case(host_name);
+        let ip_match = !clean_ip.is_empty()
+            && (slot.localaddress == clean_ip
+                || slot.manualaddress == clean_ip
+                || slot.remoteaddress == clean_ip);
+        let slot_host_norm = normalize_moonlight_hostname(&slot.hostname);
+        let name_match = !wanted_host_norm.is_empty()
+            && !slot_host_norm.is_empty()
+            && slot_host_norm == wanted_host_norm;
+
+        let port_ok_or_empty = port == 0 || slot.ports.is_empty() || slot.ports.contains(&port);
+        if port_ok_or_empty
+            && (slot.hostname.trim().is_empty()
+                || system_info::is_valid_ipv4(slot.hostname.trim()))
+        {
+            raw_ip_port_candidates.push(slot);
+        }
+
         if !ip_match && !name_match {
             continue;
         }
@@ -1276,6 +1339,10 @@ fn select_moonlight_host_slot<'a>(
             best_score = score;
             best = Some(slot);
         }
+    }
+
+    if best.is_none() && raw_ip_port_candidates.len() == 1 {
+        return Some(raw_ip_port_candidates[0]);
     }
 
     best
@@ -1720,8 +1787,29 @@ HKEY_CURRENT_USER\Software\Moonlight Game Streaming Project\Moonlight\hosts\12
         let s1 = select_moonlight_host_slot(&slots, "10.0.0.5", 47989, "Workstation-A").unwrap();
         assert_eq!(s1.uuid, "uuid-slot-10");
 
+        // Matches across .local mDNS suffix and topology transitions (USB-C, TB, PC Hotspot, Phone Hotspot, LAN)
+        for topo_ip in ["10.99.99.2", "169.254.10.2", "192.168.137.2", "172.20.10.2", "192.168.1.10"] {
+            let matched = select_moonlight_host_slot(&slots, topo_ip, 47989, "Workstation-A.local").unwrap();
+            assert_eq!(matched.uuid, "uuid-slot-10");
+            assert_eq!(resolve_win_moonlight_launch_target(matched, topo_ip), "Workstation-A");
+        }
+
         let s2 = select_moonlight_host_slot(&slots, "192.168.1.25", 48989, "").unwrap();
         assert_eq!(s2.uuid, "uuid-slot-12");
+
+        // Slot originally paired with raw IPv4 in hostname ("10.99.99.2") never returns stale IP after switching to Phone Hotspot ("172.20.10.2")
+        let raw_ip_slot = MoonlightHostSlot {
+            reg_key: r"HKCU\Software\Moonlight\hosts\1".into(),
+            hostname: "10.99.99.2".into(),
+            uuid: "uuid-raw".into(),
+            localaddress: "10.99.99.2".into(),
+            manualaddress: "10.99.99.2".into(),
+            remoteaddress: String::new(),
+            ports: vec![47989],
+        };
+        let single_slots = vec![raw_ip_slot];
+        let matched_raw = select_moonlight_host_slot(&single_slots, "172.20.10.2", 47989, "MacBook-Pro").unwrap();
+        assert_eq!(resolve_win_moonlight_launch_target(matched_raw, "172.20.10.2"), "172.20.10.2");
 
         // Unmatched host should return None (non-destructive)
         assert!(select_moonlight_host_slot(&slots, "172.16.0.99", 47989, "Unknown").is_none());
