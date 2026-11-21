@@ -452,6 +452,36 @@ pub struct GpuDeviceInfo {
     pub vram_mb: Option<u64>,
 }
 
+/// Hardware form-factor classification distinguishing laptops/notebooks from desktop workstations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceFormFactor {
+    /// Portable laptop or notebook computer with an integrated battery (e.g. MacBook Air/Pro, Windows laptop).
+    Laptop,
+    /// Stationary desktop, mini-PC, all-in-one, or tower workstation (e.g. iMac, Mac mini, Mac Studio, Mac Pro, desktop PC).
+    Desktop,
+    /// Unclassified or indeterminate hardware form factor.
+    #[default]
+    Unknown,
+}
+
+impl DeviceFormFactor {
+    /// Returns the canonical lowercase wire identifier (`"laptop"`, `"desktop"`, or `"unknown"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeviceFormFactor::Laptop => "laptop",
+            DeviceFormFactor::Desktop => "desktop",
+            DeviceFormFactor::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for DeviceFormFactor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Complete hardware and system configuration profile of the local workstation.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LocalHardwareProfile {
@@ -461,11 +491,14 @@ pub struct LocalHardwareProfile {
     pub hostname: String,
     /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
-    /// Hardware model identifier (e.g. `"MacBookPro18,1"` or motherboard product name).
+    /// Hardware model identifier (e.g. `"MacBookPro18,1"`, `"Mac15,6"`, or motherboard product name).
     pub hardware_model: String,
+    /// Detected chassis form factor (`Laptop`, `Desktop`, or `Unknown`).
+    #[serde(default)]
+    pub form_factor: DeviceFormFactor,
     /// CPU brand string (e.g. `"Apple M1 Max"` or `"13th Gen Intel(R) Core(TM) i9-13900K"`).
     pub cpu_brand: String,
-    /// `true` if MacBook Touch Bar hardware is present.
+    /// `true` if Mac Touch Bar hardware is present.
     pub has_touch_bar: bool,
     /// Primary display resolution, refresh rate, and HiDPI scale factor.
     pub primary_display: PrimaryDisplayInfo,
@@ -1124,6 +1157,199 @@ fn reg_query_sz(key: &str, value: &str) -> Option<String> {
     None
 }
 
+/// Parses `ioreg -rc AppleSmartBattery` output to determine whether a physical battery is installed.
+///
+/// Apple Silicon Macs (`Mac14,*`, `Mac15,*`, `Mac16,*`) use generic `MacX,Y` model identifiers for both
+/// MacBooks and desktop Macs (Mac mini, Mac Studio, iMac, Mac Pro). Inspecting `AppleSmartBattery`
+/// presence reliably distinguishes Mac laptops from Mac desktops.
+pub fn parse_mac_ioreg_battery_present(ioreg_output: &str) -> bool {
+    let trimmed = ioreg_output.trim();
+    if trimmed.is_empty() || !trimmed.contains("AppleSmartBattery") {
+        return false;
+    }
+    for line in trimmed.lines() {
+        let l = line.trim();
+        if l.contains("\"BatteryInstalled\"") {
+            return l.ends_with("Yes") || l.ends_with("true") || l.ends_with('1');
+        }
+    }
+    true
+}
+
+/// Pure classifier determining whether a Mac is a [`DeviceFormFactor::Laptop`] or [`DeviceFormFactor::Desktop`]
+/// from its `hw.model` string and optional `AppleSmartBattery` hardware presence.
+pub fn classify_mac_form_factor(hw_model: &str, has_battery: Option<bool>) -> DeviceFormFactor {
+    let lower = hw_model.trim().to_ascii_lowercase();
+    if lower.contains("macbook") || lower.contains("powerbook") || lower.contains("ibook") {
+        return DeviceFormFactor::Laptop;
+    }
+    if lower.contains("imac")
+        || lower.contains("macmini")
+        || lower.contains("mac mini")
+        || lower.contains("macstudio")
+        || lower.contains("mac studio")
+        || lower.contains("macpro")
+        || lower.contains("mac pro")
+        || lower.contains("xserve")
+    {
+        return DeviceFormFactor::Desktop;
+    }
+    match has_battery {
+        Some(true) => DeviceFormFactor::Laptop,
+        Some(false) => DeviceFormFactor::Desktop,
+        None => DeviceFormFactor::Unknown,
+    }
+}
+
+/// Pure classifier determining whether a Windows machine is a [`DeviceFormFactor::Laptop`] or [`DeviceFormFactor::Desktop`]
+/// from its BIOS product model name and optional system battery presence (`GetSystemPowerStatus`).
+pub fn classify_windows_form_factor(hw_model: &str, has_battery: Option<bool>) -> DeviceFormFactor {
+    if has_battery == Some(true) {
+        return DeviceFormFactor::Laptop;
+    }
+    let lower = hw_model.trim().to_ascii_lowercase();
+    if lower.contains("laptop")
+        || lower.contains("notebook")
+        || lower.contains("thinkpad")
+        || lower.contains("zenbook")
+        || lower.contains("vivobook")
+        || lower.contains("zephyrus")
+        || lower.contains("strix g")
+        || lower.contains("omen 1")
+        || lower.contains("spectre")
+        || lower.contains("envy x360")
+        || lower.contains("surface pro")
+        || lower.contains("surface laptop")
+        || lower.contains("surface book")
+        || lower.contains("xps 1")
+        || lower.contains("latitude")
+        || lower.contains("razer blade")
+        || lower.contains("legion 5")
+        || lower.contains("legion 7")
+        || lower.contains("ideapad")
+        || lower.contains("yoga")
+        || lower.contains("macbook")
+    {
+        return DeviceFormFactor::Laptop;
+    }
+    if has_battery == Some(false) {
+        return DeviceFormFactor::Desktop;
+    }
+    if lower.contains("desktop")
+        || lower.contains("tower")
+        || lower.contains("workstation")
+        || lower.contains("optiplex")
+        || lower.contains("precision t")
+        || lower.contains("alienware aurora")
+        || lower.contains("thinkstation")
+        || lower.contains("thinkcentre")
+        || lower.contains("prodesk")
+        || lower.contains("elitedesk")
+        || lower.contains("nuc")
+        || lower.contains("surface studio")
+    {
+        return DeviceFormFactor::Desktop;
+    }
+    DeviceFormFactor::Unknown
+}
+
+/// Infers a peer's [`DeviceFormFactor`] from an explicit wire string (`"laptop"` / `"desktop"`)
+/// if present, falling back to OS and hardware model heuristics for legacy beacons.
+pub fn infer_peer_form_factor(
+    os: &str,
+    hw_model: &str,
+    reported_form_factor: Option<&str>,
+) -> DeviceFormFactor {
+    if let Some(raw) = reported_form_factor {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "laptop" => return DeviceFormFactor::Laptop,
+            "desktop" => return DeviceFormFactor::Desktop,
+            _ => {}
+        }
+    }
+    let os_lower = os.trim().to_ascii_lowercase();
+    let model_lower = hw_model.trim().to_ascii_lowercase();
+    if os_lower.contains("mac")
+        || os_lower == "darwin"
+        || model_lower.starts_with("mac")
+        || model_lower.starts_with("imac")
+    {
+        classify_mac_form_factor(hw_model, None)
+    } else {
+        classify_windows_form_factor(hw_model, None)
+    }
+}
+
+/// Detects the local workstation's hardware form factor (`Laptop` vs `Desktop`) using
+/// hardware model strings and OS battery presence (`AppleSmartBattery` on macOS, `GetSystemPowerStatus` on Windows).
+pub fn detect_device_form_factor(hw_model: &str) -> DeviceFormFactor {
+    #[cfg(target_os = "macos")]
+    {
+        static HAS_BATTERY: OnceLock<Option<bool>> = OnceLock::new();
+        let has_battery = *HAS_BATTERY.get_or_init(|| {
+            Command::new(config::MACOS_IOREG_BIN)
+                .args(["-rc", "AppleSmartBattery"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| parse_mac_ioreg_battery_present(&String::from_utf8_lossy(&o.stdout)))
+        });
+        classify_mac_form_factor(hw_model, has_battery)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        static HAS_BATTERY: OnceLock<Option<bool>> = OnceLock::new();
+        let has_battery = *HAS_BATTERY.get_or_init( query_windows_has_battery );
+        classify_windows_form_factor(hw_model, has_battery)
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = hw_model;
+        DeviceFormFactor::Unknown
+    }
+}
+
+/// Queries Win32 `GetSystemPowerStatus` to determine whether a system battery is present on Windows.
+///
+/// `BatteryFlag == 128` (`0x80`) indicates "No system battery" (desktop PC); `255` (`0xFF`) indicates unknown status.
+#[cfg(target_os = "windows")]
+fn query_windows_has_battery() -> Option<bool> {
+    #[repr(C)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(lp_system_power_status: *mut SystemPowerStatus) -> i32;
+    }
+
+    const BATTERY_FLAG_NO_BATTERY: u8 = 128;
+    const BATTERY_FLAG_UNKNOWN: u8 = 255;
+
+    let mut status = SystemPowerStatus {
+        ac_line_status: 0,
+        battery_flag: BATTERY_FLAG_UNKNOWN,
+        battery_life_percent: 255,
+        system_status_flag: 0,
+        battery_life_time: u32::MAX,
+        battery_full_life_time: u32::MAX,
+    };
+    let ok = unsafe { GetSystemPowerStatus(&mut status) };
+    if ok == 0 || status.battery_flag == BATTERY_FLAG_UNKNOWN {
+        None
+    } else if (status.battery_flag & BATTERY_FLAG_NO_BATTERY) != 0 {
+        Some(false)
+    } else {
+        Some(true)
+    }
+}
+
 /// Detects whether this Mac has physical Touch Bar hardware or its daemon active.
 pub fn has_touch_bar_hardware() -> bool {
     #[cfg(target_os = "macos")]
@@ -1338,7 +1564,8 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
                             let name_lower = name.to_ascii_lowercase();
                             let is_discrete = !bus_lower.contains("built-in")
                                 && !bus_lower.contains("builtin")
-                                && !name_lower.contains("apple m")
+                                && !vendor.eq_ignore_ascii_case("Apple")
+                                && !name_lower.contains("apple")
                                 && !name_lower.contains("intel hd")
                                 && !name_lower.contains("intel iris")
                                 && !name_lower.contains("intel uhd");
@@ -1422,8 +1649,12 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
                             let is_discrete = (vendor == "NVIDIA"
                                 && !lower.contains("integrated"))
                                 || lower.contains("radeon rx")
+                                || lower.contains("radeon pro")
+                                || lower.contains("radeon vii")
+                                || lower.contains("firepro")
                                 || lower.contains("arc a")
-                                || lower.contains("arc b");
+                                || lower.contains("arc b")
+                                || lower.contains("arc pro");
                             out.push(GpuDeviceInfo {
                                 index: out.len() as u32,
                                 name,
@@ -1450,17 +1681,31 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
     out
 }
 
-/// Infers GPU vendor from adapter model name string.
+/// Infers GPU vendor from adapter model name string across desktop, laptop, x86_64, and ARM64 platforms.
 fn infer_vendor(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") || lower.contains("quadro") {
+    if lower.contains("nvidia")
+        || lower.contains("geforce")
+        || lower.contains("rtx")
+        || lower.contains("gtx")
+        || lower.contains("quadro")
+    {
         "NVIDIA"
-    } else if lower.contains("amd") || lower.contains("radeon") {
+    } else if lower.contains("amd") || lower.contains("radeon") || lower.contains("firepro") {
         "AMD"
-    } else if lower.contains("intel") || lower.contains("arc") || lower.contains("iris") || lower.contains("uhd") {
+    } else if lower.contains("intel")
+        || lower.contains("arc")
+        || lower.contains("iris")
+        || lower.contains("uhd")
+    {
         "Intel"
     } else if lower.contains("apple") {
         "Apple"
+    } else if lower.contains("qualcomm")
+        || lower.contains("adreno")
+        || lower.contains("snapdragon")
+    {
+        "Qualcomm"
     } else {
         "Unknown"
     }
@@ -1972,6 +2217,7 @@ pub fn collect_local_profile() -> LocalHardwareProfile {
     let device_id = get_or_create_device_id();
     let hostname = get_hostname();
     let (hardware_model, cpu_brand) = get_hardware_model_and_cpu();
+    let form_factor = detect_device_form_factor(&hardware_model);
     let has_touch_bar = has_touch_bar_hardware();
     let primary_display = get_primary_display_info();
     let gpus = enumerate_gpus();
@@ -1989,6 +2235,7 @@ pub fn collect_local_profile() -> LocalHardwareProfile {
         hostname,
         os: std::env::consts::OS.to_string(),
         hardware_model,
+        form_factor,
         cpu_brand,
         has_touch_bar,
         primary_display,
@@ -2942,5 +3189,120 @@ mod tests {
         assert_eq!(legacy.smb_share_name.as_deref(), Some("Public"));
         assert!(legacy.firewall_extra_subnets.is_empty());
         assert_eq!(legacy.sunshine_api_user, None);
+    }
+
+    #[test]
+    fn test_device_form_factor_classification_mac_and_windows() {
+        use super::{
+            classify_mac_form_factor, classify_windows_form_factor, infer_peer_form_factor,
+             infer_vendor, parse_mac_ioreg_battery_present, DeviceFormFactor,
+        };
+
+        // Explicit MacBook models classify as Laptop regardless of battery query
+        assert_eq!(
+            classify_mac_form_factor("MacBookPro18,1", None),
+            DeviceFormFactor::Laptop
+        );
+        assert_eq!(
+            classify_mac_form_factor("MacBookAir10,1", Some(true)),
+            DeviceFormFactor::Laptop
+        );
+
+        // Explicit Mac desktop models classify as Desktop
+        assert_eq!(
+            classify_mac_form_factor("Macmini9,1", None),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            classify_mac_form_factor("MacStudio1,1", None),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            classify_mac_form_factor("iMac21,1", None),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            classify_mac_form_factor("MacPro7,1", None),
+            DeviceFormFactor::Desktop
+        );
+
+        // Generic Apple Silicon `Mac14,x` / `Mac15,x` / `Mac16,x` models use battery presence!
+        // e.g. Mac15,6 (MacBook Pro M3) with battery vs Mac14,12 (Mac mini M2 Pro) or Mac14,13 (Mac Studio) without battery
+        assert_eq!(
+            classify_mac_form_factor("Mac15,6", Some(true)),
+            DeviceFormFactor::Laptop
+        );
+        assert_eq!(
+            classify_mac_form_factor("Mac14,12", Some(false)),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            classify_mac_form_factor("Mac16,1", None),
+            DeviceFormFactor::Unknown
+        );
+
+        // Parse ioreg AppleSmartBattery output for MacBook vs Mac mini/Studio
+        let macbook_ioreg = r#"
++-o AppleSmartBattery  <class AppleSmartBattery, id 0x100000240, registered, matched, active, busy 0 (0 ms), retain 9>
+    {
+      "BatteryInstalled" = Yes
+      "ExternalConnected" = Yes
+    }
+"#;
+        assert!(parse_mac_ioreg_battery_present(macbook_ioreg));
+        assert!(!parse_mac_ioreg_battery_present(""));
+        let desktop_no_batt = r#"
++-o AppleSmartBattery  <class AppleSmartBattery, id 0x100000240>
+    {
+      "BatteryInstalled" = No
+    }
+"#;
+        assert!(!parse_mac_ioreg_battery_present(desktop_no_batt));
+
+        // Windows form-factor detection via battery presence and model strings
+        assert_eq!(
+            classify_windows_form_factor("System Product Name", Some(true)),
+            DeviceFormFactor::Laptop
+        );
+        assert_eq!(
+            classify_windows_form_factor("System Product Name", Some(false)),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            classify_windows_form_factor("ROG Zephyrus G14", None),
+            DeviceFormFactor::Laptop
+        );
+        assert_eq!(
+            classify_windows_form_factor("Dell OptiPlex 7010 Tower", None),
+            DeviceFormFactor::Desktop
+        );
+
+        // Peer form-factor inference from explicit wire field or model fallback
+        assert_eq!(
+            infer_peer_form_factor("macos", "Mac14,12", Some("desktop")),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            infer_peer_form_factor("macos", "Mac15,6", Some("laptop")),
+            DeviceFormFactor::Laptop
+        );
+        assert_eq!(
+            infer_peer_form_factor("macos", "Macmini9,1", None),
+            DeviceFormFactor::Desktop
+        );
+        assert_eq!(
+            infer_peer_form_factor("windows", "ThinkPad X1 Carbon", None),
+            DeviceFormFactor::Laptop
+        );
+
+        // GPU vendor inference covers NVIDIA, AMD, Intel, Apple, and Qualcomm Adreno (Windows ARM64)
+        assert_eq!(infer_vendor("NVIDIA GeForce RTX 4090"), "NVIDIA");
+        assert_eq!(infer_vendor("AMD Radeon PRO W7900"), "AMD");
+        assert_eq!(infer_vendor("Intel(R) Arc(TM) A770 Graphics"), "Intel");
+        assert_eq!(infer_vendor("Apple M3 Max"), "Apple");
+        assert_eq!(
+            infer_vendor("Qualcomm(R) Adreno(TM) X1-85 GPU"),
+            "Qualcomm"
+        );
     }
 }

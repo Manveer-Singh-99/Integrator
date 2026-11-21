@@ -476,6 +476,8 @@ namespace IntegratorUI
         [JsonPropertyName("os")] public string Os { get; set; } = string.Empty;
         /// <summary>Hardware model description.</summary>
         [JsonPropertyName("hardware_model")] public string HardwareModel { get; set; } = string.Empty;
+        /// <summary>Hardware chassis form factor ("laptop", "desktop", or "unknown").</summary>
+        [JsonPropertyName("form_factor")] public string? FormFactor { get; set; }
         /// <summary>Reachable IP address.</summary>
         [JsonPropertyName("ip")] public string Ip { get; set; } = string.Empty;
         /// <summary>Local interface IP address used to contact peer.</summary>
@@ -574,10 +576,12 @@ namespace IntegratorUI
         /// <summary>Default encrypted TCP transport port for shared virtual camera streaming.</summary>
         public const ushort DefaultCameraPort = 58287;
         /// <summary>Default user-facing Windows virtual camera display name.</summary>
-        public const string DefaultCameraDeviceName = "Integrator MacBook Camera";
+        public const string DefaultCameraDeviceName = "Integrator Mac Camera";
 
         /// <summary>True if virtual camera drivers are installed and supported.</summary>
         [JsonPropertyName("supported")] public bool Supported { get; set; } = true;
+        /// <summary>True if a video capture source or virtual camera is available.</summary>
+        [JsonPropertyName("camera_available")] public bool CameraAvailable { get; set; } = true;
         /// <summary>True if camera stream is actively transmitting/receiving.</summary>
         [JsonPropertyName("active")] public bool Active { get; set; }
         /// <summary>Operational role: sender or receiver.</summary>
@@ -759,6 +763,8 @@ namespace IntegratorUI
         [JsonPropertyName("local_os")] public string LocalOs { get; set; } = string.Empty;
         /// <summary>Hardware system model description.</summary>
         [JsonPropertyName("hardware_model")] public string HardwareModel { get; set; } = string.Empty;
+        /// <summary>Local hardware chassis form factor ("laptop", "desktop", or "unknown").</summary>
+        [JsonPropertyName("form_factor")] public string? FormFactor { get; set; }
         /// <summary>Processor brand string.</summary>
         [JsonPropertyName("cpu_brand")] public string CpuBrand { get; set; } = string.Empty;
         /// <summary>Primary display configuration.</summary>
@@ -784,6 +790,8 @@ namespace IntegratorUI
         [JsonPropertyName("peer_name")] public string? PeerName { get; set; }
         /// <summary>Hardware model of connected peer.</summary>
         [JsonPropertyName("peer_hardware_model")] public string? PeerHardwareModel { get; set; }
+        /// <summary>Hardware chassis form factor of connected peer ("laptop", "desktop", or "unknown").</summary>
+        [JsonPropertyName("peer_form_factor")] public string? PeerFormFactor { get; set; }
         /// <summary>Primary display geometry of connected peer.</summary>
         [JsonPropertyName("peer_display")] public DisplayGeometryModel? PeerDisplay { get; set; }
         /// <summary>List of GPU names detected on connected peer.</summary>

@@ -19,7 +19,7 @@
 //!   forwards raw NV12 frames via C-ABI FFI (`camera_windows.cpp`) into an ACL-hardened double-buffered
 //!   shared memory region (`Global\IntegratorVCamShm_v1`). This memory feeds `integrator_vcam.dll`, a
 //!   standalone Media Foundation FrameServer COM component (`CLSID_IntegratorVCamActivate`) registered
-//!   under the friendly name **"Integrator MacBook Camera"**.
+//!   under the friendly name **"Integrator Mac Camera"**.
 //!
 //! ## 2. Architectural Linkages & Cross-Platform Flow
 //!
@@ -59,7 +59,7 @@
 //! │         ▼ (IMF2DBuffer2 / Lock2DSize row-copy)                         │
 //! │  Windows 11 Media Foundation FrameServer (`integrator_vcam.dll`)       │
 //! │  CLSID: {8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}                        │
-//! │  Friendly Name: "Integrator MacBook Camera"                            │
+//! │  Friendly Name: "Integrator Mac Camera"                                │
 //! │         │                                                              │
 //! │         ▼                                                              │
 //! │  Target Consumer Apps (Microsoft Teams, Zoom, OBS, Windows Camera)    │
@@ -191,6 +191,11 @@ fn default_camera_device_name() -> String {
     DEFAULT_CAMERA_FRIENDLY_NAME.to_string()
 }
 
+/// Serde default helper indicating camera hardware availability when deserializing legacy status payloads.
+fn default_camera_available() -> bool {
+    true
+}
+
 /// Diagnostic telemetry and status report for the Camera subsystem.
 ///
 /// Returned over local RPC to the UI and CLI to display the live state of the camera pipeline.
@@ -198,9 +203,12 @@ fn default_camera_device_name() -> String {
 pub struct CameraStatus {
     /// Whether the local platform supports camera operations (true on macOS and Windows 11).
     pub supported: bool,
+    /// Whether a video capture source (built-in, USB webcam, or Continuity Camera on Mac; Virtual Camera on Windows) is available.
+    #[serde(default = "default_camera_available")]
+    pub camera_available: bool,
     /// Whether the camera capture or virtual camera publication loop is currently active.
     pub active: bool,
-    /// Operating role of this machine: `"MacBook Camera Sender"` or `"Windows 11 Virtual Webcam"`.
+    /// Operating role of this machine: `"Mac Camera Sender"` or `"Windows 11 Virtual Webcam"`.
     pub role: String,
     /// Human-readable operational state label (e.g., `"Streaming 720p30"`, `"Standby"`, `"Error"`).
     pub state: String,
@@ -408,6 +416,7 @@ fn global_frame_slot() -> &'static Arc<LatestFrameSlot> {
 extern "C" {
     fn integrator_mac_camera_permission_state() -> i32;
     fn integrator_mac_camera_has_usage_desc() -> i32;
+    fn integrator_mac_camera_has_hardware() -> i32;
     fn integrator_mac_camera_start() -> i32;
     fn integrator_mac_camera_stop();
     fn integrator_mac_camera_is_running() -> i32;
@@ -669,13 +678,25 @@ impl CameraService {
                 .map_err(|e| e.to_string())?;
             if rc != 0 {
                 self.active.store(false, Ordering::SeqCst);
-                let msg = match rc {
-                    -2 => "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
-                    -1 => "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
-                    -3 => "No MacBook camera hardware detected".to_string(),
-                    _ => format!("Failed to initialize AVFoundation camera capture (code {})", rc),
+                let (state_lbl, msg) = match rc {
+                    -2 => (
+                        "Permission Needed",
+                        "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
+                    ),
+                    -1 => (
+                        "Permission Needed",
+                        "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
+                    ),
+                    -3 => (
+                        "No Camera Detected",
+                        "No Mac camera hardware detected (connect a USB webcam or Continuity Camera)".to_string(),
+                    ),
+                    _ => (
+                        "Error",
+                        format!("Failed to initialize AVFoundation camera capture (code {})", rc),
+                    ),
                 };
-                self.set_state("Permission Needed", Some(msg.clone()));
+                self.set_state(state_lbl, Some(msg.clone()));
                 return Err(msg);
             }
 
@@ -685,7 +706,7 @@ impl CameraService {
                 svc.run_mac_sender_loop().await;
             });
             info!("📷 Mac camera capture started (720p30 NV12)");
-            return Ok("Streaming MacBook Camera (720p30) to Windows Virtual Camera".into());
+            return Ok("Streaming Mac Camera (720p30) to Windows Virtual Camera".into());
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -810,21 +831,29 @@ impl CameraService {
         let active = self.active.load(Ordering::Relaxed);
         let enabled = self.features.is_enabled("camera");
         #[cfg(target_os = "macos")]
-        let permission_granted = unsafe { integrator_mac_camera_permission_state() == 2 && integrator_mac_camera_has_usage_desc() == 1 };
+        let (permission_granted, camera_available) = unsafe {
+            (
+                integrator_mac_camera_permission_state() == 2
+                    && integrator_mac_camera_has_usage_desc() == 1,
+                integrator_mac_camera_has_hardware() != 0,
+            )
+        };
         #[cfg(target_os = "windows")]
-        let permission_granted = true;
+        let (permission_granted, camera_available) = (true, true);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let permission_granted = false;
+        let (permission_granted, camera_available) = (false, false);
 
         let role = if cfg!(target_os = "macos") {
-            "MacBook Camera Sender"
+            "Mac Camera Sender"
         } else if cfg!(target_os = "windows") {
             "Windows 11 Virtual Webcam"
         } else {
             "Unsupported"
         };
 
-        let state = if !enabled {
+        let state = if !camera_available && !active {
+            "No Camera Detected".to_string()
+        } else if !enabled {
             "Disabled".to_string()
         } else {
             self.state_label
@@ -835,6 +864,7 @@ impl CameraService {
 
         CameraStatus {
             supported: cfg!(any(target_os = "macos", target_os = "windows")),
+            camera_available,
             active,
             role: role.to_string(),
             state,
@@ -928,12 +958,15 @@ mod tests {
         }"#;
         let parsed: CameraStatus =
             serde_json::from_str(legacy_json).expect("legacy CameraStatus JSON should deserialize");
+        assert!(parsed.camera_available);
         assert_eq!(parsed.port, CAMERA_PORT);
         assert_eq!(parsed.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
+        assert_eq!(parsed.device_name, "Integrator Mac Camera");
 
         let serialized = serde_json::to_string(&parsed).expect("CameraStatus should serialize");
         let roundtrip: CameraStatus =
             serde_json::from_str(&serialized).expect("CameraStatus should roundtrip");
+        assert!(roundtrip.camera_available);
         assert_eq!(roundtrip.port, CAMERA_PORT);
         assert_eq!(roundtrip.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
     }

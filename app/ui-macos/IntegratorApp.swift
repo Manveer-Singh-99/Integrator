@@ -248,8 +248,10 @@ struct DiscoveredPeerModel: Codable, Identifiable, Hashable {
     var hostname: String
     /// Operating system string (e.g., "macOS", "Windows").
     var os: String
-    /// Hardware model string (e.g., "MacBookPro18,1", "Custom PC").
+    /// Hardware model string (e.g., "MacBookPro18,1", "Mac14,12", "Custom PC").
     var hardware_model: String
+    /// Hardware chassis form factor ("laptop", "desktop", or "unknown").
+    var form_factor: String?
     /// Reachable IPv4 address.
     var ip: String
     /// Local interface IP address used to communicate with this peer.
@@ -321,7 +323,7 @@ private enum UiDefaults {
     /// Fallback shared camera frame rate in FPS.
     static let defaultCameraFps: UInt32 = 30
     /// Fallback Windows virtual camera friendly name when omitted by core status.
-    static let defaultCameraDeviceName: String = "Integrator MacBook Camera"
+    static let defaultCameraDeviceName: String = "Integrator Mac Camera"
     /// Placeholder system GPU name filtered from explicit discrete/integrated GPU pickers.
     static let defaultSystemGpuName: String = "Default System GPU"
     /// Fallback remote peer hostname displayed in the desk layout schematic.
@@ -375,8 +377,10 @@ struct AudioRoutingStatusModel: Codable, Hashable {
 
 /// Telemetry and state of the Mac -> PC shared virtual camera pipeline.
 struct CameraStatusModel: Codable, Hashable {
-    /// True if camera capture hardware is supported and present.
+    /// True if camera capture platform subsystem is supported.
     var supported: Bool
+    /// True if a video capture device (built-in, external USB, or Continuity Camera) is currently detected.
+    var camera_available: Bool?
     /// True if the camera stream is actively transmitting frames.
     var active: Bool
     /// Operational role: "sender" (macOS) or "receiver" (Windows Virtual Camera).
@@ -543,6 +547,8 @@ struct BridgeStatusModel: Codable {
     var local_os: String
     /// Hardware product model name.
     var hardware_model: String
+    /// Local hardware chassis form factor ("laptop", "desktop", or "unknown").
+    var form_factor: String?
     /// Processor architecture and brand string.
     var cpu_brand: String
     /// Primary local display configuration.
@@ -568,6 +574,8 @@ struct BridgeStatusModel: Codable {
     var peer_name: String?
     /// Hardware model of the connected peer.
     var peer_hardware_model: String?
+    /// Hardware chassis form factor of the connected peer ("laptop", "desktop", or "unknown").
+    var peer_form_factor: String?
     /// Display geometry of the peer's primary monitor.
     var peer_display: DisplayGeometryModel?
     /// List of GPUs present on the peer machine.
@@ -828,7 +836,7 @@ final class IntegratorViewModel: ObservableObject {
         }
     }
 
-    /// Determines the vendor tag ("nvidia", "amd", "intel", "apple", "discrete") for a GPU descriptor.
+    /// Determines the vendor tag ("nvidia", "amd", "intel", "apple", "qualcomm", "discrete") for a GPU descriptor.
     ///
     /// - Parameter gpu: GPU metadata model.
     /// - Returns: Canonical lowercase vendor tag.
@@ -837,7 +845,7 @@ final class IntegratorViewModel: ObservableObject {
         if combined.contains("nvidia") || combined.contains("geforce") || combined.contains("rtx") || combined.contains("gtx") || combined.contains("quadro") {
             return "nvidia"
         }
-        if combined.contains("amd") || combined.contains("radeon") {
+        if combined.contains("amd") || combined.contains("radeon") || combined.contains("firepro") {
             return "amd"
         }
         if combined.contains("intel") || combined.contains("arc") || combined.contains("iris") || combined.contains("uhd") {
@@ -846,7 +854,42 @@ final class IntegratorViewModel: ObservableObject {
         if combined.contains("apple") {
             return "apple"
         }
+        if combined.contains("qualcomm") || combined.contains("adreno") || combined.contains("snapdragon") {
+            return "qualcomm"
+        }
         return gpu.is_discrete ? "discrete" : "integrated"
+    }
+
+    /// Resolves the appropriate SF Symbol icon name for a Mac or Windows machine based on its
+    /// operating system, hardware product model, and form factor (Desktop vs Laptop).
+    static func deviceSymbol(os: String?, hardwareModel: String?, formFactor: String?) -> String {
+        let model = (hardwareModel ?? "").lowercased()
+        let ff = (formFactor ?? "").lowercased()
+        let osLower = (os ?? "").lowercased()
+        let isMac = osLower.contains("mac") || osLower == "darwin" || model.hasPrefix("mac") || model.hasPrefix("imac")
+        if isMac {
+            if model.contains("macstudio") || model.contains("mac studio") {
+                return "macstudio"
+            }
+            if model.contains("macmini") || model.contains("mac mini") {
+                return "macmini"
+            }
+            if model.contains("macpro") || model.contains("mac pro") {
+                return "macpro.gen3"
+            }
+            if model.contains("imac") || ff == "desktop" {
+                return "desktopcomputer"
+            }
+            if model.contains("macbook") || ff == "laptop" {
+                return "laptopcomputer"
+            }
+            return "desktopcomputer"
+        } else {
+            if ff == "laptop" || model.contains("laptop") || model.contains("notebook") || model.contains("thinkpad") || model.contains("surface") || model.contains("zephyrus") || model.contains("zenbook") {
+                return "laptopcomputer"
+            }
+            return "pc"
+        }
     }
 
     /// Builds unique picker options for GPU selection dropdowns.
@@ -1493,6 +1536,15 @@ struct MainDashboardView: View {
                     Circle()
                         .fill(s?.peer_connected == true ? .green : .orange)
                         .frame(width: 8, height: 8)
+                    if s?.peer_connected == true {
+                        Image(systemName: IntegratorViewModel.deviceSymbol(
+                            os: s?.peer_os,
+                            hardwareModel: s?.peer_hardware_model,
+                            formFactor: s?.peer_form_factor
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                     Text(s?.peer_name ?? "Discovering Peer...")
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
@@ -1524,6 +1576,14 @@ struct MainDashboardView: View {
     /// Top status bar displaying workstation host info, connection status pill, and quick action buttons.
     private var topBar: some View {
         HStack(spacing: 12) {
+            Image(systemName: IntegratorViewModel.deviceSymbol(
+                os: s?.os ?? "macos",
+                hardwareModel: s?.hardware_model,
+                formFactor: s?.form_factor
+            ))
+            .font(.system(size: 20, weight: .medium))
+            .foregroundStyle(.tint)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(s?.hostname ?? "Workstation")
                     .font(.title2.bold())
@@ -1812,8 +1872,18 @@ struct MainDashboardView: View {
         let edge = vm.kvmLayout.peer_edge
         let peerName = s?.peer_name ?? UiDefaults.defaultPeerHostname
         let localName = s?.hostname ?? UiDefaults.defaultLocalHostname
-        let localBox = monitorTile(localName, accent: true)
-        let peerBox = monitorTile(peerName, accent: false)
+        let localIcon = IntegratorViewModel.deviceSymbol(
+            os: s?.os ?? "macos",
+            hardwareModel: s?.hardware_model,
+            formFactor: s?.form_factor
+        )
+        let peerIcon = IntegratorViewModel.deviceSymbol(
+            os: s?.peer_os ?? "windows",
+            hardwareModel: s?.peer_hardware_model,
+            formFactor: s?.peer_form_factor
+        )
+        let localBox = monitorTile(localName, icon: localIcon, accent: true)
+        let peerBox = monitorTile(peerName, icon: peerIcon, accent: false)
 
         return Group {
             switch edge {
@@ -1831,21 +1901,26 @@ struct MainDashboardView: View {
     }
 
     /// Renders a single monitor rectangle in the desk layout schematic.
-    private func monitorTile(_ label: String, accent: Bool) -> some View {
-        Text(label)
-            .font(.caption.weight(.semibold))
-            .lineLimit(1)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 10)
-            .frame(minWidth: 82)
-            .background(
-                (accent ? Color.accentColor.opacity(0.24) : Color.secondary.opacity(0.18)),
-                in: RoundedRectangle(cornerRadius: 8)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(accent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.16), lineWidth: 1)
-            )
+    private func monitorTile(_ label: String, icon: String, accent: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .foregroundStyle(accent ? Color.accentColor : .secondary)
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .frame(minWidth: 82)
+        .background(
+            (accent ? Color.accentColor.opacity(0.24) : Color.secondary.opacity(0.18)),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(accent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.16), lineWidth: 1)
+        )
     }
 
     // MARK: - Card 3: Cross-Screen Drag & Drop
@@ -2012,6 +2087,13 @@ struct MainDashboardView: View {
                 let pinDraft = (vm.pairPinInputs[peer.ip] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        Image(systemName: IntegratorViewModel.deviceSymbol(
+                            os: peer.os,
+                            hardwareModel: peer.hardware_model,
+                            formFactor: peer.form_factor
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         Text(peer.hostname).font(.subheadline.weight(.semibold))
                         Text("(\(peer.ip))").font(.caption).foregroundStyle(.secondary)
                         Spacer()
@@ -2427,12 +2509,16 @@ struct MainDashboardView: View {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.orange)
+            } else if cam?.camera_available == false && !camActive {
+                Text("No camera hardware detected on this Mac. Connect a USB webcam or Continuity Camera.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } else if camActive {
                 Text("\(camWidth)×\(camHeight) @ \(camFps)fps • \(cam?.frames_transferred ?? 0) frames sent over TCP :\(camPort)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else {
-                Text("Streams your MacBook camera (\(camHeight)p\(camFps)) into Windows '\(camDeviceName)' (TCP :\(camPort)).")
+                Text("Streams your Mac camera (\(camHeight)p\(camFps)) into Windows '\(camDeviceName)' (TCP :\(camPort)).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

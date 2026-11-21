@@ -1376,7 +1376,7 @@ struct ResolvedGpuTarget {
     reg_pref: &'static str,
 }
 
-/// Identifies GPU vendor ("nvidia", "amd", "intel") from vendor and device name strings.
+/// Identifies GPU vendor ("nvidia", "amd", "intel", "qualcomm") from vendor and device name strings.
 #[cfg(any(target_os = "windows", test))]
 fn vendor_key(vendor: &str, name: &str) -> Option<String> {
     let combined = format!("{} {}", vendor, name).to_ascii_lowercase();
@@ -1387,7 +1387,7 @@ fn vendor_key(vendor: &str, name: &str) -> Option<String> {
         || combined.contains("quadro")
     {
         Some("nvidia".to_string())
-    } else if combined.contains("amd") || combined.contains("radeon") {
+    } else if combined.contains("amd") || combined.contains("radeon") || combined.contains("firepro") {
         Some("amd".to_string())
     } else if combined.contains("intel")
         || combined.contains("arc")
@@ -1395,6 +1395,11 @@ fn vendor_key(vendor: &str, name: &str) -> Option<String> {
         || combined.contains("uhd")
     {
         Some("intel".to_string())
+    } else if combined.contains("qualcomm")
+        || combined.contains("adreno")
+        || combined.contains("snapdragon")
+    {
+        Some("qualcomm".to_string())
     } else {
         None
     }
@@ -1516,11 +1521,12 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                 }
             }
         }
-        "nvidia" | "amd" | "intel" => {
+        "nvidia" | "amd" | "intel" | "qualcomm" | "adreno" => {
+            let target_vendor = if lower == "adreno" { "qualcomm" } else { lower.as_str() };
             let matched = real_gpus
                 .iter()
                 .copied()
-                .filter(|g| vendor_key(&g.vendor, &g.name).as_deref() == Some(lower.as_str()))
+                .filter(|g| vendor_key(&g.vendor, &g.name).as_deref() == Some(target_vendor))
                 .max_by_key(|g| (g.is_discrete, g.vram_mb.unwrap_or(0)));
 
             if let Some(gpu) = matched {
@@ -1538,8 +1544,8 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: None,
-                    encoder: encoder_for_gpu(&lower, &lower),
-                    reg_pref: if lower == "intel" {
+                    encoder: encoder_for_gpu(target_vendor, target_vendor),
+                    reg_pref: if target_vendor == "intel" || target_vendor == "qualcomm" {
                         DIRECTX_GPU_PREF_POWER_SAVING
                     } else {
                         DIRECTX_GPU_PREF_HIGH_PERF
@@ -1581,9 +1587,13 @@ fn resolve_gpu_target(selection: &str, gpus: &[system_info::GpuDeviceInfo]) -> R
                 let looks_integrated = lower.contains("uhd")
                     || lower.contains("iris")
                     || lower.contains("integrated")
+                    || lower.contains("adreno")
+                    || lower.contains("qualcomm")
+                    || lower.contains("radeon(tm) graphics")
                     || (lower.contains("intel")
                         && !lower.contains("arc a")
-                        && !lower.contains("arc b"));
+                        && !lower.contains("arc b")
+                        && !lower.contains("arc pro"));
                 ResolvedGpuTarget {
                     is_auto: false,
                     adapter_name: Some(trimmed.to_string()),

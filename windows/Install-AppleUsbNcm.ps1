@@ -104,7 +104,7 @@ HKR,,DeviceInterfaceGUIDs,0x10000,"{a5dcbf10-6530-11d2-901f-00c04fb951ed}"
 [Strings]
 ProviderName = "AppleUsbNcmBridge"
 MfgName      = "Apple Inc."
-DeviceDesc   = "Apple MacBook USB-C NCM Direct Link (WinUSB)"
+DeviceDesc   = "Apple Mac USB-C NCM Direct Link (WinUSB)"
 "@
 $infPath = Join-Path $dir "AppleWinUsb.inf"
 $catPath = Join-Path $dir "AppleWinUsb.cat"

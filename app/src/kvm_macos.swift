@@ -293,9 +293,12 @@ private func snapshotAndClearRemoteModKeysLocked() -> [UInt16] {
     return downCodes
 }
 
-// MARK: - Primary Screen Geometry
+// MARK: - Virtual Desktop & Multi-Monitor Screen Geometry
 
-/// Queries the primary display bounds in Quartz global coordinates.
+/// Queries the unified virtual desktop bounds across all active displays in Quartz global coordinates.
+///
+/// Supports both single-display Macs and multi-monitor Mac desktop/laptop workstations (including
+/// secondary monitors arranged to the left or above the primary display with negative `x`/`y` origins).
 @_cdecl("integrator_kvm_macos_screen_rect")
 public func integrator_kvm_macos_screen_rect(
     outX: UnsafeMutablePointer<Double>?,
@@ -303,11 +306,29 @@ public func integrator_kvm_macos_screen_rect(
     outW: UnsafeMutablePointer<Double>?,
     outH: UnsafeMutablePointer<Double>?
 ) {
-    let bounds = CGDisplayBounds(CGMainDisplayID())
-    outX?.pointee = Double(bounds.origin.x)
-    outY?.pointee = Double(bounds.origin.y)
-    outW?.pointee = Double(bounds.size.width)
-    outH?.pointee = Double(bounds.size.height)
+    var displayCount: UInt32 = 0
+    var unionBounds = CGDisplayBounds(CGMainDisplayID())
+    if CGGetActiveDisplayList(0, nil, &displayCount) == .success, displayCount > 1 {
+        let maxDisplays = min(displayCount, 32)
+        var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
+        var actualCount: UInt32 = 0
+        if CGGetActiveDisplayList(maxDisplays, &activeDisplays, &actualCount) == .success, actualCount > 0 {
+            var combined = CGRect.null
+            for idx in 0..<Int(actualCount) {
+                let b = CGDisplayBounds(activeDisplays[idx])
+                if b.width > 0 && b.height > 0 {
+                    combined = combined.isNull ? b : combined.union(b)
+                }
+            }
+            if !combined.isNull && combined.width > 0 && combined.height > 0 {
+                unionBounds = combined
+            }
+        }
+    }
+    outX?.pointee = Double(unionBounds.origin.x)
+    outY?.pointee = Double(unionBounds.origin.y)
+    outW?.pointee = Double(unionBounds.size.width)
+    outH?.pointee = Double(unionBounds.size.height)
 }
 
 // MARK: - Cursor Visibility & Warp

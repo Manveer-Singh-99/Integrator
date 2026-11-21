@@ -7,8 +7,8 @@
  * ----------------------------------------------------------------------------
  * This file implements the native macOS video capture pipeline for Integrator's
  * Shared Camera subsystem (`camera` feature). Its sole mission is to interface
- * directly with macOS AVFoundation, capture raw video from the MacBook's built-in
- * FaceTime HD Camera at 720p30, convert and pack the native bi-planar CVPixelBuffers
+ * directly with macOS AVFoundation, capture raw video from the Mac's built-in
+ * FaceTime HD Camera, external USB webcam, or Continuity Camera at 720p30, convert and pack the native bi-planar CVPixelBuffers
  * into tightly contiguous NV12 format, and stream them into the Rust core via C FFI.
  *
  * 2. END-TO-END CROSS-PLATFORM ARCHITECTURAL FLOW
@@ -32,7 +32,7 @@
  * 4. Windows 11 Media Foundation Virtual Camera (Windows 11):
  *    - Received on Windows TCP :58287, forwarded via `integrator_win_vcam_push_nv12`.
  *    - Pushed into double-buffered ACL-hardened shared memory (`Global\IntegratorVCamShm_v1`).
- *    - Ingested by standalone COM DLL `integrator_vcam.dll` (`Integrator MacBook Camera`).
+ *    - Ingested by standalone COM DLL `integrator_vcam.dll` (`Integrator Mac Camera`).
  *    - Windows 11 Media Foundation FrameServer delivers live frames to any consumer (Teams, Zoom, OBS)
  *      without requiring third-party drivers or physical camera source wrapper attributes
  *      (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES` is omitted).
@@ -193,6 +193,35 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
         }
     }
 
+    /// Discovers the preferred video capture device across built-in Mac cameras, external USB webcams
+    /// (for Mac mini, Mac Studio, Mac Pro, or docked setups), and Continuity Camera devices.
+    private static func discoverPreferredCameraDevice() -> AVCaptureDevice? {
+        if let builtIn = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified) {
+            return builtIn
+        }
+        var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+        if #available(macOS 14.0, *) {
+            deviceTypes.append(.external)
+            deviceTypes.append(.continuityCamera)
+        } else {
+            deviceTypes.append(.externalUnknown)
+        }
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .video,
+            position: .unspecified
+        )
+        if let discovered = session.devices.first(where: { $0.isConnected && !$0.isSuspended }) ?? session.devices.first {
+            return discovered
+        }
+        return AVCaptureDevice.default(for: .video)
+    }
+
+    /// Returns `true` if at least one physical, external USB, or Continuity video capture device is present.
+    func hasCameraHardware() -> Bool {
+        return Self.discoverPreferredCameraDevice() != nil
+    }
+
     /// Configures and starts the AVFoundation camera capture session with explicit geometry, frame rate, and callback.
     ///
     /// - Parameters:
@@ -204,7 +233,7 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
     ///   - `0`: Successfully started.
     ///   - `-1`: Camera permission denied.
     ///   - `-2`: Bundle missing `NSCameraUsageDescription`.
-    ///   - `-3`: No built-in camera hardware detected.
+    ///   - `-3`: No camera hardware detected.
     ///   - `-4`: Unable to add camera device input to session.
     ///   - `-5`: Unable to add video data output to session.
     ///   - `-6`: Initialization exception.
@@ -225,19 +254,17 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
         }
         lock.unlock()
 
+        // Verify that a built-in, external USB, or Continuity camera exists before prompting or starting
+        guard let device = Self.discoverPreferredCameraDevice() else {
+            return -3
+        }
+
         let auth = requestPermissionIfNeeded()
         if auth == -2 {
             return -2
         }
         if auth != 2 {
             return -1
-        }
-
-        // Discover built-in FaceTime HD camera or primary video capture device
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified)
-            ?? AVCaptureDevice.default(for: .video)
-        else {
-            return -3
         }
 
         do {
@@ -441,6 +468,12 @@ public func integrator_mac_camera_permission_state() -> Int32 {
 @_cdecl("integrator_mac_camera_has_usage_desc")
 public func integrator_mac_camera_has_usage_desc() -> Int32 {
     return MacCameraCaptureController.shared.hasUsageDescription() ? 1 : 0
+}
+
+/// Returns 1 if at least one video capture device (built-in, external USB, or Continuity) is present, or 0 if none.
+@_cdecl("integrator_mac_camera_has_hardware")
+public func integrator_mac_camera_has_hardware() -> Int32 {
+    return MacCameraCaptureController.shared.hasCameraHardware() ? 1 : 0
 }
 
 /// Starts 720p30 NV12 AVFoundation camera capture. Returns 0 on success, negative error code on failure.

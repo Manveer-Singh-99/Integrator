@@ -35,11 +35,11 @@
  *
  * 3. COEXISTENCE WITH SHARED CAMERA SUBSYSTEM
  * ----------------------------------------------------------------------------
- * While this module provides the extended display screen for Sunshine, the MacBook's
- * built-in FaceTime HD camera operates concurrently:
+ * While this module provides the extended display screen for Sunshine, the Mac's
+ * camera (built-in FaceTime HD, external USB, or Continuity Camera) operates concurrently:
  * - AVFoundation captures 720p30 NV12 bi-planar video (`camera_macos.swift`).
  * - Frames stream across `TransportSessionV2` on port 58287 into Windows 11 Media
- *   Foundation FrameServer (`integrator_vcam.dll` / `Integrator MacBook Camera`).
+ *   Foundation FrameServer (`integrator_vcam.dll` / `Integrator Mac Camera`).
  * - The Windows virtual camera operates standalone without requiring physical webcam
  *   hardware or wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
  * Both display streaming and camera capture run simultaneously with zero thread contention
