@@ -120,20 +120,23 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 use tracing::{error, info};
 
-use crate::config::CAMERA_PORT;
+use crate::config::{
+    CAMERA_PORT, DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_FRIENDLY_NAME, DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
+};
 use crate::discovery::DiscoveryManager;
 use crate::features::FeatureManager;
 use crate::security::transport::ServiceId;
 use crate::trust;
 
 /// Captured frame width in pixels (720p standard high definition).
-pub const CAMERA_WIDTH: u32 = 1280;
+pub const CAMERA_WIDTH: u32 = DEFAULT_CAMERA_WIDTH;
 
 /// Captured frame height in pixels (720p standard high definition).
-pub const CAMERA_HEIGHT: u32 = 720;
+pub const CAMERA_HEIGHT: u32 = DEFAULT_CAMERA_HEIGHT;
 
 /// Target camera capture and streaming frame rate in frames per second (fps).
-pub const CAMERA_FPS: u32 = 30;
+pub const CAMERA_FPS: u32 = DEFAULT_CAMERA_FPS;
 
 /// Total payload byte size for an uncompressed 1280x720 NV12 frame.
 ///
@@ -166,9 +169,27 @@ pub const PIXEL_FMT_NV12: u8 = 1;
 /// when the camera is paused or idling without transferring full uncompressed video frames.
 pub const FLAG_STANDBY_KEEPALIVE: u8 = 0x01;
 
+/// Maximum timeout duration when establishing an outbound encrypted camera stream connection.
+#[cfg(target_os = "macos")]
+const CAMERA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum timeout duration for transmitting a single encoded NV12 camera frame over the transport.
+#[cfg(target_os = "macos")]
+const CAMERA_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum number of concurrent unauthenticated TCP connections allowed on the camera port.
 #[cfg(target_os = "windows")]
 const MAX_PRE_AUTH_CAMERA_CONNS: usize = 8;
+
+/// Serde default helper providing the canonical virtual camera TCP streaming port.
+fn default_camera_port() -> u16 {
+    CAMERA_PORT
+}
+
+/// Serde default helper providing the canonical friendly virtual camera device name.
+fn default_camera_device_name() -> String {
+    DEFAULT_CAMERA_FRIENDLY_NAME.to_string()
+}
 
 /// Diagnostic telemetry and status report for the Camera subsystem.
 ///
@@ -195,6 +216,12 @@ pub struct CameraStatus {
     pub frames_transferred: u64,
     /// Optional error description from the most recent failure, if any.
     pub last_error: Option<String>,
+    /// TCP streaming port carrying encrypted camera frames (defaults to [`CAMERA_PORT`]).
+    #[serde(default = "default_camera_port")]
+    pub port: u16,
+    /// Friendly device name exposed for the shared virtual camera (defaults to [`DEFAULT_CAMERA_FRIENDLY_NAME`]).
+    #[serde(default = "default_camera_device_name")]
+    pub device_name: String,
 }
 
 /// Parsed, zero-copy camera frame received over the network transport.
@@ -615,8 +642,11 @@ impl CameraService {
                 Ok(()) => {
                     self.active.store(true, Ordering::Relaxed);
                     self.set_state("Virtual Camera Active", None);
-                    info!("📷 Virtual camera 'Integrator MacBook Camera' active");
-                    return Ok("Windows Virtual Camera 'Integrator MacBook Camera' started".into());
+                    info!("📷 Virtual camera '{}' active", DEFAULT_CAMERA_FRIENDLY_NAME);
+                    return Ok(format!(
+                        "Windows Virtual Camera '{}' started",
+                        DEFAULT_CAMERA_FRIENDLY_NAME
+                    ));
                 }
                 Err(e) => {
                     self.active.store(false, Ordering::Relaxed);
@@ -678,7 +708,7 @@ impl CameraService {
                 &peer_ip,
                 CAMERA_PORT,
                 ServiceId::CameraStream,
-                Duration::from_secs(3),
+                CAMERA_CONNECT_TIMEOUT,
             )
             .await
             {
@@ -694,7 +724,7 @@ impl CameraService {
             while self.active.load(Ordering::Relaxed) && self.features.is_enabled("camera") {
                 if let Some(frame_bytes) = slot.take() {
                     if let Err(e) = tokio::time::timeout(
-                        Duration::from_secs(2),
+                        CAMERA_FRAME_SEND_TIMEOUT,
                         session.send_message(&frame_bytes),
                     )
                     .await
@@ -814,6 +844,8 @@ impl CameraService {
             fps: CAMERA_FPS,
             frames_transferred: self.frames_transferred.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|e| e.clone()),
+            port: CAMERA_PORT,
+            device_name: DEFAULT_CAMERA_FRIENDLY_NAME.to_string(),
         }
     }
 }
@@ -824,13 +856,21 @@ mod tests {
 
     #[test]
     fn encode_and_decode_valid_nv12_frame_roundtrip() {
+        assert_eq!(NV12_FRAME_BYTES, 1280 * 720 * 3 / 2);
         let payload = vec![0x7Au8; NV12_FRAME_BYTES];
-        let pkt = encode_camera_frame(1280, 720, PIXEL_FMT_NV12, 0, 1_234_567, &payload)
-            .expect("valid frame");
+        let pkt = encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            0,
+            1_234_567,
+            &payload,
+        )
+        .expect("valid frame");
         assert_eq!(pkt.len(), CAMERA_FRAME_HEADER_LEN + NV12_FRAME_BYTES);
         let decoded = decode_camera_frame(&pkt).expect("decode succeeds");
-        assert_eq!(decoded.width, 1280);
-        assert_eq!(decoded.height, 720);
+        assert_eq!(decoded.width, CAMERA_WIDTH as u16);
+        assert_eq!(decoded.height, CAMERA_HEIGHT as u16);
         assert_eq!(decoded.pix_fmt, PIXEL_FMT_NV12);
         assert_eq!(decoded.timestamp_us, 1_234_567);
         assert_eq!(decoded.payload.len(), NV12_FRAME_BYTES);
@@ -845,15 +885,56 @@ mod tests {
         assert!(decode_camera_frame(&bad).is_err());
 
         let oversized = vec![0u8; NV12_FRAME_BYTES + 1];
-        assert!(encode_camera_frame(1280, 720, PIXEL_FMT_NV12, 0, 0, &oversized).is_err());
+        assert!(encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            0,
+            0,
+            &oversized,
+        )
+        .is_err());
     }
 
     #[test]
     fn keepalive_frame_encodes_and_decodes_with_empty_payload() {
-        let pkt = encode_camera_frame(1280, 720, PIXEL_FMT_NV12, FLAG_STANDBY_KEEPALIVE, 42, &[])
-            .expect("keepalive frame");
+        let pkt = encode_camera_frame(
+            CAMERA_WIDTH as u16,
+            CAMERA_HEIGHT as u16,
+            PIXEL_FMT_NV12,
+            FLAG_STANDBY_KEEPALIVE,
+            42,
+            &[],
+        )
+        .expect("keepalive frame");
         let dec = decode_camera_frame(&pkt).expect("decode keepalive");
         assert_eq!(dec.flags, FLAG_STANDBY_KEEPALIVE);
         assert!(dec.payload.is_empty());
+    }
+
+    #[test]
+    fn camera_status_serde_defaults_preserve_backward_compatibility() {
+        let legacy_json = r#"{
+            "supported": true,
+            "active": false,
+            "role": "MacBook Camera Sender",
+            "state": "Standby",
+            "permission_granted": true,
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "frames_transferred": 0,
+            "last_error": null
+        }"#;
+        let parsed: CameraStatus =
+            serde_json::from_str(legacy_json).expect("legacy CameraStatus JSON should deserialize");
+        assert_eq!(parsed.port, CAMERA_PORT);
+        assert_eq!(parsed.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
+
+        let serialized = serde_json::to_string(&parsed).expect("CameraStatus should serialize");
+        let roundtrip: CameraStatus =
+            serde_json::from_str(&serialized).expect("CameraStatus should roundtrip");
+        assert_eq!(roundtrip.port, CAMERA_PORT);
+        assert_eq!(roundtrip.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
     }
 }

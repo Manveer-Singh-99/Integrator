@@ -109,6 +109,11 @@
 //! - **Subprocess Isolation**: On Windows, all child processes are spawned with `CREATE_NO_WINDOW`
 //!   to avoid GUI console flashes or interactive prompts hanging the runtime.
 
+#[cfg(target_os = "macos")]
+use crate::config::{
+    MACOS_DISKUTIL_BIN, MACOS_MOUNT_BIN, MACOS_OPEN_BIN, MACOS_OSASCRIPT_BIN, MACOS_SMBUTIL_BIN,
+    MACOS_UMOUNT_BIN,
+};
 use crate::{system_info, trust};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -117,29 +122,13 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// Absolute path to macOS AppleScript interpreter binary.
-#[cfg(target_os = "macos")]
-const OSASCRIPT_BIN: &str = "/usr/bin/osascript";
+/// Default fallback SMB share name used when anonymous peer share enumeration is unavailable.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const DEFAULT_SMB_FALLBACK_SHARE: &str = "Public";
 
-/// Absolute path to macOS disk management utility binary.
+/// Canonical macOS mount prefix for user-session NetFS SMB volumes when mount-table lookup is pending.
 #[cfg(target_os = "macos")]
-const DISKUTIL_BIN: &str = "/usr/sbin/diskutil";
-
-/// Absolute path to macOS unmount utility binary.
-#[cfg(target_os = "macos")]
-const UMOUNT_BIN: &str = "/sbin/umount";
-
-/// Absolute path to macOS SMB control and enumeration utility binary.
-#[cfg(target_os = "macos")]
-const SMBUTIL_BIN: &str = "/usr/bin/smbutil";
-
-/// Absolute path to macOS mount table inspection utility binary.
-#[cfg(target_os = "macos")]
-const MOUNT_BIN: &str = "/sbin/mount";
-
-/// Absolute path to Windows network resource command binary.
-#[cfg(target_os = "windows")]
-const NET_EXE_BIN: &str = r"C:\Windows\System32\net.exe";
+const MACOS_VOLUMES_PREFIX: &str = "/Volumes";
 
 /// Process-wide mutual exclusion lock for active mount state file operations.
 static MOUNT_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -275,7 +264,7 @@ impl StorageManager {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = Command::new("/usr/bin/open").arg(path).status()?;
+            let _ = Command::new(MACOS_OPEN_BIN).arg(path).status()?;
             Ok(())
         }
         #[cfg(target_os = "windows")]
@@ -392,7 +381,7 @@ impl StorageManager {
             let smb_url = format!("smb://{}/{}", clean_ip, encoded_share);
 
             tracing::info!("📂 Mounting macOS SMB volume via NetFS: {}", smb_url);
-            let output = Command::new(OSASCRIPT_BIN)
+            let output = Command::new(MACOS_OSASCRIPT_BIN)
                 .args([
                     "-e",
                     "on run argv",
@@ -406,11 +395,13 @@ impl StorageManager {
                 .output()?;
 
             if output.status.success() {
+                // Query the live macOS mount table first so suffixed volume paths (e.g. /Volumes/Share-1)
+                // are captured accurately, falling back to MACOS_VOLUMES_PREFIX if not yet listed.
                 let detected = detect_active_mount_matching(Some(clean_ip), Some(&share))
-                    .unwrap_or(ActiveMountRecord {
+                    .unwrap_or_else(|| ActiveMountRecord {
                         peer_ip: clean_ip.to_string(),
                         remote_share: share.clone(),
-                        mount_path: format!("/Volumes/{}", share),
+                        mount_path: format!("{}/{}", MACOS_VOLUMES_PREFIX, share),
                     });
                 save_active_mount(&detected);
                 return Ok(StorageStatus {
@@ -449,7 +440,7 @@ impl StorageManager {
             let unc_path = format!(r"\\{}\{}", clean_ip, share);
             tracing::info!("📂 Mounting Windows network drive via dynamic letter: {}", unc_path);
 
-            let mut cmd = Command::new(NET_EXE_BIN);
+            let mut cmd = Command::new(crate::system_info::system32_exe("net.exe"));
             cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.args(["use", "*", &unc_path, "/persistent:no"]);
             let out = cmd.output()?;
@@ -519,12 +510,12 @@ impl StorageManager {
 
         #[cfg(target_os = "macos")]
         {
-            let diskutil_out = Command::new(DISKUTIL_BIN)
+            let diskutil_out = Command::new(MACOS_DISKUTIL_BIN)
                 .args(["unmount", &rec.mount_path])
                 .output();
             let mut ok = diskutil_out.map(|o| o.status.success()).unwrap_or(false);
             if !ok {
-                ok = Command::new(UMOUNT_BIN)
+                ok = Command::new(MACOS_UMOUNT_BIN)
                     .arg(&rec.mount_path)
                     .output()
                     .map(|o| o.status.success())
@@ -547,7 +538,7 @@ impl StorageManager {
         {
             use std::os::windows::process::CommandExt;
             let target = rec.mount_path.trim_end_matches('\\');
-            let mut cmd = Command::new(NET_EXE_BIN);
+            let mut cmd = Command::new(crate::system_info::system32_exe("net.exe"));
             cmd.creation_flags(0x08000000);
             cmd.args(["use", target, "/delete", "/yes"]);
             let out = cmd.output()?;
@@ -726,7 +717,7 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
     #[cfg(target_os = "macos")]
     {
         for target in [format!("//{}", peer_ip), format!("//guest@{}", peer_ip)] {
-            if let Ok(out) = Command::new(SMBUTIL_BIN)
+            if let Ok(out) = Command::new(MACOS_SMBUTIL_BIN)
                 .args(["view", "-N", &target])
                 .output()
             {
@@ -739,13 +730,13 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
             }
         }
         // Fallback default share if anonymous enumeration was rejected
-        Some("Public".to_string())
+        Some(DEFAULT_SMB_FALLBACK_SHARE.to_string())
     }
 
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new(NET_EXE_BIN);
+        let mut cmd = Command::new(crate::system_info::system32_exe("net.exe"));
         cmd.creation_flags(0x08000000);
         cmd.args(["view", &format!(r"\\{}", peer_ip)]);
         if let Ok(out) = cmd.output() {
@@ -757,7 +748,7 @@ fn resolve_remote_share(peer_ip: &str, share_hint: Option<&str>) -> Option<Strin
             }
         }
         // Fallback default share if NetBIOS view was rejected
-        Some("Public".to_string())
+        Some(DEFAULT_SMB_FALLBACK_SHARE.to_string())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -779,7 +770,7 @@ fn detect_active_mount_matching(
 ) -> Option<ActiveMountRecord> {
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new(MOUNT_BIN).output().ok()?;
+        let out = Command::new(MACOS_MOUNT_BIN).output().ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let saved = load_active_mount();
 
@@ -843,7 +834,7 @@ fn detect_active_mount_matching(
     {
         use std::os::windows::process::CommandExt;
         let saved = load_active_mount();
-        let mut cmd = Command::new(NET_EXE_BIN);
+        let mut cmd = Command::new(crate::system_info::system32_exe("net.exe"));
         cmd.creation_flags(0x08000000);
         cmd.arg("use");
         let out = cmd.output().ok()?;
@@ -1002,7 +993,7 @@ fn parse_assigned_windows_drive(stdout: &str) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn find_windows_drive_for_unc(unc: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new(NET_EXE_BIN);
+    let mut cmd = Command::new(crate::system_info::system32_exe("net.exe"));
     cmd.creation_flags(0x08000000);
     cmd.arg("use");
     let out = cmd.output().ok()?;

@@ -123,14 +123,28 @@ fn chime_file_lock() -> &'static Mutex<()> {
     CHIME_FILE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Serde default helper providing the canonical UDP audio streaming port.
+fn default_audio_port() -> u16 {
+    AUDIO_PORT
+}
+
+/// Diagnostic runtime status snapshot for the experimental authenticated UDP audio sink.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioRoutingStatus {
+    /// Human-readable description of the active UDP audio sink state and topology.
     pub topology: String,
+    /// Measured audio pipeline latency in milliseconds.
     pub latency_ms: f32,
+    /// Configured PCM sample rate in Hz.
     pub sample_rate: u32,
+    /// Configured PCM sample bit depth.
     pub bit_depth: u8,
+    /// Whether active OS audio playback routing is currently enabled.
     pub is_active: bool,
+    /// UDP port bound by the authenticated `IUA2` audio sink (defaults to [`AUDIO_PORT`]).
+    #[serde(default = "default_audio_port")]
+    pub port: u16,
 }
 
 impl Default for AudioRoutingStatus {
@@ -138,9 +152,10 @@ impl Default for AudioRoutingStatus {
         Self {
             topology: "UDP Audio Sink (Experimental Preview - Offline)".to_string(),
             latency_ms: 0.0,
-            sample_rate: 48_000,
-            bit_depth: 24,
+            sample_rate: config::DEFAULT_AUDIO_SAMPLE_RATE,
+            bit_depth: config::DEFAULT_AUDIO_BIT_DEPTH,
             is_active: false,
+            port: AUDIO_PORT,
         }
     }
 }
@@ -210,9 +225,10 @@ impl AudioManager {
         AudioRoutingStatus {
             topology: topology.to_string(),
             latency_ms: 0.0,
-            sample_rate: 48_000,
-            bit_depth: 24,
+            sample_rate: config::DEFAULT_AUDIO_SAMPLE_RATE,
+            bit_depth: config::DEFAULT_AUDIO_BIT_DEPTH,
             is_active: false,
+            port: AUDIO_PORT,
         }
     }
 
@@ -358,10 +374,10 @@ impl AudioManager {
         // Play sound via native OS audio engine using qualified system binaries
         #[cfg(target_os = "macos")]
         {
-            let child = Command::new("/usr/bin/afplay")
+            let child = Command::new(config::MACOS_AFPLAY_BIN)
                 .arg(&wav_path)
                 .spawn()
-                .context("Failed to spawn /usr/bin/afplay")?;
+                .with_context(|| format!("Failed to spawn {}", config::MACOS_AFPLAY_BIN))?;
 
             reap_child(child);
             Ok("Played 24-bit 48kHz stereo chime via macOS audio output".to_string())
@@ -374,7 +390,8 @@ impl AudioManager {
                 "(New-Object Media.SoundPlayer '{}').PlaySync()",
                 path_str.replace('\'', "''")
             );
-            let mut cmd = Command::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+            let ps_exe = crate::system_info::system32_exe(config::POWERSHELL_SYSTEM32_REL_PATH);
+            let mut cmd = Command::new(ps_exe);
             cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd]);
             cmd.creation_flags(CREATE_NO_WINDOW);
             let child = cmd
@@ -576,12 +593,33 @@ mod tests {
         let status = AudioRoutingStatus::default();
         assert!(!status.is_active);
         assert_eq!(status.latency_ms, 0.0);
-        assert_eq!(status.sample_rate, 48_000);
-        assert_eq!(status.bit_depth, 24);
+        assert_eq!(status.sample_rate, config::DEFAULT_AUDIO_SAMPLE_RATE);
+        assert_eq!(status.bit_depth, config::DEFAULT_AUDIO_BIT_DEPTH);
+        assert_eq!(status.port, AUDIO_PORT);
         assert_eq!(
             status.topology,
             "UDP Audio Sink (Experimental Preview - Offline)"
         );
+    }
+
+    #[test]
+    fn audio_routing_status_serde_defaults_preserve_backward_compatibility() {
+        let legacy_json = r#"{
+            "topology": "UDP Audio Sink (Experimental Preview - Offline)",
+            "latency_ms": 0.0,
+            "sample_rate": 48000,
+            "bit_depth": 24,
+            "is_active": false
+        }"#;
+        let parsed: AudioRoutingStatus = serde_json::from_str(legacy_json)
+            .expect("legacy AudioRoutingStatus JSON should deserialize");
+        assert_eq!(parsed.port, AUDIO_PORT);
+
+        let serialized =
+            serde_json::to_string(&parsed).expect("AudioRoutingStatus should serialize");
+        let roundtrip: AudioRoutingStatus =
+            serde_json::from_str(&serialized).expect("AudioRoutingStatus should roundtrip");
+        assert_eq!(roundtrip.port, AUDIO_PORT);
     }
 
     #[test]
