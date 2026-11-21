@@ -309,7 +309,22 @@ class GoopyLiquidGlassPillView: NSView {
 @objc public class TouchBarHudController: NSObject, NSTouchBarDelegate {
     public static let shared = TouchBarHudController()
 
-    private static let rpcPort: UInt16 = 58281
+    /// Fallback control RPC port used only if Rust has not yet pushed `config::CONTROL_PORT`.
+    private static let defaultControlPort: UInt16 = 58281
+    private var _rpcPort: UInt16 = TouchBarHudController.defaultControlPort
+    /// Active Integrator control RPC port configured dynamically from Rust `config::CONTROL_PORT`.
+    public var rpcPort: UInt16 {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _rpcPort
+        }
+        set {
+            stateLock.lock()
+            _rpcPort = newValue > 0 ? newValue : Self.defaultControlPort
+            stateLock.unlock()
+        }
+    }
     private let stateLock = NSLock()
 
     private var _isActive: Bool = false
@@ -721,7 +736,7 @@ class GoopyLiquidGlassPillView: NSView {
                 return
             }
 
-            guard let response = self.sendRpcRequest(host: host, port: Self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
+            guard let response = self.sendRpcRequest(host: host, port: self.rpcPort, requestJson: "\"GetGpuTelemetry\"") else {
                 self.updateOfflineUi(statusText: "Peer Offline", expectedGeneration: gen)
                 return
             }
@@ -942,6 +957,11 @@ class GoopyLiquidGlassPillView: NSView {
 }
 
 // MARK: - C FFI Interface for Main App Integration
+@_cdecl("set_touchbar_rpc_port_in_app")
+public func set_touchbar_rpc_port_in_app(port: UInt16) {
+    TouchBarHudController.shared.rpcPort = port
+}
+
 @_cdecl("init_touchbar_in_app")
 public func init_touchbar_in_app(peerIpPtr: UnsafePointer<CChar>?) {
     let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil

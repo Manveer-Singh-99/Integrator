@@ -83,16 +83,75 @@ fn app_config_lock() -> &'static Mutex<()> {
     APP_CONFIG_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Resolves an executable path in `%SystemRoot%\System32` on Windows, falling back to `C:\Windows\System32`.
+/// Resolves the Windows installation root directory dynamically via `GetWindowsDirectoryW`,
+/// falling back to `%SystemRoot%` / `%WINDIR%` environment variables.
 #[cfg(target_os = "windows")]
-pub(crate) fn system32_exe(name: &str) -> PathBuf {
-    if let Ok(root) = std::env::var("SystemRoot") {
-        let p = PathBuf::from(root).join("System32").join(name);
+pub(crate) fn windows_root_dir() -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    extern "system" {
+        fn GetWindowsDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
+    }
+
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len > 0 && (len as usize) < buf.len() {
+        let p = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
         if p.exists() {
             return p;
         }
     }
-    PathBuf::from(r"C:\Windows\System32").join(name)
+    for key in ["SystemRoot", "WINDIR"] {
+        if let Some(val) = std::env::var_os(key) {
+            let p = PathBuf::from(val);
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    PathBuf::from(format!(r"{}\Windows", drive.trim_end_matches('\\')))
+}
+
+/// Resolves the Windows system drive root (e.g., `C:`) dynamically from `%SystemDrive%`
+/// or the resolved Windows installation directory.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) fn windows_system_drive() -> String {
+    if let Ok(drive) = std::env::var("SystemDrive") {
+        let trimmed = drive.trim().trim_end_matches('\\');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let root = windows_root_dir();
+    if let Some(std::path::Component::Prefix(prefix)) = root.components().next() {
+        return prefix.as_os_str().to_string_lossy().to_string();
+    }
+    "C:".to_string()
+}
+
+/// Resolves an executable path in the Windows System32 directory dynamically via
+/// `GetSystemDirectoryW`, falling back to `windows_root_dir().join("System32")`.
+#[cfg(target_os = "windows")]
+pub(crate) fn system32_exe(name: &str) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    extern "system" {
+        fn GetSystemDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
+    }
+
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len > 0 && (len as usize) < buf.len() {
+        let p = PathBuf::from(OsString::from_wide(&buf[..len as usize])).join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+    windows_root_dir().join("System32").join(name)
 }
 
 /// Atomically writes a private file to disk with strict permissions, symlink rejection, and atomic replacement.
