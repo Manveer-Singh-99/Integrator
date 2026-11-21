@@ -167,12 +167,19 @@ fn resolve_secondary_sunshine_conf_name(prefs: &system_info::AppPathPreferences)
     config::SUNSHINE_SECONDARY_CONF_NAME.to_string()
 }
 
-/// Clamps PC-to-Mac stream dimensions against configured VDD maximums (or matches secondary slot max).
+/// Resolves PC-to-Mac stream dimensions from the peer's reported resolution `(w, h)` against
+/// configured VDD maximum bounds (`vdd_max_width` / `vdd_max_height`).
+///
+/// Preserves the peer's actual resolution (whether a 1080p desktop monitor, 1440p QHD display,
+/// 2560×1600 MacBook Retina display, or 4K Studio Display) on both primary and secondary Sunshine
+/// instances instead of forcing 2560×1600 on the secondary port. When `(w, h)` exceeds `(max_w, max_h)`,
+/// scales down proportionally to fit within `(max_w, max_h)` while preserving the peer's aspect ratio
+/// and even-pixel alignment required by H.264/HEVC hardware encoders.
 fn resolve_vdd_stream_dimensions(
     w: u32,
     h: u32,
-    active_port: u16,
-    secondary_port: u16,
+    _active_port: u16,
+    _secondary_port: u16,
     prefs: &system_info::AppPathPreferences,
 ) -> (u32, u32) {
     let max_w = prefs
@@ -185,10 +192,22 @@ fn resolve_vdd_stream_dimensions(
         .unwrap_or(config::VDD_DEFAULT_MAX_HEIGHT)
         .clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT)
         & !1;
-    if active_port == secondary_port || w > max_w || h > max_h {
-        (max_w, max_h)
+    if w == 0 || h == 0 {
+        return (max_w, max_h);
+    }
+    if w <= max_w && h <= max_h {
+        let even_w = w.clamp(config::MIN_DISPLAY_WIDTH, max_w) & !1;
+        let even_h = h.clamp(config::MIN_DISPLAY_HEIGHT, max_h) & !1;
+        (even_w, even_h)
     } else {
-        (w, h)
+        let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+        let scaled_w = ((w as f64 * scale).round() as u32)
+            .clamp(config::MIN_DISPLAY_WIDTH, max_w)
+            & !1;
+        let scaled_h = ((h as f64 * scale).round() as u32)
+            .clamp(config::MIN_DISPLAY_HEIGHT, max_h)
+            & !1;
+        (scaled_w, scaled_h)
     }
 }
 
@@ -1579,6 +1598,7 @@ mod tests {
     #[test]
     fn resolve_vdd_stream_dimensions_respects_prefs_and_secondary_slot() {
         let defaults = system_info::AppPathPreferences::default();
+        // 1080p desktop/laptop peer preserved on both primary and secondary Sunshine ports
         assert_eq!(
             resolve_vdd_stream_dimensions(
                 1920,
@@ -1591,14 +1611,59 @@ mod tests {
         );
         assert_eq!(
             resolve_vdd_stream_dimensions(
+                1920,
+                1080,
+                config::SUNSHINE_SECONDARY_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (1920, 1080)
+        );
+        // 1440p QHD desktop peer preserved on both primary and secondary ports
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                2560,
+                1440,
+                config::SUNSHINE_SECONDARY_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (2560, 1440)
+        );
+        // 2560x1600 16:10 laptop peer preserved on both primary and secondary ports
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                2560,
+                1600,
+                config::SUNSHINE_SECONDARY_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (2560, 1600)
+        );
+        // 4K 16:9 desktop monitor (3840x2160) with default 2560x1600 max bounds scales aspect-preservingly to 2560x1440
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
                 3840,
                 2160,
                 config::SUNSHINE_DEFAULT_PORT,
                 config::SUNSHINE_SECONDARY_PORT,
                 &defaults
             ),
-            (config::VDD_DEFAULT_MAX_WIDTH, config::VDD_DEFAULT_MAX_HEIGHT)
+            (2560, 1440)
         );
+        // 16:10 Retina display (3840x2400) with default 2560x1600 max bounds scales aspect-preservingly to 2560x1600
+        assert_eq!(
+            resolve_vdd_stream_dimensions(
+                3840,
+                2400,
+                config::SUNSHINE_SECONDARY_PORT,
+                config::SUNSHINE_SECONDARY_PORT,
+                &defaults
+            ),
+            (2560, 1600)
+        );
+        // Custom 4K VDD bounds allow native 3840x2160 on both primary and secondary ports
         let custom = system_info::AppPathPreferences {
             vdd_max_width: Some(3840),
             vdd_max_height: Some(2160),
@@ -1606,9 +1671,9 @@ mod tests {
         };
         assert_eq!(
             resolve_vdd_stream_dimensions(
-                3456,
-                2234,
-                config::SUNSHINE_DEFAULT_PORT,
+                3840,
+                2160,
+                config::SUNSHINE_SECONDARY_PORT,
                 config::SUNSHINE_SECONDARY_PORT,
                 &custom
             ),
@@ -1622,7 +1687,7 @@ mod tests {
                 config::SUNSHINE_SECONDARY_PORT,
                 &custom
             ),
-            (3840, 2160)
+            (1920, 1080)
         );
     }
 

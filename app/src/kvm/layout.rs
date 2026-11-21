@@ -410,4 +410,69 @@ mod tests {
         assert!((wx - 6.0).abs() < 1e-4);
         assert!((wy - 600.0).abs() < 1e-4);
     }
+
+    #[test]
+    fn test_multi_monitor_negative_origin_edge_crossing_and_clamping() {
+        // Multi-monitor desktop where a secondary 1920x1080 monitor sits to the left and slightly above
+        // the primary 2560x1440 display -> virtual screen origin at (-1920, -320), total 4480x1760.
+        let multi_desk_rect = ScreenRect {
+            x: -1920.0,
+            y: -320.0,
+            width: 4480.0,
+            height: 1760.0,
+        };
+        assert!((multi_desk_rect.max_x() - 2560.0).abs() < 1e-4);
+        assert!((multi_desk_rect.max_y() - 1440.0).abs() < 1e-4);
+
+        // Top-left and bottom-left corners at x = -1920 must trigger dead-corner guard
+        assert!(is_in_dead_corner(
+            multi_desk_rect,
+            ScreenEdge::Left,
+            -1920.0,
+            -310.0
+        ));
+        assert!(is_in_dead_corner(
+            multi_desk_rect,
+            ScreenEdge::Left,
+            -1920.0,
+            1430.0
+        ));
+        // Midpoint of left edge (y = -320 + 880 = 560) is not in a dead corner
+        assert!(!is_in_dead_corner(
+            multi_desk_rect,
+            ScreenEdge::Left,
+            -1920.0,
+            560.0
+        ));
+
+        // Normalized edge position at midpoint (x = 320, y = 560) should be 0.5
+        let norm_left = compute_normalized_edge_pos(
+            multi_desk_rect,
+            ScreenEdge::Left,
+            -1920.0,
+            560.0,
+            0.0,
+        );
+        assert!((norm_left - 0.5).abs() < 1e-5);
+
+        let norm_top = compute_normalized_edge_pos(
+            multi_desk_rect,
+            ScreenEdge::Top,
+            320.0,
+            -320.0,
+            0.0,
+        );
+        assert!((norm_top - 0.5).abs() < 1e-5);
+
+        // Entry points on a negative-origin multi-monitor destination must land inside [x..max_x, y..max_y]
+        let (enter_lx, enter_ly) =
+            resolve_entry_point(multi_desk_rect, ScreenEdge::Left, 0.5, 6.0);
+        assert!((enter_lx - (-1914.0)).abs() < 1e-4);
+        assert!((enter_ly - 560.0).abs() < 1e-4);
+
+        let (enter_rx, enter_ry) =
+            resolve_entry_point(multi_desk_rect, ScreenEdge::Right, 0.5, 6.0);
+        assert!((enter_rx - 2554.0).abs() < 1e-4);
+        assert!((enter_ry - 560.0).abs() < 1e-4);
+    }
 }

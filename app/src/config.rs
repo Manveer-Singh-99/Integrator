@@ -381,7 +381,7 @@ pub const DEFAULT_CAMERA_FPS: u32 = 30;
 
 /// Default friendly device name exposed to Windows Media Foundation for the shared camera.
 #[allow(dead_code)]
-pub const DEFAULT_CAMERA_FRIENDLY_NAME: &str = "Integrator MacBook Camera";
+pub const DEFAULT_CAMERA_FRIENDLY_NAME: &str = "Integrator Mac Camera";
 
 /// Default bidirectional audio sample rate in Hz (48 kHz).
 #[allow(dead_code)]

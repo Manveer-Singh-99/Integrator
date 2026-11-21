@@ -5,7 +5,7 @@
  *
  * 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
  * ----------------------------------------------------------------------------
- * This module owns the Windows 11 host-side lifecycle of the "Integrator MacBook
+ * This module owns the Windows 11 host-side lifecycle of the "Integrator Mac
  * Camera" virtual webcam. It is responsible for:
  * 1. Safe installation and HKLM COM registration of `integrator_vcam.dll`
  *    (`CLSID_IntegratorVCamActivate`: {8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}).
@@ -22,7 +22,7 @@
  * 2. END-TO-END CROSS-OS FRAME FLOW
  * ----------------------------------------------------------------------------
  * 1. Capture (Mac):
- *    MacBook FaceTime HD camera captured at 720p30 NV12 by AVFoundation (`camera_macos.swift`).
+ *    Mac camera (built-in FaceTime HD, external USB, or Continuity Camera) captured at 720p30 NV12 by AVFoundation (`camera_macos.swift`).
  * 2. Wire Streaming:
  *    Transported over encrypted `TransportSessionV2` (port 58287, ChaCha20-Poly1305)
  *    to the Windows receiver in `camera/mod.rs`.
@@ -149,7 +149,7 @@ struct SharedVCamMemory {
 constexpr wchar_t kClsidStr[] = L"{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}";
 
 /// Default user-facing friendly display name shown in Windows Device Manager and camera menus.
-constexpr wchar_t kFriendlyName[] = L"Integrator MacBook Camera";
+constexpr wchar_t kFriendlyName[] = L"Integrator Mac Camera";
 
 /// Resolves the active virtual camera friendly name, allowing an `INTEGRATOR_CAMERA_NAME`
 /// environment variable override while falling back safely to [`kFriendlyName`].

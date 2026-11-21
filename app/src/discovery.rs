@@ -275,9 +275,12 @@ pub struct DiscoveryBeacon {
     pub sender_name: String,
     /// Operating system platform name (`"macos"`, `"windows"`).
     pub os: String,
-    /// Hardware product model name (e.g. `"MacBookPro18,1"` or `"Dell XPS 15 9520"`).
+    /// Hardware product model name (e.g. `"MacBookPro18,1"`, `"Mac14,12"`, or `"Dell XPS 15 9520"`).
     #[serde(default)]
     pub hardware_model: String,
+    /// Detected chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    #[serde(default)]
+    pub form_factor: String,
     /// TCP service port for control handshakes and SPAKE2+ key exchange.
     pub control_port: u16,
     /// TCP service port for clipboard synchronization streams.
@@ -330,6 +333,8 @@ pub struct PeerCandidate {
     pub device_name: String,
     /// Remote hardware model identifier.
     pub hardware_model: String,
+    /// Remote hardware chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    pub form_factor: String,
     /// Width of remote display in physical pixels.
     pub display_width: u32,
     /// Height of remote display in physical pixels.
@@ -751,13 +756,25 @@ impl DiscoveryManager {
                             let now = Instant::now();
                             list.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
 
+                            let os_clean = sanitize_display_text(&beacon.os, 64);
+                            let hw_model_clean = sanitize_display_text(&beacon.hardware_model, 128);
+                            let raw_ff = sanitize_display_text(&beacon.form_factor, 32);
+                            let form_factor = system_info::infer_peer_form_factor(
+                                &os_clean,
+                                &hw_model_clean,
+                                (!raw_ff.is_empty()).then_some(raw_ff.as_str()),
+                            )
+                            .as_str()
+                            .to_string();
+
                             let candidate = PeerCandidate {
                                 addr: SocketAddr::new(addr.ip(), valid_control_port),
                                 last_seen: now,
-                                os: sanitize_display_text(&beacon.os, 64),
+                                os: os_clean,
                                 device_id: dev_id,
                                 device_name: sender_name_clean,
-                                hardware_model: sanitize_display_text(&beacon.hardware_model, 128),
+                                hardware_model: hw_model_clean,
+                                form_factor,
                                 display_width: beacon.display_width.clamp(0, MAX_DISPLAY_WIDTH),
                                 display_height: beacon.display_height.clamp(0, MAX_DISPLAY_HEIGHT),
                                 display_fps: beacon.display_fps.clamp(0, MAX_DISPLAY_FPS),
@@ -906,6 +923,7 @@ impl DiscoveryManager {
                         sender_name,
                         os,
                         hardware_model,
+                        form_factor: profile.form_factor.as_str().to_string(),
                         control_port: CONTROL_PORT,
                         clipboard_port: CLIPBOARD_PORT,
                         display_width: profile.primary_display.width,
@@ -1216,6 +1234,7 @@ mod tests {
             device_id: "peer1".into(),
             device_name: "PC".into(),
             hardware_model: "Laptop".into(),
+            form_factor: "laptop".into(),
             display_width: 1920,
             display_height: 1200,
             display_fps: 165,

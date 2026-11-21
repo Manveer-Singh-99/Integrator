@@ -192,6 +192,9 @@ pub struct DiscoveredPeerInfo {
     pub os: String,
     /// Hardware product model name.
     pub hardware_model: String,
+    /// Detected chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    #[serde(default)]
+    pub form_factor: String,
     /// Resolved IP address string.
     pub ip: String,
     /// Local network interface IP used to reach this peer.
@@ -247,8 +250,11 @@ pub struct BridgeStatus {
     pub os: String,
     /// Local operating system identifier.
     pub local_os: String,
-    /// Local hardware model name (e.g. `"MacBookPro18,1"` or `"PC"`).
+    /// Local hardware model name (e.g. `"MacBookPro18,1"`, `"Mac14,12"`, or motherboard model).
     pub hardware_model: String,
+    /// Local hardware chassis form factor (`"laptop"`, `"desktop"`, or `"unknown"`).
+    #[serde(default)]
+    pub form_factor: String,
     /// Local CPU processor brand string.
     pub cpu_brand: String,
     /// Local primary display geometry and color depth.
@@ -275,6 +281,9 @@ pub struct BridgeStatus {
     pub peer_name: Option<String>,
     /// Hardware product model of active peer.
     pub peer_hardware_model: Option<String>,
+    /// Hardware chassis form factor of active peer (`"laptop"`, `"desktop"`, or `"unknown"`).
+    #[serde(default)]
+    pub peer_form_factor: Option<String>,
     /// Display geometry of active peer.
     pub peer_display: Option<DisplayGeometry>,
     /// GPU adapters of active peer.
@@ -1432,6 +1441,7 @@ impl IntegratorCore {
                 hostname: p.device_name,
                 os: p.os,
                 hardware_model: p.hardware_model,
+                form_factor: p.form_factor,
                 ip: p.addr.ip().to_string(),
                 local_ip_used: p.local_ip_used,
                 transport_label: p.transport.label().to_string(),
@@ -1479,6 +1489,7 @@ impl IntegratorCore {
             os: local_prof.os.clone(),
             local_os: std::env::consts::OS.to_string(),
             hardware_model: local_prof.hardware_model,
+            form_factor: local_prof.form_factor.as_str().to_string(),
             cpu_brand: local_prof.cpu_brand,
             primary_display: local_prof.primary_display,
             local_gpus: local_prof.gpus,
@@ -1495,6 +1506,7 @@ impl IntegratorCore {
             peer_os: best.as_ref().map(|p| p.os.clone()),
             peer_name: best.as_ref().map(|p| p.device_name.clone()),
             peer_hardware_model: best.as_ref().map(|p| p.hardware_model.clone()),
+            peer_form_factor: best.as_ref().map(|p| p.form_factor.clone()),
             peer_display: best.as_ref().map(|p| DisplayGeometry {
                 width: p.display_width,
                 height: p.display_height,

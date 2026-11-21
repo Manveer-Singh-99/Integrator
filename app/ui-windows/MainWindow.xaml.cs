@@ -445,7 +445,10 @@ namespace IntegratorUI
                 // Top Bar
                 TopHostnameText.Text = string.IsNullOrWhiteSpace(s.Hostname) ? "Workstation" : s.Hostname;
                 string safeDevId = s.DeviceId ?? string.Empty;
-                string safeHw = string.IsNullOrWhiteSpace(s.HardwareModel) ? "Windows PC" : s.HardwareModel;
+                string fallbackHw = string.Equals(s.FormFactor, "laptop", StringComparison.OrdinalIgnoreCase)
+                    ? "Windows Laptop"
+                    : "Windows PC";
+                string safeHw = string.IsNullOrWhiteSpace(s.HardwareModel) ? fallbackHw : s.HardwareModel;
                 TopSubtitleText.Text = string.Format(
                     CultureInfo.InvariantCulture,
                     "{0} • {1}x{2} • {3}",
@@ -723,10 +726,12 @@ namespace IntegratorUI
             string combined = (g.Vendor + " " + g.Name).ToLowerInvariant();
             if (combined.Contains("nvidia") || combined.Contains("geforce") || combined.Contains("quadro") || combined.Contains("rtx"))
                 return "nvidia";
-            if (combined.Contains("amd") || combined.Contains("radeon"))
+            if (combined.Contains("amd") || combined.Contains("radeon") || combined.Contains("firepro"))
                 return "amd";
             if (combined.Contains("intel") || combined.Contains("uhd") || combined.Contains("iris") || combined.Contains("arc"))
                 return "intel";
+            if (combined.Contains("qualcomm") || combined.Contains("adreno") || combined.Contains("snapdragon"))
+                return "qualcomm";
             return g.IsDiscrete ? "discrete" : "integrated";
         }
 
