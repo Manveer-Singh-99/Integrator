@@ -77,6 +77,24 @@ pub const DEAD_CORNER_PX: f32 = 36.0;
 /// Maximum allowable forward clock skew in milliseconds (5 minutes).
 const MAX_CLOCK_SKEW_MS: u64 = 300_000;
 
+/// Maximum configurable edge hop dwell delay in milliseconds (250 ms).
+const MAX_HOP_DELAY_MS: u32 = 250;
+
+/// Maximum fraction of a display edge dimension covered by a corner exclusion guard (15%).
+const MAX_DEAD_CORNER_RATIO: f32 = 0.15;
+
+/// Minimum clamped normalized edge coordinate along a display boundary (`0.02`).
+const EDGE_NORM_MIN: f32 = 0.02;
+
+/// Maximum clamped normalized edge coordinate along a display boundary (`0.98`).
+const EDGE_NORM_MAX: f32 = 0.98;
+
+/// Minimum inward cursor entry inset in device pixels (`2.0` px) on a destination display.
+const MIN_ENTRY_INSET_PX: f32 = 2.0;
+
+/// Fallback inward cursor entry inset in device pixels (`6.0` px) when the supplied inset is non-finite.
+const DEFAULT_ENTRY_INSET_PX: f32 = 6.0;
+
 /// Global synchronization lock ensuring atomic file serialization for layout configurations.
 static LAYOUT_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -112,7 +130,7 @@ impl ScreenRect {
 /// Located inside the application data directory (`~/Library/Application Support/Integrator` on macOS,
 /// `%LOCALAPPDATA%\Integrator` on Windows).
 pub fn layout_config_path() -> PathBuf {
-    crate::system_info::app_data_dir().join("kvm_layout.json")
+    crate::system_info::app_data_dir().join(crate::config::KVM_LAYOUT_FILE)
 }
 
 /// Loads and validates the persisted KVM layout configuration from disk.
@@ -173,7 +191,7 @@ pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
     cfg.alignment_offset = cfg.alignment_offset.clamp(-0.5, 0.5);
 
     // 2. Sanitize edge hop delay threshold
-    cfg.hop_delay_ms = cfg.hop_delay_ms.min(250);
+    cfg.hop_delay_ms = cfg.hop_delay_ms.min(MAX_HOP_DELAY_MS);
 
     // 3. Normalize drop destination folder
     cfg.drop_folder = match cfg.drop_folder.trim().to_ascii_lowercase().as_str() {
@@ -208,7 +226,7 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
     KvmLayoutConfig {
         peer_edge: local.peer_edge.opposite(),
         alignment_offset: (-local.alignment_offset).clamp(-0.5, 0.5),
-        hop_delay_ms: local.hop_delay_ms.min(250),
+        hop_delay_ms: local.hop_delay_ms.min(MAX_HOP_DELAY_MS),
         dead_corners: local.dead_corners,
         modifier_translation: local.modifier_translation,
         precision_touchpad: local.precision_touchpad,
@@ -234,8 +252,8 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
 /// # Returns
 /// `true` if within a dead corner, suppressing KVM hopping.
 pub fn is_in_dead_corner(rect: ScreenRect, edge: ScreenEdge, x: f32, y: f32) -> bool {
-    let guard_y = DEAD_CORNER_PX.min(rect.height * 0.15);
-    let guard_x = DEAD_CORNER_PX.min(rect.width * 0.15);
+    let guard_y = DEAD_CORNER_PX.min(rect.height * MAX_DEAD_CORNER_RATIO);
+    let guard_x = DEAD_CORNER_PX.min(rect.width * MAX_DEAD_CORNER_RATIO);
     match edge {
         ScreenEdge::Left | ScreenEdge::Right => {
             y < rect.y + guard_y || y > rect.max_y() - guard_y
@@ -292,7 +310,7 @@ pub fn compute_normalized_edge_pos(
     if !raw.is_finite() {
         return 0.5;
     }
-    (raw - offset).clamp(0.02, 0.98)
+    (raw - offset).clamp(EDGE_NORM_MIN, EDGE_NORM_MAX)
 }
 
 /// Resolves an entry point `(px, py)` just inside `entry_edge` on the destination display.
@@ -316,14 +334,14 @@ pub fn resolve_entry_point(
     inset_px: f32,
 ) -> (f32, f32) {
     let n = if norm_pos.is_finite() {
-        norm_pos.clamp(0.02, 0.98)
+        norm_pos.clamp(EDGE_NORM_MIN, EDGE_NORM_MAX)
     } else {
         0.5
     };
     let inset = if inset_px.is_finite() {
-        inset_px.max(2.0)
+        inset_px.max(MIN_ENTRY_INSET_PX)
     } else {
-        6.0
+        DEFAULT_ENTRY_INSET_PX
     };
     match entry_edge {
         ScreenEdge::Left => (

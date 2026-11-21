@@ -119,6 +119,9 @@ pub const RFC9382_ED25519_N_BYTES: [u8; 32] = [
     0xa1, 0xed, 0x32, 0x81, 0xdc, 0x69, 0xb3, 0x5d, 0xd8, 0x68, 0xba, 0x85, 0xf8, 0x86, 0xc4, 0xab,
 ];
 
+/// Maximum permitted byte length for SPAKE2 identity strings (`id_a`, `id_b`) and associated data (`aad`).
+pub const MAX_SPAKE2_TRANSCRIPT_INPUT_BYTES: usize = 4096;
+
 /// Failure scenarios encountered during RFC 9382 SPAKE2 computation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spake2Error {
@@ -456,7 +459,9 @@ impl Spake2State {
         if bool::from(xy_scalar.ct_eq(&Scalar::ZERO)) {
             return Err(Spake2Error::ZeroEphemeralScalar);
         }
-        if id_a.len() > 4096 || id_b.len() > 4096 {
+        if id_a.len() > MAX_SPAKE2_TRANSCRIPT_INPUT_BYTES
+            || id_b.len() > MAX_SPAKE2_TRANSCRIPT_INPUT_BYTES
+        {
             return Err(Spake2Error::OversizedTranscriptInput);
         }
         let w_scalar = derive_password_scalar(password, salt_pw)?;
@@ -502,7 +507,7 @@ impl Spake2State {
         peer_share_bytes: &[u8; 32],
         aad: &[u8],
     ) -> Result<Spake2TranscriptOutput, Spake2Error> {
-        if aad.len() > 4096 {
+        if aad.len() > MAX_SPAKE2_TRANSCRIPT_INPUT_BYTES {
             return Err(Spake2Error::OversizedTranscriptInput);
         }
         let peer_point = decode_valid_peer_share(peer_share_bytes)?;

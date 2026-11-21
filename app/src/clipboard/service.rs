@@ -110,7 +110,9 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::CLIPBOARD_PORT;
+use crate::config::{CLIPBOARD_PORT, DRAG_STAGING_DIR_NAME};
+#[cfg(target_os = "macos")]
+use crate::config::MACOS_OSASCRIPT_BIN;
 use crate::discovery::DiscoveryManager;
 use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
@@ -129,6 +131,27 @@ const CLIP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB high-throughput AEAD chunk
 const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum age before orphaned staging directories are swept on startup or announcement (1 hour).
+const STALE_STAGING_DIR_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Backoff delay after a clipboard TCP listener `accept()` error before retrying (500 ms).
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Polling interval for lightweight OS clipboard sequence monitoring (120 ms).
+const CLIPBOARD_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// Outbound TCP + `TransportV2` connection timeout for clipboard transfers (5 seconds).
+const CLIPBOARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of concurrent pending cross-screen drag sessions retained in memory (16 sessions).
+const MAX_CONCURRENT_DRAG_SESSIONS: usize = 16;
+
+/// Minimum interval between Touch Bar paste progress HUD updates (100 ms).
+const TOUCHBAR_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Maximum number of SHA-256-verified clipboard cache entries retained in the LRU queue (8 entries).
+const MAX_VERIFIED_CACHE_ENTRIES: usize = 8;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -363,10 +386,13 @@ fn sweep_staging_dir_entries(parent: &Path, prefixes: &[&str], max_age: Duration
 }
 
 fn cleanup_orphaned_staging_dirs(cache_dir: &Path) {
-    let stale_age = Duration::from_secs(3600);
-    sweep_staging_dir_entries(cache_dir, &[".staging_", ".integrator_staging_"], stale_age);
-    let drag_root = crate::system_info::app_data_dir().join("drag_staging");
-    sweep_staging_dir_entries(&drag_root, &["drag_"], stale_age);
+    sweep_staging_dir_entries(
+        cache_dir,
+        &[".staging_", ".integrator_staging_"],
+        STALE_STAGING_DIR_MAX_AGE,
+    );
+    let drag_root = crate::system_info::app_data_dir().join(DRAG_STAGING_DIR_NAME);
+    sweep_staging_dir_entries(&drag_root, &["drag_"], STALE_STAGING_DIR_MAX_AGE);
 }
 
 /// Checks whether a path component is a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
@@ -721,7 +747,7 @@ impl ClipboardService {
                     }
                     Err(e) => {
                         error!("Clipboard TCP listener accept error: {}", e);
-                        sleep(Duration::from_millis(500)).await;
+                        sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                     }
                 }
             }
@@ -1181,7 +1207,7 @@ impl ClipboardService {
         }
 
         loop {
-            sleep(Duration::from_millis(120)).await;
+            sleep(CLIPBOARD_MONITOR_POLL_INTERVAL).await;
 
             let current_seq = tokio::task::spawn_blocking(os_seq::get_clipboard_sequence)
                 .await
@@ -1417,7 +1443,7 @@ impl ClipboardService {
             peer_ip,
             CLIPBOARD_PORT,
             ServiceId::ClipboardTransfer,
-            Duration::from_secs(5),
+            CLIPBOARD_CONNECT_TIMEOUT,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to establish Clipboard TransportV2 to {}: {}", addr, e))?;
@@ -1458,7 +1484,7 @@ impl ClipboardService {
             peer_ip,
             CLIPBOARD_PORT,
             ServiceId::ClipboardTransfer,
-            Duration::from_secs(5),
+            CLIPBOARD_CONNECT_TIMEOUT,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect ImageStream TransportV2 to {}: {}", addr, e))?;
@@ -1629,7 +1655,7 @@ impl ClipboardService {
                 end try
             end tell
             "#;
-            if let Ok(output) = std::process::Command::new("/usr/bin/osascript")
+            if let Ok(output) = std::process::Command::new(MACOS_OSASCRIPT_BIN)
                 .arg("-e")
                 .arg(script)
                 .output()
@@ -1663,7 +1689,7 @@ impl ClipboardService {
     if (count of argv) < 1 then return
     tell application "Finder" to reveal POSIX file (item 1 of argv)
 end run"#;
-            if let Ok(mut child) = std::process::Command::new("/usr/bin/osascript")
+            if let Ok(mut child) = std::process::Command::new(MACOS_OSASCRIPT_BIN)
                 .arg("-e")
                 .arg(script)
                 .arg("--")
@@ -1687,10 +1713,7 @@ end run"#;
             {
                 return;
             }
-            let sys_root = std::env::var_os("SystemRoot")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-            let explorer = sys_root.join("explorer.exe");
+            let explorer = crate::system_info::windows_root_dir().join("explorer.exe");
             let mut cmd = std::process::Command::new(explorer);
             cmd.raw_arg(format!("/select,\"{}\"", path_str));
             if let Ok(mut child) = cmd.spawn() {
@@ -1766,7 +1789,7 @@ end run"#;
             peer_ip,
             CLIPBOARD_PORT,
             ServiceId::ClipboardTransfer,
-            Duration::from_secs(5),
+            CLIPBOARD_CONNECT_TIMEOUT,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect TransportV2 to {}: {}", addr, e))?;
@@ -1892,7 +1915,7 @@ end run"#;
     pub async fn register_drag_session(&self, copy: LocalPendingCopy) {
         let mut map = self.pending_drag_sessions.write().await;
         let mut order = self.pending_drag_order.write().await;
-        if map.len() >= 16 {
+        if map.len() >= MAX_CONCURRENT_DRAG_SESSIONS {
             while let Some(oldest) = order.pop_front() {
                 if map.remove(&oldest).is_some() {
                     break;
@@ -1932,7 +1955,7 @@ end run"#;
         }
 
         let base_dir = crate::system_info::app_data_dir();
-        let staging_root = base_dir.join("drag_staging");
+        let staging_root = base_dir.join(DRAG_STAGING_DIR_NAME);
         ensure_dir_no_symlinks(&base_dir, &staging_root)?;
         let session_dir = staging_root.join(format!("drag_{}", session_id));
         if let Ok(meta) = std::fs::symlink_metadata(&session_dir) {
@@ -2151,7 +2174,7 @@ end run"#;
                     remaining -= chunk.len() as u64;
                     transferred_bytes += chunk.len() as u64;
 
-                    if last_progress_report.elapsed() >= Duration::from_millis(100) {
+                    if last_progress_report.elapsed() >= TOUCHBAR_PROGRESS_INTERVAL {
                         last_progress_report = std::time::Instant::now();
                         let elapsed = start_time.elapsed().as_secs_f64();
                         #[allow(unused_variables)]
@@ -2274,7 +2297,7 @@ end run"#;
         {
             cache.remove(pos);
         }
-        while cache.len() >= 8 {
+        while cache.len() >= MAX_VERIFIED_CACHE_ENTRIES {
             if let Some(evicted) = cache.pop_front() {
                 if evicted.session_dir != entry.session_dir {
                     let dir = evicted.session_dir;

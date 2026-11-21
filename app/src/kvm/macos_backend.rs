@@ -75,10 +75,17 @@ use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::kvm::layout::ScreenRect;
 use crate::kvm::protocol::{LogicalKey, ModifierMask, RemoteMouseButton};
 use crate::kvm::service::{HookDecision, KvmService};
+
+/// Polling interval between background `CGEventTap` retries while awaiting Accessibility permission (2 seconds).
+const ACCESSIBILITY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum absolute scroll wheel delta clamped per axis to prevent Quartz driver overflow (`5000.0`).
+const MAX_SCROLL_DELTA: f32 = 5000.0;
 
 /// Global handle to the active `KvmService` instance for event routing.
 static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
@@ -175,7 +182,7 @@ pub fn start(service: Arc<KvmService>) {
             .name("kvm-macos-tap-retry".into())
             .spawn(|| {
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    std::thread::sleep(ACCESSIBILITY_RETRY_INTERVAL);
                     let active_now = unsafe { integrator_kvm_macos_is_tap_active() };
                     if active_now {
                         TAP_ACTIVE.store(true, Ordering::Release);
@@ -238,16 +245,16 @@ pub fn request_accessibility() -> bool {
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
-    let mut w = 1440.0;
-    let mut h = 900.0;
+    let mut w = crate::config::DEFAULT_MACOS_DISPLAY_WIDTH;
+    let mut h = crate::config::DEFAULT_MACOS_DISPLAY_HEIGHT;
     unsafe {
         integrator_kvm_macos_screen_rect(&mut x, &mut y, &mut w, &mut h);
     }
     ScreenRect {
         x: x as f32,
         y: y as f32,
-        width: (w as f32).max(320.0),
-        height: (h as f32).max(200.0),
+        width: (w as f32).max(crate::config::MIN_KVM_DISPLAY_WIDTH),
+        height: (h as f32).max(crate::config::MIN_KVM_DISPLAY_HEIGHT),
     }
 }
 
@@ -363,8 +370,8 @@ pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: 
 ///
 /// Values are clamped within `[-5000.0, 5000.0]` to prevent driver-level overflow.
 pub fn inject_scroll(dx: f32, dy: f32) {
-    let safe_dx = if dx.is_finite() { dx.clamp(-5000.0, 5000.0) } else { 0.0 };
-    let safe_dy = if dy.is_finite() { dy.clamp(-5000.0, 5000.0) } else { 0.0 };
+    let safe_dx = if dx.is_finite() { dx.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) } else { 0.0 };
+    let safe_dy = if dy.is_finite() { dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) } else { 0.0 };
     unsafe {
         integrator_kvm_macos_inject_scroll(safe_dx as f64, safe_dy as f64);
     }
