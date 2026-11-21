@@ -117,7 +117,7 @@
 //!   - `crate::security::keystore::KeystoreV2`: Sources pinned master root keys.
 //! ============================================================================
 
-use crate::security::{constant_time_eq, csprng_array, unix_epoch_secs};
+use crate::security::{constant_time_eq, csprng_array};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
@@ -266,20 +266,6 @@ pub struct AudioDatagramHeader {
 }
 
 impl AudioDatagramHeader {
-    /// Serializes this header into a 32-byte canonical network byte order (big-endian) wire buffer.
-    pub fn to_bytes(&self) -> [u8; AUDIO_UDP_HEADER_LEN] {
-        let mut out = [0u8; AUDIO_UDP_HEADER_LEN];
-        out[0..4].copy_from_slice(&AUDIO_UDP_WIRE_MAGIC);
-        out[4..6].copy_from_slice(&self.version.to_be_bytes());
-        out[6..8].copy_from_slice(&self.flags.to_be_bytes());
-        out[8..16].copy_from_slice(&self.session_id);
-        out[16..24].copy_from_slice(&self.pkt_seq.to_be_bytes());
-        out[24..28].copy_from_slice(&self.timestamp_us.to_be_bytes());
-        out[28..30].copy_from_slice(&self.frame_samples.to_be_bytes());
-        out[30..32].copy_from_slice(&self.payload_len.to_be_bytes());
-        out
-    }
-
     /// Parses and validates a 32-byte wire slice into an `AudioDatagramHeader`.
     ///
     /// Validates magic bytes, protocol version, flags, non-zero sequence bounds, and payload bounds.
@@ -354,11 +340,6 @@ impl ReplayWindow64 {
             highest_seq: 0,
             bitmap: 0,
         }
-    }
-
-    /// Returns the highest authenticated packet sequence number committed to this window.
-    pub fn highest_seq(&self) -> u64 {
-        self.highest_seq
     }
 
     /// Pre-AEAD verification: checks whether `pkt_seq` is valid, within the sliding window,
@@ -485,25 +466,11 @@ impl AudioSessionSender {
         }
     }
 
-    /// Returns the 8-byte session identifier.
-    pub fn session_id(&self) -> [u8; 8] {
-        self.session_id
-    }
-
-    /// Returns the expiration timestamp in epoch seconds.
-    pub fn expires_at_secs(&self) -> u64 {
-        self.expires_at_secs
-    }
-
-    /// Returns the sequence number that will be assigned to the next transmitted datagram.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
-    }
-
     /// Seals a PCM audio payload or keepalive frame into a complete `IUA2` wire datagram.
     ///
     /// Constructs the 32-byte header, serializes it as AAD, derives the 96-bit nonce,
     /// executes ChaCha20-Poly1305 encryption, and returns the assembled datagram.
+    #[allow(dead_code)]
     pub fn seal_datagram(
         &mut self,
         flags: u16,
@@ -533,16 +500,15 @@ impl AudioSessionSender {
         let pkt_seq = self.next_seq;
         self.next_seq += 1;
 
-        let header = AudioDatagramHeader {
-            version: AUDIO_UDP_PROTOCOL_VERSION,
-            flags,
-            session_id: self.session_id,
-            pkt_seq,
-            timestamp_us,
-            frame_samples,
-            payload_len: plaintext.len() as u16,
-        };
-        let header_bytes = header.to_bytes();
+        let mut header_bytes = [0u8; AUDIO_UDP_HEADER_LEN];
+        header_bytes[0..4].copy_from_slice(&AUDIO_UDP_WIRE_MAGIC);
+        header_bytes[4..6].copy_from_slice(&AUDIO_UDP_PROTOCOL_VERSION.to_be_bytes());
+        header_bytes[6..8].copy_from_slice(&flags.to_be_bytes());
+        header_bytes[8..16].copy_from_slice(&self.session_id);
+        header_bytes[16..24].copy_from_slice(&pkt_seq.to_be_bytes());
+        header_bytes[24..28].copy_from_slice(&timestamp_us.to_be_bytes());
+        header_bytes[28..30].copy_from_slice(&frame_samples.to_be_bytes());
+        header_bytes[30..32].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
         let nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, pkt_seq);
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.k_audio));
@@ -573,14 +539,10 @@ pub struct AudioSessionReceiver {
     k_audio: Zeroizing<[u8; 32]>,
     /// 4-byte static IV salt prefix for nonce derivation.
     nonce_salt: [u8; 4],
-    /// Configured PCM audio sample rate in Hz (e.g. 48000).
-    sample_rate: u32,
     /// Configured audio channel count (1..=8).
     channels: u8,
     /// Configured audio bit depth per sample (16, 24, or 32).
     bit_depth: u8,
-    /// Epoch timestamp in seconds when this session was initialized.
-    created_at_secs: u64,
     /// Epoch timestamp in seconds when this session hard-expires.
     expires_at_secs: u64,
     /// Epoch timestamp in seconds when the last authentic datagram was decrypted.
@@ -596,7 +558,6 @@ impl AudioSessionReceiver {
         peer_device_id: [u8; 16],
         k_audio: Zeroizing<[u8; 32]>,
         nonce_salt: [u8; 4],
-        sample_rate: u32,
         channels: u8,
         bit_depth: u8,
         now_secs: u64,
@@ -606,49 +567,12 @@ impl AudioSessionReceiver {
             peer_device_id,
             k_audio,
             nonce_salt,
-            sample_rate,
             channels,
             bit_depth,
-            created_at_secs: now_secs,
             expires_at_secs: now_secs.saturating_add(AUDIO_SESSION_TTL_SECS),
             last_activity_secs: now_secs,
             replay_window: ReplayWindow64::new(),
         }
-    }
-
-    /// Returns the 8-byte session identifier.
-    pub fn session_id(&self) -> [u8; 8] {
-        self.session_id
-    }
-
-    /// Returns the 16-byte device UUID of the authenticated remote peer.
-    pub fn peer_device_id(&self) -> [u8; 16] {
-        self.peer_device_id
-    }
-
-    /// Returns the configured PCM sample rate in Hz.
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    /// Returns the configured channel count.
-    pub fn channels(&self) -> u8 {
-        self.channels
-    }
-
-    /// Returns the configured bit depth per sample.
-    pub fn bit_depth(&self) -> u8 {
-        self.bit_depth
-    }
-
-    /// Returns the epoch timestamp in seconds when this receiver session was created.
-    pub fn created_at_secs(&self) -> u64 {
-        self.created_at_secs
-    }
-
-    /// Returns the epoch timestamp in seconds when this receiver session expires.
-    pub fn expires_at_secs(&self) -> u64 {
-        self.expires_at_secs
     }
 
     /// Checks whether this session has expired due to hard TTL (`AUDIO_SESSION_TTL_SECS`) or idle inactivity (`AUDIO_SESSION_IDLE_TIMEOUT_SECS`).
@@ -845,7 +769,6 @@ impl AudioSessionRegistry {
             peer_device_id,
             k_audio,
             nonce_salt,
-            sample_rate,
             channels,
             bit_depth,
             now_secs,
@@ -883,16 +806,12 @@ impl AudioSessionRegistry {
     }
 
     /// Returns the number of currently active, non-expired sessions at `now_secs`.
+    #[cfg(test)]
     pub fn active_session_count_at(&self, now_secs: u64) -> usize {
         self.sessions
             .values()
             .filter(|s| !s.is_expired(now_secs))
             .count()
-    }
-
-    /// Returns the number of currently active sessions at the current system time.
-    pub fn active_session_count(&self) -> usize {
-        self.active_session_count_at(unix_epoch_secs())
     }
 }
 
