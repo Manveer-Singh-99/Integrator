@@ -45,6 +45,9 @@ namespace IntegratorUI
     /// </summary>
     public static class Program
     {
+        /// <summary>Win32 MessageBox style flag rendering a stop-sign error icon.</summary>
+        private const uint MB_ICONERROR = 0x00000010u;
+
         /// <summary>
         /// Main application entry point running in a Single-Threaded Apartment (STA).
         /// </summary>
@@ -102,7 +105,7 @@ namespace IntegratorUI
                     System.IntPtr.Zero,
                     "Integrator failed to initialize the core backend (integrator_core.dll).\n\nPlease verify that integrator_core.dll is present alongside IntegratorUI.exe and check the application logs.",
                     "Integrator — Startup Error",
-                    0x00000010u); // MB_ICONERROR
+                    MB_ICONERROR);
                 try { singleInstanceMutex.ReleaseMutex(); } catch { }
                 return 1;
             }

@@ -753,7 +753,7 @@
                                             Background="#2220B85A" BorderBrush="#4420B85A" BorderThickness="1" VerticalAlignment="Center">
                                         <StackPanel Orientation="Horizontal" Spacing="5">
                                             <Ellipse x:Name="AudioPillDot" Width="7" Height="7" Fill="#20B85A" />
-                                            <TextBlock Text="UDP :58284" FontSize="11" FontWeight="SemiBold" />
+                                            <TextBlock x:Name="AudioPillText" Text="UDP" FontSize="11" FontWeight="SemiBold" />
                                         </StackPanel>
                                     </Border>
                                     <ToggleSwitch x:Name="SwitchAudio" Grid.Column="3" Style="{StaticResource CompactSwitchStyle}"
@@ -799,7 +799,7 @@
                                 </Grid>
 
                                 <TextBlock x:Name="CameraSummaryText"
-                                           Text="Exposes 'Integrator MacBook Camera' (720p30) via encrypted TCP :58287 when enabled on Mac and PC."
+                                           Text="Exposes the shared virtual camera via encrypted TCP when enabled on Mac and PC."
                                            Style="{StaticResource SubCaptionStyle}" />
 
                                 <StackPanel Orientation="Horizontal">

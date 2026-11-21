@@ -49,7 +49,8 @@
  * ----------------------------------------------------------------------------
  * - Synchronization: Synchronized lock object `vd_lock_obj()` guards global state
  *   (`g_virtual_display`, `g_virtual_display_id`, `g_vd_queue`).
- * - Dedicated Dispatch Queue: A serial GCD queue `com.manveersingh.integrator.vd`
+ * - Dedicated Dispatch Queue: A serial GCD queue labeled dynamically from
+ *   `[[NSBundle mainBundle] bundleIdentifier]` + `.vd` (fallback `com.integrator.vd`)
  *   handles asynchronous termination callbacks from CoreGraphics.
  * - Spontaneous Teardown Handling: The `terminationHandler` block automatically
  *   resets global state if the display is terminated by the OS (e.g. system sleep/wake).
@@ -84,6 +85,21 @@ static const uint32_t INTEGRATOR_VD_PRODUCT = 0x0165;
 
 /// Custom serial number (0x00010001) for Integrator Virtual Display.
 static const uint32_t INTEGRATOR_VD_SERIAL  = 0x00010001;
+
+/// Fallback horizontal display resolution in pixels when caller passes 0.
+static const uint32_t kDefaultVirtualDisplayWidth  = 1920;
+
+/// Fallback vertical display resolution in pixels when caller passes 0.
+static const uint32_t kDefaultVirtualDisplayHeight = 1080;
+
+/// Fallback display refresh rate in Hertz when caller passes 0 or OS reports 0 Hz.
+static const uint32_t kDefaultVirtualDisplayFps    = 60;
+
+/// User-facing monitor display name registered with CoreGraphics Window Server.
+static NSString * const kDefaultVirtualDisplayName = @"Integrator Extended Display";
+
+/// Fallback GCD queue label when host application has no bundle identifier.
+static NSString * const kFallbackVdQueueLabel = @"com.integrator.vd";
 
 /// Objective-C protocol interface describing the private `CGVirtualDisplayMode` class.
 @interface IntegratorVDModeProto : NSObject
@@ -157,13 +173,17 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                 return 0;
             }
 
-            if (width == 0) width = 1920;
-            if (height == 0) height = 1080;
-            if (fps == 0) fps = 60;
+            if (width == 0) width = kDefaultVirtualDisplayWidth;
+            if (height == 0) height = kDefaultVirtualDisplayHeight;
+            if (fps == 0) fps = kDefaultVirtualDisplayFps;
 
             @synchronized(vd_lock_obj()) {
                 if (!g_vd_queue) {
-                    g_vd_queue = dispatch_queue_create("com.manveersingh.integrator.vd", DISPATCH_QUEUE_SERIAL);
+                    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+                    NSString *queueLabel = (bundleId.length > 0)
+                        ? [bundleId stringByAppendingString:@".vd"]
+                        : kFallbackVdQueueLabel;
+                    g_vd_queue = dispatch_queue_create([queueLabel UTF8String], DISPATCH_QUEUE_SERIAL);
                 }
 
                 // Tear down any previous virtual display cleanly before creating a new one with the same serial.
@@ -184,7 +204,7 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                     return 0;
                 }
 
-                [(IntegratorVDDescriptorProto *)desc setName:@"Integrator Extended Display"];
+                [(IntegratorVDDescriptorProto *)desc setName:kDefaultVirtualDisplayName];
                 [(IntegratorVDDescriptorProto *)desc setMaxPixelsWide:width];
                 [(IntegratorVDDescriptorProto *)desc setMaxPixelsHigh:height];
 
@@ -352,7 +372,7 @@ void get_primary_display_info_mac(uint32_t *out_w, uint32_t *out_h, uint32_t *ou
     CGDirectDisplayID main_id = CGMainDisplayID();
     uint32_t w = (uint32_t)CGDisplayPixelsWide(main_id);
     uint32_t h = (uint32_t)CGDisplayPixelsHigh(main_id);
-    uint32_t fps = 60;
+    uint32_t fps = kDefaultVirtualDisplayFps;
 
     CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_id);
     if (mode != NULL) {

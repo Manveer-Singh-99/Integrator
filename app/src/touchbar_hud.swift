@@ -60,6 +60,12 @@ import AppKit
 import Foundation
 import IOKit
 
+/// macOS Control Strip daemon bundle identifier probed to verify Touch Bar runtime presence.
+private let controlStripBundleId = "com.apple.controlstrip"
+
+/// macOS Finder bundle identifier scoped for intercepting remote file Cmd+V shortcuts.
+private let finderBundleId = "com.apple.finder"
+
 // MARK: - RPC Data Models
 struct GpuTelemetryData: Codable {
     let gpu_name: String
@@ -392,7 +398,7 @@ class GoopyLiquidGlassPillView: NSView {
             (NSTouchBar.responds(to: presentSelLegacy) && class_getClassMethod(NSTouchBar.self, presentSelLegacy) != nil)
         guard hasModalApi else { return false }
 
-        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.controlstrip").isEmpty {
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: controlStripBundleId).isEmpty {
             return true
         }
 
@@ -1217,7 +1223,7 @@ public class PasteboardShortcutInterceptor: NSObject {
             let pasting = _isPasting
             lock.unlock()
 
-            if pending && !pasting && frontApp == "com.apple.finder" {
+            if pending && !pasting && frontApp == finderBundleId {
                 NSLog("🎯 [PasteboardShortcutInterceptor] Intercepting Cmd+V in Finder! Streaming remote files...")
                 triggerPaste()
                 return nil // Intercept & swallow event so Finder does not paste stale text clippings or beep!

@@ -543,6 +543,9 @@ namespace IntegratorUI
     /// </summary>
     internal sealed class AudioRoutingStatusModel
     {
+        /// <summary>Default UDP transport port for spatial audio streaming when omitted by core.</summary>
+        public const ushort DefaultAudioPort = 58284;
+
         /// <summary>Active audio routing topology description.</summary>
         [JsonPropertyName("topology")] public string Topology { get; set; } = string.Empty;
         /// <summary>Measured latency in milliseconds.</summary>
@@ -553,6 +556,8 @@ namespace IntegratorUI
         [JsonPropertyName("bit_depth")] public byte BitDepth { get; set; }
         /// <summary>True if audio streaming session is active.</summary>
         [JsonPropertyName("is_active")] public bool IsActive { get; set; }
+        /// <summary>Active UDP transport port bound for spatial audio streaming.</summary>
+        [JsonPropertyName("port")] public ushort Port { get; set; } = DefaultAudioPort;
     }
 
     /// <summary>
@@ -560,6 +565,17 @@ namespace IntegratorUI
     /// </summary>
     internal sealed class CameraStatusModel
     {
+        /// <summary>Default virtual camera video frame width in pixels.</summary>
+        public const uint DefaultCameraWidth = 1280;
+        /// <summary>Default virtual camera video frame height in pixels.</summary>
+        public const uint DefaultCameraHeight = 720;
+        /// <summary>Default virtual camera frame rate in FPS.</summary>
+        public const uint DefaultCameraFps = 30;
+        /// <summary>Default encrypted TCP transport port for shared virtual camera streaming.</summary>
+        public const ushort DefaultCameraPort = 58287;
+        /// <summary>Default user-facing Windows virtual camera display name.</summary>
+        public const string DefaultCameraDeviceName = "Integrator MacBook Camera";
+
         /// <summary>True if virtual camera drivers are installed and supported.</summary>
         [JsonPropertyName("supported")] public bool Supported { get; set; } = true;
         /// <summary>True if camera stream is actively transmitting/receiving.</summary>
@@ -571,15 +587,19 @@ namespace IntegratorUI
         /// <summary>Camera permissions granted status.</summary>
         [JsonPropertyName("permission_granted")] public bool PermissionGranted { get; set; } = true;
         /// <summary>Video frame width in pixels.</summary>
-        [JsonPropertyName("width")] public uint Width { get; set; } = 1280;
+        [JsonPropertyName("width")] public uint Width { get; set; } = DefaultCameraWidth;
         /// <summary>Video frame height in pixels.</summary>
-        [JsonPropertyName("height")] public uint Height { get; set; } = 720;
+        [JsonPropertyName("height")] public uint Height { get; set; } = DefaultCameraHeight;
         /// <summary>Video frame rate in FPS.</summary>
-        [JsonPropertyName("fps")] public uint Fps { get; set; } = 30;
+        [JsonPropertyName("fps")] public uint Fps { get; set; } = DefaultCameraFps;
         /// <summary>Cumulative frame count received.</summary>
         [JsonPropertyName("frames_transferred")] public ulong FramesTransferred { get; set; }
         /// <summary>Last error string encountered in the camera pipeline.</summary>
         [JsonPropertyName("last_error")] public string? LastError { get; set; }
+        /// <summary>Active encrypted TCP transport port bound for virtual camera streaming.</summary>
+        [JsonPropertyName("port")] public ushort Port { get; set; } = DefaultCameraPort;
+        /// <summary>Friendly display name advertised by the Windows virtual camera.</summary>
+        [JsonPropertyName("device_name")] public string DeviceName { get; set; } = DefaultCameraDeviceName;
     }
 
     /// <summary>

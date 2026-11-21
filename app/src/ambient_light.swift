@@ -110,6 +110,23 @@ private let iohidEventGetFloatValue: FnIOHIDEventGetFloatValue? = {
     return unsafeBitCast(sym, to: FnIOHIDEventGetFloatValue.self)
 }()
 
+// MARK: - Photometric Physical Constants
+
+/// Standard CIE D65 daylight neutral Correlated Color Temperature in Kelvin.
+private let kD65NeutralKelvin: Double = 6500.0
+
+/// Warm baseline Correlated Color Temperature in Kelvin for blue/red channel ratio estimation.
+private let kCctBaseKelvin: Double = 3000.0
+
+/// Linear Kelvin scaling factor applied to the blue-to-red ambient light channel ratio.
+private let kCctScaleKelvin: Double = 3500.0
+
+/// Minimum valid Correlated Color Temperature clamp bound in Kelvin.
+private let kCctMinKelvin: Double = 2500.0
+
+/// Maximum valid Correlated Color Temperature clamp bound in Kelvin.
+private let kCctMaxKelvin: Double = 9000.0
+
 // MARK: - Ambient Light Sensor Reader FFI
 
 /// Reads the macOS hardware Ambient Light Sensor via IOKit HID.
@@ -203,13 +220,13 @@ public func read_mac_ambient_sensor(
         let ch2 = getFloatValue(UnsafeRawPointer(eventRaw), ch2Field) // Blue / Cool channel
         _ = eventObj
 
-        // Calculate Correlated Color Temperature (Kelvin) relative to D65 (6500K).
-        var cctKelvin: Double = 6500.0
+        // Calculate Correlated Color Temperature (Kelvin) relative to D65 neutral.
+        var cctKelvin: Double = kD65NeutralKelvin
         if ch0.isFinite, ch2.isFinite, ch0 > 0.0, ch2 > 0.0 {
             let ratio = ch2 / ch0
             if ratio.isFinite {
-                cctKelvin = 3000.0 + (ratio * 3500.0)
-                cctKelvin = min(max(cctKelvin, 2500.0), 9000.0)
+                cctKelvin = kCctBaseKelvin + (ratio * kCctScaleKelvin)
+                cctKelvin = min(max(cctKelvin, kCctMinKelvin), kCctMaxKelvin)
             }
         }
         guard cctKelvin.isFinite else {
