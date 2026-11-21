@@ -53,18 +53,20 @@
 //!   Symlinks are detected and rejected to prevent symlink-poisoning attacks.
 //! - **Log Rotation**: Active log files exceeding 5 MiB (`MAX_LOG_FILE_BYTES`) are automatically rotated
 //!   to `.log.1` to prevent disk filling.
-//! - **Inbound Firewall Scoping**: Windows firewall rules are explicitly scoped to direct cable subnets
-//!   (`169.254.0.0/16`, `10.99.99.0/24`, `192.168.2.0/24`, `192.168.137.0/24`) and local subnets.
+//! - **Inbound Firewall Scoping**: Windows firewall rules are dynamically scoped to `LocalSubnet`,
+//!   RFC 3927 link-local (`169.254.0.0/16`), active local IPv4 adapter network CIDRs, and validated
+//!   user-authorized `firewall_extra_subnets`.
 //! - **Mandatory Cryptographic Pairing**: Operations requiring mutual trust strictly enforce SPAKE2+
 //!   PIN verification before granting access.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
+use std::net::Ipv4Addr;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -91,6 +93,46 @@ use crate::trust;
 /// Passes NUL-terminated UTF-8 C string pointers for `event_name` and `payload_json`.
 pub type UiEventCallback = extern "C" fn(event_name: *const c_char, payload_json: *const c_char);
 
+/// Maximum number of log entries retained in the in-memory UI diagnostic ring buffer.
+const LOG_RING_CAPACITY: usize = 200;
+
+/// Maximum duration to wait for in-flight native UI callbacks to drain during deregistration.
+const UI_CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Sleep interval while polling in-flight native UI callbacks during deregistration.
+const UI_CALLBACK_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// TCP connect timeout when probing loopback to detect an existing Integrator instance.
+const SINGLE_INSTANCE_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Canonical IPv4 loopback address string for local CLI-to-daemon RPC invocations.
+const LOOPBACK_IPV4: &str = "127.0.0.1";
+
+/// macOS System Settings deep link opening the Privacy & Security Accessibility pane.
+#[cfg(target_os = "macos")]
+const MACOS_ACCESSIBILITY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// Windows process creation flag suppressing visible console window creation.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Windows Defender Firewall rule name for core Integrator TCP services.
+#[cfg(target_os = "windows")]
+const WIN_FW_RULE_CORE_TCP: &str = "Integrator Core (TCP)";
+
+/// Windows Defender Firewall rule name for core Integrator UDP services.
+#[cfg(target_os = "windows")]
+const WIN_FW_RULE_CORE_UDP: &str = "Integrator Core (UDP)";
+
+/// Windows Defender Firewall rule name for inbound SMB file sharing.
+#[cfg(target_os = "windows")]
+const WIN_FW_RULE_SMB_TCP: &str = "Integrator SMB File Sharing (TCP)";
+
+/// Windows Defender Firewall symbolic scope keyword permitting local on-link subnet peers.
+#[cfg(any(target_os = "windows", test))]
+const FIREWALL_SCOPE_LOCAL_SUBNET: &str = "LocalSubnet";
+
 /// Global singleton container holding the active `IntegratorCore` engine instance.
 pub static GLOBAL_CORE: OnceLock<Arc<IntegratorCore>> = OnceLock::new();
 
@@ -100,11 +142,13 @@ static UI_EVENT_CALLBACK: Mutex<Option<UiEventCallback>> = Mutex::new(None);
 /// Atomic counter tracking the number of active callback invocations currently executing inside native UI code.
 static IN_FLIGHT_UI_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
-/// In-memory ring buffer storing the most recent 200 formatted log entries for UI diagnostics views.
+/// In-memory ring buffer storing the most recent [`LOG_RING_CAPACITY`] formatted log entries for UI diagnostics views.
 static LOG_RING: Mutex<Option<VecDeque<LogEntry>>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Configures the TCP control RPC port used by the macOS Touch Bar HUD prior to initialization.
+    fn set_touchbar_rpc_port_in_app(port: u16);
     /// Native macOS Objective-C/Swift Touch Bar initialization entry point.
     fn init_touchbar_in_app(peer_ip: *const c_char);
     /// Native macOS Touch Bar dismissal entry point.
@@ -404,10 +448,10 @@ impl<S: tracing::Subscriber> Layer<S> for UiRingLogLayer {
             message: formatted_msg,
         };
 
-        // Append to in-memory bounded ring buffer (capacity: 200)
+        // Append to in-memory bounded ring buffer
         if let Ok(mut guard) = LOG_RING.lock() {
-            let deque = guard.get_or_insert_with(|| VecDeque::with_capacity(200));
-            if deque.len() >= 200 {
+            let deque = guard.get_or_insert_with(|| VecDeque::with_capacity(LOG_RING_CAPACITY));
+            if deque.len() >= LOG_RING_CAPACITY {
                 deque.pop_front();
             }
             deque.push_back(entry.clone());
@@ -438,12 +482,12 @@ pub fn register_ui_callback(cb: Option<UiEventCallback>) {
         *guard = cb;
     }
     if cb.is_none() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + UI_CALLBACK_DRAIN_TIMEOUT;
         while IN_FLIGHT_UI_CALLBACKS.load(Ordering::Acquire) > 0
             && std::time::Instant::now() < deadline
         {
             std::thread::yield_now();
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(UI_CALLBACK_DRAIN_POLL_INTERVAL);
         }
     }
 }
@@ -512,7 +556,7 @@ pub fn open_app_data_folder() {
 
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("/usr/bin/open");
+        let mut cmd = std::process::Command::new(config::MACOS_OPEN_BIN);
         cmd.arg(&cache_dir);
         spawn_and_reap(cmd);
     }
@@ -520,12 +564,9 @@ pub fn open_app_data_folder() {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let windir = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("WINDIR"))
-            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-        let explorer = std::path::PathBuf::from(windir).join("explorer.exe");
+        let explorer = system_info::windows_root_dir().join("explorer.exe");
         let mut cmd = std::process::Command::new(explorer);
-        cmd.arg(&cache_dir).creation_flags(0x08000000);
+        cmd.arg(&cache_dir).creation_flags(CREATE_NO_WINDOW);
         spawn_and_reap(cmd);
     }
 }
@@ -557,12 +598,12 @@ fn format_link_speed(speed_mbps: Option<u32>, connected: bool) -> String {
 
 /// Detects whether an active Integrator instance is already running locally.
 ///
-/// Probes `127.0.0.1:58281`. If connection succeeds, sends `ShowWindow` RPC to bring the
+/// Probes `127.0.0.1:CONTROL_PORT`. If connection succeeds, sends `ShowWindow` RPC to bring the
 /// active window forward and returns `true`.
 pub fn try_focus_existing_instance() -> bool {
     if let Ok(stream) = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], config::CONTROL_PORT)),
-        std::time::Duration::from_millis(150),
+        &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, config::CONTROL_PORT)),
+        SINGLE_INSTANCE_PROBE_TIMEOUT,
     ) {
         drop(stream);
         if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -570,7 +611,7 @@ pub fn try_focus_existing_instance() -> bool {
             .build()
         {
             let _ = rt.block_on(DisplayController::send_remote_rpc(
-                "127.0.0.1",
+                LOOPBACK_IPV4,
                 &DisplayRpcRequest::ShowWindow,
             ));
         }
@@ -592,7 +633,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 match DisplayController::send_remote_rpc(
-                    "127.0.0.1",
+                    LOOPBACK_IPV4,
                     &DisplayRpcRequest::PasteRemote,
                 )
                 .await
@@ -680,7 +721,10 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     anyhow::bail!("Usage: integrator touchbar <peer_ip>");
                 };
                 let c_ip = CString::new(peer_ip)?;
-                unsafe { run_touchbar_cli_loop(c_ip.as_ptr()) };
+                unsafe {
+                    set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                    run_touchbar_cli_loop(c_ip.as_ptr());
+                }
                 Ok(())
             }
             #[cfg(not(target_os = "macos"))]
@@ -700,7 +744,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     "status" => DisplayRpcRequest::GetStatus,
                     _ => anyhow::bail!("Unknown display subcommand: {}", subcmd),
                 };
-                let resp = DisplayController::send_remote_rpc("127.0.0.1", &req).await?;
+                let resp = DisplayController::send_remote_rpc(LOOPBACK_IPV4, &req).await?;
                 println!("{}", resp.message);
                 if !resp.success {
                     anyhow::bail!("Display command failed: {}", resp.message);
@@ -712,7 +756,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let resp = DisplayController::send_remote_rpc(
-                    "127.0.0.1",
+                    LOOPBACK_IPV4,
                     &DisplayRpcRequest::GetPairingPin,
                 )
                 .await?;
@@ -738,7 +782,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     anyhow::bail!("Usage: integrator pair <peer_ip> <6_digit_pin>");
                 };
                 let resp = DisplayController::send_remote_rpc(
-                    "127.0.0.1",
+                    LOOPBACK_IPV4,
                     &DisplayRpcRequest::PairWithPeer { ip, pin },
                 )
                 .await?;
@@ -753,7 +797,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let resp = DisplayController::send_remote_rpc(
-                    "127.0.0.1",
+                    LOOPBACK_IPV4,
                     &DisplayRpcRequest::GetBridgeStatus,
                 )
                 .await?;
@@ -776,7 +820,7 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                     "status" => DisplayRpcRequest::GetCameraStatus,
                     _ => anyhow::bail!("Unknown camera subcommand: {}. Use toggle, start, stop, or status.", subcmd),
                 };
-                let resp = DisplayController::send_remote_rpc("127.0.0.1", &req).await?;
+                let resp = DisplayController::send_remote_rpc(LOOPBACK_IPV4, &req).await?;
                 println!("{}", resp.message);
                 if let Some(cs) = resp.camera_status {
                     println!("{}", serde_json::to_string_pretty(&cs)?);
@@ -831,18 +875,152 @@ fn open_private_rotating_log(path: &Path) -> Option<std::fs::File> {
     opts.open(path).ok()
 }
 
+/// Formats a slice of numeric TCP/UDP ports into a comma-separated `netsh` `localport=` value.
+#[cfg(any(target_os = "windows", test))]
+fn format_firewall_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Computes the canonical IPv4 network CIDR (e.g. `192.168.1.0/24`) for an active local interface.
+#[cfg(any(target_os = "windows", test))]
+fn interface_to_cidr(iface: &system_info::LocalInterfaceInfo) -> Option<String> {
+    let ip = iface.ip.trim().parse::<Ipv4Addr>().ok()?;
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() {
+        return None;
+    }
+
+    let mask_u = if let Ok(mask) = iface.netmask.trim().parse::<Ipv4Addr>() {
+        let m = u32::from(mask);
+        if m != 0 {
+            m
+        } else if (1..=32).contains(&iface.cidr_prefix) {
+            if iface.cidr_prefix == 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - iface.cidr_prefix as u32)
+            }
+        } else {
+            return None;
+        }
+    } else if (1..=32).contains(&iface.cidr_prefix) {
+        if iface.cidr_prefix == 32 {
+            u32::MAX
+        } else {
+            u32::MAX << (32 - iface.cidr_prefix as u32)
+        }
+    } else {
+        return None;
+    };
+
+    let prefix = mask_u.leading_ones();
+    if prefix == 0 || prefix > 32 {
+        return None;
+    }
+    let canonical_mask = if prefix == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    if mask_u != canonical_mask {
+        return None;
+    }
+
+    let network = Ipv4Addr::from(u32::from(ip) & canonical_mask);
+    Some(format!("{}/{}", network, prefix))
+}
+
+/// Validates and normalizes an extra Windows firewall remote scope entry (IPv4 CIDR or host IP).
+///
+/// Rejects wildcard `/0` ranges, control characters, and non-IPv4 tokens to prevent `netsh` injection
+/// or overly permissive rules.
+#[cfg(any(target_os = "windows", test))]
+fn validate_firewall_scope_entry(raw: &str) -> Option<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if let Some((ip_part, prefix_part)) = trimmed.split_once('/') {
+        let ip = ip_part.parse::<Ipv4Addr>().ok()?;
+        let prefix = prefix_part.parse::<u8>().ok()?;
+        if !(1..=32).contains(&prefix) {
+            return None;
+        }
+        let mask = if prefix == 32 {
+            u32::MAX
+        } else {
+            u32::MAX << (32 - prefix as u32)
+        };
+        let network = Ipv4Addr::from(u32::from(ip) & mask);
+        if network.is_unspecified() {
+            return None;
+        }
+        return Some(format!("{}/{}", network, prefix));
+    }
+    let ip = trimmed.parse::<Ipv4Addr>().ok()?;
+    if ip.is_unspecified() || ip.is_broadcast() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+/// Pure helper building the deduplicated comma-separated Windows Defender Firewall `remoteip=`
+/// string from `LocalSubnet`, [`config::IPV4_LINK_LOCAL_CIDR`], active adapter network CIDRs,
+/// and validated user-configured extra subnets.
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_firewall_remote_scopes_from(
+    interfaces: &[system_info::LocalInterfaceInfo],
+    extra_subnets: &[String],
+) -> String {
+    let mut scopes: Vec<String> = Vec::new();
+    let mut push_unique = |entry: String| {
+        if !scopes.iter().any(|existing| existing.eq_ignore_ascii_case(&entry)) {
+            scopes.push(entry);
+        }
+    };
+
+    push_unique(FIREWALL_SCOPE_LOCAL_SUBNET.to_string());
+    push_unique(config::IPV4_LINK_LOCAL_CIDR.to_string());
+
+    for iface in interfaces {
+        if let Some(cidr) = interface_to_cidr(iface) {
+            push_unique(cidr);
+        }
+    }
+
+    for extra in extra_subnets {
+        if let Some(validated) = validate_firewall_scope_entry(extra) {
+            push_unique(validated);
+        }
+    }
+
+    scopes.join(",")
+}
+
+/// Builds the dynamic Windows Defender Firewall `remoteip=` scope list by combining `LocalSubnet`,
+/// [`config::IPV4_LINK_LOCAL_CIDR`], currently active local IPv4 adapter subnets, and validated
+/// `AppPathPreferences.firewall_extra_subnets`.
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_firewall_remote_scopes() -> String {
+    let interfaces = system_info::list_local_ipv4_interfaces();
+    let prefs = system_info::load_path_preferences();
+    build_windows_firewall_remote_scopes_from(&interfaces, &prefs.firewall_extra_subnets)
+}
+
 /// Automatically configures Windows Defender Firewall rules for Integrator on Windows hosts.
 ///
 /// Ensures direct Thunderbolt/USB4, USB-C NCM, Ethernet, and Mobile Hotspot interfaces
-/// permit inbound traffic on Integrator TCP/UDP ports even if assigned to Public network profiles.
+/// permit inbound traffic on Integrator TCP/UDP/SMB ports even if assigned to Public network profiles.
 #[cfg(target_os = "windows")]
 fn ensure_windows_firewall_rules() {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const REMOTE_SCOPES: &str =
-        "LocalSubnet,10.99.99.0/24,192.168.2.0/24,192.168.137.0/24,169.254.0.0/16";
 
     let Ok(exe_path) = std::env::current_exe() else {
         return;
@@ -855,13 +1033,35 @@ fn ensure_windows_firewall_rules() {
         return;
     }
 
+    let remote_scopes = build_windows_firewall_remote_scopes();
+    let tcp_ports_str = format_firewall_ports(&config::TCP_SERVICE_PORTS);
+    let udp_ports_str = format_firewall_ports(&config::UDP_SERVICE_PORTS);
+    let smb_ports_str = format_firewall_ports(&config::SMB_SERVICE_PORTS);
+
     let netsh = system_info::system32_exe("netsh.exe");
-    let rules = [
-        ("Integrator Core (TCP)", "TCP", "58281,58283,58285,58286,58287"),
-        ("Integrator Core (UDP)", "UDP", "58280,58284"),
+    let rules: [(&str, &str, &[u16], &str); 2] = [
+        (
+            WIN_FW_RULE_CORE_TCP,
+            "TCP",
+            &config::TCP_SERVICE_PORTS,
+            &tcp_ports_str,
+        ),
+        (
+            WIN_FW_RULE_CORE_UDP,
+            "UDP",
+            &config::UDP_SERVICE_PORTS,
+            &udp_ports_str,
+        ),
     ];
 
-    for (rule_name, proto, ports) in rules {
+    let scopes_match = |txt: &str| {
+        remote_scopes.split(',').all(|scope| {
+            let token = scope.split('/').next().unwrap_or(scope).to_ascii_lowercase();
+            txt.contains(&token)
+        })
+    };
+
+    for (rule_name, proto, port_list, ports_arg) in rules {
         let already_matches = Command::new(&netsh)
             .args([
                 "advfirewall",
@@ -879,10 +1079,8 @@ fn ensure_windows_firewall_rules() {
             .filter(|o| o.status.success())
             .map(|o| {
                 let txt = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
-                let has_all_ports = proto != "TCP" || txt.contains("58287");
-                txt.contains(&exe_str.to_ascii_lowercase())
-                    && txt.contains("localsubnet")
-                    && has_all_ports
+                let has_all_ports = port_list.iter().all(|p| txt.contains(&p.to_string()));
+                txt.contains(&exe_str.to_ascii_lowercase()) && scopes_match(&txt) && has_all_ports
             })
             .unwrap_or(false);
 
@@ -904,7 +1102,7 @@ fn ensure_windows_firewall_rules() {
             .stderr(Stdio::null())
             .status();
 
-        // Add scoped rule
+        // Add dynamically scoped rule
         let _ = Command::new(&netsh)
             .args([
                 "advfirewall",
@@ -916,8 +1114,8 @@ fn ensure_windows_firewall_rules() {
                 "action=allow",
                 &format!("program={}", exe_str),
                 &format!("protocol={}", proto),
-                &format!("localport={}", ports),
-                &format!("remoteip={}", REMOTE_SCOPES),
+                &format!("localport={}", ports_arg),
+                &format!("remoteip={}", remote_scopes),
                 "profile=any",
                 "enable=yes",
             ])
@@ -927,15 +1125,14 @@ fn ensure_windows_firewall_rules() {
             .status();
     }
 
-    // Ensure inbound SMB file sharing (TCP 445/139) is permitted across all Integrator subnets (wired and wireless)
-    let smb_rule_name = "Integrator SMB File Sharing (TCP)";
+    // Ensure inbound SMB file sharing is permitted across all dynamically resolved local subnets
     let smb_matches = Command::new(&netsh)
         .args([
             "advfirewall",
             "firewall",
             "show",
             "rule",
-            &format!("name={}", smb_rule_name),
+            &format!("name={}", WIN_FW_RULE_SMB_TCP),
             "verbose",
         ])
         .creation_flags(CREATE_NO_WINDOW)
@@ -946,7 +1143,10 @@ fn ensure_windows_firewall_rules() {
         .filter(|o| o.status.success())
         .map(|o| {
             let txt = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
-            txt.contains("localsubnet") && txt.contains("445")
+            let has_all_smb_ports = config::SMB_SERVICE_PORTS
+                .iter()
+                .all(|p| txt.contains(&p.to_string()));
+            scopes_match(&txt) && has_all_smb_ports
         })
         .unwrap_or(false);
 
@@ -957,7 +1157,7 @@ fn ensure_windows_firewall_rules() {
                 "firewall",
                 "delete",
                 "rule",
-                &format!("name={}", smb_rule_name),
+                &format!("name={}", WIN_FW_RULE_SMB_TCP),
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
@@ -970,12 +1170,12 @@ fn ensure_windows_firewall_rules() {
                 "firewall",
                 "add",
                 "rule",
-                &format!("name={}", smb_rule_name),
+                &format!("name={}", WIN_FW_RULE_SMB_TCP),
                 "dir=in",
                 "action=allow",
                 "protocol=TCP",
-                "localport=445,139",
-                &format!("remoteip={}", REMOTE_SCOPES),
+                &format!("localport={}", smb_ports_str),
+                &format!("remoteip={}", remote_scopes),
                 "profile=any",
                 "enable=yes",
             ])
@@ -1004,7 +1204,7 @@ impl IntegratorCore {
         }
 
         // 1. Logging setup (private file permissions, symlink guard, 5 MiB rotation cap)
-        let log_path = system_info::user_home_dir().join(".integrator.log");
+        let log_path = system_info::user_home_dir().join(config::LOG_FILE_NAME);
         let file_opt = open_private_rotating_log(&log_path);
 
         let env_filter =
@@ -1168,7 +1368,7 @@ impl IntegratorCore {
                 } else {
                     truetone::AmbientLightData {
                         lux: 0.0,
-                        cct_kelvin: 6500,
+                        cct_kelvin: config::D65_CCT_KELVIN,
                         supported: false,
                         updated_at_secs: 0,
                     }
@@ -1193,7 +1393,7 @@ impl IntegratorCore {
                 ("auto".to_string(), "auto".to_string()),
                 truetone::AmbientLightData {
                     lux: 0.0,
-                    cct_kelvin: 6500,
+                    cct_kelvin: config::D65_CCT_KELVIN,
                     supported: false,
                     updated_at_secs: 0,
                 },
@@ -1512,7 +1712,10 @@ impl IntegratorCore {
                             Ok(serde_json::json!(false))
                         } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
                             if let Ok(c_ip) = CString::new(peer_ip) {
-                                unsafe { init_touchbar_in_app(c_ip.as_ptr()) };
+                                unsafe {
+                                    set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                                    init_touchbar_in_app(c_ip.as_ptr());
+                                }
                                 Ok(serde_json::json!(true))
                             } else {
                                 Err("Invalid peer IP".into())
@@ -1538,7 +1741,7 @@ impl IntegratorCore {
                     let data = if !self.features.is_enabled("truetone") {
                         truetone::AmbientLightData {
                             lux: 0.0,
-                            cct_kelvin: 6500,
+                            cct_kelvin: config::D65_CCT_KELVIN,
                             supported: false,
                             updated_at_secs: 0,
                         }
@@ -1547,14 +1750,14 @@ impl IntegratorCore {
                             .await
                             .unwrap_or(truetone::AmbientLightData {
                                 lux: 0.0,
-                                cct_kelvin: 6500,
+                                cct_kelvin: config::D65_CCT_KELVIN,
                                 supported: false,
                                 updated_at_secs: 0,
                             });
                         if !als.supported || !als.lux.is_finite() || als.lux < 0.0 {
                             truetone::AmbientLightData {
                                 lux: 0.0,
-                                cct_kelvin: 6500,
+                                cct_kelvin: config::D65_CCT_KELVIN,
                                 supported: false,
                                 updated_at_secs: 0,
                             }
@@ -1575,16 +1778,23 @@ impl IntegratorCore {
                         comp_factor: f32,
                     }
                     let args: TtArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
-                    if !(2500..=9000).contains(&args.cct) {
+                    if !(config::MIN_CCT_KELVIN..=config::MAX_CCT_KELVIN).contains(&args.cct) {
                         return Err(format!(
-                            "Invalid color temperature {}K (must be 2500..=9000K)",
-                            args.cct
+                            "Invalid color temperature {}K (must be {}..={}K)",
+                            args.cct,
+                            config::MIN_CCT_KELVIN,
+                            config::MAX_CCT_KELVIN
                         ));
                     }
-                    if !args.comp_factor.is_finite() || !(0.5..=1.5).contains(&args.comp_factor) {
+                    if !args.comp_factor.is_finite()
+                        || !(config::MIN_GAMMA_COMP_FACTOR..=config::MAX_GAMMA_COMP_FACTOR)
+                            .contains(&args.comp_factor)
+                    {
                         return Err(format!(
-                            "Invalid gamma compensation factor {} (must be 0.5..=1.5)",
-                            args.comp_factor
+                            "Invalid gamma compensation factor {} (must be {}..={})",
+                            args.comp_factor,
+                            config::MIN_GAMMA_COMP_FACTOR,
+                            config::MAX_GAMMA_COMP_FACTOR
                         ));
                     }
                     if cfg!(target_os = "windows") {
@@ -1610,7 +1820,7 @@ impl IntegratorCore {
                             .await
                             .unwrap_or(truetone::AmbientLightData {
                                 lux: 0.0,
-                                cct_kelvin: 6500,
+                                cct_kelvin: config::D65_CCT_KELVIN,
                                 supported: false,
                                 updated_at_secs: 0,
                             });
@@ -1793,8 +2003,8 @@ impl IntegratorCore {
                         .await
                         .unwrap_or(false);
                         if !trusted {
-                            let mut cmd = std::process::Command::new("/usr/bin/open");
-                            cmd.arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+                            let mut cmd = std::process::Command::new(config::MACOS_OPEN_BIN);
+                            cmd.arg(MACOS_ACCESSIBILITY_SETTINGS_URL);
                             spawn_and_reap(cmd);
                         }
                         Ok(serde_json::json!(if trusted {
@@ -1963,8 +2173,13 @@ impl IntegratorCore {
                         return Err(format!("Invalid peer IPv4 address: {}", args.ip));
                     }
                     let tpin = args.pin.trim().to_string();
-                    if tpin.len() != 6 || !tpin.chars().all(|c| c.is_ascii_digit()) {
-                        return Err("Pairing PIN must be 6 digits".into());
+                    if tpin.len() != config::PAIRING_PIN_LENGTH
+                        || !tpin.chars().all(|c| c.is_ascii_digit())
+                    {
+                        return Err(format!(
+                            "Pairing PIN must be {} digits",
+                            config::PAIRING_PIN_LENGTH
+                        ));
                     }
                     let (creds, sas_6) =
                         trust::pair_with_remote_peer_v2(&tip, config::CONTROL_PORT, &tpin).await?;
@@ -2050,4 +2265,92 @@ pub fn c_str_to_rust(ptr: *const c_char) -> String {
     }
     // SAFETY: Pointer is non-null and assumed to point to a NUL-terminated C string.
     unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_ports_format_from_canonical_config() {
+        assert_eq!(
+            format_firewall_ports(&config::TCP_SERVICE_PORTS),
+            format!(
+                "{},{},{},{},{}",
+                config::CONTROL_PORT,
+                config::CLIPBOARD_PORT,
+                config::TELEMETRY_PORT,
+                config::INPUT_PORT,
+                config::CAMERA_PORT
+            )
+        );
+        assert_eq!(
+            format_firewall_ports(&config::UDP_SERVICE_PORTS),
+            format!("{},{}", config::DISCOVERY_PORT, config::AUDIO_PORT)
+        );
+        assert_eq!(
+            format_firewall_ports(&config::SMB_SERVICE_PORTS),
+            format!("{},{}", config::SMB_TCP_PORT, config::NETBIOS_SSN_PORT)
+        );
+    }
+
+    #[test]
+    fn dynamic_windows_firewall_scopes_combine_adapters_and_validated_extras() {
+        let ifaces = vec![
+            system_info::LocalInterfaceInfo {
+                name: "Ethernet 2".into(),
+                friendly_name: "USB-C Direct".into(),
+                ip: "10.99.99.2".into(),
+                netmask: "255.255.255.0".into(),
+                broadcast: "10.99.99.255".into(),
+                cidr_prefix: 24,
+                transport: system_info::LinkTransport::DirectUsb,
+                link_speed_mbps: None,
+                description: "USB-C Direct".into(),
+            },
+            system_info::LocalInterfaceInfo {
+                name: "Wi-Fi".into(),
+                friendly_name: "Wi-Fi".into(),
+                ip: "192.168.50.42".into(),
+                netmask: "255.255.252.0".into(),
+                broadcast: "192.168.51.255".into(),
+                cidr_prefix: 22,
+                transport: system_info::LinkTransport::Wifi,
+                link_speed_mbps: None,
+                description: "Wi-Fi".into(),
+            },
+            system_info::LocalInterfaceInfo {
+                name: "Thunderbolt".into(),
+                friendly_name: "Thunderbolt Bridge".into(),
+                ip: "169.254.10.2".into(),
+                netmask: "255.255.0.0".into(),
+                broadcast: "169.254.255.255".into(),
+                cidr_prefix: 16,
+                transport: system_info::LinkTransport::Thunderbolt,
+                link_speed_mbps: None,
+                description: "Thunderbolt".into(),
+            },
+        ];
+
+        let extras = vec![
+            "172.20.10.5/24".to_string(),
+            "10.10.10.7".to_string(),
+            "0.0.0.0/0".to_string(),
+            "any".to_string(),
+            "192.168.1.0/24; calc.exe".to_string(),
+            "10.99.99.0/24".to_string(), // duplicate of active adapter CIDR
+        ];
+
+        let scopes = build_windows_firewall_remote_scopes_from(&ifaces, &extras);
+        assert_eq!(
+            scopes,
+            format!(
+                "LocalSubnet,{},10.99.99.0/24,192.168.48.0/22,172.20.10.0/24,10.10.10.7",
+                config::IPV4_LINK_LOCAL_CIDR
+            )
+        );
+
+        let live_scopes = build_windows_firewall_remote_scopes();
+        assert!(live_scopes.starts_with(&format!("LocalSubnet,{}", config::IPV4_LINK_LOCAL_CIDR)));
+    }
 }

@@ -53,9 +53,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use integrator_core::{core, ffi};
+
+/// Polling interval used by the POSIX signal watcher thread to check `SHUTDOWN_REQUESTED`.
+#[cfg(unix)]
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Polling interval used by the headless daemon wait loop on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Global atomic flag signaling that a process termination signal (SIGINT, SIGTERM)
 /// has been intercepted and asynchronous shutdown must commence.
@@ -177,9 +186,9 @@ fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("signal-watcher".to_string())
             .spawn(move || {
-                // Poll atomic flag at 200ms intervals to respond promptly to SIGINT/SIGTERM
+                // Poll atomic flag periodically to respond promptly to SIGINT/SIGTERM
                 while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::thread::sleep(SIGNAL_POLL_INTERVAL);
                 }
                 // Initiate orderly subsystem shutdown
                 core_for_sig.shutdown();
@@ -202,7 +211,7 @@ fn main() -> Result<()> {
         // On Windows, native WinUI 3 (`app/ui-windows/Integrator.exe`) hosts `integrator_core.dll` directly.
         // If `integrator.exe` CLI binary is run standalone as a headless daemon, park until shutdown.
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(DAEMON_POLL_INTERVAL);
         }
     }
 

@@ -63,14 +63,201 @@
 //! - **Synthetic Speed Rejection**: `sanitize_adapter_link_speed` filters out bogus virtual driver speeds
 //!   (e.g. Windows USB NCM drivers reporting `100 Gbps` or macOS reporting `100baseTX`).
 
+use crate::config;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Environment variable overriding the Sunshine REST API username.
+const ENV_SUNSHINE_API_USER: &str = "INTEGRATOR_SUNSHINE_USER";
+
+/// Environment variable overriding the Sunshine REST API password.
+const ENV_SUNSHINE_API_PASS: &str = "INTEGRATOR_SUNSHINE_PASS";
+
+/// Maximum permitted length in bytes for a Sunshine GPU `adapter_name` setting.
+const MAX_SUNSHINE_ADAPTER_NAME_LEN: usize = 256;
+
+/// Time-to-live for cached GPU adapter enumeration results.
+const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Upper threshold in Mbps above which USB-C NCM reported link speeds are rejected as synthetic.
+const SYNTHETIC_USB_NCM_MAX_VALID_MBPS: u32 = 40_000;
+
+/// Known bogus placeholder speed in Mbps reported by macOS/Windows USB-C NCM drivers.
+const SYNTHETIC_USB_NCM_PLACEHOLDER_MBPS: u32 = 100;
+
+/// Fallback SMB share directory name when no user shares are configured.
+const DEFAULT_PUBLIC_SHARE_NAME: &str = "Public";
+
+/// Fallback hostname label used on macOS when `scutil` and `hostname` are unavailable.
+#[cfg(target_os = "macos")]
+const FALLBACK_HOSTNAME_MACOS: &str = "Mac";
+
+/// Fallback hardware model string used on macOS when `sysctl hw.model` fails.
+#[cfg(target_os = "macos")]
+const FALLBACK_MODEL_MACOS: &str = "Mac";
+
+/// Fallback sentinel path used on Unix when `HOME` is unset to prevent writing to `/tmp`.
+#[cfg(not(target_os = "windows"))]
+const INVALID_HOME_SENTINEL_UNIX: &str = "/var/empty/integrator_no_home";
+
+/// Fallback hostname label used on non-macOS, non-Windows platforms.
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+const FALLBACK_HOSTNAME_OTHER: &str = "Host";
+
+/// Fallback hardware model label used on non-macOS, non-Windows platforms.
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+const FALLBACK_MODEL_OTHER: &str = "Linux";
+
+/// Time-to-live for cached macOS `networksetup -listallhardwareports` results.
+#[cfg(target_os = "macos")]
+const MAC_HARDWARE_PORTS_CACHE_TTL: Duration = Duration::from_secs(15);
+
+/// Time-to-live for cached macOS IOKit USB-C NCM BSD interface checks.
+#[cfg(target_os = "macos")]
+const MAC_USB_NCM_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// Secondary path for macOS `sharing` utility when `/usr/sbin/sharing` is absent.
+#[cfg(target_os = "macos")]
+const MACOS_SHARING_FALLBACK_BIN: &str = "/usr/bin/sharing";
+
+/// System-wide configuration directories checked for `sunshine.conf` on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SUNSHINE_CONF_SYSTEM_DIRS: [&str; 2] =
+    ["/opt/homebrew/etc/sunshine", "/usr/local/etc/sunshine"];
+
+/// Relative path under `$HOME` for the default XDG Sunshine configuration directory on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SUNSHINE_CONF_HOME_REL_DIRS: [&str; 2] =
+    [".config/sunshine", "Library/Application Support/Sunshine"];
+
+/// System-wide installation paths searched for the `sunshine` binary on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SUNSHINE_SYSTEM_BIN_CANDIDATES: [&str; 3] = [
+    "/Applications/Sunshine.app/Contents/MacOS/sunshine",
+    "/opt/homebrew/bin/sunshine",
+    "/usr/local/bin/sunshine",
+];
+
+/// Relative path under `$HOME` for a user-installed `Sunshine.app` binary on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_SUNSHINE_USER_BIN_REL_PATH: &str = "Applications/Sunshine.app/Contents/MacOS/sunshine";
+
+/// System-wide installation path for `Moonlight.app` binary on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_MOONLIGHT_SYSTEM_BIN_PATH: &str =
+    "/Applications/Moonlight.app/Contents/MacOS/Moonlight";
+
+/// Relative path under `$HOME` for a user-installed `Moonlight.app` binary on macOS.
+#[cfg(target_os = "macos")]
+const MACOS_MOONLIGHT_USER_BIN_REL_PATH: &str =
+    "Applications/Moonlight.app/Contents/MacOS/Moonlight";
+
+/// Relative executable path inside any Spotlight-discovered `Moonlight.app` bundle.
+#[cfg(target_os = "macos")]
+const MACOS_MOONLIGHT_BUNDLE_BIN_REL_PATH: &str = "Contents/MacOS/Moonlight";
+
+/// Fallback Windows system drive letter used only if `%SystemDrive%` and Win32 APIs fail.
+#[cfg(target_os = "windows")]
+const DEFAULT_WINDOWS_SYSTEM_DRIVE: &str = "C:";
+
+/// Win32 `MAX_PATH` wide-character buffer length used for `GetWindowsDirectoryW`/`GetSystemDirectoryW`.
+#[cfg(target_os = "windows")]
+const WINDOWS_MAX_PATH_BUF_LEN: usize = 260;
+
+/// Relative sentinel directory under the system drive when Windows user profile env vars are unset.
+#[cfg(target_os = "windows")]
+const INVALID_HOME_SENTINEL_WINDOWS_REL: &str = r"ProgramData\IntegratorInvalidHome";
+
+/// Fallback relative path under the system drive for Windows `Users\Public` when `%PUBLIC%` is unset.
+#[cfg(target_os = "windows")]
+const WINDOWS_PUBLIC_USERS_REL_PATH: &str = r"Users\Public";
+
+/// Relative path under `%ProgramFiles%` for the NVIDIA System Management Interface CLI.
+#[cfg(target_os = "windows")]
+const NVIDIA_SMI_REL_PATH: &str = r"NVIDIA Corporation\NVSMI\nvidia-smi.exe";
+
+/// Windows Known Folder GUID for the user's Downloads shell directory (`FOLDERID_Downloads`).
+#[cfg(target_os = "windows")]
+const KNOWNFOLDERID_DOWNLOADS: &str = "{374DE290-123F-4565-9164-39C4925E467B}";
+
+/// Windows PnP device setup class GUID for Display adapters (`GUID_DEVCLASS_DISPLAY`).
+#[cfg(target_os = "windows")]
+const GUID_DEVCLASS_DISPLAY: &str = "{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+/// Windows Registry key storing per-user special shell folder paths.
+#[cfg(target_os = "windows")]
+const WINDOWS_USER_SHELL_FOLDERS_REG_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
+
+/// Windows Registry key storing system BIOS and motherboard product metadata.
+#[cfg(target_os = "windows")]
+const WINDOWS_BIOS_REG_KEY: &str = r"HKLM\HARDWARE\DESCRIPTION\System\BIOS";
+
+/// Windows Registry key storing primary CPU processor brand metadata.
+#[cfg(target_os = "windows")]
+const WINDOWS_CPU0_REG_KEY: &str = r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+
+/// Windows Registry root under which device setup class subkeys reside.
+#[cfg(target_os = "windows")]
+const WINDOWS_CONTROL_CLASS_REG_ROOT: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Class";
+
+/// Standard 100% baseline DPI on Windows (`USER_DEFAULT_SCREEN_DPI`).
+#[cfg(target_os = "windows")]
+const WINDOWS_STANDARD_DPI: u32 = 96;
+
+/// Floating-point representation of [`WINDOWS_STANDARD_DPI`] for scale factor division.
+#[cfg(target_os = "windows")]
+const WINDOWS_STANDARD_DPI_F64: f64 = 96.0;
+
+/// Fallback hostname label used on Windows when `%COMPUTERNAME%` and `hostname.exe` fail.
+#[cfg(target_os = "windows")]
+const FALLBACK_HOSTNAME_WINDOWS: &str = "Windows-PC";
+
+/// Fallback hardware model string used on Windows when BIOS registry queries fail.
+#[cfg(target_os = "windows")]
+const FALLBACK_MODEL_WINDOWS: &str = "Windows PC";
+
+/// Upper safety bound in bytes for `GetIpAddrTable` buffer growth retries (4 MiB).
+#[cfg(target_os = "windows")]
+const MAX_IP_ADDR_TABLE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Time-to-live for cached Windows `Get-NetAdapter` PowerShell metadata.
+#[cfg(target_os = "windows")]
+const WIN_ADAPTER_META_CACHE_TTL: Duration = Duration::from_secs(20);
+
+/// Environment variables searched for Sunshine/Apollo configuration files on Windows.
+#[cfg(target_os = "windows")]
+const WINDOWS_CONF_ENV_KEYS: [&str; 5] = [
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "LOCALAPPDATA",
+    "APPDATA",
+];
+
+/// Environment variables searched for companion app binaries (Sunshine/Moonlight) on Windows.
+#[cfg(target_os = "windows")]
+const WINDOWS_APP_ENV_KEYS: [&str; 4] = [
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "LOCALAPPDATA",
+];
+
+/// Candidate installation folder names for Sunshine-compatible streaming hosts on Windows.
+#[cfg(target_os = "windows")]
+const WINDOWS_SUNSHINE_APP_DIRS: [&str; 2] = ["Sunshine", "Apollo"];
+
+/// Candidate installation folder names for Moonlight clients on Windows.
+#[cfg(target_os = "windows")]
+const WINDOWS_MOONLIGHT_APP_DIRS: [&str; 2] = ["Moonlight Game Streaming Project", "Moonlight"];
 
 /// Global mutex serializing concurrent disk operations on `app_config.json`.
 static APP_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -94,7 +281,7 @@ pub(crate) fn windows_root_dir() -> PathBuf {
         fn GetWindowsDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
     }
 
-    let mut buf = [0u16; 260];
+    let mut buf = [0u16; WINDOWS_MAX_PATH_BUF_LEN];
     let len = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     if len > 0 && (len as usize) < buf.len() {
         let p = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
@@ -110,7 +297,8 @@ pub(crate) fn windows_root_dir() -> PathBuf {
             }
         }
     }
-    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let drive = std::env::var("SystemDrive")
+        .unwrap_or_else(|_| DEFAULT_WINDOWS_SYSTEM_DRIVE.to_string());
     PathBuf::from(format!(r"{}\Windows", drive.trim_end_matches('\\')))
 }
 
@@ -129,7 +317,7 @@ pub(crate) fn windows_system_drive() -> String {
     if let Some(std::path::Component::Prefix(prefix)) = root.components().next() {
         return prefix.as_os_str().to_string_lossy().to_string();
     }
-    "C:".to_string()
+    DEFAULT_WINDOWS_SYSTEM_DRIVE.to_string()
 }
 
 /// Resolves an executable path in the Windows System32 directory dynamically via
@@ -143,7 +331,7 @@ pub(crate) fn system32_exe(name: &str) -> PathBuf {
         fn GetSystemDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
     }
 
-    let mut buf = [0u16; 260];
+    let mut buf = [0u16; WINDOWS_MAX_PATH_BUF_LEN];
     let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     if len > 0 && (len as usize) < buf.len() {
         let p = PathBuf::from(OsString::from_wide(&buf[..len as usize])).join(name);
@@ -228,10 +416,7 @@ fn find_nvidia_smi_path() -> Option<PathBuf> {
         return Some(sys);
     }
     if let Ok(pf) = std::env::var("ProgramFiles") {
-        let p = PathBuf::from(pf)
-            .join("NVIDIA Corporation")
-            .join("NVSMI")
-            .join("nvidia-smi.exe");
+        let p = PathBuf::from(pf).join(NVIDIA_SMI_REL_PATH);
         if p.is_file() {
             return Some(p);
         }
@@ -353,19 +538,185 @@ pub struct LocalInterfaceInfo {
     pub description: String,
 }
 
-/// User path overrides stored in `app_config.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// User path and runtime configuration overrides stored in `app_config.json`.
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AppPathPreferences {
     /// Preferred local SMB share name.
+    #[serde(default)]
     pub smb_share_name: Option<String>,
     /// Preferred remote peer SMB share name.
+    #[serde(default)]
     pub peer_smb_share_name: Option<String>,
     /// User-specified custom directory path for local SMB file sharing (overriding user home folder default).
+    #[serde(default)]
     pub local_shared_folder: Option<String>,
     /// Custom path to `sunshine.conf`.
+    #[serde(default)]
     pub sunshine_conf_path: Option<String>,
     /// Custom path to `Moonlight` executable.
+    #[serde(default)]
     pub moonlight_path: Option<String>,
+    /// Optional Sunshine REST API username (overridden by `INTEGRATOR_SUNSHINE_USER`).
+    #[serde(default)]
+    pub sunshine_api_user: Option<String>,
+    /// Optional Sunshine REST API password (overridden by `INTEGRATOR_SUNSHINE_PASS`).
+    #[serde(default)]
+    pub sunshine_api_password: Option<String>,
+    /// Optional override for the secondary Sunshine base port (default: [`config::SUNSHINE_SECONDARY_PORT`]).
+    #[serde(default)]
+    pub sunshine_secondary_port: Option<u16>,
+    /// Optional override for the secondary Sunshine config filename (default: [`config::SUNSHINE_SECONDARY_CONF_NAME`]).
+    #[serde(default)]
+    pub sunshine_secondary_conf_name: Option<String>,
+    /// Optional override for the Windows secondary Sunshine scheduled task name.
+    #[serde(default)]
+    pub sunshine_secondary_task_name: Option<String>,
+    /// Optional override for the Windows primary Sunshine service name.
+    #[serde(default)]
+    pub sunshine_service_name: Option<String>,
+    /// Optional override for the Windows VDD dynamic watcher scheduled task name.
+    #[serde(default)]
+    pub vdd_watcher_task_name: Option<String>,
+    /// Optional override for the VDD slot identifier passed to `VddCtl.exe`.
+    #[serde(default)]
+    pub vdd_slot: Option<String>,
+    /// Optional override for the maximum VDD stream width in pixels.
+    #[serde(default)]
+    pub vdd_max_width: Option<u32>,
+    /// Optional override for the maximum VDD stream height in pixels.
+    #[serde(default)]
+    pub vdd_max_height: Option<u32>,
+    /// Optional override for the Moonlight streaming application profile name (default: `"Desktop"`).
+    #[serde(default)]
+    pub moonlight_app_name: Option<String>,
+    /// Optional manual stream video bitrate override in kilobits per second.
+    #[serde(default)]
+    pub display_bitrate_override_kbps: Option<u32>,
+    /// Additional user-authorized IPv4 CIDRs or hosts appended to Windows Defender Firewall scopes.
+    #[serde(default)]
+    pub firewall_extra_subnets: Vec<String>,
+    /// Custom path to the `sunshine` executable binary.
+    #[serde(default)]
+    pub sunshine_binary_path: Option<String>,
+}
+
+impl fmt::Debug for AppPathPreferences {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppPathPreferences")
+            .field("smb_share_name", &self.smb_share_name)
+            .field("peer_smb_share_name", &self.peer_smb_share_name)
+            .field("local_shared_folder", &self.local_shared_folder)
+            .field("sunshine_conf_path", &self.sunshine_conf_path)
+            .field("moonlight_path", &self.moonlight_path)
+            .field("sunshine_api_user", &self.sunshine_api_user)
+            .field(
+                "sunshine_api_password",
+                &self.sunshine_api_password.as_ref().map(|_| "<REDACTED>"),
+            )
+            .field("sunshine_secondary_port", &self.sunshine_secondary_port)
+            .field(
+                "sunshine_secondary_conf_name",
+                &self.sunshine_secondary_conf_name,
+            )
+            .field(
+                "sunshine_secondary_task_name",
+                &self.sunshine_secondary_task_name,
+            )
+            .field("sunshine_service_name", &self.sunshine_service_name)
+            .field("vdd_watcher_task_name", &self.vdd_watcher_task_name)
+            .field("vdd_slot", &self.vdd_slot)
+            .field("vdd_max_width", &self.vdd_max_width)
+            .field("vdd_max_height", &self.vdd_max_height)
+            .field("moonlight_app_name", &self.moonlight_app_name)
+            .field(
+                "display_bitrate_override_kbps",
+                &self.display_bitrate_override_kbps,
+            )
+            .field("firewall_extra_subnets", &self.firewall_extra_subnets)
+            .field("sunshine_binary_path", &self.sunshine_binary_path)
+            .finish()
+    }
+}
+
+/// Validates a Sunshine API credential token, rejecting empty values and any control/NUL characters.
+fn validate_sunshine_credential(raw: &str, is_username: bool) -> Option<String> {
+    if raw.contains('\0') || raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let candidate = if is_username { raw.trim() } else { raw };
+    if candidate.is_empty() {
+        return None;
+    }
+    if is_username && candidate.contains(':') {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+/// Pure helper resolving Sunshine REST API credentials from optional environment variables
+/// first, then falling back to `AppPathPreferences`. Never supplies hardcoded credentials.
+fn resolve_sunshine_api_credentials_from(
+    env_user: Option<&str>,
+    env_pass: Option<&str>,
+    prefs: &AppPathPreferences,
+) -> Option<(String, String)> {
+    if env_user.is_some() || env_pass.is_some() {
+        let user = validate_sunshine_credential(env_user?, true)?;
+        let pass = validate_sunshine_credential(env_pass?, false)?;
+        return Some((user, pass));
+    }
+    let user = validate_sunshine_credential(prefs.sunshine_api_user.as_deref()?, true)?;
+    let pass = validate_sunshine_credential(prefs.sunshine_api_password.as_deref()?, false)?;
+    Some((user, pass))
+}
+
+/// Resolves Sunshine REST API Basic Auth credentials dynamically from environment variables
+/// (`INTEGRATOR_SUNSHINE_USER`, `INTEGRATOR_SUNSHINE_PASS`) first, then `app_config.json`.
+///
+/// Rejects values containing control characters, newlines, or NUL bytes, and returns `None`
+/// when unconfigured (no hardcoded fallback credentials exist in source).
+pub fn resolve_sunshine_api_credentials() -> Option<(String, String)> {
+    let env_user = std::env::var(ENV_SUNSHINE_API_USER).ok();
+    let env_pass = std::env::var(ENV_SUNSHINE_API_PASS).ok();
+    if env_user.is_some() || env_pass.is_some() {
+        return resolve_sunshine_api_credentials_from(
+            env_user.as_deref(),
+            env_pass.as_deref(),
+            &AppPathPreferences::default(),
+        );
+    }
+    let prefs = load_path_preferences();
+    resolve_sunshine_api_credentials_from(None, None, &prefs)
+}
+
+/// Formats validated Sunshine Basic Auth credentials into a `curl -K -` stdin config directive
+/// with `\\` and `"` properly escaped so secrets never leak onto process `argv`.
+pub(crate) fn format_curl_basic_auth_config(user: &str, pass: &str) -> String {
+    let raw = format!("{}:{}", user, pass);
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            other => escaped.push(other),
+        }
+    }
+    format!("user = \"{}\"\n", escaped)
+}
+
+/// Resolves the Moonlight streaming application profile name from user preferences,
+/// falling back to [`config::MOONLIGHT_DEFAULT_APP_NAME`].
+pub(crate) fn resolve_moonlight_app_name() -> String {
+    let prefs = load_path_preferences();
+    if let Some(ref custom) = prefs.moonlight_app_name {
+        if !custom.chars().any(|c| c.is_control()) {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('-') {
+                return trimmed.to_string();
+            }
+        }
+    }
+    config::MOONLIGHT_DEFAULT_APP_NAME.to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -469,11 +820,11 @@ pub fn user_home_dir() -> PathBuf {
     try_user_home_dir().unwrap_or_else(|| {
         #[cfg(not(target_os = "windows"))]
         {
-            PathBuf::from("/var/empty/integrator_no_home")
+            PathBuf::from(INVALID_HOME_SENTINEL_UNIX)
         }
         #[cfg(target_os = "windows")]
         {
-            PathBuf::from(r"C:\ProgramData\IntegratorInvalidHome")
+            PathBuf::from(windows_system_drive()).join(INVALID_HOME_SENTINEL_WINDOWS_REL)
         }
     })
 }
@@ -482,7 +833,7 @@ pub fn user_home_dir() -> PathBuf {
 ///
 /// Explicitly rejects symlinks to prevent directory traversal and sets Unix permissions to `0o700`.
 pub fn app_data_dir() -> PathBuf {
-    let dir = user_home_dir().join(".usbc_clipboard_cache");
+    let dir = user_home_dir().join(config::APP_DATA_DIR_NAME);
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
         if meta.file_type().is_symlink() {
             tracing::error!("Refusing symlinked app_data_dir: {}", dir.display());
@@ -501,7 +852,7 @@ pub fn app_data_dir() -> PathBuf {
 /// Loads user application path preferences from `app_config.json`.
 pub fn load_path_preferences() -> AppPathPreferences {
     let _guard = app_config_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = app_data_dir().join("app_config.json");
+    let path = app_data_dir().join(config::APP_CONFIG_FILENAME);
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<AppPathPreferences>(&s).ok())
@@ -524,7 +875,7 @@ pub fn save_path_preferences(prefs: &AppPathPreferences) -> std::io::Result<()> 
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let path = dir.join("app_config.json");
+    let path = dir.join(config::APP_CONFIG_FILENAME);
     let json = serde_json::to_string_pretty(prefs).unwrap_or_else(|_| "{}".into());
     atomic_write_private(&path, json.as_bytes())
 }
@@ -557,7 +908,7 @@ pub fn user_desktop_or_downloads_dir() -> PathBuf {
         if desktop.is_dir() {
             return desktop;
         }
-        if let Some(reg_dl) = query_windows_shell_folder("{374DE290-123F-4565-9164-39C4925E467B}") {
+        if let Some(reg_dl) = query_windows_shell_folder(KNOWNFOLDERID_DOWNLOADS) {
             let p = PathBuf::from(reg_dl);
             if p.is_dir() {
                 return p;
@@ -587,7 +938,7 @@ fn query_windows_shell_folder(value_name: &str) -> Option<String> {
     let out = win_cmd(&system32_exe("reg.exe"))
         .args([
             "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            WINDOWS_USER_SHELL_FOLDERS_REG_KEY,
             "/v",
             value_name,
         ])
@@ -652,7 +1003,10 @@ pub fn get_hostname() -> String {
     #[cfg(target_os = "macos")]
     {
         for key in ["ComputerName", "LocalHostName"] {
-            if let Ok(out) = Command::new("/usr/sbin/scutil").args(["--get", key]).output() {
+            if let Ok(out) = Command::new(config::MACOS_SCUTIL_BIN)
+                .args(["--get", key])
+                .output()
+            {
                 if out.status.success() {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !s.is_empty() {
@@ -661,7 +1015,7 @@ pub fn get_hostname() -> String {
                 }
             }
         }
-        if let Ok(out) = Command::new("/bin/hostname").arg("-s").output() {
+        if let Ok(out) = Command::new(config::MACOS_HOSTNAME_BIN).arg("-s").output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
@@ -669,7 +1023,7 @@ pub fn get_hostname() -> String {
                 }
             }
         }
-        "Mac".to_string()
+        FALLBACK_HOSTNAME_MACOS.to_string()
     }
     #[cfg(target_os = "windows")]
     {
@@ -687,11 +1041,11 @@ pub fn get_hostname() -> String {
                 }
             }
         }
-        "Windows-PC".to_string()
+        FALLBACK_HOSTNAME_WINDOWS.to_string()
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "Host".into())
+        std::env::var("HOSTNAME").unwrap_or_else(|_| FALLBACK_HOSTNAME_OTHER.into())
     }
 }
 
@@ -699,7 +1053,7 @@ pub fn get_hostname() -> String {
 pub fn get_hardware_model_and_cpu() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
-        let model = Command::new("/usr/sbin/sysctl")
+        let model = Command::new(config::MACOS_SYSCTL_BIN)
             .args(["-n", "hw.model"])
             .output()
             .ok()
@@ -709,9 +1063,9 @@ pub fn get_hardware_model_and_cpu() -> (String, String) {
                     .then_some(String::from_utf8_lossy(&o.stdout).trim().to_string())
             })
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Mac".into());
+            .unwrap_or_else(|| FALLBACK_MODEL_MACOS.into());
 
-        let cpu = Command::new("/usr/sbin/sysctl")
+        let cpu = Command::new(config::MACOS_SYSCTL_BIN)
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
@@ -727,29 +1081,18 @@ pub fn get_hardware_model_and_cpu() -> (String, String) {
     }
     #[cfg(target_os = "windows")]
     {
-        let model = reg_query_sz(
-            r"HKLM\HARDWARE\DESCRIPTION\System\BIOS",
-            "SystemProductName",
-        )
-        .or_else(|| {
-            reg_query_sz(
-                r"HKLM\HARDWARE\DESCRIPTION\System\BIOS",
-                "BaseBoardProduct",
-            )
-        })
-        .unwrap_or_else(|| "Windows PC".into());
+        let model = reg_query_sz(WINDOWS_BIOS_REG_KEY, "SystemProductName")
+            .or_else(|| reg_query_sz(WINDOWS_BIOS_REG_KEY, "BaseBoardProduct"))
+            .unwrap_or_else(|| FALLBACK_MODEL_WINDOWS.into());
 
-        let cpu = reg_query_sz(
-            r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
-            "ProcessorNameString",
-        )
-        .unwrap_or_else(|| std::env::consts::ARCH.into());
+        let cpu = reg_query_sz(WINDOWS_CPU0_REG_KEY, "ProcessorNameString")
+            .unwrap_or_else(|| std::env::consts::ARCH.into());
 
         (model, cpu)
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        ("Linux".into(), std::env::consts::ARCH.into())
+        (FALLBACK_MODEL_OTHER.into(), std::env::consts::ARCH.into())
     }
 }
 
@@ -788,13 +1131,19 @@ pub fn has_touch_bar_hardware() -> bool {
         static HAS_TB: OnceLock<bool> = OnceLock::new();
         *HAS_TB.get_or_init(|| {
             for class_name in ["AppleDFR", "AppleTouchBar"] {
-                if let Ok(out) = Command::new("/usr/sbin/ioreg").args(["-rc", class_name]).output() {
+                if let Ok(out) = Command::new(config::MACOS_IOREG_BIN)
+                    .args(["-rc", class_name])
+                    .output()
+                {
                     if out.status.success() && !out.stdout.is_empty() {
                         return true;
                     }
                 }
             }
-            if let Ok(out) = Command::new("/usr/sbin/ioreg").args(["-n", "dispdfr", "-r"]).output() {
+            if let Ok(out) = Command::new(config::MACOS_IOREG_BIN)
+                .args(["-n", "dispdfr", "-r"])
+                .output()
+            {
                 if out.status.success() && !out.stdout.is_empty() {
                     return true;
                 }
@@ -837,27 +1186,27 @@ pub fn get_primary_display_info() -> PrimaryDisplayInfo {
             }
         };
         PrimaryDisplayInfo {
-            width: if w > 0 { w } else { 1920 },
-            height: if h > 0 { h } else { 1080 },
-            fps: if fps > 0 { fps } else { 60 },
+            width: if w > 0 { w } else { config::DEFAULT_DISPLAY_WIDTH },
+            height: if h > 0 { h } else { config::DEFAULT_DISPLAY_HEIGHT },
+            fps: if fps > 0 { fps } else { config::DEFAULT_DISPLAY_FPS },
             scale_factor: scale,
         }
     }
     #[cfg(target_os = "windows")]
     {
         win_primary_display_info().unwrap_or(PrimaryDisplayInfo {
-            width: 1920,
-            height: 1080,
-            fps: 60,
+            width: config::DEFAULT_DISPLAY_WIDTH,
+            height: config::DEFAULT_DISPLAY_HEIGHT,
+            fps: config::DEFAULT_DISPLAY_FPS,
             scale_factor: 1.0,
         })
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         PrimaryDisplayInfo {
-            width: 1920,
-            height: 1080,
-            fps: 60,
+            width: config::DEFAULT_DISPLAY_WIDTH,
+            height: config::DEFAULT_DISPLAY_HEIGHT,
+            fps: config::DEFAULT_DISPLAY_FPS,
             scale_factor: 1.0,
         }
     }
@@ -913,10 +1262,10 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     let ok = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) };
     if ok != 0 && dm.dm_pels_width > 0 && dm.dm_pels_height > 0 {
         let sys_dpi = unsafe { GetDpiForSystem() };
-        let scale = if dm.dm_log_pixels >= 96 {
-            dm.dm_log_pixels as f64 / 96.0
-        } else if sys_dpi >= 96 {
-            sys_dpi as f64 / 96.0
+        let scale = if (dm.dm_log_pixels as u32) >= WINDOWS_STANDARD_DPI {
+            dm.dm_log_pixels as f64 / WINDOWS_STANDARD_DPI_F64
+        } else if sys_dpi >= WINDOWS_STANDARD_DPI {
+            sys_dpi as f64 / WINDOWS_STANDARD_DPI_F64
         } else {
             1.0
         };
@@ -926,7 +1275,7 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
             fps: if dm.dm_display_frequency > 1 {
                 dm.dm_display_frequency
             } else {
-                60
+                config::DEFAULT_DISPLAY_FPS
             },
             scale_factor: scale,
         })
@@ -935,19 +1284,21 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     }
 }
 
-/// Enumerates graphics adapters with a 30-second in-memory cache to prevent frequent OS subprocess calls.
+/// Enumerates graphics adapters with a [`GPU_CACHE_TTL`] in-memory cache to prevent frequent OS subprocess calls.
 pub fn enumerate_gpus() -> Vec<GpuDeviceInfo> {
-    static GPU_CACHE: OnceLock<Mutex<(Instant, Vec<GpuDeviceInfo>)>> = OnceLock::new();
-    let cache = GPU_CACHE.get_or_init(|| Mutex::new((Instant::now() - std::time::Duration::from_secs(120), Vec::new())));
+    static GPU_CACHE: OnceLock<Mutex<Option<(Instant, Vec<GpuDeviceInfo>)>>> = OnceLock::new();
+    let cache = GPU_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
-        if !guard.1.is_empty() && guard.0.elapsed() < std::time::Duration::from_secs(30) {
-            return guard.1.clone();
+        if let Some((captured_at, ref cached)) = *guard {
+            if !cached.is_empty() && captured_at.elapsed() < GPU_CACHE_TTL {
+                return cached.clone();
+            }
         }
     }
 
     let gpus = enumerate_gpus_uncached();
     if let Ok(mut guard) = cache.lock() {
-        *guard = (Instant::now(), gpus.clone());
+        *guard = Some((Instant::now(), gpus.clone()));
     }
     gpus
 }
@@ -958,7 +1309,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(cmd) = Command::new("/usr/sbin/system_profiler")
+        if let Ok(cmd) = Command::new(config::MACOS_SYSTEM_PROFILER_BIN)
             .args(["SPDisplaysDataType", "-json"])
             .output()
         {
@@ -1039,14 +1390,12 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
         }
 
         // Also inspect Windows Display class registry keys for all adapters (Intel, AMD, NVIDIA, etc.)
+        let display_class_key = format!(
+            r"{}\{}",
+            WINDOWS_CONTROL_CLASS_REG_ROOT, GUID_DEVCLASS_DISPLAY
+        );
         if let Ok(cmd) = win_cmd(&system32_exe("reg.exe"))
-            .args([
-                "query",
-                r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
-                "/s",
-                "/v",
-                "DriverDesc",
-            ])
+            .args(["query", &display_class_key, "/s", "/v", "DriverDesc"])
             .output()
         {
             if cmd.status.success() {
@@ -1092,7 +1441,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
     if out.is_empty() {
         out.push(GpuDeviceInfo {
             index: 0,
-            name: "Default System GPU".into(),
+            name: config::DEFAULT_SYSTEM_GPU_NAME.into(),
             vendor: "System".into(),
             is_discrete: false,
             vram_mb: None,
@@ -1203,29 +1552,40 @@ pub fn find_sunshine_conf() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]
     {
-        for env_key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA", "APPDATA"] {
+        for env_key in WINDOWS_CONF_ENV_KEYS {
             if let Ok(base) = std::env::var(env_key) {
-                candidates.push(PathBuf::from(&base).join("Sunshine").join("config").join("sunshine.conf"));
-                candidates.push(PathBuf::from(&base).join("Sunshine").join("sunshine.conf"));
-                candidates.push(PathBuf::from(&base).join("Apollo").join("config").join("sunshine.conf"));
+                for app_dir in WINDOWS_SUNSHINE_APP_DIRS {
+                    candidates.push(
+                        PathBuf::from(&base)
+                            .join(app_dir)
+                            .join("config")
+                            .join(config::SUNSHINE_CONF_FILENAME),
+                    );
+                }
+                candidates.push(
+                    PathBuf::from(&base)
+                        .join("Sunshine")
+                        .join(config::SUNSHINE_CONF_FILENAME),
+                );
             }
         }
         if let Ok(prog_data) = std::env::var("ProgramData") {
-            candidates.push(PathBuf::from(&prog_data).join("Sunshine").join("sunshine.conf"));
+            candidates.push(
+                PathBuf::from(&prog_data)
+                    .join("Sunshine")
+                    .join(config::SUNSHINE_CONF_FILENAME),
+            );
         }
     }
     #[cfg(target_os = "macos")]
     {
         let home = user_home_dir();
-        candidates.push(home.join(".config").join("sunshine").join("sunshine.conf"));
-        candidates.push(
-            home.join("Library")
-                .join("Application Support")
-                .join("Sunshine")
-                .join("sunshine.conf"),
-        );
-        candidates.push(PathBuf::from("/opt/homebrew/etc/sunshine/sunshine.conf"));
-        candidates.push(PathBuf::from("/usr/local/etc/sunshine/sunshine.conf"));
+        for rel_dir in MACOS_SUNSHINE_CONF_HOME_REL_DIRS {
+            candidates.push(home.join(rel_dir).join(config::SUNSHINE_CONF_FILENAME));
+        }
+        for sys_dir in MACOS_SUNSHINE_CONF_SYSTEM_DIRS {
+            candidates.push(PathBuf::from(sys_dir).join(config::SUNSHINE_CONF_FILENAME));
+        }
     }
 
     candidates.into_iter().find(|p| p.is_file())
@@ -1233,13 +1593,25 @@ pub fn find_sunshine_conf() -> Option<PathBuf> {
 
 /// Locates the `sunshine` streaming server executable binary.
 pub fn find_sunshine_binary() -> Option<PathBuf> {
+    let prefs = load_path_preferences();
+    if let Some(custom) = prefs.sunshine_binary_path {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() && !trimmed.chars().any(|c| c.is_control()) {
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         let mut candidates = Vec::new();
-        for env_key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"] {
+        for env_key in WINDOWS_APP_ENV_KEYS {
             if let Ok(base) = std::env::var(env_key) {
-                candidates.push(PathBuf::from(&base).join("Sunshine").join("sunshine.exe"));
-                candidates.push(PathBuf::from(&base).join("Apollo").join("sunshine.exe"));
+                for app_dir in WINDOWS_SUNSHINE_APP_DIRS {
+                    candidates.push(PathBuf::from(&base).join(app_dir).join("sunshine.exe"));
+                }
             }
         }
         if let Some(p) = candidates.into_iter().find(|p| p.is_file()) {
@@ -1249,12 +1621,16 @@ pub fn find_sunshine_binary() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        for p in [
-            PathBuf::from("/Applications/Sunshine.app/Contents/MacOS/sunshine"),
-            user_home_dir().join("Applications/Sunshine.app/Contents/MacOS/sunshine"),
-            PathBuf::from("/opt/homebrew/bin/sunshine"),
-            PathBuf::from("/usr/local/bin/sunshine"),
-        ] {
+        let mut candidates: Vec<PathBuf> = vec![
+            PathBuf::from(MACOS_SUNSHINE_SYSTEM_BIN_CANDIDATES[0]),
+            user_home_dir().join(MACOS_SUNSHINE_USER_BIN_REL_PATH),
+        ];
+        candidates.extend(
+            MACOS_SUNSHINE_SYSTEM_BIN_CANDIDATES[1..]
+                .iter()
+                .map(PathBuf::from),
+        );
+        for p in candidates {
             if p.is_file() {
                 return Some(p);
             }
@@ -1280,21 +1656,23 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         for p in [
-            PathBuf::from("/Applications/Moonlight.app/Contents/MacOS/Moonlight"),
-            user_home_dir().join("Applications/Moonlight.app/Contents/MacOS/Moonlight"),
+            PathBuf::from(MACOS_MOONLIGHT_SYSTEM_BIN_PATH),
+            user_home_dir().join(MACOS_MOONLIGHT_USER_BIN_REL_PATH),
         ] {
             if p.is_file() {
                 return Some(p);
             }
         }
         // Spotlight bundle ID fallback if installed anywhere else on disk
-        if let Ok(out) = Command::new("/usr/bin/mdfind")
-            .arg("kMDItemCFBundleIdentifier == 'com.moonlight-stream.Moonlight'")
-            .output()
-        {
+        let query = format!(
+            "kMDItemCFBundleIdentifier == '{}'",
+            config::MOONLIGHT_MACOS_PREFS_DOMAIN
+        );
+        if let Ok(out) = Command::new(config::MACOS_MDFIND_BIN).arg(&query).output() {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    let candidate = PathBuf::from(line.trim()).join("Contents/MacOS/Moonlight");
+                    let candidate =
+                        PathBuf::from(line.trim()).join(MACOS_MOONLIGHT_BUNDLE_BIN_REL_PATH);
                     if candidate.is_file() {
                         return Some(candidate);
                     }
@@ -1306,10 +1684,11 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let mut candidates = Vec::new();
-        for env_key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"] {
+        for env_key in WINDOWS_APP_ENV_KEYS {
             if let Ok(base) = std::env::var(env_key) {
-                candidates.push(PathBuf::from(&base).join("Moonlight Game Streaming Project").join("Moonlight.exe"));
-                candidates.push(PathBuf::from(&base).join("Moonlight").join("Moonlight.exe"));
+                for app_dir in WINDOWS_MOONLIGHT_APP_DIRS {
+                    candidates.push(PathBuf::from(&base).join(app_dir).join("Moonlight.exe"));
+                }
             }
         }
         if let Some(p) = candidates.into_iter().find(|p| p.is_file()) {
@@ -1326,13 +1705,13 @@ pub fn find_moonlight_binary() -> Option<PathBuf> {
 /// Parses Sunshine server name, port, and configured adapter name from `sunshine.conf`.
 pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
     let Some(conf_path) = find_sunshine_conf() else {
-        return (None, 47989, None);
+        return (None, config::SUNSHINE_DEFAULT_PORT, None);
     };
     let Ok(content) = std::fs::read_to_string(&conf_path) else {
-        return (None, 47989, None);
+        return (None, config::SUNSHINE_DEFAULT_PORT, None);
     };
     let mut name = None;
-    let mut port: u16 = 47989;
+    let mut port: u16 = config::SUNSHINE_DEFAULT_PORT;
     let mut adapter = None;
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -1357,10 +1736,14 @@ pub fn read_sunshine_config_info() -> (Option<String>, u16, Option<String>) {
     (name, port, adapter)
 }
 
-/// Validates that a Sunshine GPU adapter name contains no control characters and is under 256 chars.
+/// Validates that a Sunshine GPU adapter name contains no control characters and is within
+/// [`MAX_SUNSHINE_ADAPTER_NAME_LEN`] bytes.
 fn validate_sunshine_adapter_name(raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.chars().any(|c| c.is_control()) {
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_SUNSHINE_ADAPTER_NAME_LEN
+        || trimmed.chars().any(|c| c.is_control())
+    {
         anyhow::bail!("Invalid Sunshine adapter_name value");
     }
     Ok(trimmed.to_string())
@@ -1403,11 +1786,11 @@ pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     Ok(changed)
 }
 
-/// Resolves the default shared folder on the local machine (e.g. `~/Public` on macOS, `C:\Users\Public` on Windows).
+/// Resolves the default shared folder on the local machine (e.g. `~/Public` on macOS, `%PUBLIC%` on Windows).
 pub fn default_local_shared_folder() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let pub_dir = user_home_dir().join("Public");
+        let pub_dir = user_home_dir().join(DEFAULT_PUBLIC_SHARE_NAME);
         if pub_dir.exists() {
             Some(pub_dir.to_string_lossy().to_string())
         } else {
@@ -1416,11 +1799,25 @@ pub fn default_local_shared_folder() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let pub_dir = std::path::PathBuf::from(r"C:\Users\Public");
+        if let Ok(public_env) = std::env::var("PUBLIC") {
+            let trimmed = public_env.trim();
+            if !trimmed.is_empty() && !trimmed.contains('\0') {
+                let p = PathBuf::from(trimmed);
+                if p.exists() {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        let pub_dir = PathBuf::from(windows_system_drive()).join(WINDOWS_PUBLIC_USERS_REL_PATH);
         if pub_dir.exists() {
             Some(pub_dir.to_string_lossy().to_string())
         } else {
-            Some(user_home_dir().join("Public").to_string_lossy().to_string())
+            Some(
+                user_home_dir()
+                    .join(DEFAULT_PUBLIC_SHARE_NAME)
+                    .to_string_lossy()
+                    .to_string(),
+            )
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1441,10 +1838,10 @@ pub fn list_local_smb_shares() -> Vec<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let sharing_bin = if std::path::Path::new("/usr/sbin/sharing").exists() {
-            "/usr/sbin/sharing"
+        let sharing_bin = if Path::new(config::MACOS_SHARING_BIN).exists() {
+            config::MACOS_SHARING_BIN
         } else {
-            "/usr/bin/sharing"
+            MACOS_SHARING_FALLBACK_BIN
         };
         let mut got_shares = false;
         // 1. Structured JSON parsing via /usr/sbin/sharing -l -f json
@@ -1519,7 +1916,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
                     shares.push(name.to_string());
                 }
             } else {
-                shares.push("Public".to_string());
+                shares.push(DEFAULT_PUBLIC_SHARE_NAME.to_string());
             }
         }
     }
@@ -1563,7 +1960,7 @@ pub fn list_local_smb_shares() -> Vec<String> {
             }
         }
         if shares.is_empty() {
-            shares.push("Public".to_string());
+            shares.push(DEFAULT_PUBLIC_SHARE_NAME.to_string());
         }
     }
 
@@ -1605,8 +2002,8 @@ pub fn collect_local_profile() -> LocalHardwareProfile {
 
 /// Asks the OS routing table which local IPv4 interface will be used to route packets to `peer_ip`.
 pub fn local_ip_for_peer(peer_ip: &str) -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect((peer_ip, 58281)).ok()?;
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((peer_ip, config::CONTROL_PORT)).ok()?;
     let addr = socket.local_addr().ok()?;
     Some(addr.ip().to_string())
 }
@@ -1677,7 +2074,12 @@ pub fn describe_route_to_peer(peer_ip: &str) -> (LinkTransport, Option<u32>, Str
 
 /// Returns `true` if the route to `peer_ip` is a direct physical bridge cable (Thunderbolt or USB-C).
 pub fn is_direct_cable_route(peer_ip: &str) -> bool {
-    if peer_ip == "127.0.0.1" {
+    if peer_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+    {
         return true;
     }
     let (transport, _, _, _) = describe_route_to_peer(peer_ip);
@@ -1694,7 +2096,7 @@ pub fn discovery_broadcast_targets() -> Vec<String> {
             targets.push(iface.broadcast);
         }
     }
-    let global = "255.255.255.255".to_string();
+    let global = Ipv4Addr::BROADCAST.to_string();
     if seen.insert(global.clone()) {
         targets.push(global);
     }
@@ -1816,10 +2218,10 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
                 }
                 Ipv4Addr::from(mask_bytes)
             } else {
-                Ipv4Addr::new(255, 255, 255, 0)
+                config::DEFAULT_IPV4_FALLBACK_NETMASK
             }
         } else {
-            Ipv4Addr::new(255, 255, 255, 0)
+            config::DEFAULT_IPV4_FALLBACK_NETMASK
         };
 
         let broadcast = compute_broadcast(ip, mask);
@@ -1868,25 +2270,23 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     out
 }
 
-/// Caches macOS network hardware port mappings (`networksetup -listallhardwareports`) with a 15-second TTL.
+/// Caches macOS network hardware port mappings (`networksetup -listallhardwareports`)
+/// with a [`MAC_HARDWARE_PORTS_CACHE_TTL`] lifetime.
 #[cfg(target_os = "macos")]
 fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
-    static PORT_CACHE: OnceLock<Mutex<(Instant, std::collections::HashMap<String, String>)>> =
+    static PORT_CACHE: OnceLock<Mutex<Option<(Instant, std::collections::HashMap<String, String>)>>> =
         OnceLock::new();
-    let cache = PORT_CACHE.get_or_init(|| {
-        Mutex::new((
-            Instant::now() - std::time::Duration::from_secs(60),
-            std::collections::HashMap::new(),
-        ))
-    });
+    let cache = PORT_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
-        if !guard.1.is_empty() && guard.0.elapsed() < std::time::Duration::from_secs(15) {
-            return guard.1.clone();
+        if let Some((captured_at, ref cached)) = *guard {
+            if !cached.is_empty() && captured_at.elapsed() < MAC_HARDWARE_PORTS_CACHE_TTL {
+                return cached.clone();
+            }
         }
     }
 
     let mut map = std::collections::HashMap::new();
-    if let Ok(out) = Command::new("/usr/sbin/networksetup")
+    if let Ok(out) = Command::new(config::MACOS_NETWORKSETUP_BIN)
         .arg("-listallhardwareports")
         .output()
     {
@@ -1907,7 +2307,7 @@ fn cached_mac_hardware_ports() -> std::collections::HashMap<String, String> {
     }
 
     if let Ok(mut guard) = cache.lock() {
-        *guard = (Instant::now(), map.clone());
+        *guard = Some((Instant::now(), map.clone()));
     }
     map
 }
@@ -2006,7 +2406,7 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
     }
 
     let mut speed_mbps = None;
-    if let Ok(out) = Command::new("/sbin/ifconfig").arg(iface).output() {
+    if let Ok(out) = Command::new(config::MACOS_IFCONFIG_BIN).arg(iface).output() {
         if out.status.success() {
             let txt = String::from_utf8_lossy(&out.stdout);
             let (parsed_speed, is_ncm_media, is_wired_media) = parse_mac_ifconfig_media(&txt);
@@ -2025,22 +2425,18 @@ fn classify_mac_interface(iface: &str, friendly: &str) -> (LinkTransport, Option
 /// Inspects IOKit registry to determine if `iface` represents an Apple Silicon USB-C NCM virtual adapter.
 #[cfg(target_os = "macos")]
 fn mac_is_usb_ncm_interface(iface: &str) -> bool {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-
     static CACHE: OnceLock<Mutex<Option<(Instant, HashSet<String>)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if let Some((captured_at, ifaces)) = &*guard {
-        if now.duration_since(*captured_at) < Duration::from_secs(3) {
+        if now.duration_since(*captured_at) < MAC_USB_NCM_CACHE_TTL {
             return ifaces.contains(iface);
         }
     }
 
     let mut fresh = HashSet::new();
-    if let Ok(out) = Command::new("/usr/sbin/ioreg")
+    if let Ok(out) = Command::new(config::MACOS_IOREG_BIN)
         .args(["-r", "-c", "AppleUSBDeviceNCMData", "-l"])
         .output()
     {
@@ -2113,7 +2509,10 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
             succeeded = true;
             break;
         }
-        if rc == ERROR_INSUFFICIENT_BUFFER && (size as usize) > buf.len() && (size as usize) <= 4 * 1024 * 1024 {
+        if rc == ERROR_INSUFFICIENT_BUFFER
+            && (size as usize) > buf.len()
+            && (size as usize) <= MAX_IP_ADDR_TABLE_BYTES
+        {
             buf.resize(size as usize, 0);
         } else {
             return Vec::new();
@@ -2144,7 +2543,7 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         let mask = Ipv4Addr::from(row.dw_mask.to_ne_bytes());
         let mask_u = u32::from(mask);
         let eff_mask = if mask_u == 0 {
-            Ipv4Addr::new(255, 255, 255, 0)
+            config::DEFAULT_IPV4_FALLBACK_NETMASK
         } else {
             mask
         };
@@ -2231,29 +2630,28 @@ fn classify_windows_adapter(name: &str, desc: &str, medium: &str) -> (bool, Link
     (is_vpn, transport, is_hotspot)
 }
 
-/// Caches Windows PowerShell `Get-NetAdapter` results with a 20-second TTL.
+/// Caches Windows PowerShell `Get-NetAdapter` results with a [`WIN_ADAPTER_META_CACHE_TTL`] lifetime.
 #[cfg(target_os = "windows")]
 fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, String, LinkTransport, Option<u32>)> {
     static META_CACHE: OnceLock<
-        Mutex<(
-            Instant,
-            std::collections::HashMap<u32, (String, String, LinkTransport, Option<u32>)>,
-        )>,
+        Mutex<
+            Option<(
+                Instant,
+                std::collections::HashMap<u32, (String, String, LinkTransport, Option<u32>)>,
+            )>,
+        >,
     > = OnceLock::new();
-    let cache = META_CACHE.get_or_init(|| {
-        Mutex::new((
-            Instant::now() - std::time::Duration::from_secs(60),
-            std::collections::HashMap::new(),
-        ))
-    });
+    let cache = META_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
-        if !guard.1.is_empty() && guard.0.elapsed() < std::time::Duration::from_secs(20) {
-            return guard.1.clone();
+        if let Some((captured_at, ref cached)) = *guard {
+            if !cached.is_empty() && captured_at.elapsed() < WIN_ADAPTER_META_CACHE_TTL {
+                return cached.clone();
+            }
         }
     }
 
     let mut map = std::collections::HashMap::new();
-    let ps_exe = system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    let ps_exe = system32_exe(config::POWERSHELL_SYSTEM32_REL_PATH);
     if let Ok(out) = win_cmd(&ps_exe)
         .args([
             "-NoProfile",
@@ -2290,7 +2688,7 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
     }
 
     if let Ok(mut guard) = cache.lock() {
-        *guard = (Instant::now(), map.clone());
+        *guard = Some((Instant::now(), map.clone()));
     }
     map
 }
@@ -2298,7 +2696,12 @@ fn cached_windows_adapter_meta() -> std::collections::HashMap<u32, (String, Stri
 /// Discards synthetic placeholder link speeds reported by virtual USB-C NCM drivers.
 fn sanitize_adapter_link_speed(transport: LinkTransport, speed_mbps: Option<u32>) -> Option<u32> {
     match (transport, speed_mbps) {
-        (LinkTransport::DirectUsb, Some(mbps)) if mbps >= 40_000 || mbps == 100 => None,
+        (LinkTransport::DirectUsb, Some(mbps))
+            if mbps >= SYNTHETIC_USB_NCM_MAX_VALID_MBPS
+                || mbps == SYNTHETIC_USB_NCM_PLACEHOLDER_MBPS =>
+        {
+            None
+        }
         (_, other) => other,
     }
 }
@@ -2478,5 +2881,66 @@ mod tests {
             Ipv4Addr::new(255, 255, 255, 0),
             Ipv4Addr::new(192, 168, 2, 2),
         ));
+    }
+
+    #[test]
+    fn test_sunshine_api_credentials_resolution_and_validation() {
+        use super::{
+            format_curl_basic_auth_config, resolve_sunshine_api_credentials_from,
+            AppPathPreferences,
+        };
+
+        // Never returns hardcoded fallback credentials when unconfigured
+        let empty = AppPathPreferences::default();
+        assert_eq!(resolve_sunshine_api_credentials_from(None, None, &empty), None);
+
+        // Falls back to AppPathPreferences when env vars are unset
+        let prefs = AppPathPreferences {
+            sunshine_api_user: Some("studio".into()),
+            sunshine_api_password: Some("s3cr\"et\\pw".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_sunshine_api_credentials_from(None, None, &prefs),
+            Some(("studio".into(), "s3cr\"et\\pw".into()))
+        );
+
+        // Environment variables take precedence over preferences
+        assert_eq!(
+            resolve_sunshine_api_credentials_from(Some("envuser"), Some("envpass"), &prefs),
+            Some(("envuser".into(), "envpass".into()))
+        );
+
+        // Rejects control chars, newlines, NUL bytes, and colons in username
+        assert_eq!(
+            resolve_sunshine_api_credentials_from(Some("user\n"), Some("pass"), &prefs),
+            None
+        );
+        assert_eq!(
+            resolve_sunshine_api_credentials_from(Some("user"), Some("pass\0word"), &prefs),
+            None
+        );
+        assert_eq!(
+            resolve_sunshine_api_credentials_from(Some("bad:user"), Some("pass"), &prefs),
+            None
+        );
+
+        // Escapes quotes and backslashes for `curl -K -` stdin auth config
+        assert_eq!(
+            format_curl_basic_auth_config("studio", "s3cr\"et\\pw"),
+            "user = \"studio:s3cr\\\"et\\\\pw\"\n"
+        );
+
+        // Debug representation redacts Sunshine API password
+        let dbg = format!("{:?}", prefs);
+        assert!(dbg.contains("<REDACTED>"));
+        assert!(!dbg.contains("s3cr"));
+
+        // Backward-compatible deserialization of legacy app_config.json without new fields
+        let legacy: AppPathPreferences =
+            serde_json::from_str(r#"{"smb_share_name":"Public"}"#).unwrap();
+        assert_eq!(legacy.smb_share_name.as_deref(), Some("Public"));
+        assert!(legacy.firewall_extra_subnets.is_empty());
+        assert_eq!(legacy.sunshine_api_user, None);
     }
 }

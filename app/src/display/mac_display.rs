@@ -49,12 +49,56 @@
 //! - **AppleScript Sanitization**: Notification titles and messages are filtered to strip control
 //!   characters and truncated to safe length limits before passing to `osascript`.
 
-use crate::system_info;
+use crate::{config, system_info};
 use anyhow::{Context, Result};
+use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Maximum curl execution timeout in seconds for local Sunshine REST API control requests.
+const SUNSHINE_API_TIMEOUT_SECS: &str = "2";
+
+/// Default relative directory under `$HOME` for `sunshine.conf` when no existing config is discovered.
+const MACOS_DEFAULT_SUNSHINE_CONF_DIR: &str = ".config/sunshine";
+
+/// Relative per-user macOS diagnostic log directory under `$HOME`.
+const MACOS_LOGS_REL_DIR: &str = "Library/Logs";
+
+/// Filename for Sunshine standard output logs on macOS.
+const SUNSHINE_STDOUT_LOG_NAME: &str = "sunshine.log";
+
+/// Filename for Sunshine standard error logs on macOS.
+const SUNSHINE_STDERR_LOG_NAME: &str = "sunshine.err.log";
+
+/// Settling delay after stopping a prior Sunshine process before relaunching it.
+const SUNSHINE_RESTART_DELAY: Duration = Duration::from_millis(250);
+
+/// Maximum number of `pgrep` polling iterations while waiting for Sunshine to exit after SIGTERM.
+const SUNSHINE_STOP_POLL_ATTEMPTS: usize = 10;
+
+/// Interval between Sunshine process-exit polling checks.
+const SUNSHINE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Per-attempt TCP connect timeout when probing Sunshine readiness.
+const PORT_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Delay between TCP readiness probe attempts.
+const PORT_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Maximum number of `pgrep` polling iterations while waiting for Moonlight to terminate.
+const MOONLIGHT_STOP_POLL_ATTEMPTS: usize = 8;
+
+/// Interval between Moonlight process-exit polling checks.
+const MOONLIGHT_STOP_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Maximum safe character length for macOS notification titles passed to `osascript`.
+const MAX_NOTIFICATION_TITLE_LEN: usize = 128;
+
+/// Maximum safe character length for macOS notification messages passed to `osascript`.
+const MAX_NOTIFICATION_MESSAGE_LEN: usize = 256;
 
 /// Spawns a dedicated background thread to wait on and reap a child process, preventing zombies.
 ///
@@ -135,7 +179,8 @@ extern "C" {
 pub struct MacDisplayManager;
 
 impl MacDisplayManager {
-    /// Locates Integrator's own virtual display using custom Vendor/Product ID (`0x494E` / `0x0165`).
+    /// Locates Integrator's own virtual display using custom Vendor/Product ID
+    /// ([`config::INTEGRATOR_EDID_VENDOR_ID`] / [`config::INTEGRATOR_EDID_PRODUCT_ID`]).
     ///
     /// Guarantees that physical external displays are never misidentified as Integrator virtual displays.
     #[cfg(target_os = "macos")]
@@ -160,7 +205,9 @@ impl MacDisplayManager {
     /// - `display_id`: CoreGraphics display identifier of the target virtual screen.
     pub fn configure_sunshine_output(display_id: u32) -> Result<()> {
         let conf_path = system_info::find_sunshine_conf().unwrap_or_else(|| {
-            system_info::user_home_dir().join(".config/sunshine/sunshine.conf")
+            system_info::user_home_dir()
+                .join(MACOS_DEFAULT_SUNSHINE_CONF_DIR)
+                .join(config::SUNSHINE_CONF_FILENAME)
         });
 
         let content = if conf_path.exists() {
@@ -182,18 +229,18 @@ impl MacDisplayManager {
     /// Creates or reuses an in-process `CGVirtualDisplay` on macOS.
     ///
     /// # Arguments
-    /// - `width`: Target display width in pixels (clamped to 800..=7680).
-    /// - `height`: Target display height in pixels (clamped to 600..=4320).
-    /// - `fps`: Target refresh rate in Hertz (clamped to 30..=240).
+    /// - `width`: Target display width in pixels (clamped to [`config::MIN_DISPLAY_WIDTH`]..=[`config::MAX_DISPLAY_WIDTH`]).
+    /// - `height`: Target display height in pixels (clamped to [`config::MIN_DISPLAY_HEIGHT`]..=[`config::MAX_DISPLAY_HEIGHT`]).
+    /// - `fps`: Target refresh rate in Hertz (clamped to [`config::MIN_DISPLAY_FPS`]..=[`config::MAX_DISPLAY_FPS`]).
     ///
     /// # Returns
     /// CoreGraphics display identifier (`CGDirectDisplayID`) on success.
     pub fn start_virtual_display(width: u32, height: u32, fps: u32) -> Result<u32> {
         #[cfg(target_os = "macos")]
         {
-            let w = width.clamp(800, 7680);
-            let h = height.clamp(600, 4320);
-            let f = fps.clamp(30, 240);
+            let w = width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH);
+            let h = height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT);
+            let f = fps.clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS);
             let id = unsafe { start_virtual_display_in_app(w, h, f, false) };
             if id == 0 {
                 anyhow::bail!(
@@ -247,16 +294,16 @@ impl MacDisplayManager {
     /// to preserve Screen Recording TCC permissions.
     pub fn start_sunshine() -> Result<()> {
         let _ = Self::stop_sunshine();
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(SUNSHINE_RESTART_DELAY);
 
         let sunshine_bin = system_info::find_sunshine_binary().context(
             "Sunshine binary not found. Install Sunshine.app or add `sunshine` to PATH.",
         )?;
 
-        let log_dir = system_info::user_home_dir().join("Library/Logs");
+        let log_dir = system_info::user_home_dir().join(MACOS_LOGS_REL_DIR);
         let _ = std::fs::create_dir_all(&log_dir);
-        let log_path = log_dir.join("sunshine.log");
-        let err_log_path = log_dir.join("sunshine.err.log");
+        let log_path = log_dir.join(SUNSHINE_STDOUT_LOG_NAME);
+        let err_log_path = log_dir.join(SUNSHINE_STDERR_LOG_NAME);
         let conf_path = system_info::find_sunshine_conf().filter(|p| p.is_file());
 
         // Launch Sunshine.app via LaunchServices (`open`) when packaged inside a .app bundle
@@ -272,7 +319,7 @@ impl MacDisplayManager {
             if let Err(e) = create_private_log_file(&err_log_path) {
                 warn!("Could not prepare Sunshine stderr log {}: {}", err_log_path.display(), e);
             }
-            let mut cmd = Command::new("/usr/bin/open");
+            let mut cmd = Command::new(config::MACOS_OPEN_BIN);
             cmd.arg("-g")
                 .arg("-n")
                 .arg("-a")
@@ -316,29 +363,58 @@ impl MacDisplayManager {
 
     /// Dispatches an administrative POST request to the local Sunshine REST API on macOS.
     ///
-    /// Executes `/usr/bin/curl` with a 2-second timeout and default administrative credentials (`admin:alpine`).
+    /// Resolves credentials dynamically via [`system_info::resolve_sunshine_api_credentials`]
+    /// (environment variables or user preferences) and pipes them to `curl -K -` over `stdin`
+    /// so secrets never appear on process `argv` or `ps aux`. Skips execution cleanly if no
+    /// credentials are configured.
     ///
     /// # Arguments
-    /// - `web_port`: Sunshine web administration port (e.g. 47990).
-    /// - `path`: API endpoint path (e.g. `"/api/apps/close"`).
+    /// - `web_port`: Sunshine web administration port (e.g. [`config::SUNSHINE_DEFAULT_WEB_PORT`]).
+    /// - `path`: API endpoint path (e.g. [`config::SUNSHINE_API_CLOSE_PATH`]).
     pub fn call_sunshine_api(web_port: u16, path: &str) {
-        let url = format!("https://127.0.0.1:{}{}", web_port, path);
-        let _ = Command::new("/usr/bin/curl")
-            .args(["-s", "-k", "-m", "2", "-u", "admin:alpine", "-X", "POST", &url])
-            .stdin(Stdio::null())
+        let Some((user, pass)) = system_info::resolve_sunshine_api_credentials() else {
+            debug!(
+                "Skipping macOS Sunshine API POST to {}:{} (no Sunshine API credentials configured)",
+                web_port, path
+            );
+            return;
+        };
+        let url = format!("https://{}:{}{}", Ipv4Addr::LOCALHOST, web_port, path);
+        let auth_cfg = system_info::format_curl_basic_auth_config(&user, &pass);
+        if let Ok(mut child) = Command::new(config::MACOS_CURL_BIN)
+            .args([
+                "-s",
+                "-k",
+                "-m",
+                SUNSHINE_API_TIMEOUT_SECS,
+                "-K",
+                "-",
+                "-X",
+                "POST",
+                &url,
+            ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(auth_cfg.as_bytes());
+            }
+            let _ = child.wait();
+        }
     }
 
     /// Stops any running Sunshine server processes on macOS.
     pub fn stop_sunshine() -> Result<()> {
-        Self::call_sunshine_api(47990, "/api/apps/close");
-        Self::call_sunshine_api(47990, "/api/reset-display-device-persistence");
+        let (_, base_port, _) = system_info::read_sunshine_config_info();
+        let web_port = base_port.saturating_add(config::SUNSHINE_WEB_PORT_OFFSET);
+        Self::call_sunshine_api(web_port, config::SUNSHINE_API_CLOSE_PATH);
+        Self::call_sunshine_api(web_port, config::SUNSHINE_API_RESET_PERSISTENCE_PATH);
 
         let is_running = || {
             ["Sunshine", "sunshine"].iter().any(|proc_name| {
-                Command::new("/usr/bin/pgrep")
+                Command::new(config::MACOS_PGREP_BIN)
                     .args(["-x", proc_name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -348,17 +424,17 @@ impl MacDisplayManager {
             })
         };
 
-        let _ = Command::new("/usr/bin/killall")
+        let _ = Command::new(config::MACOS_KILLALL_BIN)
             .args(["-q", "-TERM", "Sunshine", "sunshine"])
             .status();
-        for _ in 0..10 {
+        for _ in 0..SUNSHINE_STOP_POLL_ATTEMPTS {
             if !is_running() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(SUNSHINE_STOP_POLL_INTERVAL);
         }
         if is_running() {
-            let _ = Command::new("/usr/bin/killall")
+            let _ = Command::new(config::MACOS_KILLALL_BIN)
                 .args(["-q", "-KILL", "Sunshine", "sunshine"])
                 .status();
         }
@@ -369,7 +445,8 @@ impl MacDisplayManager {
     /// Waits until Sunshine binds its configured local port.
     pub async fn wait_for_sunshine_ready(timeout_dur: Duration) -> bool {
         let (_, port, _) = system_info::read_sunshine_config_info();
-        Self::wait_for_port("127.0.0.1", port, timeout_dur).await
+        let loopback = Ipv4Addr::LOCALHOST.to_string();
+        Self::wait_for_port(&loopback, port, timeout_dur).await
     }
 
     /// Probes a TCP port until connection succeeds or `timeout` expires.
@@ -378,12 +455,12 @@ impl MacDisplayManager {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             if matches!(
-                tokio::time::timeout(Duration::from_millis(300), tokio::net::TcpStream::connect(&addr)).await,
+                tokio::time::timeout(PORT_PROBE_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await,
                 Ok(Ok(_))
             ) {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(PORT_PROBE_RETRY_INTERVAL).await;
         }
         false
     }
@@ -429,17 +506,22 @@ impl MacDisplayManager {
             anyhow::bail!("Invalid Moonlight host target '{}'", host_target);
         }
 
-        let w = (width.clamp(800, 7680)) & !1;
-        let h = (height.clamp(600, 4320)) & !1;
+        let app_name = system_info::resolve_moonlight_app_name();
+        let w = width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH) & !1;
+        let h = height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT) & !1;
         let res_arg = format!("{}x{}", w, h);
-        let fps_arg = fps.clamp(30, 240).to_string();
-        let bitrate_arg = bitrate_kbps.clamp(5000, 500000).to_string();
+        let fps_arg = fps
+            .clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS)
+            .to_string();
+        let bitrate_arg = bitrate_kbps
+            .clamp(config::MIN_BITRATE_KBPS, config::MAX_BITRATE_KBPS)
+            .to_string();
 
         let mut cmd = Command::new(&moonlight_bin);
         cmd.args([
             "stream",
             &host_target,
-            "Desktop",
+            &app_name,
             "--resolution",
             &res_arg,
             "--fps",
@@ -473,7 +555,7 @@ impl MacDisplayManager {
     /// Stops any running Moonlight client processes on macOS.
     pub fn stop_moonlight_client() -> Result<()> {
         let is_running = || {
-            Command::new("/usr/bin/pgrep")
+            Command::new(config::MACOS_PGREP_BIN)
                 .args(["-x", "Moonlight"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -482,14 +564,14 @@ impl MacDisplayManager {
                 .unwrap_or(false)
         };
         if is_running() {
-            let _ = Command::new("/usr/bin/killall")
+            let _ = Command::new(config::MACOS_KILLALL_BIN)
                 .args(["-q", "Moonlight"])
                 .status();
-            for _ in 0..8 {
+            for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
                 if !is_running() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
             }
         }
         info!("Stopped Moonlight on macOS");
@@ -498,9 +580,17 @@ impl MacDisplayManager {
 
     /// Displays a native macOS desktop notification via AppleScript (`osascript`).
     pub fn show_notification(title: &str, message: &str) {
-        let safe_title: String = title.chars().filter(|c| !c.is_control()).take(128).collect();
-        let safe_msg: String = message.chars().filter(|c| !c.is_control()).take(256).collect();
-        if let Ok(child) = Command::new("/usr/bin/osascript")
+        let safe_title: String = title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_NOTIFICATION_TITLE_LEN)
+            .collect();
+        let safe_msg: String = message
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_NOTIFICATION_MESSAGE_LEN)
+            .collect();
+        if let Ok(child) = Command::new(config::MACOS_OSASCRIPT_BIN)
             .args([
                 "-e",
                 "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run",
@@ -517,7 +607,7 @@ impl MacDisplayManager {
     }
 }
 
-/// Inspects existing paired Moonlight hosts in `com.moonlight-stream.Moonlight` preferences
+/// Inspects existing paired Moonlight hosts in [`config::MOONLIGHT_MACOS_PREFS_DOMAIN`] preferences
 /// and refreshes ONLY the slot that genuinely matches `host_name` / `pc_ip` & `port`.
 ///
 /// Guarantees that existing user configurations and other gaming PC pairings remain completely untouched.
@@ -530,8 +620,8 @@ fn resolve_or_refresh_mac_moonlight_slot(
         return None;
     }
 
-    let out = Command::new("/usr/bin/defaults")
-        .args(["read", "com.moonlight-stream.Moonlight"])
+    let out = Command::new(config::MACOS_DEFAULTS_BIN)
+        .args(["read", config::MOONLIGHT_MACOS_PREFS_DOMAIN])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -569,6 +659,7 @@ fn resolve_or_refresh_mac_moonlight_slot(
     }
 
     let wanted_port = port.to_string();
+    let default_port_str = config::SUNSHINE_DEFAULT_PORT.to_string();
     let mut best_slot: Option<usize> = None;
 
     for idx in indices {
@@ -587,7 +678,7 @@ fn resolve_or_refresh_mac_moonlight_slot(
         let h_local_port = props
             .get(&format!("hosts.{}.localport", idx))
             .map(String::as_str)
-            .unwrap_or("47989");
+            .unwrap_or(default_port_str.as_str());
         let h_manual_port = props
             .get(&format!("hosts.{}.manualport", idx))
             .map(String::as_str)
@@ -620,8 +711,14 @@ fn resolve_or_refresh_mac_moonlight_slot(
     // Update the matched slot's active direct route IP so USB-C/Wi-Fi switching works seamlessly
     for field in ["localaddress", "manualaddress"] {
         let key = format!("hosts.{}.{}", idx, field);
-        match Command::new("/usr/bin/defaults")
-            .args(["write", "com.moonlight-stream.Moonlight", &key, "-string", pc_ip])
+        match Command::new(config::MACOS_DEFAULTS_BIN)
+            .args([
+                "write",
+                config::MOONLIGHT_MACOS_PREFS_DOMAIN,
+                &key,
+                "-string",
+                pc_ip,
+            ])
             .status()
         {
             Ok(s) if s.success() => {}
