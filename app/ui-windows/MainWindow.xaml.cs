@@ -1606,9 +1606,8 @@ namespace IntegratorUI
                     RunInvoke("set_local_shared_folder", new { folder = folder.Path });
                 }
             }
-            catch (Exception ex)
+            catch
             {
-                Log($"[Storage] FolderPicker error: {ex.Message}");
             }
         }
 
