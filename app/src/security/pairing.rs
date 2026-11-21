@@ -411,6 +411,7 @@ impl PairingCoordinatorV2 {
     }
 
     /// Opens the pairing window with an explicit 6-digit PIN (for testing or user specification).
+    #[cfg(test)]
     pub fn open_pairing_window_with_pin(
         &mut self,
         pin: &str,
@@ -1137,6 +1138,7 @@ where
 }
 
 /// Executes the complete 4-message Client (`Initiator A`) pairing flow over an async stream.
+#[cfg(test)]
 pub async fn run_client_pairing_over_stream<S>(
     stream: &mut S,
     keystore: &mut KeystoreV2,
@@ -1365,6 +1367,7 @@ where
 }
 
 /// Executes the complete 4-message Server (`Responder B`) pairing flow over an async stream.
+#[cfg(test)]
 pub async fn handle_server_pairing_over_stream<S>(
     stream: &mut S,
     coordinator: &mut PairingCoordinatorV2,
@@ -1387,6 +1390,7 @@ where
 }
 
 /// Executes the 4-message Server pairing flow when the 4-byte `IPR2` magic has optionally already been read.
+#[cfg(test)]
 pub async fn handle_server_pairing_with_prefixed_magic<S>(
     stream: &mut S,
     already_read_magic: Option<[u8; 4]>,

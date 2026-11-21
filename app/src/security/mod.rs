@@ -98,22 +98,6 @@ pub fn csprng_array<const N: usize>() -> [u8; N] {
     arr
 }
 
-/// Returns a zeroizing fixed-size array of `N` cryptographically secure random bytes wrapped in [`zeroize::Zeroizing`].
-///
-/// The returned wrapper automatically wipes the underlying buffer with zeroes when dropped, protecting
-/// sensitive ephemeral secrets, scalar seeds, and pre-shared keys against memory dump inspection.
-///
-/// # Type Parameters
-/// * `N` - Array byte length.
-///
-/// # Errors
-/// Returns `getrandom::Error` if the OS kernel CSPRNG reports an error.
-pub fn try_csprng_array<const N: usize>() -> Result<zeroize::Zeroizing<[u8; N]>, getrandom::Error> {
-    let mut arr = zeroize::Zeroizing::new([0u8; N]);
-    try_csprng_fill(&mut *arr)?;
-    Ok(arr)
-}
-
 /// Constant-time byte slice equality check using [`subtle::ConstantTimeEq`].
 ///
 /// Evaluates in constant execution time regardless of slice length mismatch or the position of the
@@ -172,19 +156,6 @@ pub fn derive_device_id_from_pubkey(ed25519_pubkey: &[u8; 32]) -> [u8; 16] {
     let mut id = [0u8; 16];
     id.copy_from_slice(&digest[0..16]);
     id
-}
-
-/// Deterministically derives the 32-character lowercase hex `device_id` string from an Ed25519 public key.
-///
-/// Combines [`derive_device_id_from_pubkey`] with lowercase hexadecimal encoding.
-///
-/// # Arguments
-/// * `ed25519_pubkey` - 32-byte compressed Edwards25519 public key.
-///
-/// # Returns
-/// 32-character lowercase ASCII hex string representing the canonical device identifier.
-pub fn derive_device_id_hex(ed25519_pubkey: &[u8; 32]) -> String {
-    hex_encode(&derive_device_id_from_pubkey(ed25519_pubkey))
 }
 
 /// Derives the 16-byte `key_id` identifier for a 32-byte per-peer `root_key`.

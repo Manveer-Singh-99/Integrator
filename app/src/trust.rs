@@ -267,29 +267,6 @@ pub fn regenerate_pin() -> String {
     pin
 }
 
-/// Sets a specific 6-digit PIN in the pairing coordinator (tests only).
-#[cfg(test)]
-pub fn set_active_pin_for_test(pin: &str) -> Result<(), String> {
-    if !is_valid_6digit_pin(pin) {
-        return Err("PIN must be 6 digits".into());
-    }
-    let rt = runtime_state();
-    let now = security::unix_epoch_secs();
-    let mut coord = rt
-        .pairing_coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut cached = rt
-        .active_pin_cached
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    coord
-        .open_pairing_window_with_pin(pin, now)
-        .map_err(|e| e.to_string())?;
-    *cached = (pin.to_string(), now);
-    Ok(())
-}
-
 /// Discovery boundary: records an untrusted discovery advertisement in the bounded in-memory UI cache.
 /// NEVER creates or mutates trusted peer credentials; returns `true` ONLY if `device_id` is already
 /// cryptographically paired and pinned in `KeystoreV2`.
@@ -681,6 +658,7 @@ pub async fn accept_transport_from_stream(
 // ============================================================================
 
 /// Constructs the canonical ASCII signing payload for minimal v2 discovery beacons.
+#[cfg(test)]
 fn build_beacon_v2_signing_payload(
     device_id_hex: &str,
     ed25519_pubkey_hex: &str,
@@ -701,6 +679,7 @@ fn build_beacon_v2_signing_payload(
 
 /// Signs a v2 discovery beacon using the local installation's Ed25519 private key.
 /// Returns `(local_device_id_hex, local_ed25519_pubkey_hex, signature_hex)`.
+#[cfg(test)]
 pub fn sign_discovery_beacon_v2(
     timestamp_ms: u64,
     control_port: u16,
@@ -723,6 +702,7 @@ pub fn sign_discovery_beacon_v2(
 /// Verifies a v2 discovery beacon's fields, timestamp freshness (±60s), `device_id` derivation,
 /// and `Ed25519` digital signature. If `device_id` is already pinned in `KeystoreV2`, also enforces
 /// that `ed25519_pubkey_hex` matches the pinned public key.
+#[cfg(test)]
 pub fn verify_discovery_beacon_v2(
     device_id_hex: &str,
     ed25519_pubkey_hex: &str,

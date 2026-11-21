@@ -353,166 +353,159 @@ impl BenchmarkClient {
         if !features.is_enabled("benchmark") {
             anyhow::bail!("Speed benchmark is disabled in feature settings.");
         }
-        tokio::time::timeout(Duration::from_secs(20), Self::run_test_internal(peer_ip))
+        tokio::time::timeout(Duration::from_secs(20), async move {
+            // Connect and establish mutual cryptographic authentication on TELEMETRY_PORT
+            let mut session = trust::connect_transport_to_ip(
+                peer_ip,
+                TELEMETRY_PORT,
+                ServiceId::Benchmark,
+                Duration::from_secs(4),
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("Speed benchmark timed out after 20 seconds"))?
-    }
+            .map_err(|e| anyhow::anyhow!("Failed to establish authenticated benchmark session with {}: {}", peer_ip, e))?;
 
-    /// Internal benchmark execution pipeline.
-    async fn run_test_internal(peer_ip: &str) -> Result<SpeedTestResult> {
-        // Connect and establish mutual cryptographic authentication on TELEMETRY_PORT
-        let mut session = trust::connect_transport_to_ip(
-            peer_ip,
-            TELEMETRY_PORT,
-            ServiceId::Benchmark,
-            Duration::from_secs(4),
-        )
+            // --------------------------------------------------------------------
+            // Phase 1: Latency Test (Ping x 5 samples)
+            // --------------------------------------------------------------------
+            let mut latencies = Vec::new();
+            for seq in 1u64..=5 {
+                let start = Instant::now();
+                let mut cmd = [0u8; 9];
+                cmd[0] = MODE_PING;
+                let expected_seq = seq.to_be_bytes();
+                cmd[1..9].copy_from_slice(&expected_seq);
+
+                // Send 9-byte ping command
+                tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&cmd))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Benchmark ping send timed out"))?
+                    .map_err(|e| anyhow::anyhow!("Benchmark ping send error: {}", e))?;
+
+                // Await 8-byte echo response
+                let reply = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Benchmark ping recv timed out"))?
+                    .map_err(|e| anyhow::anyhow!("Benchmark ping recv error: {}", e))?;
+
+                if reply.as_slice() != expected_seq {
+                    anyhow::bail!(
+                        "Invalid benchmark ping echo payload (expected seq {}, got {} bytes)",
+                        seq,
+                        reply.len()
+                    );
+                }
+                latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            if latencies.is_empty() {
+                anyhow::bail!("Failed to measure RTT samples against {}", peer_ip);
+            }
+            let avg_latency = latencies.iter().sum::<f64>() / latencies.len() as f64;
+
+            // Baseline payload size (16 MiB) for reliable transfer across network routes
+            let bench_bytes: u64 = DEFAULT_BENCHMARK_BYTES;
+
+            // --------------------------------------------------------------------
+            // Phase 2: Upload Throughput Test (Client -> Server)
+            // --------------------------------------------------------------------
+            let dummy_chunk = vec![0x55u8; CHUNK_SIZE];
+            let start_upload = Instant::now();
+            let mut up_cmd = [0u8; 9];
+            up_cmd[0] = MODE_UPLOAD;
+            up_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
+
+            // Send upload start command with requested byte count
+            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&up_cmd))
+                .await
+                .map_err(|_| anyhow::anyhow!("Benchmark upload command timed out"))?
+                .map_err(|e| anyhow::anyhow!("Benchmark upload command error: {}", e))?;
+
+            // Stream raw chunks until bench_bytes transmitted
+            let mut remaining = bench_bytes;
+            while remaining > 0 {
+                let to_write = std::cmp::min(remaining, dummy_chunk.len() as u64) as usize;
+                tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&dummy_chunk[..to_write]))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Benchmark upload frame timed out"))?
+                    .map_err(|e| anyhow::anyhow!("Benchmark upload frame error: {}", e))?;
+                remaining -= to_write as u64;
+            }
+
+            // Await server ACK [0x01]
+            let ack = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
+                .await
+                .map_err(|_| anyhow::anyhow!("Benchmark upload ack timed out"))?
+                .map_err(|e| anyhow::anyhow!("Benchmark upload ack recv error: {}", e))?;
+
+            if ack.as_slice() != [1u8] {
+                anyhow::bail!("Invalid benchmark upload ACK from {}", peer_ip);
+            }
+
+            let upload_dur = start_upload.elapsed().as_secs_f64().max(0.000_1);
+            let upload_mb_s = (bench_bytes as f64 / (1024.0 * 1024.0)) / upload_dur;
+            let upload_gbps = (bench_bytes as f64 * 8.0) / (upload_dur * 1_000_000_000.0);
+
+            // --------------------------------------------------------------------
+            // Phase 3: Download Throughput Test (Server -> Client)
+            // --------------------------------------------------------------------
+            let start_download = Instant::now();
+            let mut down_cmd = [0u8; 9];
+            down_cmd[0] = MODE_DOWNLOAD;
+            down_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
+
+            // Send download start command with requested byte count
+            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&down_cmd))
+                .await
+                .map_err(|_| anyhow::anyhow!("Benchmark download command timed out"))?
+                .map_err(|e| anyhow::anyhow!("Benchmark download command error: {}", e))?;
+
+            // Ingest chunks from server until bench_bytes received
+            let mut remaining = bench_bytes;
+            while remaining > 0 {
+                let chunk = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Benchmark download frame timed out"))?
+                    .map_err(|e| anyhow::anyhow!("Benchmark download frame error: {}", e))?;
+
+                if chunk.is_empty() || (chunk.len() as u64) > remaining {
+                    anyhow::bail!("Benchmark download invalid chunk size {}", chunk.len());
+                }
+                remaining -= chunk.len() as u64;
+            }
+
+            let download_dur = start_download.elapsed().as_secs_f64().max(0.000_1);
+            let download_mb_s = (bench_bytes as f64 / (1024.0 * 1024.0)) / download_dur;
+            let download_gbps = (bench_bytes as f64 * 8.0) / (download_dur * 1_000_000_000.0);
+
+            // --------------------------------------------------------------------
+            // Phase 4: Format Metrics & Record Result
+            // --------------------------------------------------------------------
+            let max_gbps = upload_gbps.max(download_gbps);
+            let summary = format!(
+                "{:.2} Gbps max ({:.0} MB/s up, {:.0} MB/s down) • {:.2} ms RTT",
+                max_gbps, upload_mb_s, download_mb_s, avg_latency
+            );
+
+            info!("⚡ Live Benchmark Results with {}: {}", peer_ip, summary);
+
+            let result = SpeedTestResult {
+                success: true,
+                max_gbps: (max_gbps * 100.0).round() / 100.0,
+                upload_gbps: (upload_gbps * 100.0).round() / 100.0,
+                upload_mb_s: upload_mb_s.round(),
+                download_gbps: (download_gbps * 100.0).round() / 100.0,
+                download_mb_s: download_mb_s.round(),
+                latency_ms: (avg_latency * 100.0).round() / 100.0,
+                peer_ip: peer_ip.to_string(),
+                summary,
+            };
+
+            record_measurement(&result);
+            Ok(result)
+        })
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to establish authenticated benchmark session with {}: {}", peer_ip, e))?;
-
-        // --------------------------------------------------------------------
-        // Phase 1: Latency Test (Ping x 5 samples)
-        // --------------------------------------------------------------------
-        let mut latencies = Vec::new();
-        for seq in 1u64..=5 {
-            let start = Instant::now();
-            let mut cmd = [0u8; 9];
-            cmd[0] = MODE_PING;
-            let expected_seq = seq.to_be_bytes();
-            cmd[1..9].copy_from_slice(&expected_seq);
-
-            // Send 9-byte ping command
-            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&cmd))
-                .await
-                .map_err(|_| anyhow::anyhow!("Benchmark ping send timed out"))?
-                .map_err(|e| anyhow::anyhow!("Benchmark ping send error: {}", e))?;
-
-            // Await 8-byte echo response
-            let reply = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
-                .await
-                .map_err(|_| anyhow::anyhow!("Benchmark ping recv timed out"))?
-                .map_err(|e| anyhow::anyhow!("Benchmark ping recv error: {}", e))?;
-
-            if reply.as_slice() != expected_seq {
-                anyhow::bail!(
-                    "Invalid benchmark ping echo payload (expected seq {}, got {} bytes)",
-                    seq,
-                    reply.len()
-                );
-            }
-            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        if latencies.is_empty() {
-            anyhow::bail!("Failed to measure RTT samples against {}", peer_ip);
-        }
-        let avg_latency = latencies.iter().sum::<f64>() / latencies.len() as f64;
-
-        // Scale payload size based on RTT so high-speed links saturate while slow Wi-Fi doesn't time out
-        let bench_bytes: u64 = if avg_latency < 2.0 {
-            64 * 1024 * 1024 // 64 MiB for low-latency Thunderbolt / multi-gigabit connections
-        } else {
-            DEFAULT_BENCHMARK_BYTES // 16 MiB baseline for Wi-Fi routes
-        };
-
-        // --------------------------------------------------------------------
-        // Phase 2: Upload Throughput Test (Client -> Server)
-        // --------------------------------------------------------------------
-        let dummy_chunk = vec![0x55u8; CHUNK_SIZE];
-        let start_upload = Instant::now();
-        let mut up_cmd = [0u8; 9];
-        up_cmd[0] = MODE_UPLOAD;
-        up_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
-
-        // Send upload start command with requested byte count
-        tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&up_cmd))
-            .await
-            .map_err(|_| anyhow::anyhow!("Benchmark upload command timed out"))?
-            .map_err(|e| anyhow::anyhow!("Benchmark upload command error: {}", e))?;
-
-        // Stream raw chunks until bench_bytes transmitted
-        let mut remaining = bench_bytes;
-        while remaining > 0 {
-            let to_write = std::cmp::min(remaining, dummy_chunk.len() as u64) as usize;
-            tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&dummy_chunk[..to_write]))
-                .await
-                .map_err(|_| anyhow::anyhow!("Benchmark upload frame timed out"))?
-                .map_err(|e| anyhow::anyhow!("Benchmark upload frame error: {}", e))?;
-            remaining -= to_write as u64;
-        }
-
-        // Await server ACK [0x01]
-        let ack = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
-            .await
-            .map_err(|_| anyhow::anyhow!("Benchmark upload ack timed out"))?
-            .map_err(|e| anyhow::anyhow!("Benchmark upload ack recv error: {}", e))?;
-
-        if ack.as_slice() != [1u8] {
-            anyhow::bail!("Invalid benchmark upload ACK from {}", peer_ip);
-        }
-
-        let upload_dur = start_upload.elapsed().as_secs_f64().max(0.000_1);
-        let upload_mb_s = (bench_bytes as f64 / (1024.0 * 1024.0)) / upload_dur;
-        let upload_gbps = (bench_bytes as f64 * 8.0) / (upload_dur * 1_000_000_000.0);
-
-        // --------------------------------------------------------------------
-        // Phase 3: Download Throughput Test (Server -> Client)
-        // --------------------------------------------------------------------
-        let start_download = Instant::now();
-        let mut down_cmd = [0u8; 9];
-        down_cmd[0] = MODE_DOWNLOAD;
-        down_cmd[1..9].copy_from_slice(&bench_bytes.to_be_bytes());
-
-        // Send download start command with requested byte count
-        tokio::time::timeout(BENCH_IO_TIMEOUT, session.send_message(&down_cmd))
-            .await
-            .map_err(|_| anyhow::anyhow!("Benchmark download command timed out"))?
-            .map_err(|e| anyhow::anyhow!("Benchmark download command error: {}", e))?;
-
-        // Ingest chunks from server until bench_bytes received
-        let mut remaining = bench_bytes;
-        while remaining > 0 {
-            let chunk = tokio::time::timeout(BENCH_IO_TIMEOUT, session.recv_message())
-                .await
-                .map_err(|_| anyhow::anyhow!("Benchmark download frame timed out"))?
-                .map_err(|e| anyhow::anyhow!("Benchmark download frame error: {}", e))?;
-
-            if chunk.is_empty() || (chunk.len() as u64) > remaining {
-                anyhow::bail!("Benchmark download invalid chunk size {}", chunk.len());
-            }
-            remaining -= chunk.len() as u64;
-        }
-
-        let download_dur = start_download.elapsed().as_secs_f64().max(0.000_1);
-        let download_mb_s = (bench_bytes as f64 / (1024.0 * 1024.0)) / download_dur;
-        let download_gbps = (bench_bytes as f64 * 8.0) / (download_dur * 1_000_000_000.0);
-
-        // --------------------------------------------------------------------
-        // Phase 4: Format Metrics & Record Result
-        // --------------------------------------------------------------------
-        let max_gbps = upload_gbps.max(download_gbps);
-        let summary = format!(
-            "{:.2} Gbps max ({:.0} MB/s up, {:.0} MB/s down) • {:.2} ms RTT",
-            max_gbps, upload_mb_s, download_mb_s, avg_latency
-        );
-
-        info!("⚡ Live Benchmark Results with {}: {}", peer_ip, summary);
-
-        let result = SpeedTestResult {
-            success: true,
-            max_gbps: (max_gbps * 100.0).round() / 100.0,
-            upload_gbps: (upload_gbps * 100.0).round() / 100.0,
-            upload_mb_s: upload_mb_s.round(),
-            download_gbps: (download_gbps * 100.0).round() / 100.0,
-            download_mb_s: download_mb_s.round(),
-            latency_ms: (avg_latency * 100.0).round() / 100.0,
-            peer_ip: peer_ip.to_string(),
-            summary,
-        };
-
-        record_measurement(&result);
-        Ok(result)
+        .map_err(|_| anyhow::anyhow!("Speed benchmark timed out after 20 seconds"))?
     }
 }
 

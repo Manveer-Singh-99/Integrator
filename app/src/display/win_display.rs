@@ -436,103 +436,94 @@ impl WinDisplayManager {
 
     /// Reads current GPU preferences for encode and decode dynamically from Sunshine config,
     /// enumerated GPUs, and Windows `UserGpuPreferences`.
+    #[cfg(target_os = "windows")]
     pub fn get_gpu_preferences() -> (String, String) {
-        #[cfg(target_os = "windows")]
-        {
-            let gpus = system_info::enumerate_gpus();
-            let (_, _, adapter_name) = system_info::read_sunshine_config_info();
+        let gpus = system_info::enumerate_gpus();
+        let (_, _, adapter_name) = system_info::read_sunshine_config_info();
 
-            let encode_gpu = if let Some(ref adapter) = adapter_name {
-                resolve_label_from_adapter(adapter, &gpus)
-            } else if let Some(conf_path) = system_info::find_sunshine_conf() {
-                std::fs::read_to_string(&conf_path)
-                    .ok()
-                    .and_then(|c| parse_sunshine_encoder(&c))
-                    .map(|enc| match enc.as_str() {
-                        "nvenc" => "nvidia".to_string(),
-                        "amdvce" | "amf" | "amd" => "amd".to_string(),
-                        "quicksync" => "intel".to_string(),
-                        "auto" => "auto".to_string(),
-                        other => other.to_string(),
-                    })
-                    .unwrap_or_else(|| {
-                        system_info::find_sunshine_binary()
-                            .and_then(|bin| query_user_gpu_preference(&bin))
-                            .map(|pref| gpu_label_for_preference(pref, &gpus))
-                            .unwrap_or_else(|| "auto".to_string())
-                    })
-            } else {
-                system_info::find_sunshine_binary()
-                    .and_then(|bin| query_user_gpu_preference(&bin))
-                    .map(|pref| gpu_label_for_preference(pref, &gpus))
-                    .unwrap_or_else(|| "auto".to_string())
-            };
-
-            let moonlight_exe =
-                system_info::find_moonlight_binary().or_else(find_moonlight_legacy_dir_windows);
-            let decode_gpu = moonlight_exe
+        let encode_gpu = if let Some(ref adapter) = adapter_name {
+            resolve_label_from_adapter(adapter, &gpus)
+        } else if let Some(conf_path) = system_info::find_sunshine_conf() {
+            std::fs::read_to_string(&conf_path)
+                .ok()
+                .and_then(|c| parse_sunshine_encoder(&c))
+                .map(|enc| match enc.as_str() {
+                    "nvenc" => "nvidia".to_string(),
+                    "amdvce" | "amf" | "amd" => "amd".to_string(),
+                    "quicksync" => "intel".to_string(),
+                    "auto" => "auto".to_string(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_else(|| {
+                    system_info::find_sunshine_binary()
+                        .and_then(|bin| query_user_gpu_preference(&bin))
+                        .map(|pref| gpu_label_for_preference(pref, &gpus))
+                        .unwrap_or_else(|| "auto".to_string())
+                })
+        } else {
+            system_info::find_sunshine_binary()
                 .and_then(|bin| query_user_gpu_preference(&bin))
                 .map(|pref| gpu_label_for_preference(pref, &gpus))
-                .unwrap_or_else(|| "auto".to_string());
+                .unwrap_or_else(|| "auto".to_string())
+        };
 
-            (encode_gpu, decode_gpu)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            ("auto".to_string(), "auto".to_string())
-        }
+        let moonlight_exe =
+            system_info::find_moonlight_binary().or_else(find_moonlight_legacy_dir_windows);
+        let decode_gpu = moonlight_exe
+            .and_then(|bin| query_user_gpu_preference(&bin))
+            .map(|pref| gpu_label_for_preference(pref, &gpus))
+            .unwrap_or_else(|| "auto".to_string());
+
+        (encode_gpu, decode_gpu)
     }
 
     /// Sets GPU preferences on Windows for Sunshine encoder and Moonlight decoder using
     /// live GPU enumeration and dynamic binary/config discovery.
-    #[allow(unused_variables)]
+    #[cfg(target_os = "windows")]
     pub fn set_gpu_preferences(encode_gpu: &str, decode_gpu: &str) -> Result<()> {
-        #[cfg(target_os = "windows")]
-        {
-            let gpus = system_info::enumerate_gpus();
+        let gpus = system_info::enumerate_gpus();
 
-            // 1. Resolve & apply Sunshine encode GPU
-            let enc_target = resolve_gpu_target(encode_gpu, &gpus);
-            if enc_target.is_auto {
-                if let Some(conf_path) = system_info::find_sunshine_conf() {
-                    update_sunshine_conf_encoder(&conf_path, None, true).with_context(|| {
-                        format!("Failed to reset GPU keys in {}", conf_path.display())
+        // 1. Resolve & apply Sunshine encode GPU
+        let enc_target = resolve_gpu_target(encode_gpu, &gpus);
+        if enc_target.is_auto {
+            if let Some(conf_path) = system_info::find_sunshine_conf() {
+                update_sunshine_conf_encoder(&conf_path, None, true).with_context(|| {
+                    format!("Failed to reset GPU keys in {}", conf_path.display())
+                })?;
+            }
+        } else {
+            if let Some(ref adapter_name) = enc_target.adapter_name {
+                system_info::write_sunshine_adapter_name(adapter_name)
+                    .context("Could not update Sunshine adapter_name")?;
+            }
+            if let Some(conf_path) = system_info::find_sunshine_conf() {
+                update_sunshine_conf_encoder(&conf_path, enc_target.encoder, false)
+                    .with_context(|| {
+                        format!("Failed to update encoder in {}", conf_path.display())
                     })?;
-                }
-            } else {
-                if let Some(ref adapter_name) = enc_target.adapter_name {
-                    system_info::write_sunshine_adapter_name(adapter_name)
-                        .context("Could not update Sunshine adapter_name")?;
-                }
-                if let Some(conf_path) = system_info::find_sunshine_conf() {
-                    update_sunshine_conf_encoder(&conf_path, enc_target.encoder, false)
-                        .with_context(|| {
-                            format!("Failed to update encoder in {}", conf_path.display())
-                        })?;
-                }
             }
-
-            if let Some(sunshine_exe) = system_info::find_sunshine_binary() {
-                set_user_gpu_preference(&sunshine_exe, enc_target.reg_pref)?;
-            }
-
-            // 2. Resolve & apply Moonlight decode GPU
-            let dec_target = resolve_gpu_target(decode_gpu, &gpus);
-            let moonlight_exe =
-                system_info::find_moonlight_binary().or_else(find_moonlight_legacy_dir_windows);
-            if let Some(moonlight_path) = moonlight_exe {
-                set_user_gpu_preference(&moonlight_path, dec_target.reg_pref)?;
-            }
-
-            info!(
-                "Updated Windows GPU routing: Encode GPU [{}] (adapter={:?}, {}), Decode GPU [{}] ({})",
-                encode_gpu,
-                enc_target.adapter_name,
-                enc_target.reg_pref,
-                decode_gpu,
-                dec_target.reg_pref
-            );
         }
+
+        if let Some(sunshine_exe) = system_info::find_sunshine_binary() {
+            set_user_gpu_preference(&sunshine_exe, enc_target.reg_pref)?;
+        }
+
+        // 2. Resolve & apply Moonlight decode GPU
+        let dec_target = resolve_gpu_target(decode_gpu, &gpus);
+        let moonlight_exe =
+            system_info::find_moonlight_binary().or_else(find_moonlight_legacy_dir_windows);
+        if let Some(moonlight_path) = moonlight_exe {
+            set_user_gpu_preference(&moonlight_path, dec_target.reg_pref)?;
+        }
+
+        info!(
+            "Updated Windows GPU routing: Encode GPU [{}] (adapter={:?}, {}), Decode GPU [{}] ({})",
+            encode_gpu,
+            enc_target.adapter_name,
+            enc_target.reg_pref,
+            decode_gpu,
+            dec_target.reg_pref
+        );
         Ok(())
     }
 }

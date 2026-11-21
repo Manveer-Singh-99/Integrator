@@ -136,8 +136,6 @@ pub enum Spake2Error {
     IdentitySharedElement,
     /// Constant-time comparison of the peer's confirmation MAC ($F_A$ or $F_B$) failed (wrong password or altered transcript).
     ConfirmationMacMismatch,
-    /// Ed25519 digital signature over the transcript digest failed verification.
-    InvalidSignature,
 }
 
 impl std::fmt::Display for Spake2Error {
@@ -159,9 +157,6 @@ impl std::fmt::Display for Spake2Error {
             }
             Spake2Error::ConfirmationMacMismatch => {
                 write!(f, "SPAKE2 key confirmation MAC verification failed")
-            }
-            Spake2Error::InvalidSignature => {
-                write!(f, "SPAKE2 peer Ed25519 identity signature verification failed")
             }
         }
     }
