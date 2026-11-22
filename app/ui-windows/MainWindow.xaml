@@ -707,8 +707,8 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- CARD 9: Touch Bar Hardware HUD -->
-                        <Border x:Name="CardTouchBar" Tag="display" Style="{StaticResource BentoCardStyle}">
+                        <!-- CARD 9: Touch Bar Hardware HUD (macOS-only hardware; hidden on Windows) -->
+                        <Border x:Name="CardTouchBar" Tag="display" Visibility="Collapsed" Style="{StaticResource BentoCardStyle}">
                             <StackPanel Spacing="12">
                                 <Grid ColumnSpacing="8">
                                     <Grid.ColumnDefinitions>

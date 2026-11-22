@@ -214,7 +214,7 @@ namespace IntegratorUI
             {
                 CardDisplay, CardKvm, CardClipboard,
                 CardDiscovery, CardSpeed, CardStorage, CardTrueTone,
-                CardTouchBar, CardAudio, CardCamera, CardSystem, CardLogs
+                CardAudio, CardCamera, CardSystem, CardLogs
             };
             _navButtons = new[]
             {
