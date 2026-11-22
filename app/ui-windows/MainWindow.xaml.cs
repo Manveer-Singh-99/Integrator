@@ -1807,7 +1807,7 @@ namespace IntegratorUI
             }
             catch (Exception ex)
             {
-                ShowToast("Folder selection failed: " + ex.Message, isError: true);
+                ShowToast("Folder selection failed: " + ex.Message, true);
             }
         }
 
