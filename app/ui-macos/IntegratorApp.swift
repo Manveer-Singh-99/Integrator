@@ -2724,7 +2724,7 @@ struct MainDashboardView: View {
                 Slider(value: $glassIntensity, in: 0.1...1.0, step: 0.05)
             }
 
-            Text("Roadmap Modules: Touch ID Biometric Gate • Multi-WAN Bonding")
+            Text("Roadmap Modules: Touch ID Biometric Gate • Precision Trackpad Gestures")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

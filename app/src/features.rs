@@ -84,8 +84,6 @@ pub struct FeatureFlags {
     pub audio: bool,
     /// MacBook Pro Touch Bar extension and virtual function key surface.
     pub touchbar: bool,
-    /// Multi-path network aggregation over concurrent Ethernet and Wi-Fi links.
-    pub multiwan: bool,
     /// Built-in hardware encode/decode and network bandwidth benchmarking suite.
     pub benchmark: bool,
 }
@@ -94,7 +92,7 @@ impl Default for FeatureFlags {
     /// Returns default feature configuration for first-time installation.
     ///
     /// Core continuity features (display, clipboard, input, audio, truetone) are enabled by default.
-    /// Camera and Multi-WAN are disabled by default until explicitly enabled by the user.
+    /// Camera and Touch ID are disabled by default until explicitly enabled by the user.
     fn default() -> Self {
         Self {
             display: true,
@@ -107,7 +105,6 @@ impl Default for FeatureFlags {
             camera: false,
             audio: true,
             touchbar: true,
-            multiwan: false,
             benchmark: true,
         }
     }
@@ -129,7 +126,6 @@ impl FeatureFlags {
             camera: false,
             audio: false,
             touchbar: false,
-            multiwan: false,
             benchmark: false,
         }
     }
@@ -246,7 +242,6 @@ impl FeatureManager {
             "camera" => f.camera,
             "audio" => f.audio,
             "touchbar" => f.touchbar,
-            "multiwan" => f.multiwan,
             "benchmark" => f.benchmark,
             unknown => {
                 warn!("Queried unknown feature flag '{}' — failing closed (false)", unknown);
@@ -305,7 +300,6 @@ impl FeatureManager {
             "camera" => candidate.camera = enabled,
             "audio" => candidate.audio = enabled,
             "touchbar" => candidate.touchbar = enabled,
-            "multiwan" => candidate.multiwan = enabled,
             "benchmark" => candidate.benchmark = enabled,
             other => {
                 return Err(format!("Unknown feature identifier: '{}'", other));

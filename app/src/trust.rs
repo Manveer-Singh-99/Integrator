@@ -439,6 +439,60 @@ pub fn lookup_verified_peer_for_ip(peer_ip: &str) -> Option<VerifiedPeerCredenti
     None
 }
 
+/// Resolves pinned `VerifiedPeerCredentials` for a Bonjour- or BLE-hinted `peer_ip` even when
+/// the paired peer has roamed to a new IP address not yet recorded in `last_ip`.
+///
+/// Matches by exact `expected_device_id` (32-hex Bonjour TXT `id`) or unambiguous 8-hex
+/// `expected_prefix` (BLE magic packet), strictly enforcing blocklist checks. The caller MUST
+/// still complete a full `TransportSessionV2` mutual cryptographic handshake before trusting
+/// that `peer_ip` actually belongs to the matched peer.
+pub fn lookup_verified_peer_for_hint(
+    peer_ip: &str,
+    expected_device_id: Option<&str>,
+    expected_prefix: Option<&str>,
+) -> Option<VerifiedPeerCredentials> {
+    let trimmed = peer_ip.trim();
+    let ip_addr = trimmed.parse::<IpAddr>().ok()?;
+    let canon_ip = ip_addr.to_string();
+
+    if let Some(id) = expected_device_id {
+        let clean_id = id.trim().to_ascii_lowercase();
+        if clean_id.len() == 32 {
+            let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            if !ks.is_device_or_ip_blocked(&clean_id, &canon_ip) {
+                if let Some(creds) = ks.get_peer(&clean_id) {
+                    return Some(creds.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(pfx) = expected_prefix {
+        let clean_pfx = pfx.trim().to_ascii_lowercase();
+        if clean_pfx.len() >= 8 && clean_pfx.chars().all(|c| c.is_ascii_hexdigit()) {
+            let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut matched: Option<VerifiedPeerCredentials> = None;
+            for peer in ks.list_peers() {
+                if peer.device_id_hex.starts_with(&clean_pfx)
+                    && !ks.is_device_or_ip_blocked(&peer.device_id_hex, &canon_ip)
+                {
+                    if matched.is_some() {
+                        // Ambiguous prefix collision; refuse automatic prefix match.
+                        matched = None;
+                        break;
+                    }
+                    matched = Some(peer);
+                }
+            }
+            if matched.is_some() {
+                return matched;
+            }
+        }
+    }
+
+    lookup_verified_peer_for_ip(peer_ip)
+}
+
 /// Returns the local installation's 32-hex Ed25519-derived `device_id`.
 pub fn local_device_id_hex() -> String {
     let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
@@ -629,6 +683,67 @@ pub async fn connect_transport_to_ip(
     .await
     .map_err(|_| format!("Timed out during TransportV2 handshake with {}", addr))?
     .map_err(|e| format!("TransportV2 handshake failed with {}: {}", addr, e))?;
+
+    Ok(session)
+}
+
+/// Connects to `peer_ip:port` using a Bonjour (`expected_device_id`) or BLE (`expected_prefix`)
+/// identity hint so a previously paired peer that roamed to a new IP can authenticate cleanly.
+///
+/// Updates the runtime `ip_to_device_hint` table ONLY after the mutual `TransportSessionV2`
+/// Ed25519 + X25519 + ChaCha20-Poly1305 handshake succeeds.
+pub async fn connect_transport_to_hinted_ip(
+    peer_ip: &str,
+    port: u16,
+    service_id: ServiceId,
+    connect_timeout: Duration,
+    expected_device_id: Option<&str>,
+    expected_prefix: Option<&str>,
+) -> Result<TransportSessionV2<TcpStream>, String> {
+    let trimmed_ip = peer_ip.trim();
+    let ip_addr: IpAddr = trimmed_ip
+        .parse()
+        .map_err(|_| format!("Invalid peer IP address '{}'", trimmed_ip))?;
+    let canon_ip = ip_addr.to_string();
+
+    let creds = lookup_verified_peer_for_hint(&canon_ip, expected_device_id, expected_prefix)
+        .ok_or_else(|| {
+            format!(
+                "Peer at {} is not paired or trusted. Pair using the 6-digit PIN in the Integrator UI first.",
+                canon_ip
+            )
+        })?;
+
+    let addr = SocketAddr::new(ip_addr, port);
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("Timed out connecting to {} ({:?})", addr, service_id))?
+        .map_err(|e| format!("Failed to connect to {} ({:?}): {}", addr, service_id, e))?;
+    let _ = stream.set_nodelay(true);
+
+    let session = tokio::time::timeout(
+        TRANSPORT_HANDSHAKE_TIMEOUT,
+        TransportSessionV2::connect_client_with_shared_keystore(
+            stream,
+            global_keystore(),
+            &creds,
+            service_id,
+        ),
+    )
+    .await
+    .map_err(|_| format!("Timed out during TransportV2 handshake with {}", addr))?
+    .map_err(|e| format!("TransportV2 handshake failed with {}: {}", addr, e))?;
+
+    // Handshake cryptographically proved possession of `creds`'s Ed25519 identity key & root_key
+    // at `canon_ip`; bind `canon_ip -> device_id_hex` for all subsequent services (KVM, Clipboard, etc.).
+    {
+        let rt = runtime_state();
+        let mut hints = rt
+            .ip_to_device_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hints.insert(canon_ip, creds.device_id_hex.clone());
+    }
 
     Ok(session)
 }
@@ -1123,5 +1238,47 @@ mod tests {
             &tampered_gpu,
             &sig_hex
         ));
+    }
+
+    #[test]
+    fn lookup_verified_peer_for_hint_resolves_pinned_peer_across_ip_change() {
+        let pk = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let peer_id_bytes = security::derive_device_id_from_pubkey(&pk);
+        let dev_id = security::hex_encode(&peer_id_bytes);
+        let prefix = &dev_id[..8];
+        {
+            let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.commit_paired_peer(
+                peer_id_bytes,
+                pk,
+                zeroize::Zeroizing::new([0x99; 32]),
+                "RoamingPeer".to_string(),
+                "windows".to_string(),
+                "172.20.10.7".to_string(),
+                false,
+            )
+            .expect("commit_paired_peer should succeed with matching pubkey-derived device_id");
+        }
+
+        // Plain IP lookup at new college/hotspot IP 10.145.1.70 fails before hint resolution
+        assert!(lookup_verified_peer_for_ip("10.145.1.70").is_none());
+
+        // Bonjour full device_id hint resolves the pinned peer at its new IP
+        let by_id = lookup_verified_peer_for_hint("10.145.1.70", Some(&dev_id), None)
+            .expect("Bonjour full device_id hint should resolve pinned peer across IP change");
+        assert_eq!(by_id.device_id_hex, dev_id);
+
+        // BLE 8-hex prefix hint resolves the pinned peer at its new IP
+        let by_prefix = lookup_verified_peer_for_hint("10.145.1.70", None, Some(prefix))
+            .expect("BLE 8-hex prefix hint should resolve pinned peer across IP change");
+        assert_eq!(by_prefix.device_id_hex, dev_id);
+
+        // Unknown prefix must never match
+        assert!(lookup_verified_peer_for_hint("10.145.1.70", None, Some("00000000")).is_none());
+
+        // Clean up temporary test peer
+        untrust_or_block_device(&dev_id, false);
     }
 }

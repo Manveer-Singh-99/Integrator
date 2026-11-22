@@ -275,7 +275,6 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 | **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental authenticated UDP audio sink (`IUA2` ChaCha20-Poly1305 AEAD + 64-pkt replay window on `:58284`) & local 24-bit/48kHz test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
 | **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver (`input_kvm` feature toggle) |
-| **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover (`multiwan` feature toggle) |
 
 ---
 
@@ -435,11 +434,6 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
     * **macOS:** Accessibility, Input Monitoring, Screen Recording, Camera (hardware-aware), Local Network, Bluetooth (CoreBluetooth TCC), and SMB File Sharing.
     * **Windows 11:** Scoped Defender Firewall rules, Active Network Profile (`Private` vs `Public`), Camera Privacy consent, SMB Server (`LanmanServer`), and on-demand elevation status.
     * **Companion Tools & Drivers:** Auto-detects and guides 1-click installation via Homebrew / WinGet / bundled scripts for **Sunshine / Apollo**, **Moonlight**, **Windows Virtual Display Driver (VDD)**, **Apple USB-C NCM Direct-Link Bridge/Watchdog**, and **Windows 11 Virtual Camera (`integrator_vcam.dll`)**.
-* **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing (📋 Planned):**
-  * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
-    * **Local Multi-Socket Balancing (Zero 3rd Device / Zero Cloud)**: Routes distinct connections and chunked downloads (HTTP range requests, Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput) without session breaking or account lockouts.
-    * **Traffic Isolation & Ping Protection**: Routes latency-sensitive gaming packets (UDP) exclusively through the stable wired connection while offloading heavy background downloads and 4K video to the secondary link, guaranteeing zero in-game ping spikes.
-    * **True Packet Bonding (Cloud-Assisted Option)**: For seamless single-stream aggregation (e.g. uninterrupted Zoom calls or live Twitch broadcasts across dropping Wi-Fi), optionally tunnels through an MPTCP / Speedify-style VPS proxy to present a single unified public IP.
 
 ---
 
@@ -456,7 +450,7 @@ When running all features simultaneously over a standard USB-C charging cable (U
 [ Tier 2: Real-Time Stream]  165Hz Display (Sunshine -> Moonlight)    (Adaptive)   --> DYNAMIC BITRATE ABR / FRAME DROP
 [ Tier 3: Secondary Video ]  Universal Webcam Feed                    (Adaptive)   --> DOWNSCALED TO 720p30
 [ Tier 4: Background Bulk ]  File Drag-and-Drop / Large Clipboard     (Elastic)    --> TOKEN-BUCKET CLAMPED
-[ Tier 5: Scavenger       ]  Multi-WAN / Two-Way Internet Sharing     (Elastic)    --> FIRST TO BE CHOKED
+[ Tier 5: Scavenger       ]  Two-Way Internet Sharing (ICS)           (Elastic)    --> FIRST TO BE CHOKED
 ```
 
 * **Automatic Graceful Degradation Ladder**:

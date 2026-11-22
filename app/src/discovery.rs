@@ -1189,6 +1189,8 @@ fn allow_hint_probe(
 async fn authenticate_hint_via_transport_v2(
     peer_ip: Ipv4Addr,
     port: u16,
+    expected_device_id: Option<&str>,
+    expected_prefix: Option<&str>,
 ) -> Result<(String, Option<system_info::LocalHardwareProfile>, f64)> {
     use crate::display::protocol::{DisplayRpcRequest, DisplayRpcResponse};
     use crate::security::transport::ServiceId;
@@ -1199,11 +1201,13 @@ async fn authenticate_hint_via_transport_v2(
 
     let ip_str = peer_ip.to_string();
     let start = Instant::now();
-    let mut session = trust::connect_transport_to_ip(
+    let mut session = trust::connect_transport_to_hinted_ip(
         &ip_str,
         port,
         ServiceId::DisplayRpc,
         Duration::from_secs(4),
+        expected_device_id,
+        expected_prefix,
     )
     .await
     .map_err(|e| anyhow::anyhow!("TransportV2 authentication to {}:{} failed: {}", ip_str, port, e))?;
@@ -1254,8 +1258,13 @@ async fn ingest_authenticated_hint(
         return;
     }
 
-    let Ok((verified_dev_id, prof_opt, rtt_ms)) =
-        authenticate_hint_via_transport_v2(peer_ip, port).await
+    let Ok((verified_dev_id, prof_opt, rtt_ms)) = authenticate_hint_via_transport_v2(
+        peer_ip,
+        port,
+        expected_device_id,
+        expected_prefix,
+    )
+    .await
     else {
         return;
     };
@@ -1395,8 +1404,13 @@ pub async fn authenticate_peer_via_ble(timeout: Duration) -> Result<AuthDiscover
     let own_id = trust::local_device_id_hex();
     let hint = crate::ble_discovery::scan_once_for_ble_hint(&own_id, timeout).await?;
 
-    let (verified_dev_id, prof_opt, rtt_ms) =
-        authenticate_hint_via_transport_v2(hint.ip, hint.port).await?;
+    let (verified_dev_id, prof_opt, rtt_ms) = authenticate_hint_via_transport_v2(
+        hint.ip,
+        hint.port,
+        None,
+        Some(hint.device_id_prefix.as_str()),
+    )
+    .await?;
 
     if !verified_dev_id.starts_with(&hint.device_id_prefix) {
         anyhow::bail!(
@@ -1436,8 +1450,13 @@ pub async fn authenticate_peer_via_bonjour(timeout: Duration) -> Result<AuthDisc
     let own_id = trust::local_device_id_hex();
     let hint = crate::bonjour_discovery::browse_once_for_bonjour_hint(&own_id, timeout).await?;
 
-    let (verified_dev_id, prof_opt, rtt_ms) =
-        authenticate_hint_via_transport_v2(hint.ip, hint.port).await?;
+    let (verified_dev_id, prof_opt, rtt_ms) = authenticate_hint_via_transport_v2(
+        hint.ip,
+        hint.port,
+        hint.device_id.as_deref(),
+        None,
+    )
+    .await?;
 
     if let Some(ref txt_id) = hint.device_id {
         if !verified_dev_id.eq_ignore_ascii_case(txt_id) {

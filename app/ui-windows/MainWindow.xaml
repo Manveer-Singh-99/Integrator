@@ -861,7 +861,7 @@
                                             ValueChanged="SliderGlassIntensity_ValueChanged" />
                                 </StackPanel>
 
-                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Mac → PC Camera • Multi-WAN Bonding"
+                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Precision Trackpad Gestures"
                                            Style="{StaticResource SubCaptionStyle}" />
                             </StackPanel>
                         </Border>
