@@ -3,11 +3,11 @@
 <div align="center">
   <img src="app/icons/icon.png" width="160" alt="Integrator App Icon" />
   <h1>Integrator</h1>
-  <p><strong>Direct USB-C, Thunderbolt, Ethernet &amp; Wireless Workstation Fusion Bridge between Macs (Apple Silicon &amp; Post-2016 USB-C Intel) and Windows 11 PCs</strong></p>
+  <p><strong>Direct USB-C, Thunderbolt, Ethernet, Hotspot &amp; Wireless Workstation Fusion Bridge between Macs (Apple Silicon &amp; Post-2016 USB-C Intel — Laptops &amp; Desktops) and Windows 11 PCs</strong></p>
   <p>$$\int_{\text{Windows 11}}^{\text{macOS}} (\text{Workstation Fusion})\, dt = \text{\textbf{Integrator}}$$</p>
 </div>
 
-**Low-latency (`<1 ms` wired) workstation fusion between Macs and Windows PCs — over a plain USB-C cable (`<1 ms` CDC-NCM on Apple Silicon with Secure Boot ON and zero reboots), Thunderbolt 3/4 Bridge, Wired Ethernet, or the Windows PC's Wireless Hotspot.**
+**Low-latency (`<1 ms` wired) workstation fusion between Macs and Windows 11 PCs (laptops or desktops) — over a plain USB-C cable (`<1 ms` CDC-NCM on Apple Silicon with Secure Boot ON and zero reboots), Thunderbolt 3/4 / USB4 Bridge, Wired Ethernet / LAN, a Windows PC Mobile Hotspot, or a Phone Hotspot — with zero-config Bonjour (`_integrator._tcp.local.`), BLE magic-packet proximity discovery, and an integrated Setup &amp; Permissions Assistant.**
 
 > [!WARNING]
 > **Intel Mac Testing Status:** Support for post-2016 Intel Macs with USB-C ports (Universal `arm64` + `x86_64` macOS `12.0+` build, wired via Ethernet / USB-C Ethernet adapters / Thunderbolt 3–4 Bridge or wireless via Windows PC Mobile Hotspot / LAN) has been added cleanly to the app, **however Intel Macs have NOT been tested at all as of now or for the foreseeable future.** Only Apple Silicon (M1) + Windows 11 have been physically tested.
@@ -157,9 +157,10 @@ Use this only if your **Windows PC has no USB-C port**, only rectangular USB-A p
 * If your Mac doesn't have an Ethernet port, buy a basic **USB-C to Gigabit Ethernet adapter** (an inexpensive adapter, around 15 USD), plug it into the Mac, and run a standard Ethernet cable to your **Windows PC's Ethernet port** (or connect both to your Wi-Fi router).
 * Gives `<1 ms` wired speed and works on **Intel Macs, Apple Silicon Macs, and older USB-A Macs**.
 
-#### Option E: Windows PC Wireless Hotspot or Wi-Fi *(Zero cables)*
-* On your Windows PC, open **Settings → Network & internet → Mobile hotspot** and turn it on, then connect your Mac's Wi-Fi to that hotspot.
-* Great when traveling or on college/office Wi-Fi where normal Wi-Fi blocks laptops from talking to each other.
+#### Option E: Windows PC Hotspot, Phone Hotspot, or Normal Wi-Fi LAN *(Zero cables)*
+* **Windows PC Mobile Hotspot:** Open **Settings → Network & internet → Mobile hotspot** and connect your Mac's Wi-Fi to it (great on college/office networks with AP isolation).
+* **Phone Personal Hotspot:** Connect both your Mac and Windows PC to an iPhone or Android hotspot (including non-`/24` subnets such as iOS `172.20.10.0/28`). Integrator classifies hotspots separately from direct cables so wireless tethering is never auto-trusted without pairing.
+* **Normal Wi-Fi / LAN:** Connect both devices to the same router. Even on restrictive networks that drop UDP broadcasts, Integrator's **Bonjour (`_integrator._tcp.local.`)** and **BLE magic-packet proximity discovery** automatically locate nearby paired machines.
 
 ### Step 4: Quick "Will My Setup Work?" Cheat Sheet
 
@@ -252,25 +253,28 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 
 | Fusion Feature | Platform | Status | Implementation Details |
 | :--- | :---: | :---: | :--- |
-| **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Hardened `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, locked `C:\ProgramData\AppleUsbNcm` ACLs) |
-| **Dual-Subnet Networking & ICS** | macOS & Win 11 | ✅ **Live** | Bidirectional Internet Sharing simultaneously alongside direct USB-C link |
-| **Native SwiftUI & WinUI 3 UI** | macOS & Win 11 | ✅ **Live** | Real-time latency, peer discovery/block controls, category filters, Light/Dark contrast & live status pills |
-| **Cryptographic Pairing & Transport** | macOS & Win 11 | ✅ **Live** | OS CSPRNG 6-digit PIN SPAKE2 RFC 9382 + Ed25519 mutual auth + ChaCha20-Poly1305 AEAD & SAS verification |
-| **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 verification and echo-loop prevention |
+| **Direct USB-C CDC-NCM Bridge** | macOS & Win 11 | ✅ **Live** | Hardened `WinUSB` $\leftrightarrow$ `WinTun` (`<0.7ms` ping, parameterized subnet/ACL installer `Install-AppleUsbNcm.ps1`) |
+| **Multi-Topology Networking & ICS** | macOS & Win 11 | ✅ **Live** | USB-C, Thunderbolt/USB4, Ethernet/LAN, PC Hotspot & Phone Hotspot (`/28` CIDR-aware, VPN/WSL/Docker exclusion, bidirectional ICS) |
+| **3-Layer Hybrid Peer Discovery** | macOS & Win 11 | ✅ **Live** | Private **Bonjour / mDNS** (`_integrator._tcp.local.`), **BLE magic packets** (CoreBluetooth + WinRT, rotating XOR-masked nonce), and Ed25519-signed UDP beacons (`:58280`) — zero Apple AirPlay/AirDrop interference |
+| **Setup, Drivers & Permissions Assistant** | macOS & Win 11 | ✅ **Live** | Launch-time OS permissions audit (macOS TCC + Bluetooth; Windows Firewall/Profile/Camera/SMB) and 1-click guided installers for Sunshine, Moonlight, VDD, USB-C NCM & Virtual Camera |
+| **Laptop & Desktop Hardware Support** | macOS & Win 11 | ✅ **Live** | Dynamic `DeviceFormFactor` detection (MacBooks, Mac mini/Studio/Pro/iMac, Windows laptops & desktops), negative multi-monitor origins, external/absent cameras & ARM64/Workstation GPUs |
+| **Native SwiftUI & WinUI 3 UI** | macOS & Win 11 | ✅ **Live** | Liquid Glass (macOS) & Mica (Win 11) dashboards with real-time RTT, discovery provenance, peer trust/block controls, launch setup sheet/dialog & live logs |
+| **Cryptographic Pairing & Transport** | macOS & Win 11 | ✅ **Live** | OS CSPRNG 6-digit PIN SPAKE2 RFC 9382 + Ed25519 mutual auth + X25519/ChaCha20-Poly1305 `TransportSessionV2` (`ITR2`) & SAS verification |
+| **Universal Clipboard (Text & Images)** | macOS & Win 11 | ✅ **Live** | Bidirectional text & PNG/TIFF with SHA-256 verification and echo-loop prevention (`:58283`) |
 | **Universal Clipboard (Folders & Files)** | macOS & Win 11 | ✅ **Live** | Multi-GB, multi-item recursive folder copy-paste streaming over NVMe buffers with LRU pruning |
-| **Live Network Benchmark Engine** | macOS & Win 11 | ✅ **Live** | Built-in real-time throughput benchmark saturating USB-C NVMe transfer speeds |
-| **Touch Bar NVIDIA Performance HUD** | macOS (client) | ✅ **Live** | Liquid Glass OLED HUD with interactive physics and native Control Strip integration |
+| **Shared Camera (`Mac → Win 11`)** | Mac → Win 11 | ✅ **Live** *(Win→Mac ⏸️)* | `AVFoundation` 720p30 NV12 capture over encrypted TCP `:58287` → Windows 11 Media Foundation FrameServer COM virtual webcam (`"Integrator Mac Camera"`, `integrator_vcam.dll`); `Win 11 → Mac` (`CMIOExtension`) shelved due to paid Apple Developer requirement |
+| **Live Network Benchmark Engine** | macOS & Win 11 | ✅ **Live** | Built-in real-time throughput benchmark saturating USB-C / LAN / Hotspot speeds (`:58285`) |
+| **Touch Bar NVIDIA Performance HUD** | macOS (client) | ✅ **Live** | Liquid Glass OLED HUD with interactive physics and native Control Strip integration (auto-hidden on Macs without a Touch Bar) |
 | **Auto-Mounted Shared Storage** | macOS & Win 11 | ✅ **Live** | Dynamic peer SMB share discovery (trust-gated), mount & clean teardown on macOS (`/Volumes/<Share>`) and Windows |
 | **True Tone & Chromatic Adaptation** | macOS & Win 11 | ✅ **Live** | Mac ambient sensor (Kelvin) $\to$ Bradford CAT GPU gamma ramp injection |
-| **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional streaming via Sunshine host + Moonlight client with dynamic resolution & refresh rate |
-| **Universal Input KVM & Edge Hopping** | macOS & Win 11 | ✅ **Live** | Edge-hopping mouse/keyboard sharing, 2D desk alignment schematic, corner guard & panic key (`Ctrl+Alt+Shift+Esc`) |
+| **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional streaming via Sunshine/Apollo host + Moonlight client with aspect-preserving VDD scaling & half-duplex Wi-Fi/Hotspot bitrate derating |
+| **Universal Input KVM & Edge Hopping** | macOS & Win 11 | ✅ **Live** | Edge-hopping mouse/keyboard sharing (`:58286`), 2D desk alignment schematic, multi-monitor negative coordinates, corner guard & panic key (`Ctrl+Alt+Shift+Esc`) |
 | **Cross-Border File Drag & Drop** | macOS & Win 11 | ✅ **Live** | Cursor-following cross-screen file staging & transfer over authenticated AEAD transport |
 | **Master ON/OFF Feature Switches** | macOS & Win 11 | ✅ **Live** | Independent persistent toggles saved to `~/.usbc_clipboard_cache/features.json` |
 | **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | User LaunchAgent (macOS) & Elevated Scheduled Task (`IntegratorAutostart` on Win 11) |
-| **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental UDP packet sink (`58284`) & local 24-bit/48kHz spatial test chime; full CoreAudio/WASAPI duplex playback planned |
+| **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental authenticated UDP audio sink (`IUA2` ChaCha20-Poly1305 AEAD + 64-pkt replay window on `:58284`) & local 24-bit/48kHz test chime; full CoreAudio/WASAPI duplex playback planned |
 | **Touch ID Passkey & Windows Lock** | macOS & Win 11 | 🚧 **Scaffolded** | WebAuthn FIDO2 HID over USB/IP + Credential Provider DLL (`LogonUI.exe`) |
 | **Apple Precision Trackpad Gestures** | macOS & Win 11 | 📋 **Planned** | Raw contact points streamed to virtual `vmulti` Precision Touchpad driver (`input_kvm` feature toggle) |
-| **Shared Camera (`Mac → Win 11` planned / `Win 11 → Mac` shelved)** | Mac → Win 11 | 📋 **Planned** *(Win→Mac ⏸️)* | **Mac → Win 11** (`AVFoundation` → `MFCreateVirtualCamera`, 0 USD Apple/MS fees); **Win 11 → Mac** (`CMIOExtension`) shelved unless explored via opt-in SIP/AMFI bypass (user's own risk) |
 | **Multi-WAN Packet Bonding** | macOS & Win 11 | 📋 **Planned** | Dynamic dual-gateway load balancing, ping protection, and failover (`multiwan` feature toggle) |
 
 ---
@@ -284,28 +288,42 @@ The companion app is located in the [`app/`](app/) directory:
 # Single-architecture build for this Mac:
 cd app && cargo build --release
 
-# Or build a Universal (arm64 + x86_64) .app bundle targeting macOS 12.0+ at app/target/bundle/Integrator.app:
-bash ./macos/build-universal-app.sh
+# Build & install Universal (arm64 + x86_64) .app bundle to /Applications/Integrator.app:
+bash ./macos/build-universal-app.sh --install
 ```
-To run the packaged bundle or copy to your Applications folder:
+To run the packaged bundle or invoke CLI diagnostics:
 ```bash
-# Executable binary located at:
-./target/release/integrator
-
-# Packaged macOS Application bundle:
+# Launch the macOS Application bundle:
 open /Applications/Integrator.app
+
+# Inspect OS permissions & companion tools, or test isolated BLE / Bonjour authentication:
+/Applications/Integrator.app/Contents/MacOS/integrator setup status
+/Applications/Integrator.app/Contents/MacOS/integrator discovery status
+/Applications/Integrator.app/Contents/MacOS/integrator discovery auth-via-ble 20
+/Applications/Integrator.app/Contents/MacOS/integrator discovery auth-via-bonjour 20
 ```
 
 > [!NOTE]
-> **Post-2016 Intel Macs (`x86_64`, USB-C):** Intel Macs cannot act as a plain USB-C CDC-NCM gadget (`USB\VID_05AC&PID_1902`), so skip `Install-AppleUsbNcm.ps1` and `install-macos.sh`. Instead, connect via **Thunderbolt 3/4 Bridge**, **Wired Ethernet** (USB-C Ethernet dongle / RJ-45, including routerless `169.254.x.x`), or the **Windows PC's Mobile Hotspot** (`192.168.137.x` — Integrator automatically opens scoped `LocalSubnet` Windows Firewall rules on startup and binds per-interface UDP broadcasts across both hosts). **Intel Macs have NOT been tested at all as of now or for the foreseeable future.**
+> **Post-2016 Intel Macs (`x86_64`, USB-C):** Intel Macs cannot act as a plain USB-C CDC-NCM gadget (`USB\VID_05AC&PID_1902`), so skip `Install-AppleUsbNcm.ps1` and `install-macos.sh`. Instead, connect via **Thunderbolt 3/4 Bridge**, **Wired Ethernet** (USB-C Ethernet dongle / RJ-45, including routerless `169.254.x.x`), **Phone Hotspot**, or the **Windows PC's Mobile Hotspot** (`192.168.137.x` — Integrator automatically opens scoped local-subnet Windows Firewall rules on startup and binds per-interface UDP, Bonjour, and BLE discovery across both hosts). **Intel Macs have NOT been tested at all as of now or for the foreseeable future.**
 
 #### On Windows 11 (x64 or ARM64):
 ```powershell
 cd app
 cargo build --release
-dotnet build ui-windows\IntegratorUI.csproj -c Release -p:Platform=x64
+dotnet publish ui-windows\IntegratorUI.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained true -o ui-windows\publish
+Copy-Item -Force target\release\integrator_core.dll ui-windows\publish\integrator_core.dll
 ```
-`cargo build --release` builds `target\release\integrator.exe` (CLI) and `target\release\integrator_core.dll` (core FFI library), which `IntegratorUI.csproj` automatically copies alongside the elevated (`requireAdministrator`) WinUI 3 GUI binary `IntegratorUI.exe`.
+`cargo build --release` builds `target\release\integrator.exe` (CLI) and `target\release\integrator_core.dll` (core FFI library), paired with the self-contained WinUI 3 GUI binary `Integrator.exe`. Integrator runs safely without forcing always-Administrator execution and requests UAC elevation only on-demand (e.g., configuring Windows Defender Firewall rules or registering drivers).
+
+#### Running Unit Tests & Discovery Verification CLI
+```bash
+# Run the full Rust unit test suite (128 tests on macOS / 126 on Windows 11):
+cd app && cargo test --lib
+
+# Force a single discovery backend for diagnostics (default: all):
+INTEGRATOR_DISCOVERY_MODE=bonjour ./target/release/integrator discovery status
+INTEGRATOR_DISCOVERY_MODE=ble ./target/release/integrator discovery status
+```
 
 ---
 
@@ -397,19 +415,26 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
   * Reads ambient room lighting (CCT in Kelvin) from the Mac’s bezel ambient sensor.
   * Applies a **Bradford Chromatic Adaptation Transform (CAT)** with perceptual gamma compensation for matte vs. glossy panel differences.
   * Injects the resulting curves directly into the Windows GPU hardware Look-Up Table (`SetDeviceGammaRamp`) in `<0.1 ms`, ensuring both screens smoothly transition to the exact same paper-white warmth as ambient room lighting changes.
-* **🎥 Shared Camera (`Mac → Win 11` 📋 Planned / `Win 11 → Mac` ⏸️ Shelved):**
-  * **Mac → Windows 11 (📋 Planned):** Stream the MacBook’s FaceTime HD camera (`AVFoundation`) to Windows 11 as a native user-mode virtual webcam (`MFCreateVirtualCamera`, requires zero Apple Developer fee and zero Windows kernel driver signing).
+* **🎥 Shared Camera (`Mac → Win 11` ✅ Live / `Win 11 → Mac` ⏸️ Shelved):**
+  * **Mac → Windows 11 (✅ Live):** Streams the Mac’s built-in FaceTime HD, USB, or Continuity Camera (`AVFoundation`, 720p30 NV12) over encrypted `TransportSessionV2` TCP `:58287` directly into a standalone Windows 11 Media Foundation FrameServer COM virtual camera (`"Integrator Mac Camera"`, `integrator_vcam.dll`, CLSID `{8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}` — zero Apple Developer fee and zero Windows kernel driver signing). Automatically detects headless/desktop Macs without camera hardware.
   * **Windows 11 → Mac (⏸️ Shelved):** Creating a virtual webcam inside macOS (`CMIOExtension`) requires a paid Apple Developer Program account (`99 USD/yr`) for System Extension provisioning/signing, so that direction is shelved for now *(if ever revisited without a paid account, it would strictly require users to opt into disabling macOS SIP/security protections at their own risk)*.
   * Cross-machine microphone / audio streaming remains separate under **Dynamic Audio Routing** (`audio`).
 * **🔊 Dynamic Audio Routing (System Tray Selector — 🧪 Experimental Preview):**
-  * Currently implements an experimental UDP audio packet validator/sink (`58284`), topology state persistence, and a local 24-bit/48kHz spatial stereo test chime. Full cross-machine CoreAudio/WASAPI duplex playback is planned across three topologies:
+  * Currently implements an authenticated UDP audio sink (`IUA2` ChaCha20-Poly1305 AEAD with 64-packet replay window on `:58284`), topology state persistence, and a local 24-bit/48kHz spatial stereo test chime. Full cross-machine CoreAudio/WASAPI duplex playback is planned across three topologies:
     * **Mac Studio Speakers Only**: Automatically mutes the PC and pipes uncompressed 24-bit master audio to the MacBook's high-fidelity Spatial Audio sound system (<6ms latency).
     * **Windows PC / Headset Only**: Leaves audio on the PC (ideal when gaming with a low-latency headset or DAC plugged into Windows).
     * **Dual Stereo / Surround (Both Simultaneously)**: Plays across both physical machines with an integrated millisecond sync-calibration slider to eliminate room echo and comb-filtering.
-* **📡 Cryptographic Pairing & Automatic Handover (✅ Live):**
-  * Mutual peer discovery across direct USB-C (`10.99.99.x` / `192.168.2.x`) and local Wi-Fi/LAN with Ed25519-signed UDP beacon verification (`58280`).
-  * Seamless fallback to wireless if the cable is disconnected, and instant handover to wired speed when plugged back in.
-  * End-to-end encrypted control (`58281`), clipboard (`58283`), benchmark (`58285`), and KVM/drag-drop (`58286`) channels via `TransportSessionV2` (`ITR2`: ephemeral X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305 AEAD), paired via an OS CSPRNG 6-digit PIN SPAKE2 (RFC 9382) + Ed25519 + SAS handshake with per-IP/global rate-limiting and lockout.
+* **📡 3-Layer Hybrid Discovery, Cryptographic Pairing & Automatic Handover (✅ Live):**
+  * Discovers peers seamlessly across **USB-C Direct**, **Thunderbolt / USB4 Bridge**, **Wired Ethernet / LAN**, **PC Mobile Hotspot**, and **Phone Hotspot** (including non-`/24` `/28` subnets, while excluding VPN/WSL/Docker virtual NICs):
+    1. **Private Bonjour / mDNS (`_integrator._tcp.local.`)**: Pure-Rust `mdns-sd` discovery with dynamic active IPv4 refresh — completely isolated from Apple AirPlay (`_airplay._tcp`), AirDrop, and Apple TV.
+    2. **BLE Magic-Packet Proximity Discovery**: Privacy-masked rotating-nonce Bluetooth LE beacons via native macOS `CoreBluetooth` (128-bit `ADV_IND` Service UUID `7A4E...` + `LocalName` + GATT mirror) and Windows 11 WinRT `BluetoothLEAdvertisementPublisher`/`Watcher` (`ManufacturerData` Company ID `0xFFFF`, never Apple's `0x004C`). Discovers nearby paired endpoints even on broadcast-isolated Wi-Fi networks.
+    3. **Ed25519-Signed UDP Beacons (`:58280`)**: Directed subnet broadcast + unicast peer history fallback.
+  * **Zero Trust Bypass:** Neither Bonjour nor BLE grants trust — every hinted IPv4 endpoint must pass full mutual Ed25519 + X25519 + ChaCha20-Poly1305 `TransportSessionV2` (`ITR2`) authentication across control (`58281`), clipboard (`58283`), benchmark (`58285`), KVM/drag-drop (`58286`), and camera (`58287`) channels. Initial pairing uses OS CSPRNG 6-digit PIN SPAKE2 (RFC 9382) + Ed25519 + SAS verification with per-IP/global rate-limiting and lockout, and wireless hotspots are never auto-trusted as direct cables.
+* **🛠️ Guided Setup, Drivers & Permissions Assistant (✅ Live):**
+  * Automatically checks OS permissions and companion tools at launch and presents a non-blocking assistant sheet (macOS SwiftUI) or dialog (Windows WinUI 3) whenever a required item is missing:
+    * **macOS:** Accessibility, Input Monitoring, Screen Recording, Camera (hardware-aware), Local Network, Bluetooth (CoreBluetooth TCC), and SMB File Sharing.
+    * **Windows 11:** Scoped Defender Firewall rules, Active Network Profile (`Private` vs `Public`), Camera Privacy consent, SMB Server (`LanmanServer`), and on-demand elevation status.
+    * **Companion Tools & Drivers:** Auto-detects and guides 1-click installation via Homebrew / WinGet / bundled scripts for **Sunshine / Apollo**, **Moonlight**, **Windows Virtual Display Driver (VDD)**, **Apple USB-C NCM Direct-Link Bridge/Watchdog**, and **Windows 11 Virtual Camera (`integrator_vcam.dll`)**.
 * **🌐 Multi-WAN Bonding & Dynamic Dual-Gateway Load Balancing (📋 Planned):**
   * Turns your desk into a high-availability dual-WAN router node by bonding independent internet connections across both machines over the `<0.6ms` USB-C interconnect:
     * **Local Multi-Socket Balancing (Zero 3rd Device / Zero Cloud)**: Routes distinct connections and chunked downloads (HTTP range requests, Steam, git clones, large assets) across both connections simultaneously (e.g. 100 Mbps Mac Wi-Fi + 150 Mbps Windows 5G/Ethernet = 250 Mbps combined throughput) without session breaking or account lockouts.
