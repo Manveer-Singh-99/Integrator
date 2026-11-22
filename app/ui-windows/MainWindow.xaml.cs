@@ -1907,6 +1907,15 @@ namespace IntegratorUI
         private void ToggleCamera_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_camera");
 
         /// <summary>
+        /// Initiates a live Touch ID Secure Enclave biometric challenge to the paired Mac over TransportSessionV2.
+        /// </summary>
+        private void VerifyTouchId_Click(object sender, RoutedEventArgs e)
+        {
+            ShowToast("Touch ID prompt sent to your paired Mac — place your finger on the Mac Touch ID sensor...", "info");
+            RunInvoke("verify_touchid");
+        }
+
+        /// <summary>
         /// Configures Integrator to launch automatically at Windows user logon via Task Scheduler.
         /// </summary>
         private void AutostartSwitch_Toggled(object sender, RoutedEventArgs e)

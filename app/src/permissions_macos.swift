@@ -42,16 +42,24 @@
 //    preventing TCC `SIGABRT` termination when invoked from unbundled CLI test binaries.
 //
 
+import AppKit
 import ApplicationServices
 import AVFoundation
 import CoreGraphics
 import Foundation
+import LocalAuthentication
 
 /// Info.plist key required by macOS TCC before requesting video capture authorization.
 private let kCameraUsageDescriptionKey: String = "NSCameraUsageDescription"
 
 /// Maximum wait timeout in seconds when awaiting an interactive AVFoundation camera prompt.
 private let kCameraPromptTimeoutSec: Int = 15
+
+/// Maximum wait timeout in seconds when awaiting an interactive macOS Touch ID biometric prompt.
+private let kTouchIdPromptTimeoutSec: Int = 45
+
+/// Fallback reason string displayed in the macOS Touch ID sheet when caller passes an empty reason.
+private let kTouchIdDefaultPromptReason: String = "authenticate a remote Touch ID challenge from your paired Windows PC"
 
 /// Queries whether the current process is trusted for macOS Accessibility (`AXIsProcessTrusted`).
 ///
@@ -165,4 +173,96 @@ public func integrator_mac_perm_camera_request() {
         sem.signal()
     }
     _ = sem.wait(timeout: .now() + .seconds(kCameraPromptTimeoutSec))
+}
+
+/// Checks whether physical Apple Touch ID Secure Enclave biometric authentication is available
+/// and enrolled on this Mac (`LAContext.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`).
+///
+/// - Returns: `true` if Touch ID hardware is present, enrolled, and ready; otherwise `false`.
+@_cdecl("integrator_mac_touchid_available")
+public func integrator_mac_touchid_available() -> Bool {
+    let context = LAContext()
+    var authError: NSError?
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError) else {
+        return false
+    }
+    return context.biometryType == .touchID
+}
+
+/// Copies a human-readable UTF-8 error message into a caller-allocated C character buffer.
+private func writeCStringBuffer(_ text: String, into buf: UnsafeMutablePointer<CChar>?, cap: Int) {
+    guard let buf = buf, cap > 1 else { return }
+    let utf8 = Array(text.utf8)
+    let copyLen = min(utf8.count, cap - 1)
+    for i in 0..<copyLen {
+        buf[i] = CChar(bitPattern: utf8[i])
+    }
+    buf[copyLen] = 0
+}
+
+/// Presents the native macOS Touch ID fingerprint authentication sheet backed by the Apple Secure Enclave.
+///
+/// - Parameters:
+///   - reasonPtr: NUL-terminated UTF-8 reason string displayed inside the macOS Touch ID sheet.
+///   - outErrorBuf: Optional caller-allocated UTF-8 buffer receiving a failure explanation.
+///   - outErrorCap: Capacity in bytes of `outErrorBuf`.
+/// - Returns:
+///   - `1`: Biometric Touch ID match succeeded.
+///   - `0`: User cancelled or authentication failed.
+///   - `-1`: Touch ID hardware unavailable or not enrolled on this Mac.
+@_cdecl("integrator_mac_touchid_authenticate")
+public func integrator_mac_touchid_authenticate(
+    reasonPtr: UnsafePointer<CChar>?,
+    outErrorBuf: UnsafeMutablePointer<CChar>?,
+    outErrorCap: Int
+) -> Int32 {
+    let reason: String
+    if let reasonPtr = reasonPtr {
+        let parsed = String(cString: reasonPtr).trimmingCharacters(in: .whitespacesAndNewlines)
+        reason = parsed.isEmpty ? kTouchIdDefaultPromptReason : parsed
+    } else {
+        reason = kTouchIdDefaultPromptReason
+    }
+
+    let context = LAContext()
+    context.localizedFallbackTitle = ""
+    var preflightError: NSError?
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &preflightError) else {
+        let msg = preflightError?.localizedDescription ?? "Touch ID is not available or not enrolled on this Mac."
+        writeCStringBuffer(msg, into: outErrorBuf, cap: outErrorCap)
+        return -1
+    }
+
+    // Bring Integrator to foreground on main thread so the Touch ID system sheet is immediately visible
+    DispatchQueue.main.async {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    let sem = DispatchSemaphore(value: 0)
+    var authSuccess: Bool = false
+    var evalErrorMsg: String = ""
+
+    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, evalError in
+        authSuccess = success
+        if let evalError = evalError {
+            evalErrorMsg = evalError.localizedDescription
+        }
+        sem.signal()
+    }
+
+    let waitResult = sem.wait(timeout: .now() + .seconds(kTouchIdPromptTimeoutSec))
+    if waitResult == .timedOut {
+        context.invalidate()
+        writeCStringBuffer("Touch ID biometric prompt timed out after \(kTouchIdPromptTimeoutSec)s.", into: outErrorBuf, cap: outErrorCap)
+        return 0
+    }
+
+    if authSuccess {
+        writeCStringBuffer("", into: outErrorBuf, cap: outErrorCap)
+        return 1
+    } else {
+        let msg = evalErrorMsg.isEmpty ? "Touch ID verification was cancelled or did not match." : evalErrorMsg
+        writeCStringBuffer(msg, into: outErrorBuf, cap: outErrorCap)
+        return 0
+    }
 }

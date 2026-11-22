@@ -115,6 +115,9 @@ const RPC_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Socket read timeout awaiting remote Display RPC responses.
 const RPC_RECV_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Extended socket read timeout awaiting interactive human Touch ID fingerprint authentication on the remote Mac.
+const TOUCHID_RPC_RECV_TIMEOUT: Duration = Duration::from_secs(50);
+
 /// Maximum permitted size in bytes for an inbound Display RPC response payload (1 MiB).
 const MAX_RPC_RESPONSE_BYTES: usize = 1_048_576;
 
@@ -1483,6 +1486,61 @@ impl DisplayController {
                     self.base_response(false, "Core not initialized").await
                 }
             }
+            DisplayRpcRequest::VerifyTouchId {
+                challenge_nonce_hex,
+                requester_hostname,
+            } => {
+                let Some(req_dev_id) = peer_device_id.map(|s| s.to_string()) else {
+                    return self
+                        .base_response(
+                            false,
+                            "Rejected Touch ID challenge: missing authenticated TransportV2 peer identity",
+                        )
+                        .await;
+                };
+                let nonce = challenge_nonce_hex.trim().to_ascii_lowercase();
+                let req_host = requester_hostname.trim().to_string();
+                crate::core::emit_ui_toast(
+                    "info",
+                    &format!(
+                        "Touch ID requested by '{}' — place your finger on Touch ID...",
+                        if req_host.is_empty() { "Paired PC" } else { &req_host }
+                    ),
+                );
+                let eval_res = tokio::task::spawn_blocking(move || {
+                    trust::evaluate_local_touchid_and_sign(&nonce, &req_dev_id, &req_host)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Touch ID task panicked: {}", e)));
+
+                match eval_res {
+                    Ok(assertion) => {
+                        crate::core::emit_ui_toast(
+                            "success",
+                            &format!(
+                                "Touch ID verified via Secure Enclave for {} (sig {}…)",
+                                assertion.requester_device_id.chars().take(8).collect::<String>(),
+                                assertion.signature_hex.chars().take(12).collect::<String>()
+                            ),
+                        );
+                        let mut resp = self
+                            .base_response(
+                                true,
+                                format!(
+                                    "Touch ID verified on '{}' via Apple Secure Enclave",
+                                    assertion.signer_hostname
+                                ),
+                            )
+                            .await;
+                        resp.touchid_assertion = Some(assertion);
+                        resp
+                    }
+                    Err(err_msg) => {
+                        crate::core::emit_ui_toast("error", &format!("Touch ID failed: {}", err_msg));
+                        self.base_response(false, err_msg).await
+                    }
+                }
+            }
         }
     }
 
@@ -1514,6 +1572,10 @@ impl DisplayController {
         peer_ip: &str,
         req: &DisplayRpcRequest,
     ) -> Result<DisplayRpcResponse> {
+        let recv_timeout = match req {
+            DisplayRpcRequest::VerifyTouchId { .. } => TOUCHID_RPC_RECV_TIMEOUT,
+            _ => RPC_RECV_TIMEOUT,
+        };
         let addr = Self::format_socket_target(peer_ip, CONTROL_PORT);
         let mut session = trust::connect_transport_to_ip(
             peer_ip,
@@ -1530,7 +1592,7 @@ impl DisplayController {
             .with_context(|| format!("Timed out sending RPC request to {}", addr))?
             .map_err(|e| anyhow::anyhow!("TransportV2 send error to {}: {}", addr, e))?;
 
-        let plain_resp = tokio::time::timeout(RPC_RECV_TIMEOUT, session.recv_message())
+        let plain_resp = tokio::time::timeout(recv_timeout, session.recv_message())
             .await
             .with_context(|| format!("Timed out waiting for RPC response from {}", addr))?
             .map_err(|e| anyhow::anyhow!("TransportV2 receive error from {}: {}", addr, e))?;

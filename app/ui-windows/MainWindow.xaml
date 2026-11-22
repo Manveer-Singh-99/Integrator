@@ -861,8 +861,15 @@
                                             ValueChanged="SliderGlassIntensity_ValueChanged" />
                                 </StackPanel>
 
-                                <TextBlock Text="Roadmap Modules: Touch ID Biometric Gate • Precision Trackpad Gestures"
-                                           Style="{StaticResource SubCaptionStyle}" />
+                                <Border Height="1" Background="{ThemeResource CardStrokeColorDefaultBrush}" Margin="0,2" />
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Touch ID Biometric Gate (Mac → Windows 11)" FontSize="12" FontWeight="SemiBold" />
+                                    <TextBlock Text="Requests a live Apple Secure Enclave Touch ID fingerprint prompt on your paired Mac over TransportV2 (no USB cable required)."
+                                               Style="{StaticResource SubCaptionStyle}" TextWrapping="Wrap" />
+                                    <Button x:Name="BtnVerifyTouchId" Content="Test Touch ID Biometric Prompt"
+                                            Style="{StaticResource AccentButtonStyle}" Click="VerifyTouchId_Click" />
+                                </StackPanel>
                             </StackPanel>
                         </Border>
 

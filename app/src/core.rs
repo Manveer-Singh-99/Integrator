@@ -930,6 +930,104 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                 ),
             }
         })()),
+        "touchid" => Some((|| {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("verify");
+            match subcmd {
+                "status" => {
+                    let status = serde_json::json!({
+                        "local_os": std::env::consts::OS,
+                        "local_touchid_available": trust::is_local_touchid_available(),
+                        "local_device_id": trust::local_device_id_hex(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
+                }
+                "verify" => {
+                    let target_ip_opt = args
+                        .get(3)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let challenge_nonce_hex = trust::generate_random_token_hex(32);
+                    let my_device_id = trust::local_device_id_hex();
+                    let my_hostname = system_info::get_hostname();
+                    let started = std::time::Instant::now();
+
+                    if cfg!(target_os = "macos") && target_ip_opt.is_none() {
+                        let assertion = trust::evaluate_local_touchid_and_sign(
+                            &challenge_nonce_hex,
+                            &my_device_id,
+                            &my_hostname,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                        trust::verify_touchid_assertion(
+                            &assertion,
+                            &challenge_nonce_hex,
+                            &my_device_id,
+                            &my_device_id,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                        let out = serde_json::json!({
+                            "verified": true,
+                            "mode": "local_macos_secure_enclave",
+                            "elapsed_ms": (started.elapsed().as_secs_f64() * 1000.0).round(),
+                            "assertion": assertion,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        Ok(())
+                    } else {
+                        let rt = tokio::runtime::Runtime::new()?;
+                        rt.block_on(async {
+                            let peer_ip = match target_ip_opt {
+                                Some(ip) => ip,
+                                None => {
+                                    let (cfg, _) = trust::get_trust_snapshot();
+                                    cfg.trusted_peers
+                                        .first()
+                                        .map(|p| p.last_ip.clone())
+                                        .filter(|ip| !ip.is_empty())
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "Usage: integrator touchid verify <mac_peer_ip>"
+                                            )
+                                        })?
+                                }
+                            };
+                            let rpc = DisplayRpcRequest::VerifyTouchId {
+                                challenge_nonce_hex: challenge_nonce_hex.clone(),
+                                requester_hostname: my_hostname,
+                            };
+                            let resp = DisplayController::send_remote_rpc(&peer_ip, &rpc).await?;
+                            if !resp.success {
+                                anyhow::bail!("Remote Touch ID verification failed: {}", resp.message);
+                            }
+                            let assertion = resp.touchid_assertion.ok_or_else(|| {
+                                anyhow::anyhow!("Remote Mac returned success without Touch ID assertion")
+                            })?;
+                            trust::verify_touchid_assertion(
+                                &assertion,
+                                &challenge_nonce_hex,
+                                &my_device_id,
+                                &assertion.signer_device_id,
+                            )
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                            let out = serde_json::json!({
+                                "verified": true,
+                                "mode": "remote_transport_v2_secure_enclave",
+                                "peer_ip": peer_ip,
+                                "elapsed_ms": (started.elapsed().as_secs_f64() * 1000.0).round(),
+                                "assertion": assertion,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&out)?);
+                            Ok(())
+                        })
+                    }
+                }
+                _ => anyhow::bail!(
+                    "Unknown touchid subcommand: {}. Use `status` or `verify [mac_ip]`.",
+                    subcmd
+                ),
+            }
+        })()),
         _ => None,
     }
 }
@@ -2360,6 +2458,72 @@ impl IntegratorCore {
                     .await
                     .map_err(|e| e.to_string())??;
                     Ok(serde_json::json!(saved))
+                }
+                "verify_touchid" => {
+                    let _ = self.features.set_flag_checked("touchid", true);
+                    let challenge_nonce_hex = trust::generate_random_token_hex(32);
+                    let my_device_id = trust::local_device_id_hex();
+                    let my_hostname = system_info::get_hostname();
+                    let started = std::time::Instant::now();
+
+                    if cfg!(target_os = "macos") {
+                        let nonce_clone = challenge_nonce_hex.clone();
+                        let dev_clone = my_device_id.clone();
+                        let host_clone = my_hostname.clone();
+                        let assertion = tokio::task::spawn_blocking(move || {
+                            trust::evaluate_local_touchid_and_sign(&nonce_clone, &dev_clone, &host_clone)
+                        })
+                        .await
+                        .map_err(|e| format!("Touch ID task panicked: {}", e))??;
+                        trust::verify_touchid_assertion(
+                            &assertion,
+                            &challenge_nonce_hex,
+                            &my_device_id,
+                            &my_device_id,
+                        )?;
+                        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        Ok(serde_json::json!(format!(
+                            "Touch ID Secure Enclave verified on '{}' in {:.0} ms [Ed25519 sig: {}…]",
+                            assertion.signer_hostname,
+                            elapsed_ms,
+                            assertion.signature_hex.chars().take(16).collect::<String>()
+                        )))
+                    } else {
+                        let peer = self
+                            .discovery
+                            .get_best_peer()
+                            .await
+                            .ok_or_else(|| "No paired Mac discovered to request Touch ID verification".to_string())?;
+                        let peer_ip = peer.addr.ip().to_string();
+                        let peer_dev_id = peer.device_id.clone();
+                        let rpc = DisplayRpcRequest::VerifyTouchId {
+                            challenge_nonce_hex: challenge_nonce_hex.clone(),
+                            requester_hostname: my_hostname,
+                        };
+                        let resp = DisplayController::send_remote_rpc(&peer_ip, &rpc)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if !resp.success {
+                            return Err(resp.message);
+                        }
+                        let assertion = resp
+                            .touchid_assertion
+                            .ok_or_else(|| "Mac peer returned success without a signed Touch ID assertion".to_string())?;
+                        trust::verify_touchid_assertion(
+                            &assertion,
+                            &challenge_nonce_hex,
+                            &my_device_id,
+                            &peer_dev_id,
+                        )?;
+                        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        Ok(serde_json::json!(format!(
+                            "Touch ID verified on '{}' ({}) in {:.0} ms [Ed25519 sig: {}…]",
+                            assertion.signer_hostname,
+                            peer_ip,
+                            elapsed_ms,
+                            assertion.signature_hex.chars().take(16).collect::<String>()
+                        )))
+                    }
                 }
                 _ => Err(format!("Unknown native command: {}", method)),
             }

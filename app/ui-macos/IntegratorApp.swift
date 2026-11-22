@@ -2723,9 +2723,20 @@ struct MainDashboardView: View {
                 Slider(value: $glassIntensity, in: 0.1...1.0, step: 0.05)
             }
 
-            Text("Roadmap Modules: Touch ID Biometric Gate • Precision Trackpad Gestures")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Touch ID Biometric Gate (Mac → Windows 11)", systemImage: "touchid")
+                    .font(.subheadline.weight(.semibold))
+                Text("Authenticates local or remote Windows 11 Touch ID challenges via Apple Secure Enclave over encrypted TransportV2.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Test Touch ID Prompt") {
+                    vm.showToast("info", "Place your finger on the Touch ID sensor…")
+                    vm.runAction("verify_touchid")
+                }
+                .buttonStyle(.borderedProminent)
+            }
         }
         .modifier(LiquidGlassCardModifier())
     }

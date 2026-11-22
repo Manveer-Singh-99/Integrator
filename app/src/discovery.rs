@@ -599,7 +599,6 @@ impl DiscoveryManager {
         let rtt_cache = Arc::clone(&self.rtt_cache);
         let my_device_id = self.local_device_id.clone();
         let my_trust_device_id = trust::local_device_id_hex();
-        let my_name = sanitize_display_text(&self.local_name, 128);
         let replay_cache = Arc::new(Mutex::new(BeaconReplayCache::default()));
         let rtt_probe_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_RTT_PROBES));
 
@@ -710,7 +709,6 @@ impl DiscoveryManager {
 
                             let valid_control_port = beacon.control_port;
                             let peer_ip_for_route = peer_ip.clone();
-                            let my_name_clone = my_name.clone();
                             let sender_name_clean =
                                 sanitize_display_text(&beacon.sender_name, 128);
                             if sender_name_clean.is_empty() {
@@ -729,8 +727,9 @@ impl DiscoveryManager {
                                 same_subnet,
                                 trusted,
                             )) = tokio::task::spawn_blocking(move || {
-                                let is_self = sender_name_clone == my_name_clone
-                                    && is_own_local_ip(&peer_ip_for_route);
+                                // Unconditionally drop any beacon arriving from one of our own local interface
+                                // IPs (including Windows ICS Mobile Hotspot NAT source-IP reflections).
+                                let is_self = is_own_local_ip(&peer_ip_for_route);
                                 if is_self {
                                     return (
                                         true,
@@ -754,8 +753,8 @@ impl DiscoveryManager {
                                     &peer_ip_for_route,
                                     transport.is_direct_cable(),
                                 );
-                                // Persist verified paired peer IPs only, preventing spoofed LAN history pollution
-                                if trusted {
+                                // Persist verified paired peer IPs only when on a matching local subnet
+                                if trusted && same_subnet {
                                     record_recent_peer_ip(&peer_ip_for_route);
                                 }
                                 (
@@ -1020,13 +1019,14 @@ impl DiscoveryManager {
                     let hist = load_peer_history();
 
                     // Accumulate manual IP overrides, active verified candidate IPs (for bidirectional
-                    // discovery on broadcast-isolated APs), and recent peer history for unicast delivery
+                    // discovery on broadcast-isolated APs), and recent peer history for unicast delivery.
+                    // Never send unicast beacons to our own local interface IPs (prevents Windows ICS NAT reflection).
                     for ip in manual_snapshot
                         .iter()
                         .chain(active_candidate_ips.iter())
                         .chain(hist.recent_ips.iter())
                     {
-                        if seen.insert(ip.clone()) {
+                        if !is_own_local_ip(ip) && seen.insert(ip.clone()) {
                             unicast_targets.push(ip.clone());
                         }
                     }
@@ -1318,7 +1318,7 @@ async fn ingest_authenticated_hint(
                 &ip_for_route,
                 transport.is_direct_cable(),
             );
-            if trusted {
+            if trusted && same_subnet {
                 record_recent_peer_ip(&ip_for_route);
             }
             (transport, speed_mbps, link_desc, local_ip, same_subnet, trusted)
