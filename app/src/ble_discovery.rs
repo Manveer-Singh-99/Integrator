@@ -372,6 +372,7 @@ pub fn decode_ble_service_uuid_bytes(
 }
 
 /// Decodes an Integrator v2 128-bit Service UUID string (with or without hyphens).
+#[allow(dead_code)]
 pub fn decode_ble_service_uuid_str(uuid_str: &str, rssi: i16) -> Option<BleDiscoveryHint> {
     let compact: String = uuid_str
         .trim()
