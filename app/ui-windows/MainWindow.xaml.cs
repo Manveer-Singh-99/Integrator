@@ -1715,26 +1715,99 @@ namespace IntegratorUI
             });
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct BROWSEINFOW
+        {
+            public IntPtr hwndOwner;
+            public IntPtr pidlRoot;
+            public IntPtr pszDisplayName;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string lpszTitle;
+            public uint ulFlags;
+            public IntPtr lpfn;
+            public IntPtr lParam;
+            public int iImage;
+        }
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern IntPtr SHBrowseForFolderW(ref BROWSEINFOW lpbi);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SHGetPathFromIDListW(IntPtr pidl, [Out] char[] pszPath);
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern void CoTaskMemFree(IntPtr pv);
+
         /// <summary>
-        /// Prompts the user to select a local directory to share over SMB via native WinUI 3 FolderPicker.
+        /// Prompts the user to select a local directory to share over SMB.
+        /// Uses Win32 SHBrowseForFolderW (BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE) first because
+        /// WinRT FolderPicker fails with E_ACCESSDENIED when running elevated as Administrator.
         /// </summary>
         private async void ChooseFolder_Click(object sender, RoutedEventArgs e)
         {
             try
             {
+                IntPtr hwnd = WindowNative.GetWindowHandle(this);
+                IntPtr displayBuf = Marshal.AllocHGlobal(520);
+                IntPtr pidl = IntPtr.Zero;
+                try
+                {
+                    var bi = new BROWSEINFOW
+                    {
+                        hwndOwner = hwnd,
+                        pidlRoot = IntPtr.Zero,
+                        pszDisplayName = displayBuf,
+                        lpszTitle = "Select a local folder to share with your paired Mac over SMB:",
+                        ulFlags = 0x00000001 | 0x00000040, // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+                        lpfn = IntPtr.Zero,
+                        lParam = IntPtr.Zero,
+                        iImage = 0
+                    };
+                    pidl = SHBrowseForFolderW(ref bi);
+                    if (pidl != IntPtr.Zero)
+                    {
+                        char[] pathChars = new char[260];
+                        if (SHGetPathFromIDListW(pidl, pathChars))
+                        {
+                            string selectedPath = new string(pathChars).TrimEnd('\0').Trim();
+                            if (!string.IsNullOrWhiteSpace(selectedPath))
+                            {
+                                LocalSharedFolderInput.Text = selectedPath;
+                                RunInvoke("set_local_shared_folder", new { folder = selectedPath });
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        return;
+                    }
+                }
+                finally
+                {
+                    if (pidl != IntPtr.Zero) CoTaskMemFree(pidl);
+                    if (displayBuf != IntPtr.Zero) Marshal.FreeHGlobal(displayBuf);
+                }
+
+                // Fallback to WinRT FolderPicker if non-elevated and Win32 dialog returned empty
                 var picker = new Windows.Storage.Pickers.FolderPicker();
                 picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder;
                 picker.FileTypeFilter.Add("*");
-                IntPtr hwnd = WindowNative.GetWindowHandle(this);
                 WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
                 var folder = await picker.PickSingleFolderAsync();
                 if (folder != null && !string.IsNullOrWhiteSpace(folder.Path))
                 {
+                    LocalSharedFolderInput.Text = folder.Path;
                     RunInvoke("set_local_shared_folder", new { folder = folder.Path });
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                ShowToast("Folder selection failed: " + ex.Message, isError: true);
             }
         }
 
