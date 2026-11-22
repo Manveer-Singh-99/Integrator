@@ -35,6 +35,14 @@
 //  - `CoreBluetooth`: `CBCentralManager`, `CBPeripheralManager`, `CBMutableService`,
 //    `CBMutableCharacteristic`, `CBUUID`, `CBManager.authorization`.
 //
+//  Cross-Platform / Cross-Device Flow:
+//  - **macOS -> Windows 11**: `CBPeripheralManager` advertises the 16-byte masked IPv4+port
+//    payload as a 128-bit `ADV_IND` Service UUID (`7A4E...`) alongside the 27-character
+//    `LocalName` (`IG2...`) in `SCAN_RSP` and a read-only GATT characteristic mirror.
+//  - **Windows 11 -> macOS**: `CBCentralManager` receives Windows 11 `ManufacturerData`
+//    beacons (`CompanyId = 0xFFFF`, `IG2` magic) and forwards the 17-byte payload to Rust
+//    `ble_discovery::macos_ble::on_binary_packet` for SHA-256 tag verification and IP unmasking.
+//
 //  ========================================================================================
 //  3. THREADING & CONCURRENCY MODEL
 //  ========================================================================================

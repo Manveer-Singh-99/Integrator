@@ -37,6 +37,16 @@
 //! - Windows 11: WinRT `Windows.Devices.Bluetooth.Advertisement` via the `windows` crate.
 //! - `sha2::Sha256` + `getrandom`: Keystream masking and rotating anti-tracking nonce generation.
 //!
+//! ### Cross-Platform / Cross-Device Flow:
+//! - **macOS -> Windows 11**: macOS encodes its highest-priority local IPv4 + port into a
+//!   128-bit `ADV_IND` Service UUID (`7A4E...`) and a 27-char `SCAN_RSP` `LocalName` (`IG2...`).
+//!   Windows `BluetoothLEAdvertisementWatcher` (in `Active` scan mode) decodes either format and
+//!   initiates an authenticated `TransportSessionV2` TCP handshake to the Mac's IPv4 address.
+//! - **Windows 11 -> macOS**: Windows publishes a 17-byte `ManufacturerData` payload (`0xFFFF` +
+//!   `IG2`). macOS `CBCentralManager` (`withServices: nil`) captures the packet, verifies its
+//!   16-bit SHA-256 tag, unmasks the PC's IPv4 + port, and initiates an authenticated
+//!   `TransportSessionV2` TCP handshake to the PC.
+//!
 //! ## 3. Threading & Concurrency Model
 //! - Platform BLE callbacks run on OS-managed radio dispatch threads (macOS `com.integrator.ble`
 //!   serial GCD queue; Windows WinRT MTA callback threadpool) and push hints locklessly into a

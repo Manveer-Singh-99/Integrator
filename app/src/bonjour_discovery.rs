@@ -25,6 +25,14 @@
 //! - `system_info::list_local_ipv4_interfaces`: Provides filtered, non-virtual active IPv4
 //!   addresses so VPN/Docker/WSL virtual interfaces are never advertised over Bonjour.
 //!
+//! ### Cross-Platform / Cross-Device Flow:
+//! - Both macOS and Windows 11 peers register `<hostname>-<dev_prefix>._integrator._tcp.local.`
+//!   on UDP multicast `224.0.0.251:5353` with TXT metadata (`v`, `id`, `os`, `ff`, `port`).
+//! - When either peer resolves a remote `_integrator._tcp.local.` record, it forwards the
+//!   extracted [`BonjourDiscoveryHint`] into `discovery::DiscoveryManager`, which verifies the
+//!   peer via a mutual Ed25519 + X25519 + ChaCha20-Poly1305 `TransportSessionV2` handshake on
+//!   TCP `:58281`.
+//!
 //! ## 3. Threading & Concurrency Model
 //! - `mdns_sd::ServiceDaemon` runs its internal multicast socket I/O on a dedicated OS thread.
 //! - A lightweight Tokio background task refreshes service IP registrations whenever the host's

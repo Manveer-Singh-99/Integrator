@@ -614,6 +614,8 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
         bool pressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        // Intercept local Ctrl+V when a large (>128 MB) remote Mac file/folder is pending
+        // on-demand pull so pressing Ctrl+V on the Windows Desktop streams and stages CF_HDROP.
         if (pressed && !g_controlling_peer.load() && ks->vkCode == 'V' && g_has_pending_remote_file.load()) {
             bool ctrl_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             bool alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
@@ -1395,6 +1397,8 @@ void integrator_kvm_win_cancel_remote_drag() {
     }
 }
 
+/// Updates the atomic flag indicating whether a large (>128 MB) remote Mac file or folder
+/// announcement is pending an on-demand pull when the user presses local `Ctrl+V` on Windows.
 void set_has_pending_remote_file(bool pending) {
     g_has_pending_remote_file.store(pending);
 }

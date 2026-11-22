@@ -1715,29 +1715,62 @@ namespace IntegratorUI
             });
         }
 
+        /// <summary>Maximum character capacity for a standard Win32 MAX_PATH buffer.</summary>
+        private const int MaxPathChars = 260;
+
+        /// <summary>Byte capacity for a UTF-16 Wide MAX_PATH display buffer (260 * 2 bytes).</summary>
+        private const int MaxPathWideBytes = MaxPathChars * 2;
+
+        /// <summary>SHBrowseForFolderW flag restricting selection to file system directories (`BIF_RETURNONLYFSDIRS`).</summary>
+        private const uint BifReturnOnlyFsDirs = 0x00000001;
+
+        /// <summary>SHBrowseForFolderW flag enabling the resizable modern folder dialog (`BIF_NEWDIALOGSTYLE`).</summary>
+        private const uint BifNewDialogStyle = 0x00000040;
+
+        /// <summary>
+        /// Win32 `BROWSEINFOW` structure configuring the `SHBrowseForFolderW` shell folder picker dialog.
+        /// Works reliably under both standard user tokens and elevated Administrator (`RunLevel Highest`) sessions.
+        /// </summary>
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct BROWSEINFOW
         {
+            /// <summary>Handle to the owner window for the modal browse dialog (`HWND`).</summary>
             public IntPtr hwndOwner;
+            /// <summary>Root `ITEMIDLIST` pointer (`IntPtr.Zero` starts at the Desktop root namespace).</summary>
             public IntPtr pidlRoot;
+            /// <summary>Unmanaged buffer (`MAX_PATH` UTF-16 chars) receiving the display name of the selected folder.</summary>
             public IntPtr pszDisplayName;
+            /// <summary>Instructional title string displayed above the folder tree view.</summary>
             [MarshalAs(UnmanagedType.LPWStr)]
             public string lpszTitle;
+            /// <summary>Bitmask of `BIF_*` option flags controlling folder filtering and dialog layout.</summary>
             public uint ulFlags;
+            /// <summary>Optional browse callback procedure pointer (`IntPtr.Zero` when unused).</summary>
             public IntPtr lpfn;
+            /// <summary>Application-defined parameter passed to `lpfn` (`IntPtr.Zero` when unused).</summary>
             public IntPtr lParam;
+            /// <summary>Output system image list index associated with the selected folder.</summary>
             public int iImage;
         }
 
+        /// <summary>
+        /// Displays a modal Win32 Shell folder browser dialog and returns an `ITEMIDLIST` pointer (`PIDL`).
+        /// </summary>
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
         private static extern IntPtr SHBrowseForFolderW(ref BROWSEINFOW lpbi);
 
+        /// <summary>
+        /// Converts a Shell `ITEMIDLIST` pointer (`PIDL`) into a canonical UTF-16 file system path.
+        /// </summary>
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool SHGetPathFromIDListW(IntPtr pidl, [Out] char[] pszPath);
 
+        /// <summary>
+        /// Frees a block of COM task memory allocated by Shell APIs such as `SHBrowseForFolderW`.
+        /// </summary>
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll", ExactSpelling = true)]
         private static extern void CoTaskMemFree(IntPtr pv);
@@ -1752,7 +1785,7 @@ namespace IntegratorUI
             try
             {
                 IntPtr hwnd = WindowNative.GetWindowHandle(this);
-                IntPtr displayBuf = Marshal.AllocHGlobal(520);
+                IntPtr displayBuf = Marshal.AllocHGlobal(MaxPathWideBytes);
                 IntPtr pidl = IntPtr.Zero;
                 try
                 {
@@ -1762,7 +1795,7 @@ namespace IntegratorUI
                         pidlRoot = IntPtr.Zero,
                         pszDisplayName = displayBuf,
                         lpszTitle = "Select a local folder to share with your paired Mac over SMB:",
-                        ulFlags = 0x00000001 | 0x00000040, // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+                        ulFlags = BifReturnOnlyFsDirs | BifNewDialogStyle,
                         lpfn = IntPtr.Zero,
                         lParam = IntPtr.Zero,
                         iImage = 0
@@ -1770,7 +1803,7 @@ namespace IntegratorUI
                     pidl = SHBrowseForFolderW(ref bi);
                     if (pidl != IntPtr.Zero)
                     {
-                        char[] pathChars = new char[260];
+                        char[] pathChars = new char[MaxPathChars];
                         if (SHGetPathFromIDListW(pidl, pathChars))
                         {
                             string selectedPath = new string(pathChars).TrimEnd('\0').Trim();
@@ -1807,7 +1840,7 @@ namespace IntegratorUI
             }
             catch (Exception ex)
             {
-                ShowToast("Folder selection failed: " + ex.Message, true);
+                ShowToast("Folder selection failed: " + ex.Message, "error");
             }
         }
 
