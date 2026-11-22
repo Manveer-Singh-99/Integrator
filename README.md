@@ -269,7 +269,6 @@ In [`Legacy/moonlight-second-screen/`](Legacy/moonlight-second-screen/), you'll 
 | **True Tone & Chromatic Adaptation** | macOS & Win 11 | ✅ **Live** | Mac ambient sensor (Kelvin) $\to$ Bradford CAT GPU gamma ramp injection |
 | **Second-Screen Extended Display** | macOS & Win 11 | ✅ **Live** | Bidirectional streaming via Sunshine/Apollo host + Moonlight client with aspect-preserving VDD scaling & half-duplex Wi-Fi/Hotspot bitrate derating |
 | **Universal Input KVM & Edge Hopping** | macOS & Win 11 | ✅ **Live** | Edge-hopping mouse/keyboard sharing (`:58286`), 2D desk alignment schematic, multi-monitor negative coordinates, corner guard & panic key (`Ctrl+Alt+Shift+Esc`) |
-| **Cross-Border File Drag & Drop** | macOS & Win 11 | ✅ **Live** | Cursor-following cross-screen file staging & transfer over authenticated AEAD transport |
 | **Master ON/OFF Feature Switches** | macOS & Win 11 | ✅ **Live** | Independent persistent toggles saved to `~/.usbc_clipboard_cache/features.json` |
 | **Native Launch at Login** | macOS & Win 11 | ✅ **Live** | User LaunchAgent (macOS) & Elevated Scheduled Task (`IntegratorAutostart` on Win 11) |
 | **Dynamic Audio Routing** | macOS & Win 11 | 🧪 **Preview** | Experimental authenticated UDP audio sink (`IUA2` ChaCha20-Poly1305 AEAD + 64-pkt replay window on `:58284`) & local 24-bit/48kHz test chime; full CoreAudio/WASAPI duplex playback planned |
@@ -394,9 +393,6 @@ Regardless of whether the app is in **Extended Desktop** or **Input Sharing** mo
 * **📋 Universal Clipboard (✅ Live):**
   * Bidirectional clipboard synchronization for plain text, image bitmaps (PNG/TIFF), and recursive folder/file trees over authenticated `TransportSessionV2` (`ITR2`, X25519 + ChaCha20-Poly1305 AEAD) transport.
   * Cryptographic SHA-256 payload verification and hash-based deduplication to prevent infinite ping-pong echo loops between devices.
-* **📂 Cross-Border File Drag & Drop ("AirDrop Across Screens" — ✅ Live):**
-  * Click and drag any file from macOS Finder past the screen boundary onto the Windows desktop (or vice versa).
-  * A semi-transparent ghost thumbnail follows the cursor across operating systems, and releasing the mouse button streams the file buffer over the USB-C link directly into the target folder in milliseconds.
 * **📁 Auto-Mounted Shared Folders (✅ Live):**
   * Discovers advertised or enumerated SMB shares on the connected peer and mounts them into `/Volumes/<Share>` on macOS and mapped drives on Windows.
   * Clean, automated unmounting when the link is disconnected or the storage toggle is turned off.

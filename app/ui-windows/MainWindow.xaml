@@ -366,8 +366,8 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- CARD 3: Cross-Screen Drag & Drop -->
-                        <Border x:Name="CardDragDrop" Tag="input" Style="{StaticResource BentoCardStyle}">
+                        <!-- CARD 3: Cross-Screen Drag & Drop (Retired / Hidden) -->
+                        <Border x:Name="CardDragDrop" Tag="input" Visibility="Collapsed" Style="{StaticResource BentoCardStyle}">
                             <StackPanel Spacing="12">
                                 <Grid ColumnSpacing="8">
                                     <Grid.ColumnDefinitions>

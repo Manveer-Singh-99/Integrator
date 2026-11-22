@@ -212,7 +212,7 @@ namespace IntegratorUI
 
             _allCards = new[]
             {
-                CardDisplay, CardKvm, CardDragDrop, CardClipboard,
+                CardDisplay, CardKvm, CardClipboard,
                 CardDiscovery, CardSpeed, CardStorage, CardTrueTone,
                 CardTouchBar, CardAudio, CardCamera, CardSystem, CardLogs
             };

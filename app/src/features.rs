@@ -98,7 +98,7 @@ impl Default for FeatureFlags {
             display: true,
             clipboard: true,
             input_kvm: true,
-            dragdrop: true,
+            dragdrop: false,
             storage: true,
             touchid: false,
             truetone: true,
@@ -161,10 +161,11 @@ impl FeatureManager {
             match fs::read_to_string(&config_path) {
                 Ok(data) => match serde_json::from_str::<FeatureFlags>(&data) {
                     Ok(mut parsed) => {
-                        // Enforce dependency rule: clipboard and dragdrop cannot be active without KVM
+                        // Cross-screen drag-and-drop has been retired; keep disabled.
+                        parsed.dragdrop = false;
+                        // Enforce dependency rule: clipboard cannot be active without KVM
                         if !parsed.input_kvm {
                             parsed.clipboard = false;
-                            parsed.dragdrop = false;
                         }
                         parsed
                     }
@@ -235,7 +236,7 @@ impl FeatureManager {
             "display" => f.display,
             "clipboard" => f.input_kvm && f.clipboard,
             "input_kvm" | "input" => f.input_kvm,
-            "dragdrop" => f.input_kvm && f.dragdrop,
+            "dragdrop" => false,
             "storage" => f.storage,
             "touchid" => f.touchid,
             "truetone" => f.truetone,
@@ -286,13 +287,7 @@ impl FeatureManager {
                 }
             }
             "dragdrop" => {
-                if enabled && !candidate.input_kvm {
-                    return Err(
-                        "Universal Input & KVM must be enabled before turning on Cross-Screen Drag & Drop."
-                            .to_string(),
-                    );
-                }
-                candidate.dragdrop = enabled;
+                candidate.dragdrop = false;
             }
             "storage" => candidate.storage = enabled,
             "touchid" => candidate.touchid = enabled,
@@ -388,16 +383,9 @@ mod tests {
 
         assert!(mgr.is_enabled("input_kvm"));
         assert!(mgr.is_enabled("clipboard"));
-        assert!(mgr.is_enabled("dragdrop"));
-
-        // With KVM on, dragdrop and clipboard toggle independently.
-        mgr.set_flag_checked("dragdrop", false).unwrap();
         assert!(!mgr.is_enabled("dragdrop"));
-        assert!(mgr.is_enabled("clipboard"));
-        mgr.set_flag_checked("dragdrop", true).unwrap();
-        assert!(mgr.is_enabled("dragdrop"));
 
-        // Turning KVM off auto-disables both clipboard and dragdrop.
+        // Turning KVM off auto-disables clipboard.
         let off = mgr.set_flag_checked("input_kvm", false).unwrap();
         assert!(!off.input_kvm);
         assert!(!off.clipboard);
@@ -405,16 +393,14 @@ mod tests {
         assert!(!mgr.is_enabled("clipboard"));
         assert!(!mgr.is_enabled("dragdrop"));
 
-        // Turning clipboard or dragdrop on while KVM is off must fail.
+        // Turning clipboard on while KVM is off must fail.
         assert!(mgr.set_flag_checked("clipboard", true).is_err());
-        assert!(mgr.set_flag_checked("dragdrop", true).is_err());
 
-        // Re-enabling KVM unlocks independent toggling again.
+        // Re-enabling KVM unlocks clipboard toggling again.
         mgr.set_flag_checked("input_kvm", true).unwrap();
         mgr.set_flag_checked("clipboard", true).unwrap();
-        mgr.set_flag_checked("dragdrop", true).unwrap();
         assert!(mgr.is_enabled("clipboard"));
-        assert!(mgr.is_enabled("dragdrop"));
+        assert!(!mgr.is_enabled("dragdrop"));
 
         let _ = fs::remove_file(&path);
     }

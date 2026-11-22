@@ -1543,7 +1543,6 @@ struct MainDashboardView: View {
                             }
                             if show(.input) {
                                 kvmLayoutCard
-                                dragDropCard
                                 clipboardCard
                             }
                             if show(.network) {
