@@ -656,6 +656,36 @@ pub async fn pair_with_remote_peer_v2(
     let local_os = std::env::consts::OS;
     let via_cable = system_info::is_direct_cable_route(&canon_ip);
 
+    // If the user explicitly initiates outbound PIN pairing to `canon_ip`, clear any stale pinned
+    // record for the same IP or pending peer hostname whose identity key was regenerated on the peer.
+    {
+        let pending_host_and_id = {
+            let rt = runtime_state();
+            let pending = rt.pending_peers.lock().unwrap_or_else(|e| e.into_inner());
+            pending
+                .values()
+                .find(|p| p.ip == canon_ip)
+                .map(|p| (p.hostname.clone(), p.device_id.clone()))
+        };
+        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+        let stale_ids: Vec<String> = ks
+            .list_peers()
+            .into_iter()
+            .filter(|p| {
+                let same_ip = p.last_ip == canon_ip;
+                let same_host = pending_host_and_id
+                    .as_ref()
+                    .map(|(h, id)| p.hostname.eq_ignore_ascii_case(h) && &p.device_id_hex != id)
+                    .unwrap_or(false);
+                same_ip || same_host
+            })
+            .map(|p| p.device_id_hex)
+            .collect();
+        for sid in stale_ids {
+            let _ = ks.unpair_peer(&sid);
+        }
+    }
+
     let (creds, sas) = tokio::time::timeout(
         SPAKE2_HANDSHAKE_TIMEOUT,
         run_client_pairing_with_shared_keystore(
