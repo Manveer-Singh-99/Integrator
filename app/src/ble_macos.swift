@@ -99,6 +99,7 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
     private var onBinaryCb: IntegratorBleBinaryCallback?
     private var onNameCb: IntegratorBleNameCallback?
 
+    private var pendingServiceUuid: String?
     private var pendingLocalName: String?
     private var pendingBinaryPayload: Data?
     private var wantsScan: Bool = false
@@ -169,9 +170,10 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         return true
     }
 
-    func updateAdvertisement(localName: String, binaryPayload: Data) {
+    func updateAdvertisement(serviceUuid: String, localName: String, binaryPayload: Data) {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
+            self.pendingServiceUuid = serviceUuid
             self.pendingLocalName = localName
             self.pendingBinaryPayload = binaryPayload
             if self.wantsAdvertise, self.peripheralManager?.state == .poweredOn {
@@ -224,8 +226,14 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         if pm.isAdvertising {
             pm.stopAdvertising()
         }
+        let advUuid: CBUUID
+        if let dyn = pendingServiceUuid, !dyn.isEmpty {
+            advUuid = CBUUID(string: dyn)
+        } else {
+            advUuid = kIntegratorBleServiceUuid
+        }
         let adData: [String: Any] = [
-            CBAdvertisementDataServiceUUIDsKey: [kIntegratorBleServiceUuid],
+            CBAdvertisementDataServiceUUIDsKey: [advUuid],
             CBAdvertisementDataLocalNameKey: localName,
         ]
         pm.startAdvertising(adData)
@@ -274,7 +282,21 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
             }
         }
 
-        // 2. Check LocalName (`IG2...` 27-byte scan-response magic packet from macOS)
+        // 2. Check 128-bit Service UUIDs (`7A4E...` ADV_IND magic packet from macOS)
+        if let uuids = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID],
+           let cb = onNameCb
+        {
+            for uuid in uuids {
+                let s = uuid.uuidString
+                if s.hasPrefix("7A4E") || s.hasPrefix("7a4e") {
+                    s.withCString { cstr in
+                        cb(cstr, rssiVal)
+                    }
+                }
+            }
+        }
+
+        // 3. Check LocalName (`IG2...` 27-byte scan-response magic packet from macOS)
         if let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
            name.hasPrefix(kIntegratorBleLocalNamePrefix),
            let cb = onNameCb
@@ -330,17 +352,27 @@ public func integrator_mac_ble_start(
     )
 }
 
-/// Updates the advertised macOS BLE LocalName magic packet and mirrored GATT characteristic payload.
+/// Updates the advertised macOS BLE 128-bit Service UUID magic packet, LocalName, and mirrored GATT payload.
 @_cdecl("integrator_mac_ble_update_advertisement")
 public func integrator_mac_ble_update_advertisement(
+    serviceUuidPtr: UnsafePointer<CChar>?,
     localNamePtr: UnsafePointer<CChar>?,
     binPtr: UnsafePointer<UInt8>?,
     binLen: Int
 ) {
-    guard let localNamePtr = localNamePtr, let binPtr = binPtr, binLen > 0 else { return }
+    guard let serviceUuidPtr = serviceUuidPtr,
+          let localNamePtr = localNamePtr,
+          let binPtr = binPtr,
+          binLen > 0
+    else { return }
+    let serviceUuid = String(cString: serviceUuidPtr)
     let localName = String(cString: localNamePtr)
     let data = Data(bytes: binPtr, count: binLen)
-    IntegratorBleController.shared.updateAdvertisement(localName: localName, binaryPayload: data)
+    IntegratorBleController.shared.updateAdvertisement(
+        serviceUuid: serviceUuid,
+        localName: localName,
+        binaryPayload: data
+    )
 }
 
 /// Stops macOS CoreBluetooth BLE scanning and advertising cleanly.

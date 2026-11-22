@@ -257,7 +257,12 @@ const WINDOWS_SUNSHINE_APP_DIRS: [&str; 2] = ["Sunshine", "Apollo"];
 
 /// Candidate installation folder names for Moonlight clients on Windows.
 #[cfg(target_os = "windows")]
-const WINDOWS_MOONLIGHT_APP_DIRS: [&str; 2] = ["Moonlight Game Streaming Project", "Moonlight"];
+const WINDOWS_MOONLIGHT_APP_DIRS: [&str; 4] = [
+    "Moonlight Game Streaming",
+    "Moonlight Game Streaming Project",
+    "Moonlight",
+    "Moonlight-qt",
+];
 
 /// Global mutex serializing concurrent disk operations on `app_config.json`.
 static APP_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -69,6 +69,12 @@ use crate::system_info;
 /// Fixed byte length of the Integrator v2 binary BLE magic packet.
 pub const BLE_BINARY_PACKET_LEN: usize = 17;
 
+/// Fixed byte length of the Integrator v2 128-bit Service UUID BLE magic packet.
+pub const BLE_UUID_PACKET_LEN: usize = 16;
+
+/// Two-byte private UUID prefix identifying Integrator v2 BLE Service UUID magic packets (`0x7A4E`).
+pub const BLE_UUID_MAGIC_PREFIX: [u8; 2] = [0x7A, 0x4E];
+
 /// Fixed ASCII character length of the Integrator v2 LocalName BLE magic packet (`"IG2"` + 24 hex).
 pub const BLE_LOCAL_NAME_LEN: usize = 27;
 
@@ -260,6 +266,122 @@ pub fn decode_ble_binary_packet(data: &[u8], rssi: i16) -> Option<BleDiscoveryHi
     })
 }
 
+/// Encodes a 16-byte (128-bit) Service UUID Integrator v2 BLE magic packet transmitted directly
+/// inside `ADV_IND` (`CBAdvertisementDataServiceUUIDsKey`), avoiding `SCAN_RSP` name truncation.
+///
+/// Layout (16 bytes big-endian):
+/// - `[0..2]`   : `[0x7A, 0x4E]` private namespace prefix
+/// - `[2..6]`   : 4-byte `device_id` prefix
+/// - `[6..8]`   : 2-byte rotating CSPRNG nonce
+/// - `[8..14]`  : 6-byte XOR-masked `[ip0, ip1, ip2, ip3, port_hi, port_lo]`
+/// - `[14..16]` : 2-byte SHA-256 integrity tag (mode `0x03`)
+pub fn encode_ble_service_uuid_bytes(
+    device_id_hex: &str,
+    ip: Ipv4Addr,
+    port: u16,
+    nonce: [u8; 2],
+) -> Option<[u8; BLE_UUID_PACKET_LEN]> {
+    if !is_valid_ble_endpoint(ip, port) {
+        return None;
+    }
+    let dev_prefix = parse_device_prefix_4(device_id_hex)?;
+    let ks = derive_mask_keystream(&dev_prefix, &nonce);
+
+    let octets = ip.octets();
+    let port_be = port.to_be_bytes();
+    let plain = [octets[0], octets[1], octets[2], octets[3], port_be[0], port_be[1]];
+    let mut masked = [0u8; 6];
+    for i in 0..6 {
+        masked[i] = plain[i] ^ ks[i];
+    }
+    let tag = compute_integrity_tag(0x03, &dev_prefix, &nonce, &masked);
+
+    let mut out = [0u8; BLE_UUID_PACKET_LEN];
+    out[0..2].copy_from_slice(&BLE_UUID_MAGIC_PREFIX);
+    out[2..6].copy_from_slice(&dev_prefix);
+    out[6..8].copy_from_slice(&nonce);
+    out[8..14].copy_from_slice(&masked);
+    out[14..16].copy_from_slice(&tag);
+    Some(out)
+}
+
+/// Formats a 16-byte big-endian payload into a canonical hyphenated 128-bit UUID string.
+pub fn format_uuid_128(bytes: &[u8; BLE_UUID_PACKET_LEN]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// Reassembles WinRT/Win32 `GUID` fields `(data1, data2, data3, data4)` into canonical 16 big-endian UUID bytes.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn guid_fields_to_be_bytes(
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+) -> [u8; BLE_UUID_PACKET_LEN] {
+    let mut out = [0u8; BLE_UUID_PACKET_LEN];
+    out[0..4].copy_from_slice(&data1.to_be_bytes());
+    out[4..6].copy_from_slice(&data2.to_be_bytes());
+    out[6..8].copy_from_slice(&data3.to_be_bytes());
+    out[8..16].copy_from_slice(&data4);
+    out
+}
+
+/// Decodes and validates a 16-byte Integrator v2 128-bit Service UUID magic packet.
+pub fn decode_ble_service_uuid_bytes(
+    data: &[u8; BLE_UUID_PACKET_LEN],
+    rssi: i16,
+) -> Option<BleDiscoveryHint> {
+    if data[0..2] != BLE_UUID_MAGIC_PREFIX {
+        return None;
+    }
+    let mut dev_prefix = [0u8; 4];
+    dev_prefix.copy_from_slice(&data[2..6]);
+    let mut nonce = [0u8; 2];
+    nonce.copy_from_slice(&data[6..8]);
+    let masked = &data[8..14];
+    let expected_tag = compute_integrity_tag(0x03, &dev_prefix, &nonce, masked);
+    if data[14..16] != expected_tag {
+        return None;
+    }
+
+    let ks = derive_mask_keystream(&dev_prefix, &nonce);
+    let mut plain = [0u8; 6];
+    for i in 0..6 {
+        plain[i] = masked[i] ^ ks[i];
+    }
+    let ip = Ipv4Addr::new(plain[0], plain[1], plain[2], plain[3]);
+    let port = u16::from_be_bytes([plain[4], plain[5]]);
+    if !is_valid_ble_endpoint(ip, port) {
+        return None;
+    }
+
+    Some(BleDiscoveryHint {
+        device_id_prefix: bytes_to_hex_lower(&dev_prefix),
+        ip,
+        port,
+        rssi,
+        format: "ble-uuid",
+    })
+}
+
+/// Decodes an Integrator v2 128-bit Service UUID string (with or without hyphens).
+pub fn decode_ble_service_uuid_str(uuid_str: &str, rssi: i16) -> Option<BleDiscoveryHint> {
+    let compact: String = uuid_str
+        .trim()
+        .chars()
+        .filter(|c| *c != '-')
+        .collect();
+    let bytes = hex_to_bytes::<BLE_UUID_PACKET_LEN>(&compact)?;
+    decode_ble_service_uuid_bytes(&bytes, rssi)
+}
+
 /// Encodes a 27-character ASCII LocalName Integrator v2 BLE magic packet (used in macOS Scan Response).
 pub fn encode_ble_local_name(
     device_id_hex: &str,
@@ -385,6 +507,7 @@ mod macos_ble {
             name_cb: Option<NameCb>,
         ) -> bool;
         fn integrator_mac_ble_update_advertisement(
+            service_uuid_ptr: *const c_char,
             local_name_ptr: *const c_char,
             bin_ptr: *const u8,
             bin_len: usize,
@@ -394,11 +517,19 @@ mod macos_ble {
     }
 
     extern "C" fn on_binary_packet(ptr: *const u8, len: usize, rssi: i16) {
-        if ptr.is_null() || len < BLE_BINARY_PACKET_LEN || len > 64 {
+        if ptr.is_null() || len < BLE_UUID_PACKET_LEN || len > 64 {
             return;
         }
         // SAFETY: Swift CoreBluetooth callback provides a valid buffer of `len` bytes for the call duration.
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if len == BLE_UUID_PACKET_LEN {
+            let mut uuid_bytes = [0u8; BLE_UUID_PACKET_LEN];
+            uuid_bytes.copy_from_slice(slice);
+            if let Some(hint) = decode_ble_service_uuid_bytes(&uuid_bytes, rssi) {
+                dispatch_ble_hint(hint);
+                return;
+            }
+        }
         if let Some(hint) = decode_ble_binary_packet(slice, rssi) {
             dispatch_ble_hint(hint);
         }
@@ -411,6 +542,8 @@ mod macos_ble {
         // SAFETY: Swift `withCString` provides a valid NUL-terminated UTF-8 string for the call duration.
         if let Ok(name) = unsafe { CStr::from_ptr(ptr) }.to_str() {
             if let Some(hint) = decode_ble_local_name(name, rssi) {
+                dispatch_ble_hint(hint);
+            } else if let Some(hint) = decode_ble_service_uuid_str(name, rssi) {
                 dispatch_ble_hint(hint);
             }
         }
@@ -435,10 +568,15 @@ mod macos_ble {
         }
     }
 
-    pub fn update_platform_advertisement(local_name: &str, binary_pkt: &[u8; BLE_BINARY_PACKET_LEN]) {
-        if let Ok(c_name) = CString::new(local_name) {
+    pub fn update_platform_advertisement(
+        service_uuid: &str,
+        local_name: &str,
+        binary_pkt: &[u8; BLE_BINARY_PACKET_LEN],
+    ) {
+        if let (Ok(c_uuid), Ok(c_name)) = (CString::new(service_uuid), CString::new(local_name)) {
             unsafe {
                 integrator_mac_ble_update_advertisement(
+                    c_uuid.as_ptr(),
                     c_name.as_ptr(),
                     binary_pkt.as_ptr(),
                     binary_pkt.len(),
@@ -506,7 +644,26 @@ mod windows_ble {
                         if let Some(args) = args_opt {
                             let rssi = args.RawSignalStrengthInDBm().unwrap_or(-127);
                             if let Ok(adv) = args.Advertisement() {
-                                // 1. Parse LocalName (`IG2...` from macOS CoreBluetooth)
+                                // 1. Parse 128-bit Service UUIDs (`7a4e...` ADV_IND magic packet from macOS)
+                                if let Ok(uuid_list) = adv.ServiceUuids() {
+                                    let count = uuid_list.Size().unwrap_or(0);
+                                    for i in 0..count {
+                                        if let Ok(guid) = uuid_list.GetAt(i) {
+                                            let be = guid_fields_to_be_bytes(
+                                                guid.data1,
+                                                guid.data2,
+                                                guid.data3,
+                                                guid.data4,
+                                            );
+                                            if let Some(hint) =
+                                                decode_ble_service_uuid_bytes(&be, rssi)
+                                            {
+                                                dispatch_ble_hint(hint);
+                                            }
+                                        }
+                                    }
+                                }
+                                // 2. Parse LocalName (`IG2...` Scan Response fallback from macOS)
                                 if let Ok(local_name) = adv.LocalName() {
                                     let name_str = local_name.to_string_lossy();
                                     if name_str.starts_with(BLE_LOCAL_NAME_PREFIX) {
@@ -515,7 +672,7 @@ mod windows_ble {
                                         }
                                     }
                                 }
-                                // 2. Parse ManufacturerData (CompanyId 0xFFFF + 17-byte IG2 from Windows)
+                                // 3. Parse ManufacturerData (CompanyId 0xFFFF + 17-byte IG2 from Windows)
                                 if let Ok(mfg_list) = adv.ManufacturerData() {
                                     let count = mfg_list.Size().unwrap_or(0);
                                     for i in 0..count {
@@ -572,7 +729,11 @@ mod windows_ble {
         started_ok
     }
 
-    pub fn update_platform_advertisement(_local_name: &str, binary_pkt: &[u8; BLE_BINARY_PACKET_LEN]) {
+    pub fn update_platform_advertisement(
+        _service_uuid: &str,
+        _local_name: &str,
+        binary_pkt: &[u8; BLE_BINARY_PACKET_LEN],
+    ) {
         let Ok(mut guard) = win_ble_slot().lock() else {
             return;
         };
@@ -636,7 +797,11 @@ mod fallback_ble {
     pub fn start_platform(_enable_scan: bool, _enable_advertise: bool) -> bool {
         false
     }
-    pub fn update_platform_advertisement(_local_name: &str, _binary_pkt: &[u8; BLE_BINARY_PACKET_LEN]) {}
+    pub fn update_platform_advertisement(
+        _service_uuid: &str,
+        _local_name: &str,
+        _binary_pkt: &[u8; BLE_BINARY_PACKET_LEN],
+    ) {}
     pub fn stop_platform() {}
 }
 
@@ -681,11 +846,17 @@ pub fn start_ble_discovery(
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Some(best_ip) = select_best_advertisable_ipv4() {
                         let nonce = random_nonce_2();
-                        if let (Some(local_name), Some(bin_pkt)) = (
+                        if let (Some(uuid_bytes), Some(local_name), Some(bin_pkt)) = (
+                            encode_ble_service_uuid_bytes(&dev_id, best_ip, CONTROL_PORT, nonce),
                             encode_ble_local_name(&dev_id, best_ip, nonce),
                             encode_ble_binary_packet(&dev_id, best_ip, CONTROL_PORT, nonce),
                         ) {
-                            platform_ble::update_platform_advertisement(&local_name, &bin_pkt);
+                            let service_uuid = format_uuid_128(&uuid_bytes);
+                            platform_ble::update_platform_advertisement(
+                                &service_uuid,
+                                &local_name,
+                                &bin_pkt,
+                            );
                         }
                     }
                 })
@@ -806,5 +977,44 @@ mod tests {
         bad[18] = if bad[18] == b'a' { b'b' } else { b'a' };
         let bad_str = String::from_utf8(bad).unwrap();
         assert!(decode_ble_local_name(&bad_str, -48).is_none());
+    }
+
+    #[test]
+    fn ble_service_uuid_magic_packet_roundtrip_and_guid_order() {
+        let dev_id = "d1e6a343385bd648604e3e903f9e7726";
+        let ip = Ipv4Addr::new(172, 20, 10, 2);
+        let nonce = [0x9A, 0x3C];
+
+        let raw = encode_ble_service_uuid_bytes(dev_id, ip, CONTROL_PORT, nonce)
+            .expect("128-bit UUID BLE packet should encode");
+        assert_eq!(&raw[0..2], &BLE_UUID_MAGIC_PREFIX);
+
+        let uuid_str = format_uuid_128(&raw);
+        assert_eq!(uuid_str.len(), 36);
+
+        let decoded_str = decode_ble_service_uuid_str(&uuid_str, -44)
+            .expect("canonical UUID string must decode");
+        assert_eq!(decoded_str.device_id_prefix, "d1e6a343");
+        assert_eq!(decoded_str.ip, ip);
+        assert_eq!(decoded_str.port, CONTROL_PORT);
+        assert_eq!(decoded_str.rssi, -44);
+        assert_eq!(decoded_str.format, "ble-uuid");
+
+        // Verify WinRT GUID field reassembly matches canonical big-endian bytes
+        let d1 = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let d2 = u16::from_be_bytes([raw[4], raw[5]]);
+        let d3 = u16::from_be_bytes([raw[6], raw[7]]);
+        let mut d4 = [0u8; 8];
+        d4.copy_from_slice(&raw[8..16]);
+        let reassembled = guid_fields_to_be_bytes(d1, d2, d3, d4);
+        assert_eq!(reassembled, raw);
+        let decoded_guid = decode_ble_service_uuid_bytes(&reassembled, -44)
+            .expect("GUID-reassembled UUID bytes must decode");
+        assert_eq!(decoded_guid.ip, ip);
+
+        // Tamper 1 bit -> rejected
+        let mut bad = raw;
+        bad[9] ^= 0x80;
+        assert!(decode_ble_service_uuid_bytes(&bad, -44).is_none());
     }
 }
