@@ -1564,12 +1564,27 @@ fn broadcast_beacon_on_interface(
 fn upsert_peer_candidate(list: &mut Vec<PeerCandidate>, candidate: PeerCandidate, now: Instant) {
     list.retain(|c| now.saturating_duration_since(c.last_seen) < PEER_CANDIDATE_TTL);
 
-    // Evict stale DHCP address for the same device on the same local interface
+    // If a direct matching-subnet route (`same_subnet == true`) already exists for this peer on
+    // the same local interface, never let an alien/routed IP (`same_subnet == false`, e.g. a peer's
+    // upstream Wi-Fi IP advertised over BLE while connected to its Mobile Hotspot) evict or shadow it.
+    if !candidate.device_id.is_empty() && !candidate.same_subnet {
+        let has_better_same_subnet = list.iter().any(|c| {
+            c.device_id == candidate.device_id
+                && c.same_subnet
+                && (c.local_ip_used == candidate.local_ip_used || c.transport == candidate.transport)
+        });
+        if has_better_same_subnet {
+            return;
+        }
+    }
+
+    // Evict stale DHCP address or inferior non-matching-subnet route for the same device on the same local interface
     if !candidate.device_id.is_empty() && candidate.local_ip_used.is_some() {
         list.retain(|c| {
             !(c.device_id == candidate.device_id
                 && c.local_ip_used == candidate.local_ip_used
-                && c.addr.ip() != candidate.addr.ip())
+                && c.addr.ip() != candidate.addr.ip()
+                && (candidate.same_subnet || !c.same_subnet))
         });
     }
 

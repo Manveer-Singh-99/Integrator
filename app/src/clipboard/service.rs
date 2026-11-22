@@ -156,10 +156,14 @@ const MAX_VERIFIED_CACHE_ENTRIES: usize = 8;
 #[cfg(target_os = "macos")]
 extern "C" {
     pub fn init_shortcut_interceptor();
-    pub fn set_has_pending_remote_file(pending: bool);
     fn notify_touchbar_remote_file(name: *const std::os::raw::c_char, total_bytes: u64);
     fn update_touchbar_paste_progress(percent: f32, mb_per_sec: f32);
     fn reset_touchbar_paste_progress();
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+extern "C" {
+    pub fn set_has_pending_remote_file(pending: bool);
 }
 
 pub static CLIPBOARD_INSTANCE: std::sync::OnceLock<ClipboardService> = std::sync::OnceLock::new();
@@ -685,6 +689,9 @@ impl ClipboardService {
         #[cfg(target_os = "macos")]
         unsafe {
             reset_touchbar_paste_progress();
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        unsafe {
             set_has_pending_remote_file(false);
         }
     }
@@ -802,7 +809,7 @@ impl ClipboardService {
         }
 
         info!("🖼️ Verified & received remote image ({}x{} px)", width, height);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         unsafe {
             set_has_pending_remote_file(false);
         }
@@ -896,7 +903,7 @@ impl ClipboardService {
                 }
 
                 info!("📋 Verified & received remote text ({} chars)", text.len());
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 unsafe {
                     set_has_pending_remote_file(false);
                 }
@@ -1019,8 +1026,11 @@ impl ClipboardService {
                         std::ffi::CString::new(ann.root_name.clone()).unwrap_or_default();
                     unsafe {
                         notify_touchbar_remote_file(name_c.as_ptr(), ann.total_bytes);
-                        set_has_pending_remote_file(true);
                     }
+                }
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                unsafe {
+                    set_has_pending_remote_file(true);
                 }
 
                 // Only auto-stage bounded transfers (<= 128 MiB) in the background;
@@ -1432,6 +1442,9 @@ impl ClipboardService {
         #[cfg(target_os = "macos")]
         unsafe {
             reset_touchbar_paste_progress();
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        unsafe {
             set_has_pending_remote_file(false);
         }
     }
@@ -2449,6 +2462,11 @@ end run"#;
         unsafe {
             reset_touchbar_paste_progress();
         }
+        // On Windows, once `CF_HDROP` is populated on the native clipboard, let Explorer handle Ctrl+V & Right-Click Paste natively.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            set_has_pending_remote_file(false);
+        }
 
         let elapsed = start_time.elapsed().as_secs_f64();
         let avg_mb_s = (transferred_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
@@ -2481,11 +2499,14 @@ end run"#;
                 self.service
                     .is_pasting
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 unsafe {
                     if self.clear_pending_on_exit {
                         set_has_pending_remote_file(false);
                     }
+                }
+                #[cfg(target_os = "macos")]
+                unsafe {
                     reset_touchbar_paste_progress();
                 }
             }
@@ -2608,6 +2629,19 @@ end run"#;
             "📥 Initiating on-demand stream of '{}' ({} root(s)) from {} via isolated staging into {:?}",
             ann.root_name, roots.len(), peer_ip, target_dir
         );
+        crate::core::emit_ui_event(
+            "toast",
+            &serde_json::json!({
+                "message": format!(
+                    "⏳ Streaming '{}' ({:.1} MB, {} files) into {}...",
+                    ann.root_name,
+                    ann.total_bytes as f64 / (1024.0 * 1024.0),
+                    ann.total_files,
+                    target_dir.display()
+                )
+            })
+            .to_string(),
+        );
 
         let mut session = match Self::connect_and_request_stream(&peer_ip, &ann.session_id).await {
             Ok(s) => s,
@@ -2653,6 +2687,24 @@ end run"#;
         }
         let _ = std::fs::remove_dir_all(&stage_dir);
 
+        // Also register the committed destination paths on the native OS file clipboard (`CF_HDROP` / `NSPasteboard`)
+        // so subsequent Right-Click -> Paste or Ctrl+V into another folder works without re-streaming over the network.
+        {
+            let helper = Arc::clone(&self.file_helper);
+            let paths_for_cb = committed_paths.clone();
+            if let Ok(Ok(new_seq)) = tokio::task::spawn_blocking(move || -> Result<i64> {
+                helper.write_copied_files(&paths_for_cb)?;
+                Ok(os_seq::get_clipboard_sequence())
+            })
+            .await
+            {
+                if new_seq >= 0 {
+                    let mut seq_lock = self.last_seq.write().await;
+                    *seq_lock = new_seq;
+                }
+            }
+        }
+
         {
             let mut lock = self.pending_remote.write().await;
             *lock = None;
@@ -2686,6 +2738,10 @@ end run"#;
             target_dir
         );
         info!("{}", msg);
+        crate::core::emit_ui_event(
+            "toast",
+            &serde_json::json!({ "message": msg.clone() }).to_string(),
+        );
         Ok(msg)
     }
 }

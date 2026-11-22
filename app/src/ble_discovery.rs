@@ -457,10 +457,19 @@ pub fn decode_ble_local_name(name: &str, rssi: i16) -> Option<BleDiscoveryHint> 
 /// Selects the highest-priority active local IPv4 address suitable for BLE advertisement.
 ///
 /// Ranks active non-virtual interfaces by [`system_info::LinkTransport::route_priority`]
-/// (Thunderbolt > USB-C > Ethernet > Wi-Fi > Hotspot) so peers immediately receive the best path.
+/// (smaller value = higher priority: Thunderbolt > USB-C > Ethernet > Wi-Fi > Hotspot) and prefers
+/// a local Mobile Hotspot gateway (`192.168.137.1`) over an upstream client Wi-Fi interface when
+/// hosting a hotspot.
 pub fn select_best_advertisable_ipv4() -> Option<Ipv4Addr> {
     let mut ifaces = system_info::list_local_ipv4_interfaces();
-    ifaces.sort_by(|a, b| b.transport.route_priority().cmp(&a.transport.route_priority()));
+    ifaces.sort_by(|a, b| {
+        let a_is_ics_host = a.ip.starts_with("192.168.137.");
+        let b_is_ics_host = b.ip.starts_with("192.168.137.");
+        a.transport
+            .route_priority()
+            .cmp(&b.transport.route_priority())
+            .then_with(|| b_is_ics_host.cmp(&a_is_ics_host))
+    });
     for iface in ifaces {
         if let Ok(ip) = iface.ip.parse::<Ipv4Addr>() {
             if is_valid_ble_endpoint(ip, CONTROL_PORT) {

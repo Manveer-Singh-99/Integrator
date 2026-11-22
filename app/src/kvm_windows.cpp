@@ -95,6 +95,9 @@
 
 static const ULONG_PTR kIntegratorEventTag = 0x494E5447ULL; // "INTG"
 
+extern "C" void trigger_rust_remote_paste();
+static std::atomic<bool> g_has_pending_remote_file{false};
+
 /// Default fallback X coordinate in virtual-desktop pixels used when parking the hidden cursor.
 static constexpr int32_t kDefaultParkX = 400;
 
@@ -611,6 +614,16 @@ static LRESULT CALLBACK low_level_kbd_proc(int nCode, WPARAM wParam, LPARAM lPar
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
         bool pressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        if (pressed && !g_controlling_peer.load() && ks->vkCode == 'V' && g_has_pending_remote_file.load()) {
+            bool ctrl_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            bool win_down = ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
+                            ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+            if (ctrl_down && !alt_down && !win_down) {
+                trigger_rust_remote_paste();
+                return 1;
+            }
+        }
         uint32_t sw_bit = swallowed_mod_bit_for_vk(ks->vkCode);
         uint32_t preview_sw = g_swallowed_mod_keys.load();
         if (sw_bit != 0 && g_controlling_peer.load()) {
@@ -1380,6 +1393,10 @@ void integrator_kvm_win_cancel_remote_drag() {
     if (ghost_hw) {
         PostMessageW(ghost_hw, WM_APP_HIDE_GHOST, 0, 0);
     }
+}
+
+void set_has_pending_remote_file(bool pending) {
+    g_has_pending_remote_file.store(pending);
 }
 
 } // extern "C"

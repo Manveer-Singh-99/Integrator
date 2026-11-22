@@ -106,11 +106,11 @@ pub const MAX_IMAGE_DIMENSION: usize = 8_192;
 /// Maximum allowed length in bytes for serialized control message headers (16 MiB).
 pub const MAX_CLIPBOARD_HEADER_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum count of individual files or folders allowed in a single clipboard transfer (1,000).
-pub const MAX_TRANSFER_FILES: usize = 1_000;
+/// Maximum count of individual files or folders allowed in a single clipboard transfer (4,096).
+pub const MAX_TRANSFER_FILES: usize = 4_096;
 
 /// Maximum count of top-level root items allowed in a multi-file selection (1,000).
-pub const MAX_ROOTS: usize = MAX_TRANSFER_FILES;
+pub const MAX_ROOTS: usize = 1_000;
 
 /// Maximum directory nesting depth allowed during recursive tree transfers (16 levels).
 pub const MAX_DIRECTORY_DEPTH: usize = 16;
