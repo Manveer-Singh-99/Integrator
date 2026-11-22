@@ -276,6 +276,8 @@ struct DiscoveredPeerModel: Codable, Identifiable, Hashable {
     var trusted: Bool
     /// True if device ID is in the administrative blocklist.
     var blocked: Bool
+    /// Discovery transport provenance (e.g., "udp", "bonjour", "ble", "udp+bonjour+ble").
+    var discovery_source: String?
 }
 
 /// Complete snapshot of the cryptographic pairing and trust database.
@@ -709,8 +711,14 @@ struct BridgeStatusModel: Codable {
     var local_interfaces: [LocalInterfaceModel]
     /// User-specified manual peer IP targets.
     var manual_peer_ips: [String]
-    /// List of peers discovered via mDNS and UDP broadcasts.
+    /// List of peers discovered via mDNS, BLE magic packets, and UDP broadcasts.
     var discovered_peers: [DiscoveredPeerModel]
+    /// Active discovery mode ("all", "udp", "bonjour", "ble").
+    var discovery_mode: String?
+    /// True if Bonjour / mDNS (`_integrator._tcp.local.`) discovery is active.
+    var bonjour_active: Bool?
+    /// True if Bluetooth LE magic-packet proximity discovery is active.
+    var ble_active: Bool?
     /// Trust store snapshot including pairing PIN and trusted peer list.
     var trust: TrustSnapshotModel
 

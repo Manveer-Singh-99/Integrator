@@ -318,6 +318,86 @@ fn default_protocol_version() -> u16 {
     DISCOVERY_PROTOCOL_VERSION
 }
 
+/// Active discovery transport combination selectable via `INTEGRATOR_DISCOVERY_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryMode {
+    /// Hybrid mode (default): UDP `:58280` + Bonjour `_integrator._tcp.local.` + BLE magic packets.
+    All,
+    /// Only signed UDP `:58280` beacons.
+    UdpOnly,
+    /// Only standard Bonjour / mDNS (`_integrator._tcp.local.`) discovery + `TransportSessionV2` auth.
+    BonjourOnly,
+    /// Only Bluetooth LE magic-packet discovery + `TransportSessionV2` auth.
+    BleOnly,
+}
+
+impl DiscoveryMode {
+    /// Reads `INTEGRATOR_DISCOVERY_MODE` from the process environment (defaults to [`DiscoveryMode::All`]).
+    pub fn from_env() -> Self {
+        match std::env::var("INTEGRATOR_DISCOVERY_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "udp" | "udp_only" | "udp-only" => Self::UdpOnly,
+            "bonjour" | "bonjour_only" | "bonjour-only" | "mdns" => Self::BonjourOnly,
+            "ble" | "ble_only" | "ble-only" | "bluetooth" => Self::BleOnly,
+            _ => Self::All,
+        }
+    }
+
+    /// Returns the wire/diagnostic label for this discovery mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::UdpOnly => "udp_only",
+            Self::BonjourOnly => "bonjour_only",
+            Self::BleOnly => "ble_only",
+        }
+    }
+
+    /// Returns `true` if UDP `:58280` beacons should run in this mode.
+    pub const fn udp_enabled(self) -> bool {
+        matches!(self, Self::All | Self::UdpOnly)
+    }
+
+    /// Returns `true` if Bonjour / mDNS (`_integrator._tcp.local.`) should run in this mode.
+    pub const fn bonjour_enabled(self) -> bool {
+        matches!(self, Self::All | Self::BonjourOnly)
+    }
+
+    /// Returns `true` if Bluetooth LE magic-packet discovery should run in this mode.
+    pub const fn ble_enabled(self) -> bool {
+        matches!(self, Self::All | Self::BleOnly)
+    }
+}
+
+/// Cryptographic proof object returned by isolated BLE-only or Bonjour-only authentication tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthDiscoveryProof {
+    /// Discovery transport under test (`"ble"` or `"bonjour"`).
+    pub transport: String,
+    /// Raw transport-specific discovery hint summary (BLE format + RSSI, or Bonjour service fullname).
+    pub hint_detail: String,
+    /// Peer IPv4 address resolved exclusively from the tested discovery transport.
+    pub discovered_ip: String,
+    /// Peer control RPC port resolved from the discovery hint.
+    pub discovered_port: u16,
+    /// `true` once full mutual Ed25519 + X25519 + ChaCha20-Poly1305 `TransportSessionV2` auth succeeded.
+    pub authenticated: bool,
+    /// Cryptographically authenticated peer `device_id` from `TransportSessionV2`.
+    pub peer_device_id: String,
+    /// Verified remote hostname returned inside the encrypted `GetHardwareProfile` RPC response.
+    pub peer_hostname: String,
+    /// Verified remote OS string returned inside the encrypted `GetHardwareProfile` RPC response.
+    pub peer_os: String,
+    /// Verified remote form factor returned inside the encrypted `GetHardwareProfile` RPC response.
+    pub peer_form_factor: String,
+    /// End-to-end encrypted handshake + RPC round-trip time in milliseconds.
+    pub rtt_ms: f64,
+}
+
 /// Discovered peer candidate route representing an active reachability path to a remote machine.
 #[derive(Debug, Clone)]
 pub struct PeerCandidate {
@@ -363,6 +443,8 @@ pub struct PeerCandidate {
     pub rtt_ms: Option<f64>,
     /// Cryptographic trust status: `true` if peer's Ed25519 key is paired in local keystore.
     pub trusted: bool,
+    /// Discovery mechanism(s) through which this candidate was observed (`"udp"`, `"bonjour"`, `"ble"`).
+    pub discovery_source: String,
 }
 
 /// Persistent schema stored in `peer_history.json` tracking known peer IPs.
@@ -490,23 +572,28 @@ impl DiscoveryManager {
         selected
     }
 
-    /// Starts the background UDP discovery listener and beacon broadcaster tasks.
-    ///
-    /// # Tasks Spawned:
-    /// 1. **UDP Listener**: Listens on `0.0.0.0:58280`, receives datagrams, verifies signatures,
-    ///    runs anti-replay checks, resolves routes, measures latency, and maintains candidate table.
-    /// 2. **UDP Broadcaster**: Every 2 seconds, collects host profile, signs beacon with local Ed25519
-    ///    key, and transmits across all active network interfaces and unicast targets.
+    /// Starts the background discovery tasks governed by [`DiscoveryMode::from_env`]:
+    /// 1. **UDP Listener & Broadcaster (`:58280`)** when `mode.udp_enabled()`.
+    /// 2. **Bonjour / mDNS (`_integrator._tcp.local.`)** when `mode.bonjour_enabled()`.
+    /// 3. **BLE Magic-Packet Advertising & Scanning** when `mode.ble_enabled()`.
     pub async fn start(&self) -> Result<()> {
-        let bind_addr = format!("0.0.0.0:{}", DISCOVERY_PORT);
-        let socket = UdpSocket::bind(&bind_addr).await?;
-        socket.set_broadcast(true)?;
-        let socket = Arc::new(socket);
+        let mode = DiscoveryMode::from_env();
+        tracing::info!("🔎 Starting discovery engine (mode={})", mode.as_str());
+
+        let socket = if mode.udp_enabled() {
+            let bind_addr = format!("0.0.0.0:{}", DISCOVERY_PORT);
+            let sock = UdpSocket::bind(&bind_addr).await?;
+            sock.set_broadcast(true)?;
+            Some(Arc::new(sock))
+        } else {
+            None
+        };
 
         // --------------------------------------------------------------------
-        // Task 1: UDP Discovery Listener Task
+        // Task 1: UDP Discovery Listener Task (when UDP mode is active)
         // --------------------------------------------------------------------
-        let listener_socket = Arc::clone(&socket);
+        if let Some(ref udp_sock) = socket {
+        let listener_socket = Arc::clone(udp_sock);
         let candidates = Arc::clone(&self.candidates);
         let active_peer_ip = Arc::clone(&self.active_peer_ip);
         let rtt_cache = Arc::clone(&self.rtt_cache);
@@ -795,6 +882,7 @@ impl DiscoveryManager {
                                 same_subnet,
                                 rtt_ms,
                                 trusted,
+                                discovery_source: "udp".to_string(),
                             };
 
                             upsert_peer_candidate(&mut list, candidate, now);
@@ -825,7 +913,7 @@ impl DiscoveryManager {
         // --------------------------------------------------------------------
         // Task 2: UDP Beacon Broadcaster Task
         // --------------------------------------------------------------------
-        let broadcaster_socket = Arc::clone(&socket);
+        let broadcaster_socket = Arc::clone(udp_sock);
         let manual_ips_ref = Arc::clone(&self.manual_ips);
         let candidates_for_unicast = Arc::clone(&self.candidates);
         let fallback_name = self.local_name.clone();
@@ -982,9 +1070,408 @@ impl DiscoveryManager {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
+        } // end if let Some(ref udp_sock) = socket
+
+        // --------------------------------------------------------------------
+        // Task 3: Bonjour / mDNS (`_integrator._tcp.local.`) Discovery Task
+        // --------------------------------------------------------------------
+        let hint_probe_times: Arc<Mutex<HashMap<(Ipv4Addr, &'static str), Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let my_trust_id = trust::local_device_id_hex();
+        let my_trust_prefix: String = my_trust_id.chars().take(8).collect();
+
+        if mode.bonjour_enabled() {
+            if let Some(mut bonjour_rx) =
+                crate::bonjour_discovery::start_bonjour_discovery(my_trust_id.clone(), true, true)
+            {
+                let cands_ref = Arc::clone(&self.candidates);
+                let active_ref = Arc::clone(&self.active_peer_ip);
+                let probe_times = Arc::clone(&hint_probe_times);
+                let own_id = my_trust_id.clone();
+
+                tokio::spawn(async move {
+                    while let Some(hint) = bonjour_rx.recv().await {
+                        if hint.device_id.as_deref() == Some(own_id.as_str()) {
+                            continue;
+                        }
+                        if !allow_hint_probe(&probe_times, hint.ip, "bonjour") {
+                            continue;
+                        }
+                        let cands = Arc::clone(&cands_ref);
+                        let active = Arc::clone(&active_ref);
+                        let expected_id = hint.device_id.clone();
+                        tokio::spawn(async move {
+                            ingest_authenticated_hint(
+                                &cands,
+                                &active,
+                                hint.ip,
+                                hint.port,
+                                expected_id.as_deref(),
+                                None,
+                                "bonjour",
+                            )
+                            .await;
+                        });
+                    }
+                });
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Task 4: BLE Magic-Packet Proximity Discovery Task
+        // --------------------------------------------------------------------
+        if mode.ble_enabled() {
+            if let Some(mut ble_rx) =
+                crate::ble_discovery::start_ble_discovery(my_trust_id.clone(), true, true)
+            {
+                let cands_ref = Arc::clone(&self.candidates);
+                let active_ref = Arc::clone(&self.active_peer_ip);
+                let probe_times = Arc::clone(&hint_probe_times);
+                let own_prefix = my_trust_prefix.clone();
+
+                tokio::spawn(async move {
+                    while let Some(hint) = ble_rx.recv().await {
+                        if hint.device_id_prefix == own_prefix {
+                            continue;
+                        }
+                        if !allow_hint_probe(&probe_times, hint.ip, "ble") {
+                            continue;
+                        }
+                        let cands = Arc::clone(&cands_ref);
+                        let active = Arc::clone(&active_ref);
+                        let prefix = hint.device_id_prefix.clone();
+                        tokio::spawn(async move {
+                            ingest_authenticated_hint(
+                                &cands,
+                                &active,
+                                hint.ip,
+                                hint.port,
+                                None,
+                                Some(prefix.as_str()),
+                                "ble",
+                            )
+                            .await;
+                        });
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
+}
+
+/// Rate-limits repeated Bonjour/BLE authentication probes to the same IPv4 address (at most once every 3s).
+fn allow_hint_probe(
+    probe_times: &Mutex<HashMap<(Ipv4Addr, &'static str), Instant>>,
+    ip: Ipv4Addr,
+    source: &'static str,
+) -> bool {
+    const HINT_PROBE_COOLDOWN: Duration = Duration::from_secs(3);
+    let mut guard = probe_times.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    guard.retain(|_, ts| now.saturating_duration_since(*ts) < Duration::from_secs(60));
+    if let Some(prev) = guard.get(&(ip, source)) {
+        if now.saturating_duration_since(*prev) < HINT_PROBE_COOLDOWN {
+            return false;
+        }
+    }
+    guard.insert((ip, source), now);
+    true
+}
+
+/// Performs a full mutually authenticated `TransportSessionV2` (`ServiceId::DisplayRpc`)
+/// `GetHardwareProfile` handshake against a Bonjour- or BLE-hinted `(peer_ip, port)`.
+///
+/// # Security Invariant
+/// Neither Bonjour nor BLE grants any trust. Authentication succeeds ONLY when the remote
+/// peer proves possession of a paired Ed25519 identity key via `TransportSessionV2` AEAD.
+async fn authenticate_hint_via_transport_v2(
+    peer_ip: Ipv4Addr,
+    port: u16,
+) -> Result<(String, Option<system_info::LocalHardwareProfile>, f64)> {
+    use crate::display::protocol::{DisplayRpcRequest, DisplayRpcResponse};
+    use crate::security::transport::ServiceId;
+
+    if peer_ip.is_loopback() || peer_ip.is_unspecified() || peer_ip.is_broadcast() || port < 1024 {
+        anyhow::bail!("Invalid hinted peer endpoint {}:{}", peer_ip, port);
+    }
+
+    let ip_str = peer_ip.to_string();
+    let start = Instant::now();
+    let mut session = trust::connect_transport_to_ip(
+        &ip_str,
+        port,
+        ServiceId::DisplayRpc,
+        Duration::from_secs(4),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("TransportV2 authentication to {}:{} failed: {}", ip_str, port, e))?;
+
+    let verified_device_id = session.peer_device_id_hex().to_ascii_lowercase();
+    let req_bytes = serde_json::to_vec(&DisplayRpcRequest::GetHardwareProfile)?;
+    tokio::time::timeout(Duration::from_secs(4), session.send_message(&req_bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out sending GetHardwareProfile to {}", ip_str))?
+        .map_err(|e| anyhow::anyhow!("TransportV2 send error to {}: {}", ip_str, e))?;
+
+    let resp_bytes = tokio::time::timeout(Duration::from_secs(5), session.recv_message())
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out receiving GetHardwareProfile from {}", ip_str))?
+        .map_err(|e| anyhow::anyhow!("TransportV2 recv error from {}: {}", ip_str, e))?;
+
+    let rtt_ms = ((start.elapsed().as_secs_f64() * 1000.0) * 100.0).round() / 100.0;
+    let resp: DisplayRpcResponse = serde_json::from_slice(&resp_bytes)?;
+    if !resp.success {
+        anyhow::bail!(
+            "Remote GetHardwareProfile RPC rejected by {}: {}",
+            ip_str,
+            resp.message
+        );
+    }
+    Ok((verified_device_id, resp.hardware_profile, rtt_ms))
+}
+
+/// Authenticates a Bonjour or BLE discovery hint via `TransportSessionV2` and upserts the
+/// verified peer into `DiscoveryManager`'s active candidate table.
+async fn ingest_authenticated_hint(
+    candidates: &Arc<RwLock<Vec<PeerCandidate>>>,
+    active_peer_ip: &Arc<RwLock<Option<String>>>,
+    peer_ip: Ipv4Addr,
+    port: u16,
+    expected_device_id: Option<&str>,
+    expected_prefix: Option<&str>,
+    source: &'static str,
+) {
+    let ip_str = peer_ip.to_string();
+    let is_self = tokio::task::spawn_blocking({
+        let s = ip_str.clone();
+        move || is_own_local_ip(&s)
+    })
+    .await
+    .unwrap_or(false);
+    if is_self {
+        return;
+    }
+
+    let Ok((verified_dev_id, prof_opt, rtt_ms)) =
+        authenticate_hint_via_transport_v2(peer_ip, port).await
+    else {
+        return;
+    };
+
+    if let Some(exp) = expected_device_id {
+        if !verified_dev_id.eq_ignore_ascii_case(exp) {
+            tracing::warn!(
+                "Rejected {} hint from {}: authenticated device_id {} != hinted {}",
+                source,
+                ip_str,
+                verified_dev_id,
+                exp
+            );
+            return;
+        }
+    }
+    if let Some(pfx) = expected_prefix {
+        if !verified_dev_id.starts_with(&pfx.to_ascii_lowercase()) {
+            tracing::warn!(
+                "Rejected {} hint from {}: authenticated device_id {} does not match prefix {}",
+                source,
+                ip_str,
+                verified_dev_id,
+                pfx
+            );
+            return;
+        }
+    }
+
+    let prof = match prof_opt {
+        Some(p) => p,
+        None => return,
+    };
+    let hostname = sanitize_display_text(&prof.hostname, 128);
+    if hostname.is_empty() {
+        return;
+    }
+
+    let ip_for_route = ip_str.clone();
+    let dev_for_obs = verified_dev_id.clone();
+    let host_for_obs = hostname.clone();
+    let Ok((transport, speed_mbps, link_desc, local_ip, same_subnet, trusted)) =
+        tokio::task::spawn_blocking(move || {
+            let (transport, speed_mbps, link_desc, local_ip) =
+                system_info::describe_route_to_peer(&ip_for_route);
+            let same_subnet =
+                system_info::is_same_subnet_as_peer(local_ip.as_deref(), &ip_for_route);
+            let trusted = trust::observe_discovered_peer(
+                &dev_for_obs,
+                &host_for_obs,
+                &ip_for_route,
+                transport.is_direct_cable(),
+            );
+            if trusted {
+                record_recent_peer_ip(&ip_for_route);
+            }
+            (transport, speed_mbps, link_desc, local_ip, same_subnet, trusted)
+        })
+        .await
+    else {
+        return;
+    };
+
+    let os_clean = sanitize_display_text(&prof.os, 64);
+    let hw_clean = sanitize_display_text(&prof.hardware_model, 128);
+    let form_factor = system_info::infer_peer_form_factor(
+        &os_clean,
+        &hw_clean,
+        Some(prof.form_factor.as_str()),
+    )
+    .as_str()
+    .to_string();
+
+    let candidate = PeerCandidate {
+        addr: SocketAddr::new(IpAddr::V4(peer_ip), port),
+        last_seen: Instant::now(),
+        os: os_clean,
+        device_id: verified_dev_id,
+        device_name: hostname.clone(),
+        hardware_model: hw_clean,
+        form_factor,
+        display_width: prof.primary_display.width.clamp(0, MAX_DISPLAY_WIDTH),
+        display_height: prof.primary_display.height.clamp(0, MAX_DISPLAY_HEIGHT),
+        display_fps: prof.primary_display.fps.clamp(0, MAX_DISPLAY_FPS),
+        share_name: prof
+            .default_share_names
+            .first()
+            .and_then(|s| crate::storage::validate_smb_share_name(s).ok()),
+        sunshine_name: prof
+            .sunshine_name
+            .map(|s| sanitize_display_text(&s, 128))
+            .filter(|s| !s.is_empty()),
+        sunshine_port: if prof.sunshine_port >= 1024 {
+            prof.sunshine_port
+        } else {
+            SUNSHINE_DEFAULT_PORT
+        },
+        gpus: prof
+            .gpus
+            .into_iter()
+            .take(8)
+            .map(|g| sanitize_display_text(&g.name, 128))
+            .filter(|g| !g.is_empty())
+            .collect(),
+        transport,
+        link_speed_mbps: speed_mbps,
+        link_description: link_desc,
+        local_ip_used: local_ip,
+        same_subnet,
+        rtt_ms: Some(rtt_ms),
+        trusted,
+        discovery_source: source.to_string(),
+    };
+
+    let mut list = candidates.write().await;
+    let now = Instant::now();
+    upsert_peer_candidate(&mut list, candidate, now);
+    let best = select_best_peer(&list).map(|c| c.addr.ip().to_string());
+    let mut active = active_peer_ip.write().await;
+    if *active != best {
+        *active = best.clone();
+        if let Some(ref b) = best {
+            tracing::info!(
+                "📡 Selected active peer route via {}: {} ({}, {:.2} ms)",
+                source,
+                b,
+                transport.label(),
+                rtt_ms
+            );
+        }
+    }
+}
+
+/// Executes an isolated, end-to-end **BLE-only** discovery + cryptographic `TransportSessionV2`
+/// authentication verification (zero UDP `:58280`, zero Bonjour mDNS, zero cached IPs).
+pub async fn authenticate_peer_via_ble(timeout: Duration) -> Result<AuthDiscoveryProof> {
+    let own_id = trust::local_device_id_hex();
+    let hint = crate::ble_discovery::scan_once_for_ble_hint(&own_id, timeout).await?;
+
+    let (verified_dev_id, prof_opt, rtt_ms) =
+        authenticate_hint_via_transport_v2(hint.ip, hint.port).await?;
+
+    if !verified_dev_id.starts_with(&hint.device_id_prefix) {
+        anyhow::bail!(
+            "BLE prefix mismatch: BLE packet advertised prefix '{}' at {}:{}, but TransportV2 authenticated '{}'",
+            hint.device_id_prefix,
+            hint.ip,
+            hint.port,
+            verified_dev_id
+        );
+    }
+
+    let (peer_hostname, peer_os, peer_form_factor) = match prof_opt {
+        Some(p) => (p.hostname, p.os, p.form_factor.as_str().to_string()),
+        None => ("Unknown".to_string(), "unknown".to_string(), "unknown".to_string()),
+    };
+
+    Ok(AuthDiscoveryProof {
+        transport: "ble".to_string(),
+        hint_detail: format!(
+            "format={} prefix={} rssi={}dBm",
+            hint.format, hint.device_id_prefix, hint.rssi
+        ),
+        discovered_ip: hint.ip.to_string(),
+        discovered_port: hint.port,
+        authenticated: true,
+        peer_device_id: verified_dev_id,
+        peer_hostname,
+        peer_os,
+        peer_form_factor,
+        rtt_ms,
+    })
+}
+
+/// Executes an isolated, end-to-end **Bonjour-only** (`_integrator._tcp.local.`) discovery +
+/// cryptographic `TransportSessionV2` authentication verification (zero UDP `:58280`, zero BLE, zero cached IPs).
+pub async fn authenticate_peer_via_bonjour(timeout: Duration) -> Result<AuthDiscoveryProof> {
+    let own_id = trust::local_device_id_hex();
+    let hint = crate::bonjour_discovery::browse_once_for_bonjour_hint(&own_id, timeout).await?;
+
+    let (verified_dev_id, prof_opt, rtt_ms) =
+        authenticate_hint_via_transport_v2(hint.ip, hint.port).await?;
+
+    if let Some(ref txt_id) = hint.device_id {
+        if !verified_dev_id.eq_ignore_ascii_case(txt_id) {
+            anyhow::bail!(
+                "Bonjour TXT device_id mismatch: mDNS advertised '{}' at {}:{}, but TransportV2 authenticated '{}'",
+                txt_id,
+                hint.ip,
+                hint.port,
+                verified_dev_id
+            );
+        }
+    }
+
+    let (peer_hostname, peer_os, peer_form_factor) = match prof_opt {
+        Some(p) => (p.hostname, p.os, p.form_factor.as_str().to_string()),
+        None => (
+            hint.hostname,
+            hint.os.unwrap_or_else(|| "unknown".to_string()),
+            hint.form_factor.unwrap_or_else(|| "unknown".to_string()),
+        ),
+    };
+
+    Ok(AuthDiscoveryProof {
+        transport: "bonjour".to_string(),
+        hint_detail: hint.fullname,
+        discovered_ip: hint.ip.to_string(),
+        discovered_port: hint.port,
+        authenticated: true,
+        peer_device_id: verified_dev_id,
+        peer_hostname,
+        peer_os,
+        peer_form_factor,
+        rtt_ms,
+    })
 }
 
 /// Transmits a UDP discovery beacon packet out of a specific physical network interface.
@@ -1068,7 +1555,10 @@ fn upsert_peer_candidate(list: &mut Vec<PeerCandidate>, candidate: PeerCandidate
     }
 
     if let Some(existing) = list.iter_mut().find(|c| c.addr.ip() == candidate.addr.ip()) {
+        // Merge discovery_source tags cleanly (e.g. "udp+bonjour+ble")
+        let merged_source = merge_discovery_sources(&existing.discovery_source, &candidate.discovery_source);
         *existing = candidate;
+        existing.discovery_source = merged_source;
     } else {
         if list.len() >= MAX_PEER_CANDIDATES {
             if let Some(evict_idx) = list
@@ -1083,6 +1573,22 @@ fn upsert_peer_candidate(list: &mut Vec<PeerCandidate>, candidate: PeerCandidate
             }
         }
         list.push(candidate);
+    }
+}
+
+/// Merges discovery transport source tags (e.g. `"udp"` + `"bonjour"` -> `"udp+bonjour"`) without duplicates.
+fn merge_discovery_sources(existing: &str, incoming: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for tag in existing.split('+').chain(incoming.split('+')) {
+        let t = tag.trim();
+        if !t.is_empty() && !parts.contains(&t) {
+            parts.push(t);
+        }
+    }
+    if parts.is_empty() {
+        "udp".to_string()
+    } else {
+        parts.join("+")
     }
 }
 
@@ -1282,6 +1788,7 @@ mod tests {
             same_subnet,
             rtt_ms: Some(rtt),
             trusted: true,
+            discovery_source: "udp".into(),
         };
 
         let stale_alias = make("192.168.2.2", LinkTransport::DirectUsb, false, 0.5);
@@ -1325,6 +1832,7 @@ mod tests {
             same_subnet,
             rtt_ms: Some(rtt),
             trusted: true,
+            discovery_source: "udp".into(),
         };
 
         // 1. Multi-homed peer reachable simultaneously over USB-C Direct (10.99.99.1) and iPhone /28 Hotspot (172.20.10.15)

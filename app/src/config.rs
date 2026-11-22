@@ -758,3 +758,72 @@ pub const WINGET_INSTALL_SUNSHINE_CMD: &str =
 #[allow(dead_code)]
 pub const WINGET_INSTALL_MOONLIGHT_CMD: &str =
     "winget install --id MoonlightGameStreamingProject.Moonlight -e --accept-source-agreements --accept-package-agreements";
+
+/// macOS System Settings deep-link URI for Privacy & Security -> Bluetooth (BLE Discovery).
+#[allow(dead_code)]
+pub const MACOS_SETTINGS_BLUETOOTH_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth";
+
+// ============================================================================
+// Bonjour / mDNS (RFC 6762 / 6763) & BLE Magic-Packet Discovery Constants
+// ============================================================================
+
+/// Private Bonjour / DNS-SD service type exclusively owned by Integrator.
+///
+/// Using a dedicated `_integrator._tcp.local.` service type ensures zero collision or
+/// interference with Apple AirPlay (`_airplay._tcp`), AirDrop, HomeKit, or printers.
+#[allow(dead_code)]
+pub const BONJOUR_SERVICE_TYPE: &str = "_integrator._tcp.local.";
+
+/// Bonjour TXT record key carrying the Integrator discovery protocol version (`"2"`).
+#[allow(dead_code)]
+pub const BONJOUR_TXT_KEY_VERSION: &str = "v";
+
+/// Bonjour TXT record key carrying the sender's 32-char lowercase hex `device_id`.
+#[allow(dead_code)]
+pub const BONJOUR_TXT_KEY_DEVICE_ID: &str = "id";
+
+/// Bonjour TXT record key carrying the sender's OS platform string (`"macos"` / `"windows"`).
+#[allow(dead_code)]
+pub const BONJOUR_TXT_KEY_OS: &str = "os";
+
+/// Bonjour TXT record key carrying the sender's hardware form factor (`"laptop"` / `"desktop"`).
+#[allow(dead_code)]
+pub const BONJOUR_TXT_KEY_FORM_FACTOR: &str = "ff";
+
+/// Bonjour TXT record key carrying the sender's TCP control RPC port.
+#[allow(dead_code)]
+pub const BONJOUR_TXT_KEY_PORT: &str = "port";
+
+/// Dedicated private 128-bit RFC 4122 v4 Bluetooth LE Service UUID for Integrator discovery.
+///
+/// Completely distinct from Apple's Continuity (`0x004C`) and Bluetooth SIG standard UUIDs
+/// so nearby iPhones, iPads, Apple TVs, and AirPods completely ignore Integrator BLE beacons.
+#[allow(dead_code)]
+pub const BLE_SERVICE_UUID: &str = "7A4E9C10-5B2F-4D81-9E3A-1C6F8B2D4E90";
+
+/// Read-only GATT characteristic UUID mirrored alongside macOS BLE advertisements.
+#[allow(dead_code)]
+pub const BLE_CHARACTERISTIC_UUID: &str = "7A4E9C11-5B2F-4D81-9E3A-1C6F8B2D4E90";
+
+/// Bluetooth SIG reserved internal/custom Manufacturer Company ID (`0xFFFF`) used for Windows
+/// BLE `ManufacturerData` magic packets (never collides with Apple's `0x004C`).
+#[allow(dead_code)]
+pub const BLE_MANUFACTURER_COMPANY_ID: u16 = 0xFFFF;
+
+/// Three-byte ASCII magic header (`"IG2"`) identifying Integrator v2 BLE magic packets.
+#[allow(dead_code)]
+pub const BLE_PACKET_MAGIC: [u8; 3] = *b"IG2";
+
+/// Three-character ASCII prefix identifying Integrator v2 BLE LocalName scan-response payloads.
+#[allow(dead_code)]
+pub const BLE_LOCAL_NAME_PREFIX: &str = "IG2";
+
+/// Domain separation string used with SHA-256 to mask IPv4/port fields inside BLE magic packets.
+#[allow(dead_code)]
+pub const BLE_MASK_DOMAIN_SEP: &[u8] = b"integrator-ble-mask-v2";
+
+/// Interval in seconds between rotating the ephemeral 16-bit BLE anti-tracking nonce and
+/// refreshing the advertised active IPv4 address.
+#[allow(dead_code)]
+pub const BLE_PAYLOAD_REFRESH_SECS: u64 = 15;

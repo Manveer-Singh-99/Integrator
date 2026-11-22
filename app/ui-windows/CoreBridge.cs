@@ -502,6 +502,8 @@ namespace IntegratorUI
         [JsonPropertyName("trusted")] public bool Trusted { get; set; }
         /// <summary>True if peer is administratively blocked.</summary>
         [JsonPropertyName("blocked")] public bool Blocked { get; set; }
+        /// <summary>Discovery transport provenance (e.g., "udp", "bonjour", "ble", "udp+bonjour+ble").</summary>
+        [JsonPropertyName("discovery_source")] public string? DiscoverySource { get; set; }
     }
 
     /// <summary>
@@ -936,6 +938,12 @@ namespace IntegratorUI
         [JsonPropertyName("manual_peer_ips")] public List<string> ManualPeerIps { get; set; } = new();
         /// <summary>List of discovered peer nodes.</summary>
         [JsonPropertyName("discovered_peers")] public List<DiscoveredPeerInfo> DiscoveredPeers { get; set; } = new();
+        /// <summary>Active discovery mode ("all", "udp", "bonjour", "ble").</summary>
+        [JsonPropertyName("discovery_mode")] public string? DiscoveryMode { get; set; }
+        /// <summary>True if Bonjour / mDNS (_integrator._tcp.local.) discovery is active.</summary>
+        [JsonPropertyName("bonjour_active")] public bool? BonjourActive { get; set; }
+        /// <summary>True if Bluetooth LE magic-packet proximity discovery is active.</summary>
+        [JsonPropertyName("ble_active")] public bool? BleActive { get; set; }
         /// <summary>Cryptographic trust snapshot.</summary>
         [JsonPropertyName("trust")] public TrustSnapshotInfo Trust { get; set; } = new();
 

@@ -73,6 +73,12 @@ pub(crate) mod autostart;
 /// Network bandwidth saturation, latency evaluation, and hardware codec benchmark utilities.
 pub(crate) mod benchmark;
 
+/// Bluetooth Low Energy (BLE) magic-packet proximity discovery engine.
+pub(crate) mod ble_discovery;
+
+/// Standard Bonjour / mDNS (`_integrator._tcp.local.`) zero-configuration discovery engine.
+pub(crate) mod bonjour_discovery;
+
 /// Transport link latency (RTT) tracking and physical medium classification (Thunderbolt/Wi-Fi).
 pub(crate) mod bridge;
 

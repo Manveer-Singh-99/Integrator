@@ -159,6 +159,8 @@ pub enum PermissionId {
     Camera,
     /// macOS Sequoia+ Local Network privacy permission for LAN/Thunderbolt/USB-C discovery.
     LocalNetwork,
+    /// macOS Bluetooth privacy permission (`CBManager.authorization`) for BLE proximity magic-packet discovery.
+    Bluetooth,
     /// macOS SMB File Sharing (`sharing -l`) for shared storage auto-mounting.
     FileSharing,
     /// Windows Defender Firewall inbound TCP/UDP/SMB rules for Integrator.
@@ -187,6 +189,7 @@ impl PermissionId {
             "screen_recording" => Ok(Self::ScreenRecording),
             "camera" => Ok(Self::Camera),
             "local_network" => Ok(Self::LocalNetwork),
+            "bluetooth" => Ok(Self::Bluetooth),
             "file_sharing" => Ok(Self::FileSharing),
             "firewall" => Ok(Self::Firewall),
             "network_profile" => Ok(Self::NetworkProfile),
@@ -205,6 +208,7 @@ impl PermissionId {
             Self::ScreenRecording => "screen_recording",
             Self::Camera => "camera",
             Self::LocalNetwork => "local_network",
+            Self::Bluetooth => "bluetooth",
             Self::FileSharing => "file_sharing",
             Self::Firewall => "firewall",
             Self::NetworkProfile => "network_profile",
@@ -222,6 +226,7 @@ impl PermissionId {
             Self::ScreenRecording => Some(config::MACOS_SETTINGS_SCREEN_RECORDING_URL),
             Self::Camera => Some(config::MACOS_SETTINGS_CAMERA_URL),
             Self::LocalNetwork => Some(config::MACOS_SETTINGS_LOCAL_NETWORK_URL),
+            Self::Bluetooth => Some(config::MACOS_SETTINGS_BLUETOOTH_URL),
             Self::FileSharing => Some(config::MACOS_SETTINGS_FILE_SHARING_URL),
             Self::Firewall => Some(config::WINDOWS_SETTINGS_FIREWALL_URL),
             Self::NetworkProfile => Some(config::WINDOWS_SETTINGS_NETWORK_STATUS_URL),
@@ -1504,6 +1509,14 @@ pub fn collect_setup_health_snapshot(
             "Advisory — On macOS Sequoia+, ensure Integrator is allowed in System Settings > Privacy & Security > Local Network".to_string()
         };
 
+        let ble_auth = crate::ble_discovery::macos_bluetooth_auth_status();
+        let ble_granted = ble_auth == 2;
+        let ble_detail = match ble_auth {
+            2 => "Granted — CoreBluetooth LE magic-packet proximity discovery authorized".to_string(),
+            0 => "Not Determined — macOS will prompt when BLE discovery initializes, or enable in System Settings > Privacy & Security > Bluetooth".to_string(),
+            _ => "Denied/Restricted — Enable Integrator in System Settings > Privacy & Security > Bluetooth for BLE proximity discovery".to_string(),
+        };
+
         vec![
             PermissionStatus {
                 id: PermissionId::Accessibility.as_str().to_string(),
@@ -1560,12 +1573,22 @@ pub fn collect_setup_health_snapshot(
             PermissionStatus {
                 id: PermissionId::LocalNetwork.as_str().to_string(),
                 title: "Local Network (Peer Discovery & Transport)".to_string(),
-                description: "macOS Sequoia+ privacy setting allowing UDP discovery and encrypted TCP/UDP streams to your paired PC.".to_string(),
+                description: "macOS Sequoia+ privacy setting allowing UDP/Bonjour discovery and encrypted TCP/UDP streams to your paired PC.".to_string(),
                 granted: true,
                 required: false,
                 can_request_directly: false,
                 settings_url: PermissionId::LocalNetwork.settings_url().map(str::to_string),
                 detail: local_net_detail,
+            },
+            PermissionStatus {
+                id: PermissionId::Bluetooth.as_str().to_string(),
+                title: "Bluetooth (BLE Magic-Packet Discovery)".to_string(),
+                description: "Optional CoreBluetooth proximity discovery allowing paired devices to locate each other even on broadcast-isolated Wi-Fi networks.".to_string(),
+                granted: ble_granted,
+                required: false,
+                can_request_directly: false,
+                settings_url: PermissionId::Bluetooth.settings_url().map(str::to_string),
+                detail: ble_detail,
             },
             PermissionStatus {
                 id: PermissionId::FileSharing.as_str().to_string(),
@@ -1702,7 +1725,7 @@ fn request_permission_by_id(perm_id: PermissionId) -> Result<String, String> {
                     Ok("Opened macOS System Settings > Camera — toggle Integrator ON.".to_string())
                 }
             }
-            PermissionId::LocalNetwork | PermissionId::FileSharing => {
+            PermissionId::LocalNetwork | PermissionId::Bluetooth | PermissionId::FileSharing => {
                 open_permission_settings(perm_id.as_str())
             }
             _ => Err(format!(
@@ -2187,6 +2210,7 @@ mod tests {
             ("screen_recording", PermissionId::ScreenRecording),
             ("camera", PermissionId::Camera),
             ("local_network", PermissionId::LocalNetwork),
+            ("bluetooth", PermissionId::Bluetooth),
             ("file_sharing", PermissionId::FileSharing),
             ("firewall", PermissionId::Firewall),
             ("network_profile", PermissionId::NetworkProfile),

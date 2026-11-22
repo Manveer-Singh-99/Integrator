@@ -219,6 +219,9 @@ pub struct DiscoveredPeerInfo {
     pub trusted: bool,
     /// Blacklist status: `true` if peer has been explicitly blocked.
     pub blocked: bool,
+    /// Discovery transport(s) that reported this peer (`"udp"`, `"bonjour"`, `"ble"`, or combined).
+    #[serde(default)]
+    pub discovery_source: String,
 }
 
 /// Complete snapshot of cryptographic pairing state and authorization policies.
@@ -362,6 +365,15 @@ pub struct BridgeStatus {
     pub manual_peer_ips: Vec<String>,
     /// All discovered peers on the network.
     pub discovered_peers: Vec<DiscoveredPeerInfo>,
+    /// Active discovery mode (`"all"`, `"udp_only"`, `"bonjour_only"`, `"ble_only"`).
+    #[serde(default)]
+    pub discovery_mode: String,
+    /// `true` when standard Bonjour / mDNS (`_integrator._tcp.local.`) is actively running.
+    #[serde(default)]
+    pub bonjour_active: bool,
+    /// `true` when Bluetooth LE magic-packet proximity discovery is actively running.
+    #[serde(default)]
+    pub ble_active: bool,
     /// Keystore pairing PIN and trusted peer list.
     pub trust: TrustSnapshotInfo,
 
@@ -860,6 +872,60 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                 }
                 _ => anyhow::bail!(
                     "Unknown setup subcommand: {}. Use `integrator setup` or `integrator setup status`.",
+                    subcmd
+                ),
+            }
+        })()),
+        "discovery" => Some((|| {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            match subcmd {
+                "status" => {
+                    let mode = crate::discovery::DiscoveryMode::from_env();
+                    let status = serde_json::json!({
+                        "discovery_mode": mode.as_str(),
+                        "bonjour_service_type": config::BONJOUR_SERVICE_TYPE,
+                        "ble_service_uuid": config::BLE_SERVICE_UUID,
+                        "ble_manufacturer_company_id": format!("0x{:04X}", config::BLE_MANUFACTURER_COMPANY_ID),
+                        "local_device_id": trust::local_device_id_hex(),
+                        "macos_bluetooth_auth_status": crate::ble_discovery::macos_bluetooth_auth_status(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
+                }
+                "auth-via-ble" => {
+                    let timeout_secs: u64 = args
+                        .get(3)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(20)
+                        .clamp(3, 120);
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        let proof = crate::discovery::authenticate_peer_via_ble(
+                            Duration::from_secs(timeout_secs),
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&proof)?);
+                        Ok(())
+                    })
+                }
+                "auth-via-bonjour" => {
+                    let timeout_secs: u64 = args
+                        .get(3)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(15)
+                        .clamp(3, 120);
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        let proof = crate::discovery::authenticate_peer_via_bonjour(
+                            Duration::from_secs(timeout_secs),
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&proof)?);
+                        Ok(())
+                    })
+                }
+                _ => anyhow::bail!(
+                    "Unknown discovery subcommand: {}. Use `status`, `auth-via-ble [secs]`, or `auth-via-bonjour [secs]`.",
                     subcmd
                 ),
             }
@@ -1467,6 +1533,7 @@ impl IntegratorCore {
                 },
                 gpus: p.gpus,
                 share_name: p.share_name,
+                discovery_source: p.discovery_source,
             })
             .collect();
 
@@ -1569,6 +1636,11 @@ impl IntegratorCore {
             local_interfaces,
             manual_peer_ips,
             discovered_peers,
+            discovery_mode: crate::discovery::DiscoveryMode::from_env()
+                .as_str()
+                .to_string(),
+            bonjour_active: crate::bonjour_discovery::is_bonjour_active(),
+            ble_active: crate::ble_discovery::is_ble_active(),
             trust: TrustSnapshotInfo {
                 pairing_pin: trust_cfg.pairing_pin,
                 auto_trust_direct_cable: trust_cfg.auto_trust_direct_cable,

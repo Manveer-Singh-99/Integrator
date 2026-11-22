@@ -89,6 +89,7 @@ fn main() {
             "src/kvm_macos.swift",
             "src/camera_macos.swift",
             "src/permissions_macos.swift",
+            "src/ble_macos.swift",
             "ui-macos/IntegratorApp.swift",
             "-o",
             &lib_path,
@@ -162,6 +163,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/kvm_macos.swift");
         println!("cargo:rerun-if-changed=src/camera_macos.swift");
         println!("cargo:rerun-if-changed=src/permissions_macos.swift");
+        println!("cargo:rerun-if-changed=src/ble_macos.swift");
         println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
@@ -208,6 +210,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AVFoundation");
         println!("cargo:rustc-link-lib=framework=CoreMedia");
         println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=CoreBluetooth");
         println!("cargo:rerun-if-changed=src/virtual_display.m");
     }
 

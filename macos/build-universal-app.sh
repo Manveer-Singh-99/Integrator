@@ -92,6 +92,8 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 	<string>icon.icns</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Integrator captures your Mac camera when Shared Camera (Mac to Windows 11) is turned on.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Integrator uses Bluetooth Low Energy (BLE) magic packets to discover nearby paired Mac and Windows workstations even when Wi-Fi broadcasts are restricted.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Integrator uses your local and USB-C network to discover and connect securely with your paired Windows workstation.</string>
 	<key>NSHighResolutionCapable</key>
