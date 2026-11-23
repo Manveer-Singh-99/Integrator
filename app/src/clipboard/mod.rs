@@ -69,7 +69,7 @@
 //!
 //! ### Downstream Callees:
 //! - `protocol`: Wire framing definitions (`FRAME_DIR`, `FRAME_FILE`, `FRAME_FILE_DATA`, `FRAME_FILE_HASH`, `FRAME_END`).
-//! - `os_seq`: Fast OS-level clipboard change sequence probe (`changeCount` on macOS, `GetClipboardSequenceNumber` on Windows).
+//! - `os_seq`: Fast OS-level clipboard change sequence probe and fail-closed privacy inspector.
 //! - `file_helper`: Native OS clipboard file list ingestion and serialization (`NSPasteboard` / `CF_HDROP`).
 //! - `arboard`: Cross-platform text and image clipboard access.
 //! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58285.
@@ -77,7 +77,7 @@
 //! ## 3. Threading & Concurrency Model
 //! - **Tokio Multi-Threaded Runtime**: Manages connection establishment, inbound packet deserialization,
 //!   background polling loops, and async streaming tasks.
-//! - **Sequence Watcher Task**: Polls the lightweight OS sequence counter every 250 milliseconds.
+//! - **Sequence Watcher Task**: Polls the lightweight OS sequence counter every 120 milliseconds.
 //!   Heavy clipboard inspection occurs only when the monotonic counter increments.
 //! - **Concurrency Boundaries**: Outbound streaming tasks run with independent cancellation tokens
 //!   and timeout safeguards (`FRAME_IO_TIMEOUT = 15s`).
@@ -95,4 +95,9 @@ pub(crate) mod os_seq;
 pub(crate) mod protocol;
 pub(crate) mod service;
 
-pub use service::{ClipboardService, CLIPBOARD_INSTANCE, TOKIO_HANDLE};
+#[allow(unused_imports)]
+pub use os_seq::ClipboardPrivacyStatus;
+#[allow(unused_imports)]
+pub use service::{
+    ClipboardService, TransferCancellation, TransferPurpose, CLIPBOARD_INSTANCE, TOKIO_HANDLE,
+};

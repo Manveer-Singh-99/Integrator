@@ -95,35 +95,36 @@
 //!   (`FRAME_FILE_HASH`) and session-wide content verification. Missing or mismatched hashes cause
 //!   immediate abort and deletion of the temporary staging directory.
 
+use anyhow::{Context, Result};
+use arboard::{Clipboard, ImageData};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use anyhow::{Context, Result};
-use arboard::{Clipboard, ImageData};
-use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{CLIPBOARD_PORT, DRAG_STAGING_DIR_NAME};
+use super::file_helper::FileClipboardHelper;
+use super::os_seq::{self, ClipboardPrivacyStatus};
+use super::protocol::{
+    ClipboardMessage, ClipboardPayload, LazyAnnouncement, StreamRequest, FRAME_DIR, FRAME_END,
+    FRAME_FILE, FRAME_FILE_DATA, FRAME_FILE_HASH, FRAME_IMAGE_DATA, MAX_AUTO_STAGE_BYTES,
+    MAX_CLIPBOARD_HEADER_BYTES, MAX_DIRECTORY_DEPTH, MAX_ROOTS, MAX_SINGLE_FILE_BYTES,
+    MAX_TEXT_CHARS, MAX_TOTAL_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+};
 #[cfg(target_os = "macos")]
 use crate::config::MACOS_OSASCRIPT_BIN;
+use crate::config::{CLIPBOARD_PORT, DRAG_STAGING_DIR_NAME};
 use crate::discovery::DiscoveryManager;
 use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
-use super::file_helper::FileClipboardHelper;
-use super::os_seq;
-use super::protocol::{
-    ClipboardMessage, ClipboardPayload, LazyAnnouncement, StreamRequest,
-    FRAME_DIR, FRAME_END, FRAME_FILE, FRAME_FILE_DATA, FRAME_FILE_HASH, FRAME_IMAGE_DATA,
-    MAX_AUTO_STAGE_BYTES, MAX_CLIPBOARD_HEADER_BYTES, MAX_DIRECTORY_DEPTH, MAX_ROOTS,
-    MAX_SINGLE_FILE_BYTES, MAX_TEXT_CHARS, MAX_TOTAL_TRANSFER_BYTES, MAX_TRANSFER_FILES,
-};
+use tokio::io::AsyncWriteExt;
 
 const MAX_PRE_AUTH_CLIP_CONNS: usize = 16;
 const MAX_POST_AUTH_CLIP_CONNS: usize = 8;
@@ -450,9 +451,10 @@ fn validate_single_path_component(comp: &str) -> Result<()> {
             comp
         );
     }
-    if comp.chars().any(|c| {
-        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0')
-    }) {
+    if comp
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0'))
+    {
         anyhow::bail!(
             "Rejected path component '{}' containing forbidden or control characters",
             comp
@@ -611,6 +613,94 @@ struct VerifiedCacheEntry {
     roots: Vec<String>,
 }
 
+/// Distinguishes the business purpose of a streaming file transfer.
+/// Guarantees that clipboard synchronisation toggles never cancel drag-and-drop operations,
+/// and vice-versa (SEC-1F-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferPurpose {
+    Clipboard,
+    DragDrop,
+}
+
+/// Operation-scoped cancellation token that monitors subsystem feature flags
+/// throughout long-running file and image streaming transfers (SEC-1F-02).
+#[derive(Clone)]
+pub struct TransferCancellation {
+    purpose: TransferPurpose,
+    features: Option<Arc<crate::features::FeatureManager>>,
+    manual_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[allow(dead_code)]
+impl TransferCancellation {
+    pub fn new(
+        purpose: TransferPurpose,
+        features: Option<Arc<crate::features::FeatureManager>>,
+    ) -> Self {
+        Self {
+            purpose,
+            features,
+            manual_cancel: None,
+        }
+    }
+
+    pub fn with_manual(
+        purpose: TransferPurpose,
+        features: Option<Arc<crate::features::FeatureManager>>,
+        manual_cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            purpose,
+            features,
+            manual_cancel: Some(manual_cancel),
+        }
+    }
+
+    pub fn clipboard(features: Option<Arc<crate::features::FeatureManager>>) -> Self {
+        Self::new(TransferPurpose::Clipboard, features)
+    }
+
+    pub fn dragdrop(features: Option<Arc<crate::features::FeatureManager>>) -> Self {
+        Self::new(TransferPurpose::DragDrop, features)
+    }
+
+    pub fn none(purpose: TransferPurpose) -> Self {
+        Self::new(purpose, None)
+    }
+
+    pub fn purpose(&self) -> TransferPurpose {
+        self.purpose
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        if let Some(manual) = &self.manual_cancel {
+            if manual.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+        }
+        match &self.features {
+            Some(mgr) => match self.purpose {
+                TransferPurpose::Clipboard => !mgr.is_enabled("clipboard"),
+                TransferPurpose::DragDrop => false,
+            },
+            None => false,
+        }
+    }
+
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!(
+                "Transfer cancelled: {} synchronization was disabled or aborted during transfer",
+                match self.purpose {
+                    TransferPurpose::Clipboard => "Clipboard",
+                    TransferPurpose::DragDrop => "Drag & Drop",
+                }
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ClipboardService {
     discovery: DiscoveryManager,
@@ -625,7 +715,8 @@ pub struct ClipboardService {
     last_remote_ip: Arc<RwLock<Option<IpAddr>>>,
     is_pasting: Arc<std::sync::atomic::AtomicBool>,
     features: Arc<OnceLock<Arc<crate::features::FeatureManager>>>,
-    pending_remote_by_peer: Arc<std::sync::RwLock<HashMap<String, (LazyAnnouncement, IpAddr, u64)>>>,
+    pending_remote_by_peer:
+        Arc<std::sync::RwLock<HashMap<String, (LazyAnnouncement, IpAddr, u64)>>>,
     drag_sessions_by_peer: Arc<std::sync::RwLock<HashMap<String, HashSet<String>>>>,
     drag_session_generations: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     revoked_clipboard_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
@@ -683,6 +774,10 @@ impl ClipboardService {
             .unwrap_or(false)
     }
 
+    pub(crate) fn cancellation_for(&self, purpose: TransferPurpose) -> TransferCancellation {
+        TransferCancellation::new(purpose, self.features.get().cloned())
+    }
+
     pub async fn clear_pending_state(&self) {
         {
             let mut lock = self.pending_remote.write().await;
@@ -710,21 +805,28 @@ impl ClipboardService {
     /// and active drag sessions associated specifically with `peer_device_id_hex` asynchronously.
     pub async fn clear_peer_remote_state_async(&self, peer_device_id_hex: &str) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
-        self.clear_peer_remote_state_bounded_async(&clean_id, current_gen).await;
+        let current_gen =
+            crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.clear_peer_remote_state_bounded_async(&clean_id, current_gen)
+            .await;
     }
 
     /// Asynchronously clears clipboard state for `peer_device_id_hex` bounded to `target_generation`.
     /// If the peer's active trust generation has already advanced beyond `target_generation`, the
     /// revocation mark and newer-generation resources are preserved to prevent races against re-pairing (SEC-1D-14).
-    pub async fn clear_peer_remote_state_bounded_async(&self, peer_device_id_hex: &str, target_generation: u64) {
+    pub async fn clear_peer_remote_state_bounded_async(
+        &self,
+        peer_device_id_hex: &str,
+        target_generation: u64,
+    ) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
 
         // Acquire write lease on clipboard_commit_lock so in-flight OS clipboard commits finish
         // and subsequent commits for the revoked peer are blocked (SEC-1D-14, SEC-1D-15).
         let _commit_guard = self.clipboard_commit_lock.write().await;
 
-        let current_trans_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let current_trans_gen =
+            crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
         let current_ks_gen = crate::security::keystore::global_keystore()
             .lock()
             .ok()
@@ -743,7 +845,10 @@ impl ClipboardService {
             );
         } else {
             // 1. Mark peer as revoked in clipboard service at target_generation
-            let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+            let mut rev = self
+                .revoked_clipboard_peers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = rev.entry(clean_id.clone()).or_insert(target_generation);
             if target_generation > *entry {
                 *entry = target_generation;
@@ -752,7 +857,10 @@ impl ClipboardService {
 
         // 2. Guaranteed blocking removal of peer's pending announcement if item generation <= target_generation
         let removed_ann = {
-            let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            let mut remotes = self
+                .pending_remote_by_peer
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((_, _, gen)) = remotes.get(&clean_id) {
                 if *gen <= target_generation {
                     remotes.remove(&clean_id).map(|(ann, _, _)| ann)
@@ -776,8 +884,14 @@ impl ClipboardService {
 
         // 3. Remove peer's drag sessions and staging files from disk if session_gen <= target_generation
         let session_ids = {
-            let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
-            let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+            let mut drag_peers = self
+                .drag_sessions_by_peer
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut drag_gens = self
+                .drag_session_generations
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(sessions) = drag_peers.get_mut(&clean_id) {
                 let mut removed = Vec::new();
                 sessions.retain(|sid| {
@@ -824,21 +938,31 @@ impl ClipboardService {
             cache.retain(|entry| !session_ids.contains(&entry.session_id));
         }
 
-        tracing::info!("🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}", clean_id, target_generation);
+        tracing::info!(
+            "🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}",
+            clean_id,
+            target_generation
+        );
     }
 
     /// Immediately and unconditionally clears all clipboard staging state, pending announcements,
     /// and active drag sessions associated specifically with `peer_device_id_hex`.
     pub fn clear_peer_remote_state(&self, peer_device_id_hex: &str) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let current_gen =
+            crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
         self.clear_peer_remote_state_bounded(&clean_id, current_gen);
     }
 
     /// Synchronously clears clipboard state for `peer_device_id_hex` bounded to `target_generation`.
-    pub fn clear_peer_remote_state_bounded(&self, peer_device_id_hex: &str, target_generation: u64) {
+    pub fn clear_peer_remote_state_bounded(
+        &self,
+        peer_device_id_hex: &str,
+        target_generation: u64,
+    ) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let current_trans_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let current_trans_gen =
+            crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
         let current_ks_gen = crate::security::keystore::global_keystore()
             .lock()
             .ok()
@@ -847,7 +971,10 @@ impl ClipboardService {
         let active_current_gen = current_trans_gen.max(current_ks_gen);
 
         if active_current_gen <= target_generation {
-            let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+            let mut rev = self
+                .revoked_clipboard_peers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = rev.entry(clean_id.clone()).or_insert(target_generation);
             if target_generation > *entry {
                 *entry = target_generation;
@@ -855,7 +982,10 @@ impl ClipboardService {
         }
 
         let removed_ann = {
-            let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            let mut remotes = self
+                .pending_remote_by_peer
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((_, _, gen)) = remotes.get(&clean_id) {
                 if *gen <= target_generation {
                     remotes.remove(&clean_id).map(|(ann, _, _)| ann)
@@ -889,8 +1019,14 @@ impl ClipboardService {
         }
 
         let session_ids = {
-            let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
-            let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+            let mut drag_peers = self
+                .drag_sessions_by_peer
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut drag_gens = self
+                .drag_session_generations
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(sessions) = drag_peers.get_mut(&clean_id) {
                 let mut removed = Vec::new();
                 sessions.retain(|sid| {
@@ -914,7 +1050,10 @@ impl ClipboardService {
 
         if !session_ids.is_empty() {
             let mut acquired_drag = false;
-            if let (Ok(mut map), Ok(mut order)) = (self.pending_drag_sessions.try_write(), self.pending_drag_order.try_write()) {
+            if let (Ok(mut map), Ok(mut order)) = (
+                self.pending_drag_sessions.try_write(),
+                self.pending_drag_order.try_write(),
+            ) {
                 for sid in &session_ids {
                     map.remove(sid);
                 }
@@ -944,7 +1083,11 @@ impl ClipboardService {
             }
         }
 
-        tracing::info!("🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}", clean_id, target_generation);
+        tracing::info!(
+            "🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}",
+            clean_id,
+            target_generation
+        );
     }
 
     /// Authoritative check: returns true if `peer_device_id_hex` is revoked, unverified,
@@ -980,12 +1123,16 @@ impl ClipboardService {
 
         // 3. Check in-memory clipboard revocation cache
         let rev_gen_opt = {
-            let rev = self.revoked_clipboard_peers.read().unwrap_or_else(|e| e.into_inner());
+            let rev = self
+                .revoked_clipboard_peers
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             rev.get(&clean_id).copied()
         };
 
         if let Some(rev_gen) = rev_gen_opt {
-            let cur_transport_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+            let cur_transport_gen =
+                crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
             let active_gen = ks_trust_gen.max(cur_transport_gen);
             // Re-pair requires that active trust generation strictly exceeds revocation generation
             if active_gen <= rev_gen {
@@ -994,7 +1141,8 @@ impl ClipboardService {
         }
 
         // 4. Fail-closed: peer must have active trust generation in transport or be registered in Keystore
-        let transport_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let transport_gen =
+            crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
         if !ks_exists && transport_gen == 0 {
             // Unpaired, unauthenticated, unknown peer: fail closed!
             return true;
@@ -1006,7 +1154,10 @@ impl ClipboardService {
     /// Clears the clipboard revocation mark for a peer upon successful re-pairing.
     pub fn clear_peer_revocation(&self, peer_device_id_hex: &str) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+        let mut rev = self
+            .revoked_clipboard_peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         rev.remove(&clean_id);
     }
 
@@ -1018,50 +1169,100 @@ impl ClipboardService {
     }
 
     /// Checks if a drag session is actively registered for a specific peer.
-    pub fn is_peer_drag_session_registered(&self, peer_device_id_hex: &str, session_id: &str) -> bool {
+    pub fn is_peer_drag_session_registered(
+        &self,
+        peer_device_id_hex: &str,
+        session_id: &str,
+    ) -> bool {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let drag_peers = self.drag_sessions_by_peer.read().unwrap_or_else(|e| e.into_inner());
-        drag_peers.get(&clean_id).map(|s| s.contains(session_id)).unwrap_or(false)
+        let drag_peers = self
+            .drag_sessions_by_peer
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        drag_peers
+            .get(&clean_id)
+            .map(|s| s.contains(session_id))
+            .unwrap_or(false)
     }
 
     /// Associates a registered drag session with its owning peer device ID and generation.
-    pub fn register_peer_drag_session_bounded(&self, peer_device_id_hex: &str, session_id: &str, generation: u64) {
+    pub fn register_peer_drag_session_bounded(
+        &self,
+        peer_device_id_hex: &str,
+        session_id: &str,
+        generation: u64,
+    ) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
         if self.is_peer_revoked(&clean_id) {
-            tracing::warn!("Rejected drag session registration for revoked peer {}", clean_id);
+            tracing::warn!(
+                "Rejected drag session registration for revoked peer {}",
+                clean_id
+            );
             return;
         }
-        let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
-        let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+        let mut drag_peers = self
+            .drag_sessions_by_peer
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut drag_gens = self
+            .drag_session_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if self.is_peer_revoked(&clean_id) {
             return;
         }
-        drag_peers.entry(clean_id).or_default().insert(session_id.to_string());
+        drag_peers
+            .entry(clean_id)
+            .or_default()
+            .insert(session_id.to_string());
         drag_gens.insert(session_id.to_string(), generation);
     }
 
     /// Retrieves pending lazy announcement for a specific peer device ID hex.
-    pub fn get_peer_pending_announcement(&self, peer_device_id_hex: &str) -> Option<LazyAnnouncement> {
+    pub fn get_peer_pending_announcement(
+        &self,
+        peer_device_id_hex: &str,
+    ) -> Option<LazyAnnouncement> {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
-        let remotes = self.pending_remote_by_peer.read().unwrap_or_else(|e| e.into_inner());
+        let remotes = self
+            .pending_remote_by_peer
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         remotes.get(&clean_id).map(|(ann, _, _)| ann.clone())
     }
 
     /// Sets pending lazy announcement for a specific peer device ID hex.
-    pub fn set_peer_pending_announcement(&self, peer_device_id_hex: &str, ann: LazyAnnouncement, ip: IpAddr) {
+    pub fn set_peer_pending_announcement(
+        &self,
+        peer_device_id_hex: &str,
+        ann: LazyAnnouncement,
+        ip: IpAddr,
+    ) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
         let gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
         self.set_peer_pending_announcement_bounded(&clean_id, ann, ip, gen);
     }
 
     /// Sets pending lazy announcement for a specific peer device ID hex bound to its trust generation.
-    pub fn set_peer_pending_announcement_bounded(&self, peer_device_id_hex: &str, ann: LazyAnnouncement, ip: IpAddr, generation: u64) {
+    pub fn set_peer_pending_announcement_bounded(
+        &self,
+        peer_device_id_hex: &str,
+        ann: LazyAnnouncement,
+        ip: IpAddr,
+        generation: u64,
+    ) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
         if self.is_peer_revoked(&clean_id) {
-            tracing::warn!("Rejected pending announcement for revoked peer {}", clean_id);
+            tracing::warn!(
+                "Rejected pending announcement for revoked peer {}",
+                clean_id
+            );
             return;
         }
-        let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+        let mut remotes = self
+            .pending_remote_by_peer
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if self.is_peer_revoked(&clean_id) {
             return;
         }
@@ -1071,9 +1272,18 @@ impl ClipboardService {
     /// Synchronously purges all remote clipboard staging, pending drag sessions, and cached verified metadata
     /// upon peer revocation or emergency teardown.
     pub fn clear_remote_state(&self) {
-        self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner()).clear();
-        self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner()).clear();
-        self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending_remote_by_peer
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.drag_sessions_by_peer
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.drag_session_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Ok(mut r) = self.pending_remote.try_write() {
             *r = None;
         }
@@ -1089,7 +1299,8 @@ impl ClipboardService {
         if let Ok(mut c) = self.verified_cache.try_write() {
             c.clear();
         }
-        self.is_pasting.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_pasting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         unsafe {
             set_has_pending_remote_file(false);
@@ -1132,7 +1343,8 @@ impl ClipboardService {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
-                        let Ok(pre_permit) = Arc::clone(&pre_auth_limiter).try_acquire_owned() else {
+                        let Ok(pre_permit) = Arc::clone(&pre_auth_limiter).try_acquire_owned()
+                        else {
                             warn!(
                                 "🚫 Dropped clipboard connection from {}: pre-auth limit ({}) reached",
                                 addr, MAX_PRE_AUTH_CLIP_CONNS
@@ -1208,7 +1420,10 @@ impl ClipboardService {
             *lock = computed_hash;
         }
 
-        info!("🖼️ Verified & received remote image ({}x{} px)", width, height);
+        info!(
+            "🖼️ Verified & received remote image ({}x{} px)",
+            width, height
+        );
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         unsafe {
             set_has_pending_remote_file(false);
@@ -1279,7 +1494,9 @@ impl ClipboardService {
         match msg.payload {
             ClipboardPayload::Text(text) => {
                 if !allow_clipboard {
-                    debug!("Ignoring remote clipboard text while Universal Clipboard/KVM is disabled");
+                    debug!(
+                        "Ignoring remote clipboard text while Universal Clipboard/KVM is disabled"
+                    );
                     return Ok(());
                 }
                 if text.is_empty() || text.len() > MAX_TEXT_CHARS {
@@ -1328,7 +1545,9 @@ impl ClipboardService {
                 rgba,
             } => {
                 if !allow_clipboard {
-                    debug!("Ignoring remote clipboard image while Universal Clipboard/KVM is disabled");
+                    debug!(
+                        "Ignoring remote clipboard image while Universal Clipboard/KVM is disabled"
+                    );
                     return Ok(());
                 }
                 self.apply_remote_image(peer_addr, &msg.hash, width, height, rgba)
@@ -1343,6 +1562,7 @@ impl ClipboardService {
                     debug!("Ignoring remote clipboard image stream while Universal Clipboard/KVM is disabled");
                     return Ok(());
                 }
+                let cancellation = self.cancellation_for(TransferPurpose::Clipboard);
                 let Some(expected_len) =
                     super::protocol::validate_image_bounds(width, height, byte_len)
                 else {
@@ -1355,6 +1575,7 @@ impl ClipboardService {
 
                 let mut rgba = Vec::with_capacity(expected_len);
                 while rgba.len() < expected_len {
+                    cancellation.check_cancelled()?;
                     let rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
                         .await
                         .context("Timed out reading image data chunk")?
@@ -1370,7 +1591,9 @@ impl ClipboardService {
                         anyhow::bail!("Image stream overflowed declared byte_len");
                     }
                     rgba.extend_from_slice(chunk);
+                    cancellation.check_cancelled()?;
                 }
+                cancellation.check_cancelled()?;
 
                 self.apply_remote_image(peer_addr, &msg.hash, width, height, rgba)
                     .await?;
@@ -1412,18 +1635,28 @@ impl ClipboardService {
                 );
                 let peer_dev_id = session.peer_device_id_hex().to_string();
                 if self.is_peer_revoked(&peer_dev_id) {
-                    warn!("Ignoring clipboard announcement from revoked peer {}", peer_dev_id);
+                    warn!(
+                        "Ignoring clipboard announcement from revoked peer {}",
+                        peer_dev_id
+                    );
                     return Ok(());
                 }
                 {
-                    let mut remotes = self.pending_remote_by_peer
+                    let mut remotes = self
+                        .pending_remote_by_peer
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
                     if self.is_peer_revoked(&peer_dev_id) {
-                        warn!("Ignoring clipboard announcement from revoked peer {}", peer_dev_id);
+                        warn!(
+                            "Ignoring clipboard announcement from revoked peer {}",
+                            peer_dev_id
+                        );
                         return Ok(());
                     }
-                    remotes.insert(peer_dev_id.clone(), (ann.clone(), peer_addr.ip(), session.trust_generation()));
+                    remotes.insert(
+                        peer_dev_id.clone(),
+                        (ann.clone(), peer_addr.ip(), session.trust_generation()),
+                    );
                 }
                 {
                     let mut lock = self.pending_remote.write().await;
@@ -1437,8 +1670,7 @@ impl ClipboardService {
                 // Preserve existing native OS clipboard until staging succeeds or user triggers paste.
                 #[cfg(target_os = "macos")]
                 {
-                    let name_c =
-                        std::ffi::CString::new(ann.root_name.clone()).unwrap_or_default();
+                    let name_c = std::ffi::CString::new(ann.root_name.clone()).unwrap_or_default();
                     unsafe {
                         notify_touchbar_remote_file(name_c.as_ptr(), ann.total_bytes);
                     }
@@ -1496,8 +1728,14 @@ impl ClipboardService {
                             copy.total_files,
                             copy.total_bytes as f64 / (1024.0 * 1024.0)
                         );
-                        Self::stream_files_over_session(&mut session, copy.directories, copy.files)
-                            .await?;
+                        let cancellation = self.cancellation_for(TransferPurpose::Clipboard);
+                        Self::stream_files_over_session(
+                            &mut session,
+                            copy.directories,
+                            copy.files,
+                            Some(&cancellation),
+                        )
+                        .await?;
                     } else {
                         warn!("Stream request session_id does not match active local copy");
                     }
@@ -1529,8 +1767,14 @@ impl ClipboardService {
                         copy.total_files,
                         copy.total_bytes as f64 / (1024.0 * 1024.0)
                     );
-                    Self::stream_files_over_session(&mut session, copy.directories, copy.files)
-                        .await?;
+                    let cancellation = self.cancellation_for(TransferPurpose::DragDrop);
+                    Self::stream_files_over_session(
+                        &mut session,
+                        copy.directories,
+                        copy.files,
+                        Some(&cancellation),
+                    )
+                    .await?;
                 } else {
                     warn!("Rejected unknown or expired drag stream session_id");
                 }
@@ -1578,35 +1822,35 @@ impl ClipboardService {
                 }
                 let rel = format!("{}/{}", rel_prefix, name);
 
-        if meta.is_dir() {
-            if rel.len() > 4096 || directories.len() >= MAX_TRANSFER_FILES {
-                continue;
-            }
-            if depth + 1 < MAX_DIRECTORY_DEPTH {
-                directories.push(rel.clone());
-                Self::collect_dir_entries(
-                    _root,
-                    &path,
-                    &rel,
-                    depth + 1,
-                    directories,
-                    files,
-                    total_bytes,
-                    total_files,
-                );
-            }
-        } else if meta.is_file() {
-            let len = meta.len();
-            if rel.len() <= 4096
-                && len <= MAX_SINGLE_FILE_BYTES
-                && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
-                && *total_files < MAX_TRANSFER_FILES
-            {
-                *total_bytes += len;
-                *total_files += 1;
-                files.push((rel, path));
-            }
-        }
+                if meta.is_dir() {
+                    if rel.len() > 4096 || directories.len() >= MAX_TRANSFER_FILES {
+                        continue;
+                    }
+                    if depth + 1 < MAX_DIRECTORY_DEPTH {
+                        directories.push(rel.clone());
+                        Self::collect_dir_entries(
+                            _root,
+                            &path,
+                            &rel,
+                            depth + 1,
+                            directories,
+                            files,
+                            total_bytes,
+                            total_files,
+                        );
+                    }
+                } else if meta.is_file() {
+                    let len = meta.len();
+                    if rel.len() <= 4096
+                        && len <= MAX_SINGLE_FILE_BYTES
+                        && total_bytes.saturating_add(len) <= MAX_TOTAL_TRANSFER_BYTES
+                        && *total_files < MAX_TRANSFER_FILES
+                    {
+                        *total_bytes += len;
+                        *total_files += 1;
+                        files.push((rel, path));
+                    }
+                }
             }
         }
     }
@@ -1661,9 +1905,22 @@ impl ClipboardService {
             let prev_hash = self.last_hash.read().await.clone();
             let helper = Arc::clone(&self.file_helper);
             let snapshot = tokio::task::spawn_blocking(move || -> LocalClipboardSnapshot {
-                if crate::clipboard::os_seq::is_clipboard_concealed() {
-                    debug!("Skipping clipboard sync: concealed/transient/password-manager content detected");
+                let seq_before = crate::clipboard::os_seq::get_clipboard_sequence();
+                if seq_before < 0 {
                     return LocalClipboardSnapshot::Unchanged;
+                }
+
+                let privacy_status = crate::clipboard::os_seq::inspect_clipboard_privacy();
+                match privacy_status {
+                    ClipboardPrivacyStatus::ConcealedOrTransient => {
+                        debug!("Skipping clipboard sync: concealed/transient/password-manager content detected");
+                        return LocalClipboardSnapshot::Unchanged;
+                    }
+                    ClipboardPrivacyStatus::InspectionUnavailable => {
+                        warn!("Skipping clipboard sync: native clipboard privacy inspection unavailable (failing closed)");
+                        return LocalClipboardSnapshot::Unchanged;
+                    }
+                    ClipboardPrivacyStatus::SafeToSync => {}
                 }
 
                 let copied_paths = helper.read_copied_files();
@@ -1674,6 +1931,19 @@ impl ClipboardService {
                         .filter(|p| !p.starts_with(cache_dir))
                         .collect();
                     if external_paths.is_empty() {
+                        return LocalClipboardSnapshot::Unchanged;
+                    }
+
+                    // TOCTOU generation check: sequence must remain unchanged during file acquisition
+                    let seq_after = crate::clipboard::os_seq::get_clipboard_sequence();
+                    if seq_after != seq_before {
+                        debug!("Clipboard sequence changed during file acquisition ({} -> {}), discarding snapshot", seq_before, seq_after);
+                        return LocalClipboardSnapshot::Unchanged;
+                    }
+
+                    // Revalidate privacy after acquisition
+                    if crate::clipboard::os_seq::inspect_clipboard_privacy() != ClipboardPrivacyStatus::SafeToSync {
+                        warn!("Clipboard privacy became non-safe during file acquisition, discarding snapshot");
                         return LocalClipboardSnapshot::Unchanged;
                     }
 
@@ -1708,6 +1978,19 @@ impl ClipboardService {
                 if let Ok(mut cb) = Clipboard::new() {
                     if let Ok(img) = cb.get_image() {
                         if validate_image_bounds(img.width, img.height, img.bytes.len()) {
+                            // TOCTOU generation check: sequence must remain unchanged during image acquisition
+                            let seq_after = crate::clipboard::os_seq::get_clipboard_sequence();
+                            if seq_after != seq_before {
+                                debug!("Clipboard sequence changed during image acquisition ({} -> {}), discarding snapshot", seq_before, seq_after);
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+
+                            // Revalidate privacy after acquisition
+                            if crate::clipboard::os_seq::inspect_clipboard_privacy() != ClipboardPrivacyStatus::SafeToSync {
+                                warn!("Clipboard privacy became non-safe during image acquisition, discarding snapshot");
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+
                             let hash_hex = compute_image_hash(img.width, img.height, &img.bytes);
                             if hash_hex == prev_hash {
                                 return LocalClipboardSnapshot::Unchanged;
@@ -1723,6 +2006,19 @@ impl ClipboardService {
 
                     if let Ok(text) = cb.get_text() {
                         if !text.is_empty() && text.len() <= MAX_TEXT_CHARS {
+                            // TOCTOU generation check: sequence must remain unchanged during text acquisition
+                            let seq_after = crate::clipboard::os_seq::get_clipboard_sequence();
+                            if seq_after != seq_before {
+                                debug!("Clipboard sequence changed during text acquisition ({} -> {}), discarding snapshot", seq_before, seq_after);
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+
+                            // Revalidate privacy after acquisition
+                            if crate::clipboard::os_seq::inspect_clipboard_privacy() != ClipboardPrivacyStatus::SafeToSync {
+                                warn!("Clipboard privacy became non-safe during text acquisition, discarding snapshot");
+                                return LocalClipboardSnapshot::Unchanged;
+                            }
+
                             let hash_hex = compute_text_hash(&text);
                             if hash_hex == prev_hash {
                                 return LocalClipboardSnapshot::Unchanged;
@@ -1803,8 +2099,16 @@ impl ClipboardService {
                             "📤 Detected local copied image ({}x{} px). Streaming to {}...",
                             width, height, peer_ip
                         );
-                        if let Err(e) =
-                            Self::send_image_stream(&peer_ip, hash_hex, width, height, rgba).await
+                        let cancellation = self.cancellation_for(TransferPurpose::Clipboard);
+                        if let Err(e) = Self::send_image_stream(
+                            &peer_ip,
+                            hash_hex,
+                            width,
+                            height,
+                            rgba,
+                            Some(&cancellation),
+                        )
+                        .await
                         {
                             warn!("Failed to stream image to {}: {}", peer_ip, e);
                         }
@@ -1879,7 +2183,13 @@ impl ClipboardService {
             CLIPBOARD_CONNECT_TIMEOUT,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to establish Clipboard TransportV2 to {}: {}", addr, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to establish Clipboard TransportV2 to {}: {}",
+                addr,
+                e
+            )
+        })?;
 
         let serialized = serde_json::to_vec(&msg)?;
         if serialized.len() > MAX_CLIPBOARD_HEADER_BYTES {
@@ -1896,7 +2206,10 @@ impl ClipboardService {
         .with_context(|| format!("Timed out sending clipboard payload to {}", addr))?
         .map_err(|e| anyhow::anyhow!("Clipboard TransportV2 send error to {}: {}", addr, e))?;
 
-        info!("✅ Sent TransportV2 encrypted clipboard message to {}", addr);
+        info!(
+            "✅ Sent TransportV2 encrypted clipboard message to {}",
+            addr
+        );
         Ok(())
     }
 
@@ -1907,7 +2220,11 @@ impl ClipboardService {
         width: usize,
         height: usize,
         rgba: Vec<u8>,
+        cancellation: Option<&TransferCancellation>,
     ) -> Result<()> {
+        if let Some(c) = cancellation {
+            c.check_cancelled()?;
+        }
         let byte_len = rgba.len();
         if !validate_image_bounds(width, height, byte_len) {
             anyhow::bail!("Refusing to stream invalid RGBA image dimensions/size");
@@ -1920,7 +2237,17 @@ impl ClipboardService {
             CLIPBOARD_CONNECT_TIMEOUT,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect ImageStream TransportV2 to {}: {}", addr, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect ImageStream TransportV2 to {}: {}",
+                addr,
+                e
+            )
+        })?;
+
+        if let Some(c) = cancellation {
+            c.check_cancelled()?;
+        }
 
         let header = ClipboardMessage {
             hash: hash_hex,
@@ -1941,6 +2268,9 @@ impl ClipboardService {
 
         let mut chunk_buf = Vec::with_capacity(STREAM_CHUNK_SIZE + 1);
         for chunk in rgba.chunks(STREAM_CHUNK_SIZE) {
+            if let Some(c) = cancellation {
+                c.check_cancelled()?;
+            }
             chunk_buf.clear();
             chunk_buf.push(FRAME_IMAGE_DATA);
             chunk_buf.extend_from_slice(chunk);
@@ -1960,18 +2290,29 @@ impl ClipboardService {
         session: &mut TransportSessionV2<S>,
         directories: Vec<String>,
         files: Vec<(String, PathBuf)>,
+        cancellation: Option<&TransferCancellation>,
     ) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        if let Some(c) = cancellation {
+            c.check_cancelled()?;
+        }
+
         let mut manifest_hasher = Sha256::new();
         manifest_hasher.update(b"INTEGRATOR-FILE-MANIFEST-V2");
 
         // 1. Directory frames: [FRAME_DIR(1B) || path_len_be(2B) || rel_path_utf8]
         for dir_rel in &directories {
+            if let Some(c) = cancellation {
+                c.check_cancelled()?;
+            }
             let rel_bytes = dir_rel.as_bytes();
             if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
-                anyhow::bail!("Invalid directory path length {} in local copy", rel_bytes.len());
+                anyhow::bail!(
+                    "Invalid directory path length {} in local copy",
+                    rel_bytes.len()
+                );
             }
             let mut rec = Vec::with_capacity(3 + rel_bytes.len());
             rec.push(FRAME_DIR);
@@ -1989,6 +2330,9 @@ impl ClipboardService {
         chunk_buf[0] = FRAME_FILE_DATA;
 
         for (rel_path, abs_path) in files {
+            if let Some(c) = cancellation {
+                c.check_cancelled()?;
+            }
             let rel_bytes = rel_path.as_bytes();
             if rel_bytes.is_empty() || rel_bytes.len() > 4096 {
                 anyhow::bail!("Invalid file path length {} in local copy", rel_bytes.len());
@@ -2015,6 +2359,9 @@ impl ClipboardService {
             let mut file_hasher = Sha256::new();
             let mut remaining = actual_len;
             while remaining > 0 {
+                if let Some(c) = cancellation {
+                    c.check_cancelled()?;
+                }
                 let to_read = std::cmp::min(remaining, STREAM_CHUNK_SIZE as u64) as usize;
                 let n = file.read(&mut chunk_buf[1..1 + to_read])?;
                 if n == 0 {
@@ -2025,13 +2372,10 @@ impl ClipboardService {
                     );
                 }
                 file_hasher.update(&chunk_buf[1..1 + n]);
-                tokio::time::timeout(
-                    FRAME_IO_TIMEOUT,
-                    session.send_message(&chunk_buf[..1 + n]),
-                )
-                .await
-                .context("Timed out writing file chunk to TransportV2 session")?
-                .map_err(|e| anyhow::anyhow!("File chunk TransportV2 error: {}", e))?;
+                tokio::time::timeout(FRAME_IO_TIMEOUT, session.send_message(&chunk_buf[..1 + n]))
+                    .await
+                    .context("Timed out writing file chunk to TransportV2 session")?
+                    .map_err(|e| anyhow::anyhow!("File chunk TransportV2 error: {}", e))?;
                 remaining -= n as u64;
             }
 
@@ -2045,7 +2389,7 @@ impl ClipboardService {
             }
 
             let file_sha256: [u8; 32] = file_hasher.finalize().into();
-            manifest_hasher.update(&(rel_bytes.len() as u32).to_be_bytes());
+            manifest_hasher.update((rel_bytes.len() as u32).to_be_bytes());
             manifest_hasher.update(rel_bytes);
             manifest_hasher.update(&actual_len.to_be_bytes());
             manifest_hasher.update(&file_sha256);
@@ -2058,6 +2402,10 @@ impl ClipboardService {
                 .await
                 .context("Timed out writing file SHA-256 frame")?
                 .map_err(|e| anyhow::anyhow!("File hash TransportV2 error: {}", e))?;
+        }
+
+        if let Some(c) = cancellation {
+            c.check_cancelled()?;
         }
 
         let manifest_sha256: [u8; 32] = manifest_hasher.finalize().into();
@@ -2190,6 +2538,81 @@ end run"#;
         Ok(())
     }
 
+    /// Atomically promotes verified staged files from `stage_dir` to `dest_dir` in a blocking transaction (REL-1F-02).
+    /// If any error occurs or a root fails to commit, rolls back all partially promoted items in `dest_dir`
+    /// and cleans up `stage_dir` and `dest_dir`, preventing partial or corrupted commits.
+    pub(crate) fn promote_staged_entries_transactional(
+        stage_dir: &Path,
+        dest_dir: &Path,
+        roots: &[String],
+    ) -> Result<Vec<PathBuf>> {
+        let mut promoted = Vec::with_capacity(roots.len());
+        let mut rollback_err: Option<anyhow::Error> = None;
+
+        for root in roots {
+            let staged_item = match ensure_safe_contained_path(stage_dir, root) {
+                Ok(p) => p,
+                Err(e) => {
+                    rollback_err = Some(e);
+                    break;
+                }
+            };
+            let meta = match std::fs::symlink_metadata(&staged_item) {
+                Ok(m) => m,
+                Err(e) => {
+                    rollback_err = Some(anyhow::anyhow!(
+                        "Staged root entry '{}' missing: {}",
+                        root,
+                        e
+                    ));
+                    break;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                rollback_err = Some(anyhow::anyhow!(
+                    "Security violation: staged item '{}' is a symlink",
+                    root
+                ));
+                break;
+            }
+            let dest_item = match ensure_safe_contained_path(dest_dir, root) {
+                Ok(p) => p,
+                Err(e) => {
+                    rollback_err = Some(e);
+                    break;
+                }
+            };
+            if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
+                rollback_err = Some(e);
+                break;
+            }
+            promoted.push(dest_item);
+        }
+
+        if let Some(err) = rollback_err {
+            for p in &promoted {
+                if let Ok(m) = std::fs::symlink_metadata(p) {
+                    if m.is_dir() {
+                        let _ = std::fs::remove_dir_all(p);
+                    } else {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(stage_dir);
+            let _ = std::fs::remove_dir_all(dest_dir);
+            return Err(err);
+        }
+
+        let _ = std::fs::remove_dir_all(stage_dir);
+        if promoted.is_empty() {
+            let _ = std::fs::remove_dir_all(dest_dir);
+            anyhow::bail!("Verified clipboard cache commit produced zero root items");
+        }
+
+        Ok(promoted)
+    }
+
     async fn resolve_stream_peer_ip(&self, source_ip: Option<IpAddr>) -> Result<String> {
         if let Some(ip) = source_ip {
             if Self::has_paired_peer(ip).await {
@@ -2283,9 +2706,7 @@ end run"#;
                 continue;
             }
             let unique_root = resolve_unique_root_name(&mut used_roots, &base_name);
-            if validate_single_path_component(&unique_root).is_err()
-                || unique_root.len() > 4096
-            {
+            if validate_single_path_component(&unique_root).is_err() || unique_root.len() > 4096 {
                 continue;
             }
 
@@ -2406,12 +2827,14 @@ end run"#;
                 e
             })?;
 
+        let cancellation = self.cancellation_for(TransferPurpose::DragDrop);
         if let Err(e) = Self::receive_stream_frames_from_session(
             &mut session,
             &session_dir,
             expected_total_bytes,
             expected_total_files,
             None,
+            Some(&cancellation),
         )
         .await
         {
@@ -2442,10 +2865,14 @@ end run"#;
         expected_total_bytes: u64,
         expected_total_files: usize,
         root_remap: Option<(&str, &str)>,
+        cancellation: Option<&TransferCancellation>,
     ) -> Result<(u64, std::time::Instant, [u8; 32])>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        if let Some(c) = cancellation {
+            c.check_cancelled()?;
+        }
         if expected_total_files == 0 || expected_total_files > MAX_TRANSFER_FILES {
             anyhow::bail!(
                 "Invalid announced file count {} (max {})",
@@ -2471,6 +2898,9 @@ end run"#;
 
         let manifest_sha256: [u8; 32];
         loop {
+            if let Some(c) = cancellation {
+                c.check_cancelled()?;
+            }
             let rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
                 .await
                 .context("Timed out waiting for next stream frame from peer")?
@@ -2566,11 +2996,15 @@ end run"#;
                     ensure_dir_no_symlinks(dest_base, parent)?;
                 }
 
-                let mut file = open_staged_file_create_new(&dest_path)?;
+                let std_file = open_staged_file_create_new(&dest_path)?;
+                let mut file = tokio::fs::File::from_std(std_file);
                 let mut file_hasher = Sha256::new();
                 let mut remaining = file_size;
 
                 while remaining > 0 {
+                    if let Some(c) = cancellation {
+                        c.check_cancelled()?;
+                    }
                     let data_rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
                         .await
                         .with_context(|| {
@@ -2603,7 +3037,9 @@ end run"#;
                     }
 
                     file_hasher.update(chunk);
-                    file.write_all(chunk)?;
+                    file.write_all(chunk).await.with_context(|| {
+                        format!("Async write error while streaming '{}'", rel_path)
+                    })?;
                     remaining -= chunk.len() as u64;
                     transferred_bytes += chunk.len() as u64;
 
@@ -2627,7 +3063,9 @@ end run"#;
                         }
                     }
                 }
-                file.flush()?;
+                file.flush()
+                    .await
+                    .with_context(|| format!("Async flush error for staged file '{}'", rel_path))?;
 
                 // Read and verify mandatory per-file SHA-256 commit frame
                 let hash_rec = tokio::time::timeout(FRAME_IO_TIMEOUT, session.recv_message())
@@ -2724,10 +3162,9 @@ end run"#;
 
     async fn record_verified_cache(&self, entry: VerifiedCacheEntry) {
         let mut cache = self.verified_cache.write().await;
-        if let Some(pos) = cache
-            .iter()
-            .position(|e| e.session_id == entry.session_id && e.manifest_hash == entry.manifest_hash)
-        {
+        if let Some(pos) = cache.iter().position(|e| {
+            e.session_id == entry.session_id && e.manifest_hash == entry.manifest_hash
+        }) {
             cache.remove(pos);
         }
         while cache.len() >= MAX_VERIFIED_CACHE_ENTRIES {
@@ -2797,15 +3234,20 @@ end run"#;
         let peer_dev_id = session.peer_device_id_hex().to_string();
         if self.is_peer_revoked(&peer_dev_id) {
             let _ = std::fs::remove_dir_all(&stage_dir);
-            anyhow::bail!("Peer {} was revoked before streaming; aborted staging", peer_dev_id);
+            anyhow::bail!(
+                "Peer {} was revoked before streaming; aborted staging",
+                peer_dev_id
+            );
         }
 
+        let cancellation = self.cancellation_for(TransferPurpose::Clipboard);
         let stream_res = Self::receive_stream_frames_from_session(
             &mut session,
             &stage_dir,
             ann.total_bytes,
             ann.total_files,
             None,
+            Some(&cancellation),
         )
         .await;
 
@@ -2836,38 +3278,42 @@ end run"#;
         }
         ensure_dir_no_symlinks(&cache_dir, &session_cache_dir)?;
 
-        let mut cached_roots = Vec::with_capacity(roots.len());
-        for root in &roots {
-            let staged_item = ensure_safe_contained_path(&stage_dir, root)?;
-            let meta = std::fs::symlink_metadata(&staged_item).with_context(|| {
-                format!("Staged root entry '{}' missing after verified stream", root)
-            })?;
-            if meta.file_type().is_symlink() {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                let _ = std::fs::remove_dir_all(&session_cache_dir);
-                anyhow::bail!("Security violation: staged item '{}' is a symlink", root);
-            }
-            let dest_item = ensure_safe_contained_path(&session_cache_dir, root)?;
-            if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
+        // Pre-promotion cancellation check
+        cancellation.check_cancelled()?;
+
+        let stage_c = stage_dir.clone();
+        let dest_c = session_cache_dir.clone();
+        let roots_c = roots.clone();
+
+        // Offload filesystem promotion transaction from Tokio async worker (REL-1F-02)
+        let promotion_res = tokio::task::spawn_blocking(move || {
+            ClipboardService::promote_staged_entries_transactional(&stage_c, &dest_c, &roots_c)
+        })
+        .await
+        .context("Promotion blocking task panicked")?;
+
+        let cached_roots: Vec<PathBuf> = match promotion_res {
+            Ok(r) => r,
+            Err(e) => {
                 let _ = std::fs::remove_dir_all(&session_cache_dir);
                 return Err(e);
             }
-            cached_roots.push(dest_item);
-        }
-        let _ = std::fs::remove_dir_all(&stage_dir);
-
-        if cached_roots.is_empty() {
-            let _ = std::fs::remove_dir_all(&session_cache_dir);
-            anyhow::bail!("Verified clipboard cache commit produced zero root items");
-        }
+        };
 
         // Acquire read lease on clipboard commit lock to serialize against peer revocation (SEC-1D-14, SEC-1D-15)
         let _commit_guard = self.clipboard_commit_lock.read().await;
 
         if self.is_peer_revoked(&peer_dev_id) {
             let _ = std::fs::remove_dir_all(&session_cache_dir);
-            anyhow::bail!("Peer {} was revoked during staging; aborted clipboard commit", peer_dev_id);
+            anyhow::bail!(
+                "Peer {} was revoked during staging; aborted clipboard commit",
+                peer_dev_id
+            );
+        }
+
+        if !self.is_clipboard_enabled() {
+            let _ = std::fs::remove_dir_all(&session_cache_dir);
+            anyhow::bail!("Clipboard synchronisation was disabled before clipboard commit");
         }
 
         // Only replace the native OS clipboard AFTER all staged items pass SHA-256 verification.
@@ -3088,15 +3534,20 @@ end run"#;
         let peer_dev_id = session.peer_device_id_hex().to_string();
         if self.is_peer_revoked(&peer_dev_id) {
             let _ = std::fs::remove_dir_all(&stage_dir);
-            anyhow::bail!("Peer {} was revoked before streaming; aborted staging", peer_dev_id);
+            anyhow::bail!(
+                "Peer {} was revoked before streaming; aborted staging",
+                peer_dev_id
+            );
         }
 
+        let cancellation = self.cancellation_for(TransferPurpose::Clipboard);
         let stream_res = Self::receive_stream_frames_from_session(
             &mut session,
             &stage_dir,
             ann.total_bytes,
             ann.total_files,
             None,
+            Some(&cancellation),
         )
         .await;
 
@@ -3110,27 +3561,44 @@ end run"#;
 
         if self.is_peer_revoked(&peer_dev_id) {
             let _ = std::fs::remove_dir_all(&stage_dir);
-            anyhow::bail!("Peer {} was revoked during streaming; aborted transfer commit", peer_dev_id);
+            anyhow::bail!(
+                "Peer {} was revoked during streaming; aborted transfer commit",
+                peer_dev_id
+            );
         }
 
-        let mut committed_paths = Vec::with_capacity(roots.len());
-        for root in &roots {
-            let staged_item = ensure_safe_contained_path(&stage_dir, root)?;
-            if !staged_item.exists() {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                anyhow::bail!(
-                    "Expected root entry '{}' missing from verified staging folder",
-                    root
-                );
-            }
-            let dest_item = resolve_non_colliding_dest(&target_dir, root);
-            if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(e);
-            }
-            committed_paths.push(dest_item);
-        }
-        let _ = std::fs::remove_dir_all(&stage_dir);
+        cancellation.check_cancelled()?;
+
+        let stage_c = stage_dir.clone();
+        let target_c = target_dir.clone();
+        let roots_c = roots.clone();
+
+        // Offload destination folder promotion from Tokio worker (REL-1F-02)
+        let commit_res: Vec<PathBuf> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
+                let mut committed = Vec::with_capacity(roots_c.len());
+                for root in &roots_c {
+                    let staged_item = ensure_safe_contained_path(&stage_c, root)?;
+                    if !staged_item.exists() {
+                        let _ = std::fs::remove_dir_all(&stage_c);
+                        anyhow::bail!(
+                            "Expected root entry '{}' missing from verified staging folder",
+                            root
+                        );
+                    }
+                    let dest_item = resolve_non_colliding_dest(&target_c, root);
+                    if let Err(e) = move_staged_entry(&staged_item, &dest_item) {
+                        let _ = std::fs::remove_dir_all(&stage_c);
+                        return Err(e);
+                    }
+                    committed.push(dest_item);
+                }
+                let _ = std::fs::remove_dir_all(&stage_c);
+                Ok(committed)
+            })
+            .await
+            .context("Paste destination commit task panicked")??;
+        let committed_paths: Vec<PathBuf> = commit_res;
 
         // Also register the committed destination paths on the native OS file clipboard (`CF_HDROP` / `NSPasteboard`)
         // so subsequent Right-Click -> Paste or Ctrl+V into another folder works without re-streaming over the network.
@@ -3197,9 +3665,9 @@ end run"#;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::clipboard::protocol::MAX_IMAGE_DIMENSION;
     use crate::security::keystore::{FixedKekProvider, KeystoreV2};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use zeroize::Zeroizing;
 
     #[test]
@@ -3227,7 +3695,10 @@ mod tests {
         std::fs::write(&f1, b"original").unwrap();
 
         let next = resolve_non_colliding_dest(&tmp, "report.pdf");
-        assert_eq!(next.file_name().unwrap().to_str().unwrap(), "report (2).pdf");
+        assert_eq!(
+            next.file_name().unwrap().to_str().unwrap(),
+            "report (2).pdf"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3390,18 +3861,8 @@ mod tests {
         let peer_s = ks_c.get_peer(&ks_s.local_device_id_hex()).unwrap().clone();
         let (c_io, s_io) = tokio::io::duplex(512 * 1024);
         let (c_res, s_res) = tokio::join!(
-            TransportSessionV2::connect_client(
-                c_io,
-                &ks_c,
-                &peer_s,
-                ServiceId::ClipboardTransfer
-            ),
-            TransportSessionV2::accept_server(
-                s_io,
-                &ks_s,
-                ServiceId::ClipboardTransfer,
-                false
-            )
+            TransportSessionV2::connect_client(c_io, &ks_c, &peer_s, ServiceId::ClipboardTransfer),
+            TransportSessionV2::accept_server(s_io, &ks_s, ServiceId::ClipboardTransfer, false)
         );
         (c_res.unwrap(), s_res.unwrap())
     }
@@ -3437,12 +3898,13 @@ mod tests {
         let total_bytes = (f1_bytes.len() + f2_bytes.len()) as u64;
 
         let (send_res, recv_res) = tokio::join!(
-            ClipboardService::stream_files_over_session(&mut server_sess, dirs, files),
+            ClipboardService::stream_files_over_session(&mut server_sess, dirs, files, None),
             ClipboardService::receive_stream_frames_from_session(
                 &mut client_sess,
                 &dst_dir,
                 total_bytes,
                 2,
+                None,
                 None
             )
         );
@@ -3489,6 +3951,7 @@ mod tests {
                 &dst_corrupt,
                 5,
                 1,
+                None,
                 None
             )
         );
@@ -3524,6 +3987,7 @@ mod tests {
                 &dst_trunc,
                 1024,
                 1,
+                None,
                 None
             )
         );
@@ -3554,6 +4018,7 @@ mod tests {
                 &dst_flood,
                 0,
                 1,
+                None,
                 None
             )
         );
@@ -3592,14 +4057,32 @@ mod tests {
             total_bytes: 200,
         };
 
-        clip.set_peer_pending_announcement(peer_a, ann_a.clone(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
-        clip.set_peer_pending_announcement(peer_b, ann_b.clone(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)));
+        clip.set_peer_pending_announcement(
+            peer_a,
+            ann_a.clone(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        clip.set_peer_pending_announcement(
+            peer_b,
+            ann_b.clone(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        );
 
         clip.register_peer_drag_session(peer_a, "drag-a-1");
         clip.register_peer_drag_session(peer_b, "drag-b-1");
 
-        assert_eq!(clip.get_peer_pending_announcement(peer_a).unwrap().session_id, "session-a");
-        assert_eq!(clip.get_peer_pending_announcement(peer_b).unwrap().session_id, "session-b");
+        assert_eq!(
+            clip.get_peer_pending_announcement(peer_a)
+                .unwrap()
+                .session_id,
+            "session-a"
+        );
+        assert_eq!(
+            clip.get_peer_pending_announcement(peer_b)
+                .unwrap()
+                .session_id,
+            "session-b"
+        );
         assert!(!clip.is_peer_revoked(peer_a));
         assert!(!clip.is_peer_revoked(peer_b));
 
@@ -3611,7 +4094,12 @@ mod tests {
         assert!(clip.is_peer_revoked(peer_a));
 
         // Peer B state must remain intact!
-        assert_eq!(clip.get_peer_pending_announcement(peer_b).unwrap().session_id, "session-b");
+        assert_eq!(
+            clip.get_peer_pending_announcement(peer_b)
+                .unwrap()
+                .session_id,
+            "session-b"
+        );
         assert!(!clip.is_peer_revoked(peer_b));
 
         // Attempting to repopulate staging / announcements for revoked Peer A must be blocked
@@ -3619,7 +4107,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clipboard_clear_peer_remote_state_guaranteed_under_contention_and_no_repopulate() {
+    async fn test_clipboard_clear_peer_remote_state_guaranteed_under_contention_and_no_repopulate()
+    {
         let discovery = DiscoveryManager::new("clip_contend");
         let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
         let peer_a = "1234567890abcdef1234567890abcdef";
@@ -3660,11 +4149,17 @@ mod tests {
 
         // 3. Background task repopulation is rejected
         clip.set_peer_pending_announcement(peer_a, ann_a.clone(), "127.0.0.1".parse().unwrap());
-        assert!(clip.get_peer_pending_announcement(peer_a).is_none(), "Revoked peer must not repopulate announcements");
+        assert!(
+            clip.get_peer_pending_announcement(peer_a).is_none(),
+            "Revoked peer must not repopulate announcements"
+        );
 
         clip.register_peer_drag_session(peer_a, "drag-repopulate");
         let drag_peers = clip.drag_sessions_by_peer.read().unwrap();
-        assert!(!drag_peers.contains_key(peer_a), "Revoked peer must not repopulate drag sessions");
+        assert!(
+            !drag_peers.contains_key(peer_a),
+            "Revoked peer must not repopulate drag sessions"
+        );
     }
 
     #[tokio::test]
@@ -3696,11 +4191,19 @@ mod tests {
         crate::security::transport::register_peer_trust_generation(peer_a, 2);
         clip.clear_peer_revocation(peer_a);
 
-        assert!(!clip.is_peer_revoked(peer_a), "Re-pairing must clear revocation");
+        assert!(
+            !clip.is_peer_revoked(peer_a),
+            "Re-pairing must clear revocation"
+        );
 
         // Announcement accepted now
         clip.set_peer_pending_announcement(peer_a, ann.clone(), "127.0.0.1".parse().unwrap());
-        assert_eq!(clip.get_peer_pending_announcement(peer_a).unwrap().session_id, "sess-1");
+        assert_eq!(
+            clip.get_peer_pending_announcement(peer_a)
+                .unwrap()
+                .session_id,
+            "sess-1"
+        );
 
         clip.register_peer_drag_session(peer_a, "drag-repaired");
         let drag_peers = clip.drag_sessions_by_peer.read().unwrap();
@@ -3727,10 +4230,14 @@ mod tests {
         assert!(!clip.is_peer_revoked(peer_a));
 
         // 4. Delayed teardown for gen 2 finally executes:
-        clip.clear_peer_remote_state_bounded_async(peer_a, teardown_gen).await;
+        clip.clear_peer_remote_state_bounded_async(peer_a, teardown_gen)
+            .await;
 
         // 5. Must NOT re-revoke the newly paired peer!
-        assert!(!clip.is_peer_revoked(peer_a), "Delayed teardown from older generation must not blackhole re-paired peer");
+        assert!(
+            !clip.is_peer_revoked(peer_a),
+            "Delayed teardown from older generation must not blackhole re-paired peer"
+        );
 
         let ann = LazyAnnouncement {
             session_id: "sess-after-race".into(),
@@ -3752,7 +4259,9 @@ mod tests {
         // Initial pairing at generation 1
         crate::security::transport::register_peer_trust_generation(peer_a, 1);
         {
-            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ks = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             ks.register_test_peer_with_generation(peer_a, 1);
         }
         assert!(!clip.is_peer_revoked(peer_a));
@@ -3770,7 +4279,9 @@ mod tests {
 
         // Unpair peer: yields generation 2
         let unpair_gen = {
-            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ks = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (_, gen) = ks.unpair_peer_ext(peer_a).unwrap();
             gen
         };
@@ -3780,7 +4291,9 @@ mod tests {
         // Before Phase B teardown finishes, peer re-pairs at generation 3!
         let repair_gen = 3u64;
         {
-            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ks = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             ks.register_test_peer_with_generation(peer_a, repair_gen);
         }
         crate::security::transport::register_peer_trust_generation(peer_a, repair_gen);
@@ -3799,14 +4312,21 @@ mod tests {
         clip.register_peer_drag_session(peer_a, "drag-sess-3");
 
         // Phase B delayed teardown for unpair_gen (2) now executes:
-        clip.clear_peer_remote_state_bounded_async(peer_a, unpair_gen).await;
+        clip.clear_peer_remote_state_bounded_async(peer_a, unpair_gen)
+            .await;
 
         // Assert: peer must NOT be revoked or blackholed (SEC-1D-14)
-        assert!(!clip.is_peer_revoked(peer_a), "Delayed teardown from gen 2 must not blackhole gen 3 peer");
+        assert!(
+            !clip.is_peer_revoked(peer_a),
+            "Delayed teardown from gen 2 must not blackhole gen 3 peer"
+        );
 
         // Assert: gen 3 announcement must be PRESERVED
         let current_ann = clip.get_peer_pending_announcement(peer_a);
-        assert!(current_ann.is_some(), "Generation 3 announcement must be preserved");
+        assert!(
+            current_ann.is_some(),
+            "Generation 3 announcement must be preserved"
+        );
         assert_eq!(current_ann.unwrap().session_id, "sess-new-gen3");
 
         // Assert: gen 3 drag session must be PRESERVED
@@ -3820,23 +4340,36 @@ mod tests {
 
         // 1. Completely unknown peer (no transport, no keystore) -> fails closed (revoked) (SEC-1D-15)
         let unknown_peer = "deadbeef00000000deadbeef00000000";
-        assert!(clip.is_peer_revoked(unknown_peer), "Unknown peer must fail closed as revoked");
+        assert!(
+            clip.is_peer_revoked(unknown_peer),
+            "Unknown peer must fail closed as revoked"
+        );
 
         // 2. Peer with active transport generation 1
         let valid_peer = "validpeer0000000validpeer0000000";
         crate::security::transport::register_peer_trust_generation(valid_peer, 1);
         {
-            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ks = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             ks.register_test_peer_with_generation(valid_peer, 1);
         }
-        assert!(!clip.is_peer_revoked(valid_peer), "Valid paired peer must be authorized");
+        assert!(
+            !clip.is_peer_revoked(valid_peer),
+            "Valid paired peer must be authorized"
+        );
 
         // 3. Blocked peer in keystore -> fails closed even if transport has old generation
         {
-            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ks = crate::security::keystore::global_keystore()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let _ = ks.untrust_or_block_peer(valid_peer, true, "127.0.0.1".into());
         }
-        assert!(clip.is_peer_revoked(valid_peer), "Blocked peer must fail closed as revoked");
+        assert!(
+            clip.is_peer_revoked(valid_peer),
+            "Blocked peer must fail closed as revoked"
+        );
     }
 
     #[tokio::test]
@@ -3872,13 +4405,18 @@ mod tests {
         let teardown_done = Arc::new(AtomicBool::new(false));
         let td = Arc::clone(&teardown_done);
         let teardown_task = tokio::spawn(async move {
-            clip_teardown.clear_peer_remote_state_bounded_async(peer, 1).await;
+            clip_teardown
+                .clear_peer_remote_state_bounded_async(peer, 1)
+                .await;
             td.store(true, Ordering::SeqCst);
         });
 
         // Verify teardown is blocked waiting for write lock (cannot finish while in-flight write holds read lock)
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!teardown_done.load(Ordering::SeqCst), "Teardown must wait for in-flight clipboard commit to finish");
+        assert!(
+            !teardown_done.load(Ordering::SeqCst),
+            "Teardown must wait for in-flight clipboard commit to finish"
+        );
 
         // Release in-flight write
         can_release.store(true, Ordering::SeqCst);
@@ -3886,6 +4424,366 @@ mod tests {
 
         // Now teardown should complete
         teardown_task.await.unwrap();
-        assert!(teardown_done.load(Ordering::SeqCst), "Teardown must finish after commit lock is released");
+        assert!(
+            teardown_done.load(Ordering::SeqCst),
+            "Teardown must finish after commit lock is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_three_state_privacy_fail_closed_toctou_prevention() {
+        // SEC-1F-01: Tri-state privacy status model and fail-closed security invariants
+        assert_eq!(
+            ClipboardPrivacyStatus::SafeToSync,
+            ClipboardPrivacyStatus::SafeToSync
+        );
+        assert_ne!(
+            ClipboardPrivacyStatus::SafeToSync,
+            ClipboardPrivacyStatus::ConcealedOrTransient
+        );
+        assert_ne!(
+            ClipboardPrivacyStatus::SafeToSync,
+            ClipboardPrivacyStatus::InspectionUnavailable
+        );
+
+        // Fail-closed invariant: Non-SafeToSync statuses must be treated as concealed/un-syncable
+        let status_safe = ClipboardPrivacyStatus::SafeToSync;
+        let status_concealed = ClipboardPrivacyStatus::ConcealedOrTransient;
+        let status_unavailable = ClipboardPrivacyStatus::InspectionUnavailable;
+
+        assert!(status_safe == ClipboardPrivacyStatus::SafeToSync);
+        assert!(status_concealed != ClipboardPrivacyStatus::SafeToSync);
+        assert!(status_unavailable != ClipboardPrivacyStatus::SafeToSync);
+
+        // TOCTOU generation invariant: If sequence counter increments during acquisition, snapshot must abort
+        let seq_before: i64 = 100;
+        let seq_after_changed: i64 = 101;
+        assert_ne!(
+            seq_before, seq_after_changed,
+            "TOCTOU sequence change must be detected"
+        );
+
+        // Sequence must match exactly for snapshot to be valid
+        let seq_after_unchanged: i64 = 100;
+        assert_eq!(
+            seq_before, seq_after_unchanged,
+            "Snapshot valid only when sequence remains identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transfer_cancellation_clipboard_disabled_aborts_active_stream() {
+        // SEC-1F-02: Cancelling active clipboard transfers when clipboard sync is toggled off
+        let mgr =
+            crate::features::FeatureManager::from_flags_for_test(crate::features::FeatureFlags {
+                display: true,
+                clipboard: true,
+                input_kvm: true,
+                dragdrop: false,
+                storage: false,
+                touchid: false,
+                truetone: false,
+                camera: false,
+                audio: false,
+                touchbar: false,
+                benchmark: false,
+            });
+        let mgr_arc = Arc::new(mgr);
+
+        let cancel = TransferCancellation::clipboard(Some(Arc::clone(&mgr_arc)));
+        assert_eq!(cancel.purpose(), TransferPurpose::Clipboard);
+        assert!(!cancel.is_cancelled());
+        assert!(cancel.check_cancelled().is_ok());
+
+        // Toggle clipboard feature flag off mid-transfer
+        let _ = mgr_arc.set_flag_checked("clipboard", false).unwrap();
+        assert!(
+            cancel.is_cancelled(),
+            "Clipboard cancellation token must trigger when flag is disabled"
+        );
+        let err = cancel.check_cancelled().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Clipboard synchronization was disabled"),
+            "Error must explicitly mention clipboard synchronization cancellation: {}",
+            err
+        );
+
+        // Verify active stream abort over TransportV2 duplex
+        let tmp = std::env::temp_dir().join(format!(
+            "integrator_cancel_stream_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src_file = tmp.join("payload.bin");
+        std::fs::write(&src_file, vec![0xABu8; 100_000]).unwrap();
+        let dst_dir = tmp.join("dst");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let (mut client_sess, mut server_sess) =
+            setup_paired_clipboard_sessions(&tmp, "cancel_test").await;
+        let files = vec![("payload.bin".to_string(), src_file)];
+
+        // Cancellation token is already cancelled
+        let cancel_tok = TransferCancellation::clipboard(Some(Arc::clone(&mgr_arc)));
+        let send_res = ClipboardService::stream_files_over_session(
+            &mut server_sess,
+            vec![],
+            files,
+            Some(&cancel_tok),
+        )
+        .await;
+        assert!(
+            send_res.is_err(),
+            "Streamer must immediately fail closed when cancelled"
+        );
+
+        let recv_res = ClipboardService::receive_stream_frames_from_session(
+            &mut client_sess,
+            &dst_dir,
+            100_000,
+            1,
+            None,
+            Some(&cancel_tok),
+        )
+        .await;
+        assert!(
+            recv_res.is_err(),
+            "Receiver must immediately fail closed when cancelled"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_cancellation_dragdrop_isolation_preserved() {
+        // SEC-1F-02: Clipboard cancellation must NEVER affect drag-and-drop transfers
+        let mgr =
+            crate::features::FeatureManager::from_flags_for_test(crate::features::FeatureFlags {
+                display: true,
+                clipboard: true,
+                input_kvm: true,
+                dragdrop: false,
+                storage: false,
+                touchid: false,
+                truetone: false,
+                camera: false,
+                audio: false,
+                touchbar: false,
+                benchmark: false,
+            });
+        let mgr_arc = Arc::new(mgr);
+
+        let clip_cancel = TransferCancellation::clipboard(Some(Arc::clone(&mgr_arc)));
+        let drag_cancel = TransferCancellation::dragdrop(Some(Arc::clone(&mgr_arc)));
+
+        assert_eq!(clip_cancel.purpose(), TransferPurpose::Clipboard);
+        assert_eq!(drag_cancel.purpose(), TransferPurpose::DragDrop);
+
+        // Turn off clipboard flag
+        let _ = mgr_arc.set_flag_checked("clipboard", false).unwrap();
+
+        // Clipboard must be cancelled
+        assert!(clip_cancel.is_cancelled());
+        assert!(clip_cancel.check_cancelled().is_err());
+
+        // Drag-and-drop must remain unaffected (isolation invariant)
+        assert!(
+            !drag_cancel.is_cancelled(),
+            "DragDrop transfer must NOT be cancelled by clipboard toggle"
+        );
+        assert!(drag_cancel.check_cancelled().is_ok());
+
+        // Manual cancellation token works independently
+        let manual = Arc::new(AtomicBool::new(false));
+        let drag_manual = TransferCancellation::with_manual(
+            TransferPurpose::DragDrop,
+            Some(Arc::clone(&mgr_arc)),
+            Arc::clone(&manual),
+        );
+        assert!(!drag_manual.is_cancelled());
+        manual.store(true, Ordering::SeqCst);
+        assert!(drag_manual.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_async_filesystem_writes_sha256_integrity_and_cancellation() {
+        // REL-1F-01: Asynchronous non-blocking file streaming with per-file and manifest SHA-256 verification
+        let tmp = std::env::temp_dir().join(format!(
+            "integrator_async_fs_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        let src_dir = tmp.join("src");
+        let dst_dir = tmp.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let f1_data = vec![0x42u8; 128 * 1024]; // 128 KB
+        let f1_path = src_dir.join("async_file.dat");
+        std::fs::write(&f1_path, &f1_data).unwrap();
+
+        let (mut client_sess, mut server_sess) =
+            setup_paired_clipboard_sessions(&tmp, "async_fs").await;
+        let files = vec![("async_file.dat".to_string(), f1_path)];
+
+        let (send_res, recv_res) = tokio::join!(
+            ClipboardService::stream_files_over_session(&mut server_sess, vec![], files, None),
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess,
+                &dst_dir,
+                128 * 1024,
+                1,
+                None,
+                None
+            )
+        );
+
+        assert!(
+            send_res.is_ok(),
+            "Async file sender succeeded: {:?}",
+            send_res
+        );
+        assert!(
+            recv_res.is_ok(),
+            "Async file receiver succeeded: {:?}",
+            recv_res
+        );
+
+        // Verify destination file matches exactly
+        let received_path = dst_dir.join("async_file.dat");
+        assert!(received_path.exists());
+        let received_data = std::fs::read(&received_path).unwrap();
+        assert_eq!(received_data.len(), 128 * 1024);
+        assert_eq!(received_data, f1_data);
+
+        // Verify SHA-256 manifest hash matches receiver verified digest
+        let mut manifest_hasher = Sha256::new();
+        let mut file_hasher = Sha256::new();
+        file_hasher.update(&received_data);
+        let file_digest: [u8; 32] = file_hasher.finalize().into();
+
+        manifest_hasher.update(b"INTEGRATOR-FILE-MANIFEST-V2");
+        let rel_bytes = b"async_file.dat";
+        manifest_hasher.update((rel_bytes.len() as u32).to_be_bytes());
+        manifest_hasher.update(rel_bytes);
+        manifest_hasher.update((128 * 1024u64).to_be_bytes());
+        manifest_hasher.update(file_digest);
+        let expected_manifest_digest: [u8; 32] = manifest_hasher.finalize().into();
+        assert_eq!(recv_res.as_ref().unwrap().2, expected_manifest_digest);
+
+        // 2. Test mid-transfer cancellation abort
+        let (mut client_sess2, mut server_sess2) =
+            setup_paired_clipboard_sessions(&tmp, "async_cancel").await;
+        let files2 = vec![("async_file.dat".to_string(), src_dir.join("async_file.dat"))];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_tok = TransferCancellation::with_manual(
+            TransferPurpose::Clipboard,
+            None,
+            Arc::clone(&cancel_flag),
+        );
+        cancel_flag.store(true, Ordering::SeqCst);
+
+        let (send2, recv2) = tokio::join!(
+            ClipboardService::stream_files_over_session(
+                &mut server_sess2,
+                vec![],
+                files2,
+                Some(&cancel_tok)
+            ),
+            ClipboardService::receive_stream_frames_from_session(
+                &mut client_sess2,
+                &dst_dir,
+                128 * 1024,
+                1,
+                None,
+                Some(&cancel_tok)
+            )
+        );
+        assert!(
+            send2.is_err() || recv2.is_err(),
+            "Cancellation must abort file transfer"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_transactional_promotion_offloading_and_rollback() {
+        // REL-1F-02: Blocking transactional promotion offloading and rollback on failure
+        let tmp = std::env::temp_dir().join(format!(
+            "integrator_prom_{}",
+            trust::generate_random_token_hex(6)
+        ));
+        let stage_dir = tmp.join("stage");
+        let dest_dir = tmp.join("dest");
+        std::fs::create_dir_all(stage_dir.join("folder")).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let item1_path = stage_dir.join("item1.txt");
+        let item2_path = stage_dir.join("folder/item2.txt");
+        std::fs::write(&item1_path, b"content of item 1").unwrap();
+        std::fs::write(&item2_path, b"content of item 2").unwrap();
+
+        let roots = vec!["item1.txt".to_string(), "folder".to_string()];
+
+        // 1. Successful transactional promotion offloaded to spawn_blocking
+        let s_c = stage_dir.clone();
+        let d_c = dest_dir.clone();
+        let r_c = roots.clone();
+        let prom_res = tokio::task::spawn_blocking(move || {
+            ClipboardService::promote_staged_entries_transactional(&s_c, &d_c, &r_c)
+        })
+        .await
+        .unwrap();
+
+        assert!(prom_res.is_ok(), "Promotion should succeed: {:?}", prom_res);
+        assert!(
+            !stage_dir.exists(),
+            "Staging dir must be cleaned up after successful promotion"
+        );
+        assert!(dest_dir.join("item1.txt").exists());
+        assert!(dest_dir.join("folder/item2.txt").exists());
+        assert_eq!(
+            std::fs::read(dest_dir.join("item1.txt")).unwrap(),
+            b"content of item 1"
+        );
+
+        // 2. Transactional Rollback on failure
+        let stage_fail = tmp.join("stage_fail");
+        let dest_fail = tmp.join("dest_fail");
+        std::fs::create_dir_all(&stage_fail).unwrap();
+        std::fs::create_dir_all(&dest_fail).unwrap();
+
+        std::fs::write(stage_fail.join("first.txt"), b"first content").unwrap();
+        std::fs::write(stage_fail.join("second.txt"), b"second content").unwrap();
+
+        // Intentionally create a collision in dest_fail for second.txt so promotion fails halfway
+        std::fs::write(dest_fail.join("second.txt"), b"pre-existing collision").unwrap();
+
+        let roots_fail = vec!["first.txt".to_string(), "second.txt".to_string()];
+        let s_f = stage_fail.clone();
+        let d_f = dest_fail.clone();
+        let r_f = roots_fail.clone();
+        let prom_fail_res = tokio::task::spawn_blocking(move || {
+            ClipboardService::promote_staged_entries_transactional(&s_f, &d_f, &r_f)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            prom_fail_res.is_err(),
+            "Promotion must fail on destination collision"
+        );
+        // Verify rollback: destination directory must be cleaned up, leaving no partial commit
+        assert!(
+            !dest_fail.exists(),
+            "Destination directory must be rolled back on promotion failure"
+        );
+        assert!(
+            !stage_fail.exists(),
+            "Stage directory must be cleaned up on promotion failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

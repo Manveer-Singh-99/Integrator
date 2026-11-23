@@ -164,6 +164,9 @@ impl LinkMonitor {
     /// Emits structured `info!` logs when connection is established or re-established,
     /// and `warn!` logs when link connectivity is severed.
     pub async fn run_watchdog_until(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        if *shutdown.borrow() {
+            return;
+        }
         let peer_ip = self.peer_addr.ip().to_string();
 
         // Perform initial route discovery to classify interface medium (e.g. Thunderbolt vs Wi-Fi)

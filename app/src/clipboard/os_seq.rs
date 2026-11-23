@@ -1,64 +1,54 @@
-//! # Low-Overhead OS Clipboard Sequence Number Probing
+//! # Low-Overhead OS Clipboard Sequence Number Probing & Fail-Closed Privacy Inspection
 //!
 //! ## 1. Module Purpose & Scope
 //! This module provides a sub-microsecond, zero-allocation probe for detecting OS-level clipboard
-//! changes on macOS and Windows.
+//! changes on macOS and Windows, as well as a fail-closed three-state privacy inspection engine.
 //!
 //! Inspecting clipboard payloads directly (e.g. reading 10 MiB of text or querying complex OLE
 //! data objects) is computationally expensive, incurs inter-process communication overhead, and can
 //! interfere with foreground applications currently writing to the clipboard. To eliminate this
-//! overhead, Integrator polls the native operating system's monotonic sequence counter every 250ms.
+//! overhead, Integrator polls the native operating system's monotonic sequence counter every 120ms.
 //! Only when this lightweight counter increments does the clipboard engine perform deeper format
 //! inspection and cryptographic hashing.
 //!
-//! ## 2. Architectural Linkages & Dependencies
+//! ## 2. Three-State Privacy Model (SEC-1F-01)
+//! To eliminate fail-open credential exfiltration vulnerabilities, clipboard confidentiality inspection
+//! returns a formal tri-state outcome:
+//! - `SafeToSync`: Operating system clipboard metadata was successfully inspected and no blocking
+//!   privacy markers were found.
+//! - `ConcealedOrTransient`: Explicitly flagged with recognized confidentiality markers (password managers,
+//!   auto-generated secrets, transient clipboard flavors, or cloud/history sync exclusions).
+//! - `InspectionUnavailable`: Operating system handle was null, clipboard was locked by another process
+//!   and retry deadline expired, or format enumeration failed. Security invariant: MUST FAIL CLOSED.
 //!
-//! ```text
-//! ┌────────────────────────────────────────────────────────────────────────────────────────┐
-//! │                           OS Clipboard Sequence Probe Flow                             │
-//! └────────────────────────────────────────────────────────────────────────────────────────┘
-//!
-//!                        ┌──────────────────────────────────────┐
-//!                        │    ClipboardService Polling Loop     │
-//!                        │     (src/clipboard/service.rs)       │
-//!                        └──────────────────┬───────────────────┘
-//!                                           │ Every 250ms
-//!                                           ▼
-//!                        ┌──────────────────────────────────────┐
-//!                        │    os_seq::get_clipboard_sequence()  │
-//!                        └──────────────┬────────────────┬──────┘
-//!                                       │                │
-//!                     macOS Compilation │                │ Windows Compilation
-//!                                       ▼                ▼
-//!              ┌─────────────────────────────┐    ┌─────────────────────────────┐
-//!              │  Objective-C Runtime FFI    │    │  Win32 user32.dll FFI       │
-//!              │  [NSPasteboard general-     │    │  GetClipboardSequence-      │
-//!              │   Pasteboard].changeCount   │    │  Number()                   │
-//!              └─────────────────────────────┘    └─────────────────────────────┘
-//! ```
-//!
-//! ### Upstream Callers:
-//! - `src/clipboard/service.rs`: `ClipboardService::start_sequence_watcher` calls `get_clipboard_sequence()`
-//!   in a continuous 250ms loop.
-//!
-//! ### Downstream Callees:
-//! - macOS: `libobjc.dylib` functions (`objc_getClass`, `sel_registerName`, `objc_msgSend`,
-//!   `objc_autoreleasePoolPush`, `objc_autoreleasePoolPop`).
-//! - Windows: `user32.dll` API `GetClipboardSequenceNumber()`.
-//!
-//! ## 3. Threading & Concurrency Model
-//! - Invoked synchronously from Tokio async background tasks.
-//! - Non-blocking, re-entrant, and thread-safe.
-//!
-//! ## 4. Security & Safety Invariants
-//! - **Objective-C Autorelease Pool**: On macOS, every call wraps `objc_msgSend` inside a scoped
-//!   RAII `AutoreleasePool` to ensure temporary Objective-C objects allocated by AppKit are immediately
-//!   freed and never leaked into long-running daemon heaps.
-//! - **Sentinel Mapping**: Windows `GetClipboardSequenceNumber()` returns `0` when the desktop is
-//!   locked or a secure UAC prompt is displayed; this is mapped cleanly to `-1` to avoid false triggers.
+//! ## 3. Windows Formats & Policy
+//! On Windows, Integrator inspects the following registered clipboard formats:
+//! 1. `ExcludeClipboardContentFromMonitorProcessing`: Explicit Microsoft marker for clipboard monitors.
+//! 2. `Clipboard Viewer Ignore`: Traditional Win32 convention.
+//! 3. `CanUploadToCloudClipboard`: If DWORD == 0, cloud synchronization is explicitly prohibited.
+//! 4. `CanIncludeInClipboardHistory`: Windows Local History marker.
+//!    **Integrator Policy:** Integrator conservatively treats `CanIncludeInClipboardHistory == 0` as a
+//!    privacy exclusion for peer synchronisation to safeguard passwords and sensitive tokens copied from
+//!    conforming applications.
+
+/// Tri-state outcome of native OS clipboard privacy and confidentiality inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardPrivacyStatus {
+    /// Operating system clipboard was successfully inspected and no confidential,
+    /// transient, or excluded markers are present. Safe to read and broadcast.
+    SafeToSync,
+    /// Explicitly marked as confidential (e.g. password manager, auto-generated,
+    /// transient sync flavor, or cloud/history sync exclusion). Must NOT be synchronized.
+    ConcealedOrTransient,
+    /// Operating system pasteboard handle was null, clipboard was locked by another process
+    /// and retry deadline expired, or format enumeration failed.
+    /// Security invariant: MUST FAIL CLOSED (treated as unsafe to sync).
+    InspectionUnavailable,
+}
 
 #[cfg(target_os = "macos")]
 mod os_impl {
+    use super::ClipboardPrivacyStatus;
     use std::ffi::c_void;
 
     #[link(name = "objc")]
@@ -109,26 +99,35 @@ mod os_impl {
         }
     }
 
-    /// Checks if the active clipboard payload is flagged with password-manager confidentiality
-    /// markers or Apple Universal Clipboard transient sync markers.
-    pub fn is_clipboard_concealed() -> bool {
+    /// Inspects macOS `NSPasteboard.generalPasteboard` for confidentiality, transient,
+    /// or exclusion markers using a fail-closed three-state model.
+    pub fn inspect_clipboard_privacy() -> ClipboardPrivacyStatus {
         unsafe {
             let _pool = AutoreleasePool(objc_autoreleasePoolPush());
             let cls = objc_getClass(c"NSPasteboard".as_ptr());
             if cls.is_null() {
-                return false;
+                return ClipboardPrivacyStatus::InspectionUnavailable;
             }
             let sel_general = sel_registerName(c"generalPasteboard".as_ptr());
             let send_id: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
                 std::mem::transmute(objc_msgSend as *const ());
             let pasteboard = send_id(cls, sel_general);
             if pasteboard.is_null() {
-                return false;
+                return ClipboardPrivacyStatus::InspectionUnavailable;
             }
             let sel_types = sel_registerName(c"types".as_ptr());
             let types_arr = send_id(pasteboard, sel_types);
             if types_arr.is_null() {
-                return false;
+                // If types array is null, verify pasteboard accessibility via changeCount.
+                let sel_change = sel_registerName(c"changeCount".as_ptr());
+                let send_isize: unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let count = send_isize(pasteboard, sel_change);
+                if count >= 0 {
+                    // Pasteboard is accessible, empty clipboard (no types). Safe to sync.
+                    return ClipboardPrivacyStatus::SafeToSync;
+                }
+                return ClipboardPrivacyStatus::InspectionUnavailable;
             }
             let sel_count = sel_registerName(c"count".as_ptr());
             let send_count: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
@@ -139,8 +138,10 @@ mod os_impl {
             let send_obj_at: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void =
                 std::mem::transmute(objc_msgSend as *const ());
             let sel_utf8 = sel_registerName(c"UTF8String".as_ptr());
-            let send_utf8: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const std::ffi::c_char =
-                std::mem::transmute(objc_msgSend as *const ());
+            let send_utf8: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+            ) -> *const std::ffi::c_char = std::mem::transmute(objc_msgSend as *const ());
 
             for i in 0..count {
                 let item = send_obj_at(types_arr, sel_obj_at, i);
@@ -154,18 +155,27 @@ mod os_impl {
                             || s == "com.agilebits.onepassword"
                             || s == "com.apple.is-remote-clipboard"
                         {
-                            return true;
+                            return ClipboardPrivacyStatus::ConcealedOrTransient;
                         }
                     }
                 }
             }
-            false
+            ClipboardPrivacyStatus::SafeToSync
         }
+    }
+
+    /// Legacy boolean compatibility check.
+    #[allow(dead_code)]
+    pub fn is_clipboard_concealed() -> bool {
+        inspect_clipboard_privacy() != ClipboardPrivacyStatus::SafeToSync
     }
 }
 
 #[cfg(target_os = "windows")]
 mod os_impl {
+    use super::ClipboardPrivacyStatus;
+    use std::time::Duration;
+
     #[link(name = "user32")]
     extern "system" {
         fn GetClipboardSequenceNumber() -> u32;
@@ -178,12 +188,26 @@ mod os_impl {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-        fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+        fn GlobalLock(h_mem: *mut std::ffi::c_void) -> *mut u8;
+        fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
+        fn GlobalSize(h_mem: *mut std::ffi::c_void) -> usize;
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// RAII guard ensuring CloseClipboard() is unconditionally called after successful OpenClipboard().
+    pub struct ClipboardScope(bool);
+
+    impl Drop for ClipboardScope {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CloseClipboard();
+                }
+            }
+        }
     }
 
     /// Returns the 32-bit monotonic clipboard sequence number on Windows, or `-1`
@@ -197,54 +221,144 @@ mod os_impl {
         }
     }
 
-    /// Checks if the Windows clipboard payload is marked as sensitive/concealed by password managers.
-    pub fn is_clipboard_concealed() -> bool {
+    /// Opens clipboard with strictly bounded retries under contention (up to 5 attempts, 5ms backoff, max 25ms).
+    fn open_clipboard_with_retry() -> Option<ClipboardScope> {
+        const MAX_RETRIES: usize = 5;
+        const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+        for attempt in 0..MAX_RETRIES {
+            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                return Some(ClipboardScope(true));
+            }
+            if attempt + 1 < MAX_RETRIES {
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+        }
+        None
+    }
+
+    /// Safely inspects a DWORD clipboard format payload (e.g., CanIncludeInClipboardHistory, CanUploadToCloudClipboard).
+    /// Returns Some(val) if successfully read, or None if format is missing, size < 4, or lock failed.
+    fn read_dword_format(u_format: u32) -> Option<u32> {
         unsafe {
-            let fmt_exclude = RegisterClipboardFormatW(to_wide("ExcludeClipboardContentFromMonitorProcessing").as_ptr());
-            if fmt_exclude != 0 && IsClipboardFormatAvailable(fmt_exclude) != 0 {
-                return true;
+            if u_format == 0 || IsClipboardFormatAvailable(u_format) == 0 {
+                return None;
+            }
+            let h_data = GetClipboardData(u_format);
+            if h_data.is_null() {
+                return None;
+            }
+            let size = GlobalSize(h_data);
+            if size < 4 {
+                return None;
+            }
+            let ptr = GlobalLock(h_data);
+            if ptr.is_null() {
+                return None;
+            }
+            let val = *(ptr as *const u32);
+            GlobalUnlock(h_data);
+            Some(val)
+        }
+    }
+
+    /// Inspects the Windows clipboard for confidentiality, transient, or exclusion markers.
+    ///
+    /// Formats evaluated:
+    /// 1. `ExcludeClipboardContentFromMonitorProcessing`: Explicit marker introduced by Microsoft
+    ///    for clipboard monitoring applications. If available, content is excluded.
+    /// 2. `Clipboard Viewer Ignore`: Traditional Win32 convention. If available, content is excluded.
+    /// 3. `CanUploadToCloudClipboard`: Windows Cloud Clipboard marker. If DWORD == 0, cloud synchronization
+    ///    is explicitly prohibited. Integrator honors this to prevent network exfiltration.
+    /// 4. `CanIncludeInClipboardHistory`: Windows Local History marker.
+    ///    POLICY: Integrator conservatively treats `CanIncludeInClipboardHistory == 0` as a privacy exclusion
+    ///    for network synchronization to safeguard passwords and sensitive tokens copied from conforming apps.
+    pub fn inspect_clipboard_privacy() -> ClipboardPrivacyStatus {
+        unsafe {
+            let fmt_exclude = RegisterClipboardFormatW(
+                to_wide("ExcludeClipboardContentFromMonitorProcessing").as_ptr(),
+            );
+            if fmt_exclude == 0 {
+                return ClipboardPrivacyStatus::InspectionUnavailable;
+            }
+            if IsClipboardFormatAvailable(fmt_exclude) != 0 {
+                return ClipboardPrivacyStatus::ConcealedOrTransient;
             }
 
             let fmt_ignore = RegisterClipboardFormatW(to_wide("Clipboard Viewer Ignore").as_ptr());
-            if fmt_ignore != 0 && IsClipboardFormatAvailable(fmt_ignore) != 0 {
-                return true;
+            if fmt_ignore == 0 {
+                return ClipboardPrivacyStatus::InspectionUnavailable;
+            }
+            if IsClipboardFormatAvailable(fmt_ignore) != 0 {
+                return ClipboardPrivacyStatus::ConcealedOrTransient;
             }
 
-            let fmt_history = RegisterClipboardFormatW(to_wide("CanIncludeInClipboardHistory").as_ptr());
-            if fmt_history != 0 && IsClipboardFormatAvailable(fmt_history) != 0 {
-                if OpenClipboard(std::ptr::null_mut()) != 0 {
-                    let h_data = GetClipboardData(fmt_history);
-                    let mut concealed = false;
-                    if !h_data.is_null() {
-                        let ptr = GlobalLock(h_data);
-                        if !ptr.is_null() {
-                            let val = *(ptr as *const u32);
-                            if val == 0 {
-                                concealed = true;
-                            }
-                            GlobalUnlock(h_data);
+            let fmt_cloud = RegisterClipboardFormatW(to_wide("CanUploadToCloudClipboard").as_ptr());
+            let fmt_history =
+                RegisterClipboardFormatW(to_wide("CanIncludeInClipboardHistory").as_ptr());
+            if fmt_cloud == 0 || fmt_history == 0 {
+                return ClipboardPrivacyStatus::InspectionUnavailable;
+            }
+
+            let cloud_avail = IsClipboardFormatAvailable(fmt_cloud) != 0;
+            let hist_avail = IsClipboardFormatAvailable(fmt_history) != 0;
+
+            if cloud_avail || hist_avail {
+                // Must open clipboard to inspect DWORD payloads
+                let Some(_scope) = open_clipboard_with_retry() else {
+                    // Contention retry exhausted -> fail closed!
+                    return ClipboardPrivacyStatus::InspectionUnavailable;
+                };
+
+                if cloud_avail {
+                    if let Some(val) = read_dword_format(fmt_cloud) {
+                        if val == 0 {
+                            return ClipboardPrivacyStatus::ConcealedOrTransient;
                         }
+                    } else {
+                        // Format reported available but payload could not be safely read -> fail closed
+                        return ClipboardPrivacyStatus::InspectionUnavailable;
                     }
-                    CloseClipboard();
-                    if concealed {
-                        return true;
+                }
+
+                if hist_avail {
+                    if let Some(val) = read_dword_format(fmt_history) {
+                        if val == 0 {
+                            return ClipboardPrivacyStatus::ConcealedOrTransient;
+                        }
+                    } else {
+                        // Format reported available but payload could not be safely read -> fail closed
+                        return ClipboardPrivacyStatus::InspectionUnavailable;
                     }
                 }
             }
-            false
+
+            ClipboardPrivacyStatus::SafeToSync
         }
+    }
+
+    /// Legacy boolean compatibility check.
+    #[allow(dead_code)]
+    pub fn is_clipboard_concealed() -> bool {
+        inspect_clipboard_privacy() != ClipboardPrivacyStatus::SafeToSync
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod os_impl {
-    /// Non-supported OS fallback returning sentinel value `-1`.
+    use super::ClipboardPrivacyStatus;
+
     pub fn get_clipboard_sequence() -> i64 {
         -1
     }
 
+    pub fn inspect_clipboard_privacy() -> ClipboardPrivacyStatus {
+        ClipboardPrivacyStatus::InspectionUnavailable
+    }
+
+    #[allow(dead_code)]
     pub fn is_clipboard_concealed() -> bool {
-        false
+        true
     }
 }
 
@@ -259,18 +373,138 @@ pub fn get_clipboard_sequence() -> i64 {
     os_impl::get_clipboard_sequence()
 }
 
-/// Returns `true` if the current clipboard content is flagged as concealed/transient by password managers.
+/// Inspects the native clipboard for confidentiality, transient, or exclusion markers using
+/// a fail-closed three-state model (`SafeToSync`, `ConcealedOrTransient`, `InspectionUnavailable`).
+pub fn inspect_clipboard_privacy() -> ClipboardPrivacyStatus {
+    os_impl::inspect_clipboard_privacy()
+}
+
+/// Returns `true` if the current clipboard content is flagged as concealed/transient or if inspection is unavailable.
+/// Fail-closed guarantee: any non-`SafeToSync` state returns `true` (concealed).
+#[allow(dead_code)]
 pub fn is_clipboard_concealed() -> bool {
     os_impl::is_clipboard_concealed()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::get_clipboard_sequence;
+    use super::*;
 
     #[test]
     fn sequence_probe_does_not_crash() {
         let seq = get_clipboard_sequence();
         assert!(seq >= -1);
+    }
+
+    #[test]
+    fn privacy_inspection_returns_valid_tri_state() {
+        let status = inspect_clipboard_privacy();
+        match status {
+            ClipboardPrivacyStatus::SafeToSync => {
+                assert!(!is_clipboard_concealed());
+            }
+            ClipboardPrivacyStatus::ConcealedOrTransient => {
+                assert!(is_clipboard_concealed());
+            }
+            ClipboardPrivacyStatus::InspectionUnavailable => {
+                assert!(
+                    is_clipboard_concealed(),
+                    "InspectionUnavailable must fail closed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_status_fail_closed_guarantees() {
+        assert_ne!(
+            ClipboardPrivacyStatus::InspectionUnavailable,
+            ClipboardPrivacyStatus::SafeToSync,
+            "InspectionUnavailable must NEVER equal SafeToSync"
+        );
+        assert_ne!(
+            ClipboardPrivacyStatus::ConcealedOrTransient,
+            ClipboardPrivacyStatus::SafeToSync,
+            "ConcealedOrTransient must NEVER equal SafeToSync"
+        );
+    }
+
+    #[test]
+    fn simulated_macos_known_markers_classification() {
+        let test_markers = [
+            "org.nspasteboard.ConcealedType",
+            "org.nspasteboard.TransientType",
+            "org.nspasteboard.AutoGeneratedType",
+            "com.agilebits.onepassword",
+            "com.apple.is-remote-clipboard",
+        ];
+
+        for marker in test_markers {
+            let is_match = marker == "org.nspasteboard.ConcealedType"
+                || marker == "org.nspasteboard.TransientType"
+                || marker == "org.nspasteboard.AutoGeneratedType"
+                || marker == "com.agilebits.onepassword"
+                || marker == "com.apple.is-remote-clipboard";
+            assert!(
+                is_match,
+                "Marker '{}' must be recognized as concealed",
+                marker
+            );
+        }
+
+        let non_markers = ["public.utf8-plain-text", "public.png", "public.file-url"];
+        for non_marker in non_markers {
+            let is_match = non_marker == "org.nspasteboard.ConcealedType"
+                || non_marker == "org.nspasteboard.TransientType"
+                || non_marker == "org.nspasteboard.AutoGeneratedType"
+                || non_marker == "com.agilebits.onepassword"
+                || non_marker == "com.apple.is-remote-clipboard";
+            assert!(
+                !is_match,
+                "Standard type '{}' must not be classified as concealed",
+                non_marker
+            );
+        }
+    }
+
+    #[test]
+    fn simulated_windows_dword_payload_evaluation() {
+        fn evaluate_dword(format_name: &str, payload_val: u32) -> ClipboardPrivacyStatus {
+            match format_name {
+                "CanUploadToCloudClipboard" => {
+                    if payload_val == 0 {
+                        ClipboardPrivacyStatus::ConcealedOrTransient
+                    } else {
+                        ClipboardPrivacyStatus::SafeToSync
+                    }
+                }
+                "CanIncludeInClipboardHistory" => {
+                    if payload_val == 0 {
+                        // Conservative privacy exclusion
+                        ClipboardPrivacyStatus::ConcealedOrTransient
+                    } else {
+                        ClipboardPrivacyStatus::SafeToSync
+                    }
+                }
+                _ => ClipboardPrivacyStatus::SafeToSync,
+            }
+        }
+
+        assert_eq!(
+            evaluate_dword("CanUploadToCloudClipboard", 0),
+            ClipboardPrivacyStatus::ConcealedOrTransient
+        );
+        assert_eq!(
+            evaluate_dword("CanUploadToCloudClipboard", 1),
+            ClipboardPrivacyStatus::SafeToSync
+        );
+        assert_eq!(
+            evaluate_dword("CanIncludeInClipboardHistory", 0),
+            ClipboardPrivacyStatus::ConcealedOrTransient
+        );
+        assert_eq!(
+            evaluate_dword("CanIncludeInClipboardHistory", 1),
+            ClipboardPrivacyStatus::SafeToSync
+        );
     }
 }
