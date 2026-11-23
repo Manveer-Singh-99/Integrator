@@ -298,7 +298,7 @@ impl DependencyId {
             Self::Moonlight => config::MOONLIGHT_DOWNLOAD_URL,
             Self::Vdd => config::VDD_DOWNLOAD_URL,
             Self::UsbNcm => config::USBNCM_GUIDE_URL,
-            Self::Vcam => config::SUNSHINE_DOWNLOAD_URL,
+            Self::Vcam => config::VCAM_DOCS_URL,
         }
     }
 }
@@ -1826,11 +1826,11 @@ fn request_windows_firewall_fix() -> Result<String, String> {
 
     let netsh_cmds = format!(
         "netsh advfirewall firewall delete rule name=\"{tcp_rule}\" >nul 2>&1 & \
-         netsh advfirewall firewall add rule name=\"{tcp_rule}\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={tcp_ports} remoteip={scopes} profile=any enable=yes & \
+         netsh advfirewall firewall add rule name=\"{tcp_rule}\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={tcp_ports} remoteip={scopes} profile=private,domain enable=yes & \
          netsh advfirewall firewall delete rule name=\"{udp_rule}\" >nul 2>&1 & \
-         netsh advfirewall firewall add rule name=\"{udp_rule}\" dir=in action=allow program=\"{exe}\" protocol=UDP localport={udp_ports} remoteip={scopes} profile=any enable=yes & \
+         netsh advfirewall firewall add rule name=\"{udp_rule}\" dir=in action=allow program=\"{exe}\" protocol=UDP localport={udp_ports} remoteip={scopes} profile=private,domain enable=yes & \
          netsh advfirewall firewall delete rule name=\"{smb_rule}\" >nul 2>&1 & \
-         netsh advfirewall firewall add rule name=\"{smb_rule}\" dir=in action=allow protocol=TCP localport={smb_ports} remoteip={scopes} profile=any enable=yes",
+         netsh advfirewall firewall add rule name=\"{smb_rule}\" dir=in action=allow protocol=TCP localport={smb_ports} remoteip={scopes} profile=private,domain enable=yes",
         tcp_rule = config::WIN_FW_RULE_CORE_TCP,
         udp_rule = config::WIN_FW_RULE_CORE_UDP,
         smb_rule = config::WIN_FW_RULE_SMB_TCP,

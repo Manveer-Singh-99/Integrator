@@ -55,6 +55,7 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -99,6 +100,24 @@ const MAX_NOTIFICATION_TITLE_LEN: usize = 128;
 
 /// Maximum safe character length for macOS notification messages passed to `osascript`.
 const MAX_NOTIFICATION_MESSAGE_LEN: usize = 256;
+
+/// Retained handle to the Integrator-owned Moonlight child process (SEC-1D-16).
+static OWNED_MOONLIGHT_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Retained handle to the Integrator-owned Sunshine host process (SEC-1D-16).
+static OWNED_SUNSHINE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Sets the mock/test child handle for owned Moonlight process testing.
+#[cfg(test)]
+pub fn set_owned_moonlight_child(child: Child) {
+    *OWNED_MOONLIGHT_PROCESS.lock().unwrap() = Some(child);
+}
+
+/// Returns whether an owned Moonlight process handle is currently retained.
+#[cfg(test)]
+pub fn has_owned_moonlight_child() -> bool {
+    OWNED_MOONLIGHT_PROCESS.lock().unwrap().is_some()
+}
 
 /// Spawns a dedicated background thread to wait on and reap a child process, preventing zombies.
 ///
@@ -270,6 +289,15 @@ impl MacDisplayManager {
             unsafe {
                 stop_virtual_display_in_app();
             }
+            for _ in 0..10 {
+                if !Self::is_virtual_display_active() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if Self::is_virtual_display_active() {
+                anyhow::bail!("Virtual display remains active on macOS after stop request");
+            }
             info!("Stopped in-process virtual display");
         }
         Ok(())
@@ -306,58 +334,23 @@ impl MacDisplayManager {
         let err_log_path = log_dir.join(SUNSHINE_STDERR_LOG_NAME);
         let conf_path = system_info::find_sunshine_conf().filter(|p| p.is_file());
 
-        // Launch Sunshine.app via LaunchServices (`open`) when packaged inside a .app bundle
-        // so macOS attributes Screen Recording TCC permissions to Sunshine.app itself rather than
-        // inheriting Integrator.app's TCC context.
-        if let Some(app_bundle) = sunshine_bin
-            .ancestors()
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
-        {
-            if let Err(e) = create_private_log_file(&log_path) {
-                warn!("Could not prepare Sunshine stdout log {}: {}", log_path.display(), e);
-            }
-            if let Err(e) = create_private_log_file(&err_log_path) {
-                warn!("Could not prepare Sunshine stderr log {}: {}", err_log_path.display(), e);
-            }
-            let mut cmd = Command::new(config::MACOS_OPEN_BIN);
-            cmd.arg("-g")
-                .arg("-n")
-                .arg("-a")
-                .arg(app_bundle)
-                .arg("-o")
-                .arg(&log_path)
-                .arg("--stderr")
-                .arg(&err_log_path);
-            if let Some(conf) = &conf_path {
-                cmd.arg("--args").arg(conf);
-            }
-            let status = cmd
-                .status()
-                .with_context(|| format!("Failed to launch {} via open", app_bundle.display()))?;
-            if !status.success() {
-                anyhow::bail!(
-                    "`open` exited with status {} while starting {}",
-                    status,
-                    app_bundle.display()
-                );
-            }
-            info!("Launched Sunshine bundle ({}) via LaunchServices", app_bundle.display());
-        } else {
-            let log_file = create_private_log_file(&log_path)?;
-            let mut cmd = Command::new(&sunshine_bin);
-            if let Some(conf) = &conf_path {
-                cmd.arg(conf);
-            }
-            let child = cmd
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(log_file.try_clone()?))
-                .stderr(Stdio::from(log_file))
-                .spawn()
-                .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
-            reap_child(child, "sunshine");
-
-            info!("Launched Sunshine server ({})", sunshine_bin.display());
+        let log_file = create_private_log_file(&log_path)?;
+        let err_log_file = create_private_log_file(&err_log_path)?;
+        let mut cmd = Command::new(&sunshine_bin);
+        if let Some(conf) = &conf_path {
+            cmd.arg(conf);
         }
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(err_log_file))
+            .spawn()
+            .with_context(|| format!("Failed to launch {}", sunshine_bin.display()))?;
+
+        let pid = child.id();
+        *OWNED_SUNSHINE_PROCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+
+        info!("Launched Sunshine server ({}) with owned PID {}", sunshine_bin.display(), pid);
         Ok(())
     }
 
@@ -405,40 +398,36 @@ impl MacDisplayManager {
         }
     }
 
-    /// Stops any running Sunshine server processes on macOS.
+    /// Stops the Integrator-owned Sunshine server process on macOS without killing external processes (SEC-1D-16).
     pub fn stop_sunshine() -> Result<()> {
         let (_, base_port, _) = system_info::read_sunshine_config_info();
         let web_port = base_port.saturating_add(config::SUNSHINE_WEB_PORT_OFFSET);
         Self::call_sunshine_api(web_port, config::SUNSHINE_API_CLOSE_PATH);
         Self::call_sunshine_api(web_port, config::SUNSHINE_API_RESET_PERSISTENCE_PATH);
 
-        let is_running = || {
-            ["Sunshine", "sunshine"].iter().any(|proc_name| {
-                Command::new(config::MACOS_PGREP_BIN)
-                    .args(["-x", proc_name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            })
-        };
-
-        let _ = Command::new(config::MACOS_KILLALL_BIN)
-            .args(["-q", "-TERM", "Sunshine", "sunshine"])
-            .status();
-        for _ in 0..SUNSHINE_STOP_POLL_ATTEMPTS {
-            if !is_running() {
-                break;
+        let mut lock = OWNED_SUNSHINE_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = lock.take() {
+            let pid = child.id() as i32;
+            info!("Stopping Integrator-owned Sunshine host process (PID {})", pid);
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
             }
-            std::thread::sleep(SUNSHINE_STOP_POLL_INTERVAL);
+            let mut exited = false;
+            for _ in 0..SUNSHINE_STOP_POLL_ATTEMPTS {
+                if let Ok(Some(_)) = child.try_wait() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(SUNSHINE_STOP_POLL_INTERVAL);
+            }
+            if !exited {
+                warn!("Escalating to SIGKILL for owned Sunshine host (PID {})", pid);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            info!("Stopped Integrator-owned Sunshine host process (PID {})", pid);
         }
-        if is_running() {
-            let _ = Command::new(config::MACOS_KILLALL_BIN)
-                .args(["-q", "-KILL", "Sunshine", "sunshine"])
-                .status();
-        }
-        info!("Stopped Sunshine server on macOS");
         Ok(())
     }
 
@@ -543,38 +532,41 @@ impl MacDisplayManager {
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn {}", moonlight_bin.display()))?;
-        reap_child(child, "moonlight");
+        let pid = child.id();
+        *OWNED_MOONLIGHT_PROCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
 
         info!(
-            "Launched Moonlight on macOS -> '{}' ({}:{}) at {} @ {}Hz",
-            host_target, pc_ip, port, res_arg, fps_arg
+            "Launched Moonlight on macOS (PID {}) -> '{}' ({}:{}) at {} @ {}Hz",
+            pid, host_target, pc_ip, port, res_arg, fps_arg
         );
         Ok(())
     }
 
-    /// Stops any running Moonlight client processes on macOS.
+    /// Stops the Integrator-owned Moonlight client process on macOS without killing external processes (SEC-1D-16).
     pub fn stop_moonlight_client() -> Result<()> {
-        let is_running = || {
-            Command::new(config::MACOS_PGREP_BIN)
-                .args(["-x", "Moonlight"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-        if is_running() {
-            let _ = Command::new(config::MACOS_KILLALL_BIN)
-                .args(["-q", "Moonlight"])
-                .status();
+        let mut lock = OWNED_MOONLIGHT_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = lock.take() {
+            let pid = child.id() as i32;
+            info!("Stopping Integrator-owned Moonlight client process (PID {})", pid);
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let mut exited = false;
             for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
-                if !is_running() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    exited = true;
                     break;
                 }
                 std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
             }
+            if !exited {
+                warn!("Escalating to SIGKILL for owned Moonlight client (PID {})", pid);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            info!("Stopped Integrator-owned Moonlight client process (PID {})", pid);
         }
-        info!("Stopped Moonlight on macOS");
         Ok(())
     }
 
@@ -876,5 +868,51 @@ mod tests {
         assert_eq!(idx, 1);
         assert_eq!(target, "172.20.10.7", "must never return stale IP 10.99.99.1");
         assert!(stale_ip);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_display_owned_process_termination_spares_external_process() {
+        // Spawn an external mock process that simulates an independent Moonlight instance
+        let mut external_child = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn external mock process");
+        let ext_pid = external_child.id() as i32;
+
+        // Spawn an Integrator-owned Moonlight process
+        let owned_child = Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn owned mock process");
+        let owned_pid = owned_child.id() as i32;
+
+        set_owned_moonlight_child(owned_child);
+        assert!(has_owned_moonlight_child(), "Owned child handle must be retained");
+
+        // Stop the Moonlight client
+        let res = MacDisplayManager::stop_moonlight_client();
+        assert!(res.is_ok(), "stop_moonlight_client must succeed");
+        assert!(!has_owned_moonlight_child(), "Owned child handle must be cleared after stop");
+
+        // Verify the owned child was terminated
+        #[cfg(unix)]
+        unsafe {
+            let mut check_count = 0;
+            while libc::kill(owned_pid, 0) == 0 && check_count < 20 {
+                std::thread::sleep(Duration::from_millis(50));
+                check_count += 1;
+            }
+            let owned_alive = libc::kill(owned_pid, 0) == 0;
+            assert!(!owned_alive, "Owned process (PID {}) must be terminated", owned_pid);
+
+            // Verify the external process is STILL ALIVE (unaffected by stop_moonlight_client)
+            let ext_alive = libc::kill(ext_pid, 0) == 0;
+            assert!(ext_alive, "External process (PID {}) must NOT be terminated by stop_moonlight_client", ext_pid);
+        }
+
+        // Clean up external child
+        let _ = external_child.kill();
+        let _ = external_child.wait();
     }
 }

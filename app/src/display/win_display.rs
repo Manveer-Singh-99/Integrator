@@ -63,6 +63,7 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::Duration;
 #[allow(unused_imports)]
@@ -72,7 +73,30 @@ use tracing::{debug, info, warn};
 ///
 /// # Arguments
 /// - `child`: Spawned child process handle.
+/// Retained handle to the Integrator-owned Moonlight child process on Windows (SEC-1D-16).
+#[allow(dead_code)]
+static OWNED_MOONLIGHT_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Retained handle to the Integrator-owned Sunshine host child process on Windows (SEC-1D-16).
+#[allow(dead_code)]
+static OWNED_SUNSHINE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Sets the mock/test child handle for owned Moonlight process testing on Windows.
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn set_owned_moonlight_child(child: Child) {
+    *OWNED_MOONLIGHT_PROCESS.lock().unwrap() = Some(child);
+}
+
+/// Returns whether an owned Moonlight process handle is currently retained on Windows.
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn has_owned_moonlight_child() -> bool {
+    OWNED_MOONLIGHT_PROCESS.lock().unwrap().is_some()
+}
+
 /// - `label`: Diagnostic label naming the reaper thread.
+#[allow(dead_code)]
 fn reap_child(mut child: Child, label: &'static str) {
     let _ = std::thread::Builder::new()
         .name(format!("reap-{}", label))
@@ -301,47 +325,25 @@ impl WinDisplayManager {
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn {}", exe.display()))?;
-        reap_child(child, "moonlight");
+        let pid = child.id();
+        *OWNED_MOONLIGHT_PROCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
         info!(
-            "Launched Moonlight on Windows -> '{}' ({}:{}) at {} @ {}Hz",
-            target, mac_ip, port, res_arg, fps_arg
+            "Launched Moonlight on Windows (PID {}) -> '{}' ({}:{}) at {} @ {}Hz",
+            pid, target, mac_ip, port, res_arg, fps_arg
         );
         Ok(())
     }
 
-    /// Stops any running `Moonlight.exe` processes on Windows via `taskkill.exe`.
+    /// Stops the Integrator-owned Moonlight client process on Windows without killing external processes (SEC-1D-16).
     pub fn stop_moonlight_client() -> Result<()> {
-        #[cfg(target_os = "windows")]
-        {
-            let taskkill = system_info::system32_exe("taskkill.exe");
-            let image_name = Self::find_moonlight_exe()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .filter(|n| !n.is_empty() && !n.starts_with('/'))
-                .unwrap_or_else(|| MOONLIGHT_WINDOWS_IMAGE_NAME.to_string());
-
-            let _ = hidden_cmd(&taskkill)
-                .args(["/F", "/IM", &image_name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-
-            if !image_name.eq_ignore_ascii_case(MOONLIGHT_WINDOWS_IMAGE_NAME) {
-                let _ = hidden_cmd(&taskkill)
-                    .args(["/F", "/IM", MOONLIGHT_WINDOWS_IMAGE_NAME])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-
-            for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
-                if !is_image_running(&image_name) && !is_image_running(MOONLIGHT_WINDOWS_IMAGE_NAME)
-                {
-                    break;
-                }
-                std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
-            }
+        let mut lock = OWNED_MOONLIGHT_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = lock.take() {
+            let pid = child.id();
+            info!("Stopping Integrator-owned Moonlight client process (PID {})", pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            info!("Stopped Integrator-owned Moonlight client on Windows (PID {})", pid);
         }
-        info!("Terminated Moonlight.exe on Windows");
         Ok(())
     }
 
@@ -850,8 +852,9 @@ fn ensure_sunshine_running(prefs: &system_info::AppPathPreferences) -> Result<()
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn Sunshine {}", bin.display()))?;
-        reap_child(child, "sunshine");
-        info!("Started Sunshine binary ({})", bin.display());
+        let pid = child.id();
+        *OWNED_SUNSHINE_PROCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+        info!("Started Sunshine binary ({}) with owned PID {}", bin.display(), pid);
         return Ok(());
     }
 
@@ -1911,5 +1914,63 @@ ROOT\\BASICDISPLAY\\0000|Microsoft Basic Display Adapter|Microsoft Basic Display
 
         let inserted = merge_user_gpu_preference_value(Some("AutoHDREnable=1;"), "GpuPreference=1;");
         assert_eq!(inserted, "GpuPreference=1;AutoHDREnable=1;");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_win_display_owned_process_termination_spares_external_process() {
+        let ping_exe = system_info::system32_exe("PING.EXE");
+        let mut external_child = hidden_cmd(&ping_exe)
+            .args(["-n", "15", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn external mock process on Windows");
+
+        let owned_child = hidden_cmd(&ping_exe)
+            .args(["-n", "15", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owned mock process on Windows");
+        let owned_pid = owned_child.id();
+
+        set_owned_moonlight_child(owned_child);
+        assert!(has_owned_moonlight_child(), "Owned child handle must be retained");
+
+        let res = WinDisplayManager::stop_moonlight_client();
+        assert!(res.is_ok(), "WinDisplayManager::stop_moonlight_client must succeed");
+        assert!(
+            !has_owned_moonlight_child(),
+            "Owned child handle must be cleared after stop"
+        );
+
+        // Verify the owned child PID is actually terminated
+        let tasklist_exe = system_info::system32_exe("tasklist.exe");
+        let tl_out = hidden_cmd(&tasklist_exe)
+            .args(["/FI", &format!("PID eq {}", owned_pid), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("query Windows tasklist for owned PID");
+        let tl_stdout = String::from_utf8_lossy(&tl_out.stdout);
+        assert!(
+            !tl_stdout.contains(&format!(",\"{}\",", owned_pid)),
+            "Owned process (PID {}) must be terminated, tasklist output: {}",
+            owned_pid,
+            tl_stdout
+        );
+
+        // External process MUST remain alive (unaffected by WinDisplayManager::stop_moonlight_client)
+        assert!(
+            external_child
+                .try_wait()
+                .expect("query external child status")
+                .is_none(),
+            "External process must NOT be terminated by WinDisplayManager::stop_moonlight_client"
+        );
+
+        let _ = external_child.kill();
+        let _ = external_child.wait();
     }
 }

@@ -919,6 +919,10 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     fwc.lpszClassName = L"IntegratorKvmGhostWnd";
     RegisterClassW(&fwc);
 
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
     HWND guard_hw = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         gwc.lpszClassName, L"", WS_POPUP,
@@ -926,6 +930,7 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     );
     if (guard_hw) {
         SetLayeredWindowAttributes(guard_hw, 0, 1, LWA_ALPHA);
+        SetWindowDisplayAffinity(guard_hw, WDA_EXCLUDEFROMCAPTURE);
     }
     g_guard_hwnd.store(guard_hw);
 
@@ -937,6 +942,7 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     EdgeDropTarget* drop_target = nullptr;
     if (edge_hw) {
         SetLayeredWindowAttributes(edge_hw, 0, 1, LWA_ALPHA);
+        SetWindowDisplayAffinity(edge_hw, WDA_EXCLUDEFROMCAPTURE);
         drop_target = new EdgeDropTarget();
         RegisterDragDrop(edge_hw, drop_target);
     }
@@ -949,6 +955,7 @@ static DWORD WINAPI hook_thread_main(LPVOID param) {
     );
     if (ghost_hw) {
         SetLayeredWindowAttributes(ghost_hw, 0, 238, LWA_ALPHA);
+        SetWindowDisplayAffinity(ghost_hw, WDA_EXCLUDEFROMCAPTURE);
     }
     g_ghost_hwnd.store(ghost_hw);
 

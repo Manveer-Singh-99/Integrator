@@ -231,6 +231,10 @@ pub struct DisplayController {
     active_mode: Arc<RwLock<Option<String>>>,
     /// IP address of the peer currently engaged in an active display session.
     active_peer_ip: Arc<RwLock<Option<String>>>,
+    /// Device ID hex of the peer for whom this machine is acting as Sunshine host.
+    host_peer_id: Arc<RwLock<Option<String>>>,
+    /// Device ID hex of the peer whose screen this machine is viewing via Moonlight client.
+    client_peer_id: Arc<RwLock<Option<String>>>,
 }
 
 impl DisplayController {
@@ -248,6 +252,8 @@ impl DisplayController {
             client_active: Arc::new(RwLock::new(false)),
             active_mode: Arc::new(RwLock::new(None)),
             active_peer_ip: Arc::new(RwLock::new(None)),
+            host_peer_id: Arc::new(RwLock::new(None)),
+            client_peer_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -527,6 +533,7 @@ impl DisplayController {
     /// Clears internal host session flags and resets active mode.
     async fn clear_host_state(&self) {
         *self.host_active.write().await = false;
+        *self.host_peer_id.write().await = None;
         let client_on = *self.client_active.read().await;
         if !client_on {
             *self.active_peer_ip.write().await = None;
@@ -539,11 +546,93 @@ impl DisplayController {
     /// Clears internal client session flags and resets active mode.
     async fn clear_client_state(&self) {
         *self.client_active.write().await = false;
+        *self.client_peer_id.write().await = None;
         let host_on = *self.host_active.read().await;
         if !host_on {
             *self.active_peer_ip.write().await = None;
             *self.active_mode.write().await = None;
         }
+    }
+
+    /// Tears down display streaming resources associated with a specific revoked peer.
+    ///
+    /// - If the peer is the Moonlight client viewing our screen: terminates the local Sunshine host
+    ///   and disables virtual display / VDD.
+    /// - If the peer is the Sunshine host whose screen we are viewing: terminates the local Moonlight
+    ///   client process.
+    /// - If the peer owns neither, active display sessions of other peers are preserved without disruption.
+    pub async fn teardown_peer_display(&self, peer_device_id_hex: &str) -> Result<()> {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let _tx = self.transition_lock.lock().await;
+
+        let is_client_peer = {
+            let lock = self.client_peer_id.read().await;
+            lock.as_deref() == Some(&clean_id)
+        };
+        let is_host_peer = {
+            let lock = self.host_peer_id.read().await;
+            lock.as_deref() == Some(&clean_id)
+        };
+
+        if !is_client_peer && !is_host_peer {
+            tracing::debug!("Teardown display: peer {} owns neither host nor client session; preserving active sessions", clean_id);
+            return Ok(());
+        }
+
+        if is_client_peer {
+            tracing::info!("🛑 Revocation: stopping local Moonlight client owned by peer {}", clean_id);
+            tokio::task::spawn_blocking(|| -> Result<()> {
+                #[cfg(target_os = "macos")]
+                crate::display::mac_display::MacDisplayManager::stop_moonlight_client()?;
+                #[cfg(target_os = "windows")]
+                crate::display::win_display::WinDisplayManager::stop_moonlight_client()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Moonlight client stop task panicked: {}", e))??;
+            self.clear_client_state().await;
+        }
+
+        if is_host_peer {
+            tracing::info!("🛑 Revocation: stopping local Sunshine host and virtual display owned by peer {}", clean_id);
+            tokio::task::spawn_blocking(|| -> Result<()> {
+                #[cfg(target_os = "macos")]
+                {
+                    crate::display::mac_display::MacDisplayManager::stop_virtual_display()?;
+                    crate::display::mac_display::MacDisplayManager::stop_sunshine()?;
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = crate::display::win_display::WinDisplayManager::disable_vdd_device();
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Sunshine host stop task panicked: {}", e))??;
+            self.clear_host_state().await;
+        }
+
+        Ok(())
+    }
+
+    /// Sets the active host peer device ID.
+    pub async fn set_active_host_peer(&self, peer_device_id: Option<String>) {
+        *self.host_peer_id.write().await = peer_device_id.map(|s| s.trim().to_ascii_lowercase());
+    }
+
+    /// Sets the active client peer device ID.
+    pub async fn set_active_client_peer(&self, peer_device_id: Option<String>) {
+        *self.client_peer_id.write().await = peer_device_id.map(|s| s.trim().to_ascii_lowercase());
+    }
+
+    /// Returns the active host peer device ID if currently hosting.
+    pub async fn host_peer_id(&self) -> Option<String> {
+        self.host_peer_id.read().await.clone()
+    }
+
+    /// Returns the active client peer device ID if currently acting as Moonlight client.
+    pub async fn client_peer_id(&self) -> Option<String> {
+        self.client_peer_id.read().await.clone()
     }
 
     /// Internal locked implementation of Mac-to-PC extended desktop initiation.
@@ -649,6 +738,7 @@ impl DisplayController {
         .await;
 
         *self.host_active.write().await = true;
+        *self.host_peer_id.write().await = Some(peer.device_id.trim().to_ascii_lowercase());
         *self.active_peer_ip.write().await = Some(peer_ip);
         *self.active_mode.write().await = Some(format!("Mac -> {} ({})", peer_hostname, mode_summary));
 
@@ -858,6 +948,7 @@ impl DisplayController {
 
         let mode_summary = format!("{}x{} @ {}Hz", stream_w, stream_h, fps);
         *self.host_active.write().await = true;
+        *self.host_peer_id.write().await = Some(peer.device_id.trim().to_ascii_lowercase());
         *self.active_peer_ip.write().await = Some(peer_ip);
         *self.active_mode.write().await = Some(format!("PC -> {} ({})", peer_hostname, mode_summary));
 
@@ -1123,6 +1214,7 @@ impl DisplayController {
                 match launch_res {
                     Ok(_) => {
                         *self.client_active.write().await = true;
+                        *self.client_peer_id.write().await = peer_device_id.map(|s| s.trim().to_ascii_lowercase());
                         *self.active_peer_ip.write().await = Some(effective_host_ip.clone());
                         *self.active_mode.write().await = Some("Client".into());
                         self.base_response(
@@ -1440,11 +1532,18 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::StartCamera => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                let Some(auth_peer_id) = peer_device_id.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    return self.base_response(false, "Rejected: Camera request requires authenticated peer identity").await;
+                };
                 if let Some(core) = crate::core::GLOBAL_CORE.get() {
-                    match core.camera.start().await {
-                        Ok(msg) => {
+                    match core.camera.start_remote_request(Some(auth_peer_id)).await {
+                        Ok((msg, lease_token)) => {
                             let mut resp = self.base_response(true, msg).await;
                             resp.camera_status = Some(core.camera.status());
+                            resp.camera_lease_token_hex = Some(crate::security::hex_encode(&lease_token));
                             resp
                         }
                         Err(e) => self.base_response(false, format!("Failed to start camera: {}", e)).await,
@@ -1453,9 +1552,31 @@ impl DisplayController {
                     self.base_response(false, "Core not initialized").await
                 }
             }
-            DisplayRpcRequest::ToggleCamera => {
+            DisplayRpcRequest::CheckCameraConsent => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                let Some(auth_peer_id) = peer_device_id.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    return self.base_response(false, "Rejected: Camera request requires authenticated peer identity").await;
+                };
                 if let Some(core) = crate::core::GLOBAL_CORE.get() {
-                    match core.camera.toggle().await {
+                    let status = core.camera.query_consent_status(auth_peer_id);
+                    let mut resp = self.base_response(true, "Camera consent status retrieved").await;
+                    resp.camera_consent_status = Some(status);
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::ToggleCamera => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                let Some(auth_peer_id) = peer_device_id.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    return self.base_response(false, "Rejected: Camera request requires authenticated peer identity").await;
+                };
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    match core.camera.toggle_remote_request(Some(auth_peer_id)).await {
                         Ok(msg) => {
                             let mut resp = self.base_response(true, msg).await;
                             resp.camera_status = Some(core.camera.status());
@@ -1468,9 +1589,20 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::StopCamera => {
+                let Some(auth_peer_id) = peer_device_id.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    return self
+                        .base_response(false, "Rejected: StopCamera request requires authenticated peer identity")
+                        .await;
+                };
+                let clean_auth_id = auth_peer_id.to_ascii_lowercase();
+                if crate::security::transport::is_peer_revoked(&clean_auth_id) {
+                    return self
+                        .base_response(false, "Rejected: requesting peer is revoked")
+                        .await;
+                }
                 if let Some(core) = crate::core::GLOBAL_CORE.get() {
-                    core.camera.stop().await;
-                    let mut resp = self.base_response(true, "Shared Camera stopped").await;
+                    core.camera.teardown_peer_stream(&clean_auth_id);
+                    let mut resp = self.base_response(true, format!("Shared Camera stopped for peer {}", clean_auth_id)).await;
                     resp.camera_status = Some(core.camera.status());
                     resp
                 } else {
@@ -1478,6 +1610,9 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::GetCameraStatus => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
                 if let Some(core) = crate::core::GLOBAL_CORE.get() {
                     let mut resp = self.base_response(true, "Camera status retrieved").await;
                     resp.camera_status = Some(core.camera.status());
@@ -1490,6 +1625,9 @@ impl DisplayController {
                 challenge_nonce_hex,
                 requester_hostname,
             } => {
+                if !self.features.is_enabled("touchid") {
+                    return self.base_response(false, "Rejected: feature 'touchid' is disabled on this device").await;
+                }
                 let Some(req_dev_id) = peer_device_id.map(|s| s.to_string()) else {
                     return self
                         .base_response(
@@ -1541,6 +1679,94 @@ impl DisplayController {
                     }
                 }
             }
+            DisplayRpcRequest::PasskeyMakeCredential(make_req) => {
+                if !self.features.is_enabled("touchid") {
+                    return self.base_response(false, "Rejected: feature 'touchid' is disabled on this device").await;
+                }
+                let req_copy = make_req.clone();
+                let rp_id_label = req_copy.rp_id.clone();
+                crate::core::emit_ui_toast(
+                    "info",
+                    &format!(
+                        "Passkey registration requested for '{}' ({}) — place your finger on Touch ID...",
+                        &rp_id_label, &req_copy.user_name
+                    ),
+                );
+                // Dispatch Touch ID biometric evaluation in a dedicated blocking worker thread
+                let eval_res = tokio::task::spawn_blocking(move || {
+                    crate::security::passkey::evaluate_mac_touchid_and_make_credential(&req_copy)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Passkey registration task panicked: {}", e)));
+
+                match eval_res {
+                    Ok(cred_resp) => {
+                        crate::core::emit_ui_toast(
+                            "success",
+                            &format!(
+                                "Passkey created for '{}' via Apple Touch ID",
+                                &rp_id_label
+                            ),
+                        );
+                        let mut resp = self
+                            .base_response(
+                                true,
+                                format!("Passkey created for '{}' via Touch ID", rp_id_label),
+                            )
+                            .await;
+                        resp.passkey_credential = Some(cred_resp);
+                        resp
+                    }
+                    Err(err_msg) => {
+                        crate::core::emit_ui_toast("error", &format!("Passkey creation failed: {}", err_msg));
+                        self.base_response(false, err_msg).await
+                    }
+                }
+            }
+            DisplayRpcRequest::PasskeyGetAssertion(assert_req) => {
+                if !self.features.is_enabled("touchid") {
+                    return self.base_response(false, "Rejected: feature 'touchid' is disabled on this device").await;
+                }
+                let req_copy = assert_req.clone();
+                let rp_id_label = req_copy.rp_id.clone();
+                crate::core::emit_ui_toast(
+                    "info",
+                    &format!(
+                        "Passkey sign-in requested for '{}' — place your finger on Touch ID...",
+                        &rp_id_label
+                    ),
+                );
+                // Dispatch Touch ID biometric evaluation in a dedicated blocking worker thread
+                let eval_res = tokio::task::spawn_blocking(move || {
+                    crate::security::passkey::evaluate_mac_touchid_and_sign_assertion(&req_copy)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Passkey sign-in task panicked: {}", e)));
+
+                match eval_res {
+                    Ok(assert_resp) => {
+                        crate::core::emit_ui_toast(
+                            "success",
+                            &format!(
+                                "Passkey assertion signed for '{}' via Apple Touch ID",
+                                &rp_id_label
+                            ),
+                        );
+                        let mut resp = self
+                            .base_response(
+                                true,
+                                format!("Passkey signed for '{}' via Touch ID", rp_id_label),
+                            )
+                            .await;
+                        resp.passkey_assertion = Some(assert_resp);
+                        resp
+                    }
+                    Err(err_msg) => {
+                        crate::core::emit_ui_toast("error", &format!("Passkey sign-in failed: {}", err_msg));
+                        self.base_response(false, err_msg).await
+                    }
+                }
+            }
         }
     }
 
@@ -1573,7 +1799,9 @@ impl DisplayController {
         req: &DisplayRpcRequest,
     ) -> Result<DisplayRpcResponse> {
         let recv_timeout = match req {
-            DisplayRpcRequest::VerifyTouchId { .. } => TOUCHID_RPC_RECV_TIMEOUT,
+            DisplayRpcRequest::VerifyTouchId { .. }
+            | DisplayRpcRequest::PasskeyMakeCredential(_)
+            | DisplayRpcRequest::PasskeyGetAssertion(_) => TOUCHID_RPC_RECV_TIMEOUT,
             _ => RPC_RECV_TIMEOUT,
         };
         let addr = Self::format_socket_target(peer_ip, CONTROL_PORT);
@@ -1868,5 +2096,82 @@ mod tests {
             ),
             config::BITRATE_HOTSPOT_HIGH_FPS_KBPS
         );
+    }
+
+    #[tokio::test]
+    async fn test_display_peer_scoped_teardown_preserves_other_peer() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("display_peer_test");
+        let ctrl = DisplayController::new(discovery, features);
+
+        let peer_host = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer_client = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let peer_unrelated = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        ctrl.set_active_host_peer(Some(peer_host.to_string())).await;
+        ctrl.set_active_client_peer(Some(peer_client.to_string())).await;
+        *ctrl.host_active.write().await = true;
+        *ctrl.client_active.write().await = true;
+
+        // Revoking unrelated peer must do nothing and preserve both sessions
+        ctrl.teardown_peer_display(peer_unrelated).await.unwrap();
+        assert_eq!(ctrl.host_peer_id().await.as_deref(), Some(peer_host));
+        assert_eq!(ctrl.client_peer_id().await.as_deref(), Some(peer_client));
+        assert!(*ctrl.host_active.read().await);
+        assert!(*ctrl.client_active.read().await);
+
+        // Revoking host peer clears host state, preserves client peer
+        ctrl.teardown_peer_display(peer_host).await.unwrap();
+        assert_eq!(ctrl.host_peer_id().await, None);
+        assert!(!*ctrl.host_active.read().await);
+        assert_eq!(ctrl.client_peer_id().await.as_deref(), Some(peer_client));
+        assert!(*ctrl.client_active.read().await);
+
+        // Revoking client peer clears client state
+        ctrl.teardown_peer_display(peer_client).await.unwrap();
+        assert_eq!(ctrl.client_peer_id().await, None);
+        assert!(!*ctrl.client_active.read().await);
+    }
+
+    #[tokio::test]
+    async fn test_display_server_start_camera_rpc_propagates_authenticated_peer_id() {
+        let features = Arc::new(FeatureManager::new());
+        let _ = features.set_flag_checked("camera", true);
+        let discovery = DiscoveryManager::new("disp_cam_auth_test");
+        let ctrl = DisplayController::new(discovery, features);
+
+        let caller_ip = "192.168.1.50".parse().unwrap();
+
+        // 1. StartCamera without authenticated peer_device_id must fail closed
+        let resp_no_auth = ctrl.handle_rpc(DisplayRpcRequest::StartCamera, Some(caller_ip), None).await;
+        assert!(!resp_no_auth.success);
+        assert!(resp_no_auth.message.contains("requires authenticated peer identity"));
+
+        // 2. StartCamera with empty authenticated peer_device_id must also fail closed
+        let resp_empty_auth = ctrl.handle_rpc(DisplayRpcRequest::StartCamera, Some(caller_ip), Some("   ")).await;
+        assert!(!resp_empty_auth.success);
+        assert!(resp_empty_auth.message.contains("requires authenticated peer identity"));
+
+        // 3. ToggleCamera without authenticated peer_device_id must fail closed
+        let resp_toggle_no_auth = ctrl.handle_rpc(DisplayRpcRequest::ToggleCamera, Some(caller_ip), None).await;
+        assert!(!resp_toggle_no_auth.success);
+        assert!(resp_toggle_no_auth.message.contains("requires authenticated peer identity"));
+
+        // 4. StopCamera without authenticated peer_device_id must fail closed (SEC-1D-08)
+        let resp_stop_no_auth = ctrl.handle_rpc(DisplayRpcRequest::StopCamera, Some(caller_ip), None).await;
+        assert!(!resp_stop_no_auth.success);
+        assert!(resp_stop_no_auth.message.contains("requires authenticated peer identity"));
+
+        // 5. StopCamera with whitespace authenticated peer_device_id must fail closed
+        let resp_stop_empty = ctrl.handle_rpc(DisplayRpcRequest::StopCamera, Some(caller_ip), Some("  ")).await;
+        assert!(!resp_stop_empty.success);
+        assert!(resp_stop_empty.message.contains("requires authenticated peer identity"));
+
+        // 6. StopCamera with a revoked peer must fail closed
+        let revoked_peer = "9999999999999999999999999999999999999999999999999999999999999999";
+        crate::security::transport::invalidate_peer_trust(revoked_peer, 2);
+        let resp_stop_revoked = ctrl.handle_rpc(DisplayRpcRequest::StopCamera, Some(caller_ip), Some(revoked_peer)).await;
+        assert!(!resp_stop_revoked.success);
+        assert!(resp_stop_revoked.message.contains("requesting peer is revoked"));
     }
 }

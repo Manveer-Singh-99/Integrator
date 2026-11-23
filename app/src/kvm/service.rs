@@ -317,6 +317,7 @@ pub struct KvmService {
     controlling_peer_fast: AtomicBool,
     local_rect: RwLock<ScreenRect>,
     peer_rect: RwLock<ScreenRect>,
+    connected_peer_device_id: RwLock<Option<String>>,
     connected_peer_ip: RwLock<Option<String>>,
     peer_os: RwLock<Option<String>>,
     peer_diff_os: AtomicBool,
@@ -336,6 +337,7 @@ pub struct KvmService {
     session_abort: Mutex<Option<(AbortHandle, AbortHandle)>>,
     staging_task: Mutex<Option<AbortHandle>>,
     drag_stage_dirs: Mutex<HashMap<String, PathBuf>>,
+    last_controlled_entry_ms: AtomicU64,
 }
 
 impl KvmService {
@@ -364,6 +366,7 @@ impl KvmService {
                 width: DEFAULT_DISPLAY_WIDTH as f32,
                 height: DEFAULT_DISPLAY_HEIGHT as f32,
             }),
+            connected_peer_device_id: RwLock::new(None),
             connected_peer_ip: RwLock::new(None),
             peer_os: RwLock::new(None),
             peer_diff_os: AtomicBool::new(true),
@@ -383,6 +386,7 @@ impl KvmService {
             session_abort: Mutex::new(None),
             staging_task: Mutex::new(None),
             drag_stage_dirs: Mutex::new(HashMap::new()),
+            last_controlled_entry_ms: AtomicU64::new(0),
         });
         svc.refresh_local_rect();
         svc
@@ -394,9 +398,22 @@ impl KvmService {
 
     fn set_role_locked(&self, role_guard: &mut KvmRole, next_role: KvmRole) -> KvmRole {
         let is_controlling = matches!(next_role, KvmRole::ControllingPeer { .. });
+        let is_controlled = matches!(next_role, KvmRole::ControlledByPeer { .. });
+        let was_controlled = matches!(*role_guard, KvmRole::ControlledByPeer { .. });
         let prev = std::mem::replace(role_guard, next_role);
         self.controlling_peer_fast
             .store(is_controlling, Ordering::Release);
+
+        if is_controlled && !was_controlled {
+            crate::core::emit_ui_event("kvm_remote_control", "{\"active\":true}");
+            crate::core::emit_ui_toast(
+                "info",
+                "Remote workstation controlling local mouse & keyboard (Press any key or move mouse to take over)",
+            );
+        } else if !is_controlled && was_controlled {
+            crate::core::emit_ui_event("kvm_remote_control", "{\"active\":false}");
+        }
+
         prev
     }
 
@@ -809,6 +826,37 @@ impl KvmService {
         }
     }
 
+    /// Immediately tears down any active KVM session associated with the specified peer device ID hex.
+    pub fn teardown_peer_if_connected(&self, device_id_hex: &str) {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        let connected_id = self
+            .connected_peer_device_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(id) = connected_id {
+            if id == clean_id {
+                info!("🛑 KVM tearing down active session for revoked peer {}", clean_id);
+                self.force_release_all(false);
+                self.abort_active_session_tasks();
+                *self
+                    .connected_peer_device_id
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                *self
+                    .connected_peer_ip
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                *self
+                    .outbound_tx
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                self.active_session_id.store(0, Ordering::Release);
+                self.sync_platform_probe();
+            }
+        }
+    }
+
     pub fn force_release_all(&self, notify_peer: bool) {
         if notify_peer {
             self.try_send_wire(KvmWireMessage::ReleaseAll);
@@ -893,9 +941,14 @@ impl KvmService {
         self.force_release_all(false);
         self.active_session_id.store(my_session_id, Ordering::Release);
 
+        let peer_dev_id = session.peer_device_id_hex().to_string();
         let (mut reader, writer) = session.into_split_tcp();
         let (tx, mut rx) = mpsc::channel::<KvmOutboundCmd>(OUTBOUND_QUEUE_CAP);
 
+        *self
+            .connected_peer_device_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(peer_dev_id);
         *self
             .connected_peer_ip
             .write()
@@ -984,6 +1037,10 @@ impl KvmService {
         {
             self.abort_active_session_tasks();
             *self
+                .connected_peer_device_id
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
                 .connected_peer_ip
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = None;
@@ -1003,7 +1060,34 @@ impl KvmService {
         rx: &mut mpsc::Receiver<KvmOutboundCmd>,
         peer_ip: &str,
     ) {
-        while let Some(cmd) = rx.recv().await {
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(1));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            let cmd = tokio::select! {
+                _ = ping_interval.tick() => {
+                    let is_active = {
+                        let role = svc.role.lock().unwrap_or_else(|e| e.into_inner());
+                        !matches!(*role, KvmRole::Idle)
+                    };
+                    if is_active {
+                        if let Ok(bytes) = serde_json::to_vec(&KvmWireMessage::Ping) {
+                            if let Err(e) = writer.send_message(&bytes).await {
+                                warn!("KVM TransportV2 ping write error to {}: {}", peer_ip, e);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                cmd_opt = rx.recv() => {
+                    match cmd_opt {
+                        Some(c) => c,
+                        None => break,
+                    }
+                }
+            };
+
             let msg = match cmd {
                 KvmOutboundCmd::Wire(m) => m,
                 KvmOutboundCmd::EnterWithDragPaths {
@@ -1098,9 +1182,21 @@ impl KvmService {
         peer_ip: &str,
     ) {
         loop {
-            let bytes = match reader.recv_message().await {
-                Ok(b) => b,
-                Err(_) => break,
+            let recv_res = tokio::time::timeout(Duration::from_secs(5), reader.recv_message()).await;
+            let bytes = match recv_res {
+                Ok(Ok(b)) => b,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    let is_active = {
+                        let role = svc.role.lock().unwrap_or_else(|e| e.into_inner());
+                        !matches!(*role, KvmRole::Idle)
+                    };
+                    if is_active {
+                        warn!("⏱️ KVM peer {} silent for 5s while in active role; releasing control", peer_ip);
+                        svc.force_release_all(false);
+                    }
+                    continue;
+                }
             };
             if bytes.is_empty() || bytes.len() > MAX_WIRE_MESSAGE_BYTES {
                 warn!("Rejected malformed KVM frame size {} from {}", bytes.len(), peer_ip);
@@ -1160,6 +1256,14 @@ impl KvmService {
                 if !norm_pos.is_finite() {
                     return;
                 }
+                if !self.layout.read().unwrap_or_else(|e| e.into_inner()).allow_remote_control {
+                    tracing::warn!(
+                        "🚫 Rejected KVM EnterScreen from {}: remote control is disabled by local policy",
+                        peer_ip
+                    );
+                    self.try_send_wire(KvmWireMessage::ReleaseAll);
+                    return;
+                }
                 if let Some(handle) = self
                     .staging_task
                     .lock()
@@ -1179,6 +1283,11 @@ impl KvmService {
                 let drag_label = offer_opt.as_ref().map(|o| o.root_name.clone());
 
                 {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    self.last_controlled_entry_ms.store(now_ms, Ordering::Release);
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                     self.set_role_locked(
                         &mut role,
@@ -1770,7 +1879,20 @@ impl KvmService {
                     }
                     return HookDecision::SwallowAndParkCenter;
                 }
-                KvmRole::ControlledByPeer { .. } => return HookDecision::PassThrough,
+                KvmRole::ControlledByPeer { .. } => {
+                    drop(role);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let entered_at = self.last_controlled_entry_ms.load(Ordering::Acquire);
+                    if now_ms.saturating_sub(entered_at) > 150 && (dx.abs() > 3.0 || dy.abs() > 3.0) {
+                        info!("👋 Local physical mouse motion detected while controlled; taking back control");
+                        self.force_release_all(true);
+                        crate::core::emit_ui_toast("info", "KVM remote control suspended by local mouse motion");
+                    }
+                    return HookDecision::PassThrough;
+                }
                 KvmRole::Idle => true,
             }
         };
@@ -1923,15 +2045,24 @@ impl KvmService {
         if !self.features.is_enabled("input_kvm") {
             return HookDecision::PassThrough;
         }
-        let controlling = matches!(
-            *self.role.lock().unwrap_or_else(|e| e.into_inner()),
-            KvmRole::ControllingPeer { .. }
-        );
-        if !controlling {
-            return HookDecision::PassThrough;
+        let role = self.role.lock().unwrap_or_else(|e| e.into_inner());
+        match *role {
+            KvmRole::ControlledByPeer { .. } => {
+                drop(role);
+                if pressed {
+                    info!("🖱️ Local physical mouse click detected while controlled; taking back control");
+                    self.force_release_all(true);
+                    crate::core::emit_ui_toast("info", "KVM remote control suspended by local mouse click");
+                }
+                HookDecision::PassThrough
+            }
+            KvmRole::ControllingPeer { .. } => {
+                drop(role);
+                self.try_send_wire(KvmWireMessage::MouseButton { button, pressed });
+                HookDecision::Swallow
+            }
+            KvmRole::Idle => HookDecision::PassThrough,
         }
-        self.try_send_wire(KvmWireMessage::MouseButton { button, pressed });
-        HookDecision::Swallow
     }
 
     pub fn on_local_mouse_scroll(&self, dx: f32, dy: f32) -> HookDecision {
@@ -1961,13 +2092,6 @@ impl KvmService {
         if !self.features.is_enabled("input_kvm") {
             return HookDecision::PassThrough;
         }
-        let controlling = matches!(
-            *self.role.lock().unwrap_or_else(|e| e.into_inner()),
-            KvmRole::ControllingPeer { .. }
-        );
-        if !controlling {
-            return HookDecision::PassThrough;
-        }
 
         // Panic Escape Hatch: Ctrl + Alt + Shift + Esc immediately breaks remote control
         if pressed
@@ -1979,6 +2103,26 @@ impl KvmService {
             info!("🛟 KVM panic release hotkey triggered (Ctrl+Alt+Shift+Esc)");
             self.force_release_all(true);
             return HookDecision::Swallow;
+        }
+
+        // Physical Local Takeover: Any local keyboard event while controlled takes back control
+        let is_controlled = matches!(
+            *self.role.lock().unwrap_or_else(|e| e.into_inner()),
+            KvmRole::ControlledByPeer { .. }
+        );
+        if is_controlled && pressed {
+            info!("⌨️ Local physical keyboard event detected while controlled; taking back control");
+            self.force_release_all(true);
+            crate::core::emit_ui_toast("info", "KVM remote control suspended by local keyboard input");
+            return HookDecision::PassThrough;
+        }
+
+        let controlling = matches!(
+            *self.role.lock().unwrap_or_else(|e| e.into_inner()),
+            KvmRole::ControllingPeer { .. }
+        );
+        if !controlling {
+            return HookDecision::PassThrough;
         }
 
         let (tx_key, tx_mods) = if pressed {
@@ -2591,5 +2735,111 @@ mod tests {
             "hello"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_kvm_local_consent_gate_rejects_enterscreen() {
+        let svc = make_test_kvm_service();
+        let (tx, mut rx) = mpsc::channel(32);
+        *svc.outbound_tx.write().unwrap() = Some(tx);
+
+        // Disable remote control permission
+        {
+            let mut cfg = svc.get_layout();
+            cfg.allow_remote_control = false;
+            *svc.layout.write().unwrap() = cfg;
+        }
+
+        // Send EnterScreen from peer
+        svc.handle_inbound_message(
+            "10.99.99.2",
+            KvmWireMessage::EnterScreen {
+                entry_edge: ScreenEdge::Left,
+                norm_pos: 0.5,
+                left_button_held: false,
+                drag_offer: None,
+            },
+        )
+        .await;
+
+        // Verify role remained Idle and ReleaseAll was transmitted back
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
+        let outbound = rx.try_recv().expect("ReleaseAll should be transmitted");
+        assert!(matches!(outbound, KvmOutboundCmd::Wire(KvmWireMessage::ReleaseAll)));
+    }
+
+    #[test]
+    fn test_kvm_physical_takeover_via_keyboard_and_mouse() {
+        let svc = make_test_kvm_service();
+        let (tx, _rx) = mpsc::channel(32);
+        *svc.outbound_tx.write().unwrap() = Some(tx);
+
+        // 1. Put into ControlledByPeer
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControlledByPeer {
+                    peer_ip: "10.99.99.2".to_string(),
+                    entry_edge: ScreenEdge::Left,
+                    cur_x: 100.0,
+                    cur_y: 200.0,
+                    active_drag_session: None,
+                    active_drag_label: None,
+                    native_drag_started: false,
+                },
+            );
+        }
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::ControlledByPeer { .. }));
+
+        // 2. Physical key press triggers immediate takeover
+        let mods = ModifierMask::default();
+        let decision = svc.on_local_key_event(LogicalKey::CharA, true, mods);
+        assert_eq!(decision, HookDecision::PassThrough);
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
+
+        // 3. Put into ControlledByPeer again
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControlledByPeer {
+                    peer_ip: "10.99.99.2".to_string(),
+                    entry_edge: ScreenEdge::Left,
+                    cur_x: 100.0,
+                    cur_y: 200.0,
+                    active_drag_session: None,
+                    active_drag_label: None,
+                    native_drag_started: false,
+                },
+            );
+        }
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::ControlledByPeer { .. }));
+
+        // 4. Physical mouse click triggers immediate takeover
+        let btn_decision = svc.on_local_mouse_button(RemoteMouseButton::Left, true, 100.0, 200.0);
+        assert_eq!(btn_decision, HookDecision::PassThrough);
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
+
+        // 5. Physical mouse motion (>3px displacement) triggers immediate takeover
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControlledByPeer {
+                    peer_ip: "10.99.99.2".to_string(),
+                    entry_edge: ScreenEdge::Left,
+                    cur_x: 100.0,
+                    cur_y: 200.0,
+                    active_drag_session: None,
+                    active_drag_label: None,
+                    native_drag_started: false,
+                },
+            );
+        }
+        svc.last_controlled_entry_ms.store(1, Ordering::SeqCst); // Old entry time
+        let motion_decision = svc.on_local_mouse_move(100.0, 200.0, 5.0, 5.0, false);
+        assert_eq!(motion_decision, HookDecision::PassThrough);
+        assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
     }
 }

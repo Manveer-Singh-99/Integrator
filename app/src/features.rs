@@ -100,7 +100,7 @@ impl Default for FeatureFlags {
             input_kvm: true,
             dragdrop: false,
             storage: true,
-            touchid: false,
+            touchid: true,
             truetone: true,
             camera: false,
             audio: true,

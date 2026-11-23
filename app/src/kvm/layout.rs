@@ -233,6 +233,7 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
         ghost_thumbnail: local.ghost_thumbnail,
         qos_clamp: local.qos_clamp,
         drop_folder: local.drop_folder.clone(),
+        allow_remote_control: true,
         updated_at_ms: local.updated_at_ms,
     }
 }
@@ -379,6 +380,7 @@ mod tests {
             ghost_thumbnail: true,
             qos_clamp: true,
             drop_folder: "downloads".to_string(),
+            allow_remote_control: true,
             updated_at_ms: 12345,
         };
         sanitize_layout(&mut local);

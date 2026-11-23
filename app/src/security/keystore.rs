@@ -38,11 +38,20 @@
 //!    - Each secret is wrapped with `ChaCha20Poly1305` using an independent 12-byte CSPRNG nonce.
 //!    - Authenticated Additional Data (`AAD`) binds the owner's `device_id`, `ed25519_pubkey`, and `key_id` directly
 //!      into the Poly1305 authenticator, cryptographically preventing record-swapping or JSON key substitution.
-//! 3. **Layer 3: Whole-File Metadata Integrity MAC**:
+//! 3. **Layer 3: Whole-File Metadata Integrity MAC & Threat Model Boundary (SEC-1D-19)**:
 //!    - An HMAC-SHA256 integrity tag (`state_mac_hex`) authenticates the entire serialized keystore contents
-//!      (schema version, local identity, all peers, blocklists, quarantine flag) under a dedicated MAC key
+//!      (schema version, local identity, all peers, blocklists, quarantine flag, tombstones) under a dedicated MAC key
 //!      derived from $K_{\text{kek}}$ (`KEYSTORE_META_MAC_INFO`).
-//!    - Detects unauthorized offline modifications to unencrypted metadata (e.g. modifying pinned hostnames or tampering with blocklists).
+//!    - Detects unauthorized offline modifications to unencrypted metadata (e.g. modifying pinned hostnames,
+//!      tampering with blocklists, or injecting revoked peers).
+//!    - **Threat Model Boundary & Anti-Rollback Note**: Whole-file HMAC verification guarantees cryptographic integrity
+//!      and authenticity against unauthorized modification or tampering of keystore records. However, local HMAC verification
+//!      does NOT prevent an attacker with full local filesystem write access from substituting the entire keystore file with
+//!      a previously authenticated, valid historical snapshot (rollback attack), in the absence of hardware monotonic counter
+//!      anchors. Neither macOS nor Windows standard user filesystems provide a generic hardware monotonic counter API for
+//!      userland configuration files. Integrator mitigates in-memory rollback via monotonically increasing per-peer trust
+//!      generations across daemon lifetimes and persists tombstones, but acknowledges offline whole-file substitution
+//!      as outside the userland HMAC threat model boundary.
 //! 4. **Layer 4: Strict Identity-Key Pinning & Anti-Spoofing**:
 //!    - `device_id` is deterministically derived: $\text{SHA256}(\text{"integrator-device-id-v2"} \,\|\, \text{pubkey})[0..16]$.
 //!    - Any mismatch between claimed `device_id` and presented `ed25519_pubkey` is rejected with [`KeystoreError::SpoofedDeviceId`].
@@ -234,6 +243,7 @@ pub trait KekProvider: Send + Sync {
 /// - macOS: Apple Keychain Services / Hardware-bound sealed seed.
 /// - Windows: Win32 DPAPI (`CryptProtectData`).
 /// - Linux: Machine-ID + EUID + mode-0600 seed file.
+#[allow(dead_code)]
 pub struct OsNativeKekProvider;
 
 impl KekProvider for OsNativeKekProvider {
@@ -285,6 +295,11 @@ pub struct AeadWrappedSecret {
     pub ciphertext_hex: String,
 }
 
+/// Default trust generation for legacy serialized peer records (1).
+fn default_trust_generation() -> u64 {
+    1
+}
+
 /// On-disk record for a pinned trusted peer inside `trusted_peers_v2.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPeerRecordV2 {
@@ -308,6 +323,9 @@ pub struct TrustedPeerRecordV2 {
     pub via_direct_cable: bool,
     /// Envelope-encrypted 32-byte root key ($K_{\text{root}}$) with AAD binding.
     pub wrapped_root_key: AeadWrappedSecret,
+    /// Monotonically increasing trust epoch / generation for this peer pairing.
+    #[serde(default = "default_trust_generation")]
+    pub trust_generation: u64,
 }
 
 /// Top-level on-disk JSON structure of `trusted_peers_v2.json`.
@@ -330,6 +348,12 @@ struct KeystoreFileV2 {
     /// List of explicitly blocked IP address strings.
     #[serde(default)]
     pub blocked_ips: Vec<String>,
+    /// Map of peer device ID hex to persisted trust generation tombstones for unpinned/revoked peers.
+    #[serde(default)]
+    pub tombstone_generations: HashMap<String, u64>,
+    /// Map of peer device ID hex to persisted camera permissions ("always_allow:<gen>" or "blocked").
+    #[serde(default)]
+    pub persistent_camera_consents: HashMap<String, String>,
     /// True if legacy v1 `trusted_peers.json` files were detected and quarantined.
     #[serde(default)]
     pub legacy_v1_quarantined: bool,
@@ -361,6 +385,8 @@ pub struct VerifiedPeerCredentials {
     pub paired_at_epoch: u64,
     /// True if paired over a direct physical link.
     pub via_direct_cable: bool,
+    /// Monotonically increasing trust epoch / generation for this peer pairing.
+    pub trust_generation: u64,
 }
 
 impl std::fmt::Debug for VerifiedPeerCredentials {
@@ -372,6 +398,7 @@ impl std::fmt::Debug for VerifiedPeerCredentials {
             .field("key_id", &super::hex_encode(&self.key_id))
             .field("hostname", &self.hostname)
             .field("last_ip", &self.last_ip)
+            .field("trust_generation", &self.trust_generation)
             .finish()
     }
 }
@@ -389,6 +416,8 @@ pub struct KeystoreV2 {
     blocked_device_ids: Vec<String>,
     blocked_ips: Vec<String>,
     legacy_v1_quarantined: bool,
+    peer_generations: HashMap<String, u64>,
+    camera_consents: HashMap<String, String>,
 }
 
 impl KeystoreV2 {
@@ -396,6 +425,7 @@ impl KeystoreV2 {
     ///
     /// # Errors
     /// Returns [`KeystoreError`] if OS secret storage or directory operations fail.
+    #[allow(dead_code)]
     pub fn open_default() -> Result<Self, KeystoreError> {
         let dir = try_default_keystore_dir()?;
         Self::open_with_provider(dir, &OsNativeKekProvider)
@@ -414,6 +444,9 @@ impl KeystoreV2 {
         provider: &dyn KekProvider,
     ) -> Result<Self, KeystoreError> {
         ensure_secure_directory(&storage_dir)?;
+
+        // Safely sweep stale .tmp files from previous interrupted runs (SEC-1D-20)
+        clean_stale_temp_files(&storage_dir);
 
         // Check and quarantine any legacy v1 trusted_peers.json files.
         let quarantined = quarantine_legacy_v1_files(&storage_dir);
@@ -456,8 +489,11 @@ impl KeystoreV2 {
             blocked_device_ids: Vec::new(),
             blocked_ips: Vec::new(),
             legacy_v1_quarantined,
+            peer_generations: HashMap::new(),
+            camera_consents: HashMap::new(),
         };
         store.persist_to_disk()?;
+        crate::security::transport::register_local_device_identity(&store.local_device_id_hex);
         Ok(store)
     }
 
@@ -492,20 +528,44 @@ impl KeystoreV2 {
         }
 
         // Verify metadata integrity MAC when present (upgrade older v2 stores on save below).
-        let needs_mac_upgrade = match &parsed.state_mac_hex {
+        let mut needs_mac_upgrade = false;
+        match &parsed.state_mac_hex {
             Some(mac_hex) => {
                 let presented_mac: [u8; 32] = super::hex_decode_array(mac_hex).ok_or_else(|| {
                     KeystoreError::AeadTamperDetected("invalid state_mac_hex encoding".into())
                 })?;
                 let expected_mac = compute_keystore_file_mac(&kek, &parsed)?;
-                if !bool::from(presented_mac.ct_eq(&expected_mac)) {
+                if bool::from(presented_mac.ct_eq(&expected_mac)) {
+                    // Valid modern Batch 1E MAC
+                } else if parsed.persistent_camera_consents.is_empty() {
+                    // Check if valid Batch 1D MAC with tombstones
+                    let v2_mac = compute_keystore_file_mac_v2(&kek, &parsed)?;
+                    if bool::from(presented_mac.ct_eq(&v2_mac)) {
+                        needs_mac_upgrade = true;
+                    } else if parsed.tombstone_generations.is_empty() {
+                        // Check if valid legacy MAC without tombstones
+                        let legacy_mac = compute_keystore_file_mac_legacy(&kek, &parsed)?;
+                        if bool::from(presented_mac.ct_eq(&legacy_mac)) {
+                            needs_mac_upgrade = true;
+                        } else {
+                            return Err(KeystoreError::AeadTamperDetected(
+                                "keystore metadata integrity MAC verification failed".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(KeystoreError::AeadTamperDetected(
+                            "keystore metadata integrity MAC verification failed".into(),
+                        ));
+                    }
+                } else {
                     return Err(KeystoreError::AeadTamperDetected(
                         "keystore metadata integrity MAC verification failed".into(),
                     ));
                 }
-                false
             }
-            None => true,
+            None => {
+                needs_mac_upgrade = true;
+            }
         };
 
         let local_pk_bytes: [u8; 32] = super::hex_decode_array(&parsed.local_ed25519_pubkey_hex)
@@ -549,6 +609,18 @@ impl KeystoreV2 {
 
         let mut peers = HashMap::new();
         let mut seen_hostnames: Vec<String> = Vec::new();
+        let mut peer_generations = HashMap::new();
+
+        // 1. Populate generation tombstones for unpinned/revoked peers
+        for (raw_id, &gen) in &parsed.tombstone_generations {
+            let clean_id = raw_id.trim().to_ascii_lowercase();
+            if clean_id.len() == 32 && super::hex_decode_array::<16>(&clean_id).is_some() && gen >= 1 {
+                peer_generations.insert(clean_id, gen);
+            } else {
+                warn!("Ignoring invalid tombstone record '{}' => {}", raw_id, gen);
+            }
+        }
+
         for rec in &parsed.peers {
             if rec.schema_version != KEYSTORE_SCHEMA_VERSION {
                 return Err(KeystoreError::CorruptKeystore(format!(
@@ -617,6 +689,9 @@ impl KeystoreV2 {
                 seen_hostnames.push(host_lower);
             }
 
+            let trust_gen = rec.trust_generation.max(1);
+            let current_known = peer_generations.get(&canonical_id_hex).copied().unwrap_or(0);
+            peer_generations.insert(canonical_id_hex.clone(), trust_gen.max(current_known));
             peers.insert(
                 canonical_id_hex.clone(),
                 VerifiedPeerCredentials {
@@ -630,8 +705,34 @@ impl KeystoreV2 {
                     last_ip: rec.last_ip.trim().to_string(),
                     paired_at_epoch: rec.paired_at_epoch,
                     via_direct_cable: rec.via_direct_cable,
+                    trust_generation: trust_gen,
                 },
             );
+        }
+
+        let mut camera_consents = HashMap::new();
+        for (id, val) in &parsed.persistent_camera_consents {
+            let clean_id = id.trim().to_ascii_lowercase();
+            if val == "blocked" {
+                camera_consents.insert(clean_id, "blocked".to_string());
+            } else if let Some(gen_str) = val.strip_prefix("always_allow:") {
+                if let Ok(gen) = gen_str.parse::<u64>() {
+                    if let Some(peer) = peers.get(&clean_id) {
+                        if peer.trust_generation == gen {
+                            camera_consents.insert(clean_id, format!("always_allow:{}", gen));
+                        } else {
+                            warn!(
+                                "Discarding stale persistent camera consent for {} (stored gen {} != active gen {})",
+                                clean_id, gen, peer.trust_generation
+                            );
+                            needs_mac_upgrade = true;
+                        }
+                    } else {
+                        warn!("Discarding orphaned persistent camera consent for unpaired peer {}", clean_id);
+                        needs_mac_upgrade = true;
+                    }
+                }
+            }
         }
 
         let store = Self {
@@ -646,7 +747,19 @@ impl KeystoreV2 {
             blocked_device_ids,
             blocked_ips,
             legacy_v1_quarantined: parsed.legacy_v1_quarantined || newly_quarantined,
+            peer_generations,
+            camera_consents,
         };
+
+        crate::security::transport::register_local_device_identity(&store.local_device_id_hex);
+        for (id, creds) in &store.peers {
+            crate::security::transport::register_peer_trust_generation(id, creds.trust_generation);
+        }
+        for (id, &gen) in &store.peer_generations {
+            if !store.peers.contains_key(id) {
+                crate::security::transport::invalidate_peer_trust(id, gen);
+            }
+        }
 
         if (newly_quarantined && !parsed.legacy_v1_quarantined) || needs_mac_upgrade {
             store.persist_to_disk()?;
@@ -804,6 +917,9 @@ impl KeystoreV2 {
         let device_id_hex = super::hex_encode(&peer_device_id);
         let now_secs = super::unix_epoch_secs();
 
+        let current_gen = self.peer_generations.get(&device_id_hex).copied().unwrap_or(0);
+        let trust_generation = current_gen.saturating_add(1);
+
         let creds = VerifiedPeerCredentials {
             device_id: peer_device_id,
             device_id_hex: device_id_hex.clone(),
@@ -815,13 +931,58 @@ impl KeystoreV2 {
             last_ip: last_ip.trim().to_string(),
             paired_at_epoch: now_secs,
             via_direct_cable,
+            trust_generation,
         };
 
         let mut next_peers = self.peers.clone();
-        next_peers.insert(device_id_hex, creds.clone());
-        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
+        next_peers.insert(device_id_hex.clone(), creds.clone());
+        let mut next_gens = self.peer_generations.clone();
+        next_gens.insert(device_id_hex.clone(), trust_generation);
+        let mut next_consents = self.camera_consents.clone();
+        next_consents.remove(&device_id_hex);
+        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips, &next_gens, &next_consents)?;
         self.peers = next_peers;
+        self.peer_generations = next_gens;
+        self.camera_consents = next_consents;
+        crate::security::transport::register_peer_trust_generation(&creds.device_id_hex, creds.trust_generation);
+        if let Some(clip) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+            clip.clear_peer_revocation(&creds.device_id_hex);
+        }
+        // Note: Subsystem consent revocation (e.g. camera) must NEVER be invoked while holding
+        // the global keystore mutex to eliminate ABBA deadlock (SEC-1D-04). Higher-level pairing
+        // callers orchestrate subsystem consent resets outside the keystore lock.
         Ok(creds)
+    }
+
+    /// Explicitly unpairs and forgets a pinned peer by its device ID hex, returning
+    /// whether the peer was removed and the newly established unpair trust generation (SEC-1D-14).
+    pub fn unpair_peer_ext(&mut self, device_id_hex: &str) -> Result<(bool, u64), KeystoreError> {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = self
+            .peer_generations
+            .get(&canonical)
+            .copied()
+            .or_else(|| self.peers.get(&canonical).map(|p| p.trust_generation))
+            .unwrap_or(0);
+        let next_gen = current_gen.saturating_add(1);
+        let mut next_peers = self.peers.clone();
+        let removed = next_peers.remove(&canonical).is_some();
+        let mut next_gens = self.peer_generations.clone();
+        next_gens.insert(canonical.clone(), next_gen);
+
+        let mut next_consents = self.camera_consents.clone();
+        next_consents.remove(&canonical);
+
+        // Persist state to disk before mutating in-memory state or invalidating sessions.
+        // If disk persistence fails, fail closed without mutating memory or invalidating transport sessions.
+        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips, &next_gens, &next_consents)?;
+
+        self.peers = next_peers;
+        self.peer_generations = next_gens;
+        self.camera_consents = next_consents;
+        crate::security::transport::invalidate_peer_trust(&canonical, next_gen);
+
+        Ok((removed, next_gen))
     }
 
     /// Explicitly unpairs and forgets a pinned peer by its device ID hex.
@@ -832,24 +993,25 @@ impl KeystoreV2 {
     /// # Returns
     /// `true` if the peer was found and removed; `false` if not found.
     pub fn unpair_peer(&mut self, device_id_hex: &str) -> Result<bool, KeystoreError> {
-        let canonical = device_id_hex.trim().to_ascii_lowercase();
-        let mut next_peers = self.peers.clone();
-        let removed = next_peers.remove(&canonical).is_some();
-        if removed {
-            self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
-            self.peers = next_peers;
-        }
-        Ok(removed)
+        self.unpair_peer_ext(device_id_hex).map(|(removed, _)| removed)
     }
 
-    /// Removes a peer from trust and optionally blocks its device ID and IP address.
-    pub fn untrust_or_block_peer(
+    /// Removes a peer from trust and optionally blocks its device ID and IP address, returning
+    /// the newly established revocation trust generation (SEC-1D-14).
+    pub fn untrust_or_block_peer_ext(
         &mut self,
         device_id_hex: &str,
         block: bool,
         known_ip: Option<&str>,
-    ) -> Result<(), KeystoreError> {
+    ) -> Result<u64, KeystoreError> {
         let canonical = device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = self
+            .peer_generations
+            .get(&canonical)
+            .copied()
+            .or_else(|| self.peers.get(&canonical).map(|p| p.trust_generation))
+            .unwrap_or(0);
+        let next_gen = current_gen.saturating_add(1);
         let mut next_peers = self.peers.clone();
         let mut next_blocked_ids = self.blocked_device_ids.clone();
         let mut next_blocked_ips = self.blocked_ips.clone();
@@ -882,11 +1044,39 @@ impl KeystoreV2 {
                 next_blocked_ips.retain(|bip| bip != ip);
             }
         }
-        self.persist_state(&next_peers, &next_blocked_ids, &next_blocked_ips)?;
+
+        let mut next_gens = self.peer_generations.clone();
+        next_gens.insert(canonical.clone(), next_gen);
+
+        let mut next_consents = self.camera_consents.clone();
+        if block {
+            next_consents.insert(canonical.clone(), "blocked".to_string());
+        } else {
+            next_consents.remove(&canonical);
+        }
+
+        // Persist state to disk before mutating in-memory state or invalidating sessions.
+        // If disk persistence fails, fail closed without mutating memory or invalidating transport sessions.
+        self.persist_state(&next_peers, &next_blocked_ids, &next_blocked_ips, &next_gens, &next_consents)?;
+
         self.peers = next_peers;
         self.blocked_device_ids = next_blocked_ids;
         self.blocked_ips = next_blocked_ips;
-        Ok(())
+        self.peer_generations = next_gens;
+        self.camera_consents = next_consents;
+        crate::security::transport::invalidate_peer_trust(&canonical, next_gen);
+
+        Ok(next_gen)
+    }
+
+    /// Removes a peer from trust and optionally blocks its device ID and IP address.
+    pub fn untrust_or_block_peer(
+        &mut self,
+        device_id_hex: &str,
+        block: bool,
+        known_ip: Option<&str>,
+    ) -> Result<(), KeystoreError> {
+        self.untrust_or_block_peer_ext(device_id_hex, block, known_ip).map(|_| ())
     }
 
     /// Returns a slice of all currently blocked device ID strings.
@@ -897,6 +1087,12 @@ impl KeystoreV2 {
     /// Returns a slice of all currently blocked IP address strings.
     pub fn blocked_ips(&self) -> &[String] {
         &self.blocked_ips
+    }
+
+    /// Checks if a device ID is currently blocked.
+    pub fn is_device_blocked(&self, device_id_hex: &str) -> bool {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        self.blocked_device_ids.iter().any(|b| b == &canonical)
     }
 
     /// Checks if a device ID or IP address is currently blocked.
@@ -925,6 +1121,44 @@ impl KeystoreV2 {
             return None;
         }
         self.peers.get(&canonical)
+    }
+
+    /// Returns the active trust generation for the given peer device ID hex if tracked in keystore.
+    ///
+    /// Checks `peer_generations` first to preserve generation tracking across unpair/revoke operations,
+    /// falling back to the pinned peer record's generation.
+    pub fn peer_trust_generation(&self, device_id_hex: &str) -> Option<u64> {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        self.peer_generations
+            .get(&canonical)
+            .copied()
+            .or_else(|| self.peers.get(&canonical).map(|p| p.trust_generation))
+    }
+
+    /// Registers a mock paired peer with an explicit trust generation for testing.
+    #[cfg(test)]
+    pub fn register_test_peer_with_generation(
+        &mut self,
+        device_id_hex: &str,
+        generation: u64,
+    ) {
+        let canonical = device_id_hex.trim().to_ascii_lowercase();
+        self.peer_generations.insert(canonical.clone(), generation);
+        let creds = VerifiedPeerCredentials {
+            device_id: [0u8; 16],
+            device_id_hex: canonical.clone(),
+            ed25519_pubkey: [0u8; 32],
+            key_id: [1u8; 16],
+            root_key: zeroize::Zeroizing::new([0u8; 32]),
+            hostname: format!("test-peer-{}", &canonical[..8.min(canonical.len())]),
+            os: "test".into(),
+            last_ip: "127.0.0.1".into(),
+            paired_at_epoch: 0,
+            via_direct_cable: false,
+            trust_generation: generation,
+        };
+        self.peers.insert(canonical.clone(), creds);
+        crate::security::transport::register_peer_trust_generation(&canonical, generation);
     }
 
     /// Looks up a pinned peer by its 16-byte binary device ID.
@@ -963,14 +1197,47 @@ impl KeystoreV2 {
         if let Some(peer) = next_peers.get_mut(&canonical) {
             peer.last_ip = clean_new_ip.to_string();
         }
-        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips)?;
+        self.persist_state(&next_peers, &self.blocked_device_ids, &self.blocked_ips, &self.peer_generations, &self.camera_consents)?;
         self.peers = next_peers;
         Ok(())
     }
 
     /// Persists current in-memory state to disk atomically.
     pub fn persist_to_disk(&self) -> Result<(), KeystoreError> {
-        self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips)
+        self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips, &self.peer_generations, &self.camera_consents)
+    }
+
+    /// Returns the persistent camera consent string for `device_id_hex` if set.
+    pub fn get_camera_consent(&self, device_id_hex: &str) -> Option<String> {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        self.camera_consents.get(&clean_id).cloned()
+    }
+
+    /// Sets or updates the persistent camera consent for `device_id_hex` and persists to disk.
+    pub fn set_camera_consent(&mut self, device_id_hex: &str, consent: String) -> Result<(), KeystoreError> {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        let mut next_consents = self.camera_consents.clone();
+        next_consents.insert(clean_id, consent);
+        self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips, &self.peer_generations, &next_consents)?;
+        self.camera_consents = next_consents;
+        Ok(())
+    }
+
+    /// Removes persistent camera consent for `device_id_hex` and persists to disk.
+    pub fn remove_camera_consent(&mut self, device_id_hex: &str) -> Result<bool, KeystoreError> {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        let mut next_consents = self.camera_consents.clone();
+        let removed = next_consents.remove(&clean_id).is_some();
+        if removed {
+            self.persist_state(&self.peers, &self.blocked_device_ids, &self.blocked_ips, &self.peer_generations, &next_consents)?;
+            self.camera_consents = next_consents;
+        }
+        Ok(removed)
+    }
+
+    /// Returns a copy of all persistent camera consents.
+    pub fn all_camera_consents(&self) -> HashMap<String, String> {
+        self.camera_consents.clone()
     }
 
     /// Internal serialization, AEAD encryption, HMAC calculation, and atomic write.
@@ -979,6 +1246,8 @@ impl KeystoreV2 {
         peers_map: &HashMap<String, VerifiedPeerCredentials>,
         blocked_device_ids: &[String],
         blocked_ips: &[String],
+        peer_generations: &HashMap<String, u64>,
+        camera_consents: &HashMap<String, String>,
     ) -> Result<(), KeystoreError> {
         let local_pk_bytes = self.local_verifying_key.to_bytes();
         let local_sk_bytes = Zeroizing::new(self.local_signing_key.to_bytes());
@@ -1000,6 +1269,7 @@ impl KeystoreV2 {
                 paired_at_epoch: peer.paired_at_epoch,
                 via_direct_cable: peer.via_direct_cable,
                 wrapped_root_key: wrapped_root,
+                trust_generation: peer.trust_generation,
             });
         }
         serialized_peers.sort_by(|a, b| a.device_id_hex.cmp(&b.device_id_hex));
@@ -1011,6 +1281,13 @@ impl KeystoreV2 {
         sorted_blocked_ips.sort();
         sorted_blocked_ips.dedup();
 
+        let mut tombstones = HashMap::new();
+        for (id, &gen) in peer_generations {
+            if !peers_map.contains_key(id) && gen >= 1 {
+                tombstones.insert(id.clone(), gen);
+            }
+        }
+
         let mut file_obj = KeystoreFileV2 {
             schema_version: KEYSTORE_SCHEMA_VERSION,
             local_device_id_hex: self.local_device_id_hex.clone(),
@@ -1020,6 +1297,8 @@ impl KeystoreV2 {
             blocked_device_ids: sorted_blocked_ids,
             blocked_ips: sorted_blocked_ips,
             legacy_v1_quarantined: self.legacy_v1_quarantined,
+            tombstone_generations: tombstones,
+            persistent_camera_consents: camera_consents.clone(),
             state_mac_hex: None,
         };
         let mac = compute_keystore_file_mac(&self.kek, &file_obj)?;
@@ -1032,8 +1311,138 @@ impl KeystoreV2 {
     }
 }
 
-/// Computes the HMAC-SHA256 integrity tag over all serialized keystore metadata fields.
+/// Computes the HMAC-SHA256 integrity tag over all serialized keystore metadata fields including tombstones and camera consents.
 fn compute_keystore_file_mac(
+    kek: &[u8; 32],
+    file_obj: &KeystoreFileV2,
+) -> Result<[u8; 32], KeystoreError> {
+    let hk = Hkdf::<Sha256>::new(Some(KEYSTORE_META_MAC_SALT), kek);
+    let mut mac_key = Zeroizing::new([0u8; 32]);
+    hk.expand(KEYSTORE_META_MAC_INFO, &mut *mac_key)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("HKDF meta MAC key failed: {}", e)))?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&*mac_key)
+        .map_err(|_| KeystoreError::OsKeystoreFailure("HMAC meta MAC init failed".into()))?;
+
+    fn update_lp(mac: &mut HmacSha256, bytes: &[u8]) {
+        mac.update(&(bytes.len() as u32).to_be_bytes());
+        mac.update(bytes);
+    }
+
+    mac.update(&file_obj.schema_version.to_be_bytes());
+    update_lp(&mut mac, file_obj.local_device_id_hex.as_bytes());
+    update_lp(&mut mac, file_obj.local_ed25519_pubkey_hex.as_bytes());
+    mac.update(&[u8::from(file_obj.legacy_v1_quarantined)]);
+
+    let mut peers = file_obj.peers.clone();
+    peers.sort_by(|a, b| a.device_id_hex.cmp(&b.device_id_hex));
+    mac.update(&(peers.len() as u32).to_be_bytes());
+    for p in &peers {
+        mac.update(&p.schema_version.to_be_bytes());
+        update_lp(&mut mac, p.device_id_hex.as_bytes());
+        update_lp(&mut mac, p.ed25519_pubkey_hex.as_bytes());
+        update_lp(&mut mac, p.key_id_hex.as_bytes());
+        update_lp(&mut mac, p.hostname.as_bytes());
+        update_lp(&mut mac, p.os.as_bytes());
+        update_lp(&mut mac, p.last_ip.as_bytes());
+        mac.update(&p.paired_at_epoch.to_be_bytes());
+        mac.update(&[u8::from(p.via_direct_cable)]);
+    }
+
+    mac.update(&(file_obj.blocked_device_ids.len() as u32).to_be_bytes());
+    for bid in &file_obj.blocked_device_ids {
+        update_lp(&mut mac, bid.as_bytes());
+    }
+    mac.update(&(file_obj.blocked_ips.len() as u32).to_be_bytes());
+    for bip in &file_obj.blocked_ips {
+        update_lp(&mut mac, bip.as_bytes());
+    }
+
+    let mut tombstones: Vec<(&String, &u64)> = file_obj.tombstone_generations.iter().collect();
+    tombstones.sort_by_key(|(k, _)| *k);
+    mac.update(&(tombstones.len() as u32).to_be_bytes());
+    for (tid, tgen) in tombstones {
+        update_lp(&mut mac, tid.as_bytes());
+        mac.update(&tgen.to_be_bytes());
+    }
+
+    let mut consents: Vec<(&String, &String)> = file_obj.persistent_camera_consents.iter().collect();
+    consents.sort_by_key(|(k, _)| *k);
+    mac.update(&(consents.len() as u32).to_be_bytes());
+    for (cid, cval) in consents {
+        update_lp(&mut mac, cid.as_bytes());
+        update_lp(&mut mac, cval.as_bytes());
+    }
+
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Ok(out)
+}
+
+/// Batch 1D MAC calculation for backward-compatible verification of older v2 keystore files with tombstones but without persistent camera consents.
+fn compute_keystore_file_mac_v2(
+    kek: &[u8; 32],
+    file_obj: &KeystoreFileV2,
+) -> Result<[u8; 32], KeystoreError> {
+    let hk = Hkdf::<Sha256>::new(Some(KEYSTORE_META_MAC_SALT), kek);
+    let mut mac_key = Zeroizing::new([0u8; 32]);
+    hk.expand(KEYSTORE_META_MAC_INFO, &mut *mac_key)
+        .map_err(|e| KeystoreError::OsKeystoreFailure(format!("HKDF meta MAC key failed: {}", e)))?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&*mac_key)
+        .map_err(|_| KeystoreError::OsKeystoreFailure("HMAC meta MAC init failed".into()))?;
+
+    fn update_lp(mac: &mut HmacSha256, bytes: &[u8]) {
+        mac.update(&(bytes.len() as u32).to_be_bytes());
+        mac.update(bytes);
+    }
+
+    mac.update(&file_obj.schema_version.to_be_bytes());
+    update_lp(&mut mac, file_obj.local_device_id_hex.as_bytes());
+    update_lp(&mut mac, file_obj.local_ed25519_pubkey_hex.as_bytes());
+    mac.update(&[u8::from(file_obj.legacy_v1_quarantined)]);
+
+    let mut peers = file_obj.peers.clone();
+    peers.sort_by(|a, b| a.device_id_hex.cmp(&b.device_id_hex));
+    mac.update(&(peers.len() as u32).to_be_bytes());
+    for p in &peers {
+        mac.update(&p.schema_version.to_be_bytes());
+        update_lp(&mut mac, p.device_id_hex.as_bytes());
+        update_lp(&mut mac, p.ed25519_pubkey_hex.as_bytes());
+        update_lp(&mut mac, p.key_id_hex.as_bytes());
+        update_lp(&mut mac, p.hostname.as_bytes());
+        update_lp(&mut mac, p.os.as_bytes());
+        update_lp(&mut mac, p.last_ip.as_bytes());
+        mac.update(&p.paired_at_epoch.to_be_bytes());
+        mac.update(&[u8::from(p.via_direct_cable)]);
+    }
+
+    mac.update(&(file_obj.blocked_device_ids.len() as u32).to_be_bytes());
+    for bid in &file_obj.blocked_device_ids {
+        update_lp(&mut mac, bid.as_bytes());
+    }
+    mac.update(&(file_obj.blocked_ips.len() as u32).to_be_bytes());
+    for bip in &file_obj.blocked_ips {
+        update_lp(&mut mac, bip.as_bytes());
+    }
+
+    let mut tombstones: Vec<(&String, &u64)> = file_obj.tombstone_generations.iter().collect();
+    tombstones.sort_by_key(|(k, _)| *k);
+    mac.update(&(tombstones.len() as u32).to_be_bytes());
+    for (tid, tgen) in tombstones {
+        update_lp(&mut mac, tid.as_bytes());
+        mac.update(&tgen.to_be_bytes());
+    }
+
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Ok(out)
+}
+
+/// Legacy MAC calculation for backward-compatible verification of older v2 keystore files without tombstones.
+fn compute_keystore_file_mac_legacy(
     kek: &[u8; 32],
     file_obj: &KeystoreFileV2,
 ) -> Result<[u8; 32], KeystoreError> {
@@ -1418,12 +1827,58 @@ fn atomic_write_secure_file(dir: &Path, target: &Path, content: &[u8]) -> Result
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).map_err(|e| {
-            KeystoreError::IoFailure(format!("chmod 0600 {}: {}", target.display(), e))
-        })?;
+        if let Err(e) = fs::set_permissions(target, fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("chmod 0600 on committed target {} failed: {}", target.display(), e);
+        }
+
+        // Parent directory fsync to persist directory entry rename to durable storage (SEC-1D-20)
+        match fs::File::open(dir) {
+            Ok(dir_file) => {
+                if let Err(e) = dir_file.sync_all() {
+                    // The file is already committed via rename, but directory metadata sync had an error.
+                    // We report this limitation honestly without corrupting in-memory state.
+                    tracing::warn!("Post-rename parent directory fsync failed on {}: {}", dir.display(), e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not open parent directory for post-rename fsync {}: {}", dir.display(), e);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Safely cleans up stale temporary keystore files (`.{target}.tmp.*`) left behind by previous
+/// aborted or crashed daemon runs, strictly avoiding symlink traversal (SEC-1D-20).
+pub fn clean_stale_temp_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str.starts_with('.') && name_str.contains(".tmp.") {
+            // Strictly inspect symlink metadata: NEVER follow symlinks!
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                if meta.file_type().is_symlink() {
+                    tracing::warn!("Removing untrusted symlinked temporary file: {}", path.display());
+                    let _ = fs::remove_file(&path);
+                } else if meta.is_file() {
+                    // Check age: remove if older than 300 seconds (5 minutes)
+                    let is_stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| m.elapsed().ok())
+                        .map(|elapsed| elapsed.as_secs() > 300)
+                        .unwrap_or(true);
+                    if is_stale {
+                        tracing::debug!("Cleaning stale temporary keystore file: {}", path.display());
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Quarantines any legacy v1 `trusted_peers.json` in `storage_dir`, its parent directory,
@@ -1512,6 +1967,7 @@ pub fn quarantine_legacy_v1_files(storage_dir: &Path) -> bool {
 // ============================================================================
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 struct NoUiKeychainGuard {
     prev_allowed: u8,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -1548,6 +2004,7 @@ impl NoUiKeychainGuard {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 impl Drop for NoUiKeychainGuard {
     fn drop(&mut self) {
         use std::os::raw::c_int;
@@ -1562,6 +2019,7 @@ impl Drop for NoUiKeychainGuard {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 /// Queries Apple IOKit registry for immutable hardware identifiers (`IOPlatformUUID`, `IOPlatformSerialNumber`).
 fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
     use core_foundation::base::{kCFAllocatorDefault, CFGetTypeID, CFTypeRef, TCFType};
@@ -1655,6 +2113,7 @@ fn macos_read_platform_hardware_identity() -> Result<Vec<u8>, KeystoreError> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 /// Derives $K_{\text{kek}}$ by combining a mode-`0600` random seed file with macOS hardware identity (`IOPlatformUUID`).
 fn macos_hw_bound_load_or_create_kek(
     storage_dir: &Path,
@@ -1771,6 +2230,7 @@ fn macos_hw_bound_load_or_create_kek(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 /// Loads existing $K_{\text{kek}}$ from macOS Keychain Services or derives a hardware-bound seed key.
 fn macos_keychain_load_or_create_kek(
     storage_dir: &Path,

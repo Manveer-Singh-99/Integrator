@@ -83,10 +83,13 @@
 #include <shlobj.h>
 #include <knownfolders.h>
 #include <shlwapi.h>
+#include <commctrl.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <mutex>
+#include <atomic>
 
 namespace {
 
@@ -333,9 +336,11 @@ bool EnsureSharedObjects(char* errBuf, int32_t errCap) {
     // (A;;GA;;;BA) - Administrators: Generic All
     // (A;;GR;;;LS) - LOCAL SERVICE (FrameServer): Generic Read
     // (A;;GR;;;AC) - ALL APPLICATION PACKAGES: Generic Read
+    // (A;;GR;;;IU) - Interactive Users: Generic Read
+    // S:(ML;;NW;;;LW) - Low Integrity Label
     PSECURITY_DESCRIPTOR pShmSd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;LS)(A;;GR;;;AC)",
+            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;LS)(A;;GR;;;AC)(A;;GR;;;IU)S:(ML;;NW;;;LW)",
             SDDL_REVISION_1, &pShmSd, nullptr)) {
         WriteErr(errBuf, errCap, "Failed to create shared memory DACL");
         return false;
@@ -380,10 +385,10 @@ bool EnsureSharedObjects(char* errBuf, int32_t errCap) {
     }
 
     if (!g_hEvent) {
-        // Event DACL: SYNCHRONIZE access (0x00100000) for LOCAL SERVICE and AppContainers
+        // Event DACL: SYNCHRONIZE access (0x00100000) for LOCAL SERVICE, AppContainers, and Interactive Users
         PSECURITY_DESCRIPTOR pEvtSd = nullptr;
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;LS)(A;;0x00100000;;;AC)",
+            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;LS)(A;;0x00100000;;;AC)(A;;0x00100000;;;IU)S:(ML;;NW;;;LW)",
             SDDL_REVISION_1, &pEvtSd, nullptr);
         SECURITY_ATTRIBUTES evtSa{ sizeof(evtSa), pEvtSd, FALSE };
         g_hEvent = CreateEventW(&evtSa, FALSE, FALSE, L"Global\\IntegratorVCamEvt_v1");
@@ -550,6 +555,186 @@ void integrator_win_vcam_stop() {
 int32_t integrator_win_vcam_is_active() {
     std::lock_guard<std::mutex> guard(g_lock);
     return g_virtualCamera != nullptr ? 1 : 0;
+}
+
+namespace {
+
+// Typed camera consent decision constants
+enum IntegratorConsentChoice : int32_t {
+    INTEGRATOR_CONSENT_DENY_AND_BLOCK = -1,
+    INTEGRATOR_CONSENT_DENY           =  0,
+    INTEGRATOR_CONSENT_ALLOW_ONCE     =  1,
+    INTEGRATOR_CONSENT_ACTIVE_SESSION =  2,
+    INTEGRATOR_CONSENT_ALWAYS_ALLOW   =  3,
+};
+
+// Thread-safe state for prompt cancellation and tracking
+static std::mutex g_winPromptLock;
+static HWND g_winActivePromptHwnd = nullptr;
+static std::atomic<bool> g_winPromptCancelled{false};
+
+struct WinPromptContext {
+    DWORD timeout_ms;
+    bool timed_out;
+};
+
+static HRESULT CALLBACK WinPromptCallbackProc(
+    HWND hwnd,
+    UINT uNotification,
+    WPARAM wParam,
+    LPARAM /*lParam*/,
+    LONG_PTR dwRefData
+) {
+    auto* ctx = reinterpret_cast<WinPromptContext*>(dwRefData);
+    if (uNotification == TDN_CREATED) {
+        std::lock_guard<std::mutex> lock(g_winPromptLock);
+        g_winActivePromptHwnd = hwnd;
+        if (g_winPromptCancelled.load(std::memory_order_acquire)) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    } else if (uNotification == TDN_TIMER) {
+        DWORD elapsed_ms = static_cast<DWORD>(wParam);
+        if (ctx && elapsed_ms >= ctx->timeout_ms) {
+            ctx->timed_out = true;
+            SendMessageW(hwnd, TDM_CLICK_BUTTON, IDCANCEL, 0);
+        }
+    } else if (uNotification == TDN_DESTROYED) {
+        std::lock_guard<std::mutex> lock(g_winPromptLock);
+        if (g_winActivePromptHwnd == hwnd) {
+            g_winActivePromptHwnd = nullptr;
+        }
+    }
+    return S_OK;
+}
+
+} // namespace
+
+/// Cancels any currently pending Windows camera consent dialog immediately.
+extern "C" void integrator_win_cancel_camera_consent_prompt() {
+    g_winPromptCancelled.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_winPromptLock);
+    if (g_winActivePromptHwnd && IsWindow(g_winActivePromptHwnd)) {
+        PostMessageW(g_winActivePromptHwnd, WM_CLOSE, 0, 0);
+    }
+}
+
+/// Prompts local Windows user for camera reception consent via Win32 modal dialog.
+/// Enforces bounded timeout via TDN_TIMER, cancellable via integrator_win_cancel_camera_consent_prompt,
+/// and fails closed in non-interactive/Session 0 environments.
+/// Returns:
+///   1  = Allow Once
+///   2  = Allow for Active Session
+///   3  = Always Allow
+///   -1 = Deny and Block persistently
+///   0  = Deny / Timeout / Cancelled / Error
+extern "C" int32_t integrator_win_prompt_camera_consent_scoped(const char* peer_name, uint32_t timeout_sec) {
+    if (!peer_name) return INTEGRATOR_CONSENT_DENY;
+
+    // 1. Session 0 & interactive desktop check (fail-closed)
+    DWORD sessionId = 0;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) {
+        return INTEGRATOR_CONSENT_DENY;
+    }
+    HWINSTA hWinSta = GetProcessWindowStation();
+    if (hWinSta != NULL) {
+        USEROBJECTFLAGS flags = {};
+        if (GetUserObjectInformationW(hWinSta, UOI_FLAGS, &flags, sizeof(flags), NULL)) {
+            if ((flags.dwFlags & WSF_VISIBLE) == 0) {
+                return INTEGRATOR_CONSENT_DENY;
+            }
+        }
+    }
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, peer_name, -1, NULL, 0);
+    if (wlen <= 0) return INTEGRATOR_CONSENT_DENY;
+    std::wstring wpeer(wlen, 0);
+    MultiByteToWideChar(CP_UTF8, 0, peer_name, -1, &wpeer[0], wlen);
+    if (!wpeer.empty() && wpeer.back() == L'\0') wpeer.pop_back();
+
+    enum CustomButtons {
+        BTN_ALLOW_SESSION = 101,
+        BTN_ALLOW_ONCE    = 102,
+        BTN_ALWAYS_ALLOW  = 103,
+        BTN_DENY          = 104,
+        BTN_DENY_BLOCK    = 105,
+    };
+
+    const TASKDIALOG_BUTTON customButtons[] = {
+        { BTN_ALLOW_SESSION, L"Allow for Active Session\nPermit camera streaming until either device disconnects" },
+        { BTN_ALLOW_ONCE,    L"Allow Once\nPermit a single continuous video stream only" },
+        { BTN_ALWAYS_ALLOW,  L"Always Allow\nRemember permission permanently for this paired device" },
+        { BTN_DENY,          L"Deny\nRefuse camera access for now (triggers cooldown backoff)" },
+        { BTN_DENY_BLOCK,    L"Deny & Block\nPermanently block this device from requesting camera access" },
+    };
+
+    WinPromptContext ctx;
+    ctx.timeout_ms = (timeout_sec > 0 ? timeout_sec : 30) * 1000;
+    ctx.timed_out = false;
+
+    g_winPromptCancelled.store(false, std::memory_order_release);
+
+    TASKDIALOGCONFIG config = {};
+    config.cbSize = sizeof(config);
+    config.hwndParent = NULL;
+    config.hInstance = NULL;
+    config.dwFlags = TDF_USE_COMMAND_LINKS | TDF_CALLBACK_TIMER | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    config.pszWindowTitle = L"Integrator Camera Permission Request";
+    config.pszMainIcon = TD_WARNING_ICON;
+    config.pszMainInstruction = L"Remote Camera Stream Request";
+    std::wstring contentText = L"Device '" + wpeer + L"' wants to stream its camera to this PC as a virtual webcam.\n\nChoose an authorization scope:";
+    config.pszContent = contentText.c_str();
+    config.pButtons = customButtons;
+    config.cButtons = ARRAYSIZE(customButtons);
+    config.nDefaultButton = BTN_DENY;
+    config.pfCallback = WinPromptCallbackProc;
+    config.lpCallbackData = reinterpret_cast<LONG_PTR>(&ctx);
+
+    int nButton = 0;
+    HRESULT hr = E_FAIL;
+    HMODULE hComCtl = LoadLibraryW(L"comctl32.dll");
+    if (hComCtl) {
+        typedef HRESULT (WINAPI *PFN_TaskDialogIndirect)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+        auto pfn = (PFN_TaskDialogIndirect)GetProcAddress(hComCtl, "TaskDialogIndirect");
+        if (pfn) {
+            hr = pfn(&config, &nButton, NULL, NULL);
+        }
+        FreeLibrary(hComCtl);
+    }
+
+    if (FAILED(hr)) {
+        // Fallback for minimal/headless environments using MessageBoxTimeoutW
+        typedef int (WINAPI *PFN_MessageBoxTimeoutW)(HWND, LPCWSTR, LPCWSTR, UINT, WORD, DWORD);
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32) {
+            auto pfnMsgBoxTimeout = (PFN_MessageBoxTimeoutW)GetProcAddress(hUser32, "MessageBoxTimeoutW");
+            if (pfnMsgBoxTimeout) {
+                std::wstring msg = L"Device '" + wpeer + L"' wants to stream its camera to this PC as a virtual webcam.\n\n"
+                                   L"Click Yes to Allow for Session, No to Deny, Cancel to Deny & Block.";
+                int res = pfnMsgBoxTimeout(NULL, msg.c_str(), L"Integrator Camera Permission Request",
+                                           MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+                                           0, ctx.timeout_ms);
+                if (res == IDYES) return INTEGRATOR_CONSENT_ACTIVE_SESSION;
+                if (res == IDCANCEL) return INTEGRATOR_CONSENT_DENY_AND_BLOCK;
+                return INTEGRATOR_CONSENT_DENY;
+            }
+        }
+        return INTEGRATOR_CONSENT_DENY;
+    }
+
+    if (ctx.timed_out || g_winPromptCancelled.load(std::memory_order_acquire)) {
+        return INTEGRATOR_CONSENT_DENY;
+    }
+
+    switch (nButton) {
+        case BTN_ALLOW_SESSION: return INTEGRATOR_CONSENT_ACTIVE_SESSION;
+        case BTN_ALLOW_ONCE:    return INTEGRATOR_CONSENT_ALLOW_ONCE;
+        case BTN_ALWAYS_ALLOW:  return INTEGRATOR_CONSENT_ALWAYS_ALLOW;
+        case BTN_DENY_BLOCK:    return INTEGRATOR_CONSENT_DENY_AND_BLOCK;
+        case BTN_DENY:
+        case IDCANCEL:
+        default:
+            return INTEGRATOR_CONSENT_DENY;
+    }
 }
 
 } // extern "C"

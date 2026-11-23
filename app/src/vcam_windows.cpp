@@ -558,8 +558,11 @@ public:
                     if (pitch >= static_cast<LONG>(activeW)) {
                         CopyNV12ToOutput(dstPtr, static_cast<uint32_t>(pitch), lockedLen, m_shm->slots[slot], activeW, activeH);
                         MemoryBarrier();
-                        m_lastSeq = seq1;
-                        copiedLive = true;
+                        LONG64 seq2 = m_shm->seq;
+                        if (seq1 == seq2) {
+                            m_lastSeq = seq1;
+                            copiedLive = true;
+                        }
                     }
                 }
                 // Fallback to clean standby frame if stream is idling or host is disconnected
@@ -1227,13 +1230,12 @@ private:
 // ============================================================================
 
 /// DLL entry point managing Media Foundation startup and shutdown per process attach/detach.
-BOOL APIENTRY DllMain(HMODULE, DWORD ul_reason_for_call, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
         LogTrace("DllMain DLL_PROCESS_ATTACH");
-        MFStartup(MF_VERSION);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         LogTrace("DllMain DLL_PROCESS_DETACH");
-        MFShutdown();
     }
     return TRUE;
 }

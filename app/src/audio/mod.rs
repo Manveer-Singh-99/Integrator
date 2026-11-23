@@ -277,6 +277,7 @@ impl AudioManager {
                 .unwrap_or_else(|e| e.into_inner());
             reg.negotiate_receiver_session(
                 peer_creds.device_id,
+                peer_creds.trust_generation,
                 &peer_creds.root_key,
                 &sender_nonce,
                 sample_rate,
@@ -286,6 +287,16 @@ impl AudioManager {
             )
         };
         res.map_err(|e| e.to_string())
+    }
+
+    /// Immediately and unconditionally evicts all active audio sessions associated with the given peer device ID hex.
+    pub fn revoke_peer_audio_sessions(peer_device_id_hex: &str) -> usize {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let Some(peer_bytes) = security::hex_decode_array::<16>(&clean_id) else {
+            return 0;
+        };
+        let mut reg = global_audio_registry().lock().unwrap_or_else(|e| e.into_inner());
+        reg.revoke_peer_sessions(&peer_bytes)
     }
 
     /// Negotiates an outbound `AudioSessionSender` with `peer_ip` over `TransportSessionV2` (`DisplayRpc`).

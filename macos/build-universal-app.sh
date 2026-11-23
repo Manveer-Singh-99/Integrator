@@ -15,6 +15,8 @@ APP_DIR="$REPO_ROOT/app"
 DEPLOY_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
 INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.manveersingh.integrator}"
+APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$APP_DIR/Cargo.toml" | head -n 1)"
+APP_VERSION="${APP_VERSION:-1.0.0}"
 OUT_BUNDLE="$APP_DIR/target/bundle/Integrator.app"
 INSTALL_TO_APPS=0
 
@@ -81,9 +83,9 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>${APP_VERSION}</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.0</string>
+	<string>${APP_VERSION}</string>
 	<key>CSResourcesFileMapped</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>

@@ -725,6 +725,10 @@ pub const VDD_DOWNLOAD_URL: &str =
 #[allow(dead_code)]
 pub const USBNCM_GUIDE_URL: &str = "https://www.wintun.net/";
 
+/// Official documentation and releases URL for the Integrator Virtual Camera Extension.
+#[allow(dead_code)]
+pub const VCAM_DOCS_URL: &str = "https://github.com/manveersingh/Integrator";
+
 /// Homebrew Cask identifier for LizardByte Sunshine on macOS.
 #[allow(dead_code)]
 pub const BREW_CASK_SUNSHINE: &str = "lizardbyte/homebrew/sunshine";

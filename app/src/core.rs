@@ -1028,6 +1028,196 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                 ),
             }
         })()),
+        "passkey" => Some((|| {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            match subcmd {
+                "status" | "info" => {
+                    let info_cbor = crate::security::passkey::get_info_cbor_bytes();
+                    let info_hex = crate::security::hex_encode(&info_cbor);
+                    let creds = crate::security::passkey::list_resident_passkeys()
+                        .unwrap_or_default();
+                    let out = serde_json::json!({
+                        "plugin_authenticator": "Integrator Touch ID",
+                        "aaguid": crate::security::hex_encode(&crate::security::passkey::INTEGRATOR_AAGUID),
+                        "get_info_cbor_hex": info_hex,
+                        "stored_passkeys_count": creds.len(),
+                        "stored_passkeys": creds,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                "list" => {
+                    let creds = crate::security::passkey::list_resident_passkeys()
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    if creds.is_empty() {
+                        println!("No resident passkeys stored.");
+                    } else {
+                        println!("{:<32} {:<24} {:<24} {:<8}", "CREDENTIAL ID", "RP ID", "USER", "SIG COUNT");
+                        println!("{}", "-".repeat(90));
+                        for c in &creds {
+                            let cred_short = if c.credential_id_hex.len() > 30 {
+                                format!("{}…", &c.credential_id_hex[..29])
+                            } else {
+                                c.credential_id_hex.clone()
+                            };
+                            println!("{:<32} {:<24} {:<24} {:<8}", cred_short, c.rp_id, c.user_name, c.sign_count);
+                        }
+                    }
+                    Ok(())
+                }
+                "test" => {
+                    // Usage: integrator passkey test [mac_ip] [rp_id]
+                    let target_ip_opt = args.get(3).cloned();
+                    let rp_id = args.get(4).cloned().unwrap_or_else(|| "webauthn.io".to_string());
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        let peer_ip = match target_ip_opt {
+                            Some(ip) => ip,
+                            None => {
+                                let (cfg, _) = trust::get_trust_snapshot();
+                                cfg.trusted_peers
+                                    .first()
+                                    .map(|p| p.last_ip.clone())
+                                    .filter(|ip| !ip.is_empty())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Usage: integrator passkey test <mac_peer_ip> [rp_id]"
+                                        )
+                                    })?
+                            }
+                        };
+                        println!("==> Initiating Passkey MakeCredential test for RP '{}' against {}...", rp_id, peer_ip);
+                        let client_data_hash = crate::security::hex_encode(&crate::security::csprng_array::<32>());
+                        let user_id = crate::security::hex_encode(&crate::security::csprng_array::<16>());
+                        let make_req = crate::security::passkey::PasskeyMakeCredentialRequest {
+                            rp_id: rp_id.clone(),
+                            user_id_hex: user_id,
+                            user_name: "manveer".to_string(),
+                            user_display_name: "Manveer Singh".to_string(),
+                            client_data_hash_hex: client_data_hash.clone(),
+                            requester_hostname: system_info::get_hostname(),
+                        };
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::PasskeyMakeCredential(make_req),
+                        ).await?;
+                        if !resp.success {
+                            anyhow::bail!("Passkey creation failed: {}", resp.message);
+                        }
+                        let cred = resp.passkey_credential.ok_or_else(|| {
+                            anyhow::anyhow!("Mac peer returned success without passkey credential")
+                        })?;
+                        println!("==> Success! Passkey created with ID: {}", cred.credential_id_hex);
+
+                        println!("==> Now testing Passkey GetAssertion for RP '{}'...", rp_id);
+                        let assert_req = crate::security::passkey::PasskeyGetAssertionRequest {
+                            rp_id: rp_id.clone(),
+                            client_data_hash_hex: client_data_hash,
+                            allow_credential_ids_hex: vec![cred.credential_id_hex.clone()],
+                            requester_hostname: system_info::get_hostname(),
+                        };
+                        let assert_resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::PasskeyGetAssertion(assert_req),
+                        ).await?;
+                        if !assert_resp.success {
+                            anyhow::bail!("Passkey assertion failed: {}", assert_resp.message);
+                        }
+                        let assertion = assert_resp.passkey_assertion.ok_or_else(|| {
+                            anyhow::anyhow!("Mac peer returned success without assertion signature")
+                        })?;
+                        println!("==> Success! Passkey assertion signed via Touch ID: {}…", &assertion.signature_der_hex[..20]);
+                        Ok(())
+                    })
+                }
+                "make-hex" => {
+                    // Stateless bridge invoked by IntegratorPasskeyHost.exe (Medium-IL packaged COM server).
+                    // Arg 3: hex-encoded UTF-8 JSON of PasskeyMakeCredentialRequest.
+                    let payload_hex = args.get(3).ok_or_else(|| anyhow::anyhow!("Missing hex payload"))?;
+                    let payload_bytes = crate::security::hex_decode(payload_hex)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid hex payload"))?;
+                    let make_req: crate::security::passkey::PasskeyMakeCredentialRequest =
+                        serde_json::from_slice(&payload_bytes)?;
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let out = rt.block_on(async {
+                        let (cfg, _) = trust::get_trust_snapshot();
+                        let peer_ip = cfg
+                            .trusted_peers
+                            .iter()
+                            .find(|p| !p.last_ip.is_empty())
+                            .map(|p| p.last_ip.clone())
+                            .ok_or_else(|| "No paired Mac peer found in KeystoreV2".to_string())?;
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::PasskeyMakeCredential(make_req),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if !resp.success {
+                            return Err(resp.message);
+                        }
+                        let cred = resp
+                            .passkey_credential
+                            .ok_or_else(|| "Mac peer returned success without passkey credential".to_string())?;
+                        Ok::<_, String>(cred)
+                    });
+                    match out {
+                        Ok(cred) => {
+                            println!("{}", serde_json::json!({ "ok": true, "data": cred }));
+                            Ok(())
+                        }
+                        Err(err) => {
+                            println!("{}", serde_json::json!({ "ok": false, "error": err }));
+                            Ok(())
+                        }
+                    }
+                }
+                "assert-hex" => {
+                    // Stateless bridge invoked by IntegratorPasskeyHost.exe (Medium-IL packaged COM server).
+                    // Arg 3: hex-encoded UTF-8 JSON of PasskeyGetAssertionRequest.
+                    let payload_hex = args.get(3).ok_or_else(|| anyhow::anyhow!("Missing hex payload"))?;
+                    let payload_bytes = crate::security::hex_decode(payload_hex)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid hex payload"))?;
+                    let assert_req: crate::security::passkey::PasskeyGetAssertionRequest =
+                        serde_json::from_slice(&payload_bytes)?;
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let out = rt.block_on(async {
+                        let (cfg, _) = trust::get_trust_snapshot();
+                        let peer_ip = cfg
+                            .trusted_peers
+                            .iter()
+                            .find(|p| !p.last_ip.is_empty())
+                            .map(|p| p.last_ip.clone())
+                            .ok_or_else(|| "No paired Mac peer found in KeystoreV2".to_string())?;
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::PasskeyGetAssertion(assert_req),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if !resp.success {
+                            return Err(resp.message);
+                        }
+                        let assertion = resp
+                            .passkey_assertion
+                            .ok_or_else(|| "Mac peer returned success without assertion".to_string())?;
+                        Ok::<_, String>(assertion)
+                    });
+                    match out {
+                        Ok(assertion) => {
+                            println!("{}", serde_json::json!({ "ok": true, "data": assertion }));
+                            Ok(())
+                        }
+                        Err(err) => {
+                            let not_found = err.contains("NO_PASSKEY_FOUND") || err.contains("No passkey found");
+                            println!("{}", serde_json::json!({ "ok": false, "error": err, "not_found": not_found }));
+                            Ok(())
+                        }
+                    }
+                }
+                _ => anyhow::bail!("Unknown passkey subcommand: {}. Use status, list, test, make-hex, or assert-hex.", subcmd),
+            }
+        })()),
         _ => None,
     }
 }
@@ -1292,7 +1482,7 @@ pub(crate) fn ensure_windows_firewall_rules() {
                 &format!("protocol={}", proto),
                 &format!("localport={}", ports_arg),
                 &format!("remoteip={}", remote_scopes),
-                "profile=any",
+                "profile=private,domain",
                 "enable=yes",
             ])
             .creation_flags(CREATE_NO_WINDOW)
@@ -1352,7 +1542,7 @@ pub(crate) fn ensure_windows_firewall_rules() {
                 "protocol=TCP",
                 &format!("localport={}", smb_ports_str),
                 &format!("remoteip={}", remote_scopes),
-                "profile=any",
+                "profile=private,domain",
                 "enable=yes",
             ])
             .creation_flags(CREATE_NO_WINDOW)
@@ -1489,6 +1679,7 @@ impl IntegratorCore {
             let _ = std::thread::Builder::new()
                 .name("win-fw-init".into())
                 .spawn(ensure_windows_firewall_rules);
+            let _ = crate::autostart::migrate_task_to_least_privilege_windows();
         }
 
         Ok(core)
@@ -2332,11 +2523,33 @@ impl IntegratorCore {
                     if cid.is_empty() {
                         return Err("Device ID cannot be empty".into());
                     }
-                    trust::untrust_or_block_device(cid, args.block);
+                    trust::untrust_or_block_device(cid, args.block)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(serde_json::json!(if args.block {
                         format!("Blocked device {}", cid)
                     } else {
                         format!("Removed trust for device {}", cid)
+                    }))
+                }
+                "unpair_peer" => {
+                    #[derive(Deserialize)]
+                    struct UnpairArgs {
+                        #[serde(alias = "deviceId")]
+                        device_id: String,
+                    }
+                    let args: UnpairArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let cid = args.device_id.trim();
+                    if cid.is_empty() {
+                        return Err("Device ID cannot be empty".into());
+                    }
+                    let removed = trust::unpair_device(cid)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!(if removed {
+                        format!("Unpaired device {}", cid)
+                    } else {
+                        format!("Device {} was not paired", cid)
                     }))
                 }
                 "regenerate_pairing_pin" => Ok(serde_json::json!(trust::regenerate_pin())),
@@ -2525,6 +2738,80 @@ impl IntegratorCore {
                         )))
                     }
                 }
+                "passkey_list" => {
+                    let creds = tokio::task::spawn_blocking(crate::security::passkey::list_resident_passkeys)
+                        .await
+                        .map_err(|e| e.to_string())??;
+                    Ok(serde_json::to_value(creds).map_err(|e| e.to_string())?)
+                }
+                "passkey_get_info" => {
+                    let bytes = crate::security::passkey::get_info_cbor_bytes();
+                    let hex = crate::security::hex_encode(&bytes);
+                    Ok(serde_json::json!({
+                        "cbor_hex": hex,
+                        "aaguid": crate::security::hex_encode(&crate::security::passkey::INTEGRATOR_AAGUID),
+                    }))
+                }
+                "passkey_make_credential_remote" => {
+                    #[derive(Deserialize)]
+                    struct MakeRemoteArgs {
+                        peer_ip: Option<String>,
+                        request: crate::security::passkey::PasskeyMakeCredentialRequest,
+                    }
+                    let args: MakeRemoteArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let target_ip = match args.peer_ip {
+                        Some(ip) => ip,
+                        None => {
+                            let peer = self
+                                .discovery
+                                .get_best_peer()
+                                .await
+                                .ok_or_else(|| "No paired Mac discovered for passkey registration".to_string())?;
+                            peer.addr.ip().to_string()
+                        }
+                    };
+                    let rpc = DisplayRpcRequest::PasskeyMakeCredential(args.request);
+                    let resp = DisplayController::send_remote_rpc(&target_ip, &rpc)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !resp.success {
+                        return Err(resp.message);
+                    }
+                    let cred = resp.passkey_credential
+                        .ok_or_else(|| "Remote Mac returned success without passkey credential".to_string())?;
+                    Ok(serde_json::to_value(cred).map_err(|e| e.to_string())?)
+                }
+                "passkey_get_assertion_remote" => {
+                    #[derive(Deserialize)]
+                    struct AssertRemoteArgs {
+                        peer_ip: Option<String>,
+                        request: crate::security::passkey::PasskeyGetAssertionRequest,
+                    }
+                    let args: AssertRemoteArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let target_ip = match args.peer_ip {
+                        Some(ip) => ip,
+                        None => {
+                            let peer = self
+                                .discovery
+                                .get_best_peer()
+                                .await
+                                .ok_or_else(|| "No paired Mac discovered for passkey sign-in".to_string())?;
+                            peer.addr.ip().to_string()
+                        }
+                    };
+                    let rpc = DisplayRpcRequest::PasskeyGetAssertion(args.request);
+                    let resp = DisplayController::send_remote_rpc(&target_ip, &rpc)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !resp.success {
+                        return Err(resp.message);
+                    }
+                    let assertion = resp.passkey_assertion
+                        .ok_or_else(|| "Remote Mac returned success without passkey assertion".to_string())?;
+                    Ok(serde_json::to_value(assertion).map_err(|e| e.to_string())?)
+                }
                 _ => Err(format!("Unknown native command: {}", method)),
             }
         });
@@ -2533,6 +2820,71 @@ impl IntegratorCore {
             Ok(data) => serde_json::json!({ "ok": true, "data": data }).to_string(),
             Err(err) => wrap_err(err),
         }
+    }
+
+    /// Immediately and completely tears down all active subsystem sessions (KVM input streams,
+    /// camera capture, display streams, clipboard staging, and UDP audio sessions) associated
+    /// with the specified peer device ID hex, awaiting completion of all asynchronous teardown paths.
+    ///
+    /// Note: Phase A transport sessions were already invalidated and terminated during keystore
+    /// trust invalidation at the synchronized trust generation. Phase B (this function) runs
+    /// outside the keystore lock and must NOT double-increment or desynchronize trust generations.
+    pub async fn terminate_peer_connections_async(&self, device_id_hex: &str, target_generation: u64) -> Result<(), String> {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        tracing::info!("🛑 Terminating all active subsystem sessions for peer {} at gen {} (async/awaited)", clean_id, target_generation);
+
+        // 1. Tear down active KVM session if connected to this peer
+        self.kvm.teardown_peer_if_connected(&clean_id);
+
+        // 2. Stop camera capture and reset consent specifically for this peer - AWAITED!
+        if let Err(e) = self.camera.teardown_peer_stream_async(&clean_id).await {
+            tracing::warn!("Error tearing down camera stream for peer {}: {}", clean_id, e);
+            return Err(format!("Camera teardown failed for peer {}: {}", clean_id, e));
+        }
+
+        // 3. Immediately evict all active UDP audio sessions for this peer
+        crate::audio::AudioManager::revoke_peer_audio_sessions(&clean_id);
+
+        // 4. Teardown active Display streams owned by this peer (Moonlight client or Sunshine host) - AWAITED!
+        if let Err(e) = self.display_ctrl.teardown_peer_display(&clean_id).await {
+            tracing::warn!("Error tearing down display session for revoked peer {}: {}", clean_id, e);
+            return Err(format!("Display teardown failed for peer {}: {}", clean_id, e));
+        }
+
+        // 5. Purge clipboard pending remote data and active drag sessions scoped to this peer and generation - AWAITED!
+        self.clipboard.clear_peer_remote_state_bounded_async(&clean_id, target_generation).await;
+
+        Ok(())
+    }
+
+    /// Immediately tears down all active subsystem sessions (KVM input streams, camera capture,
+    /// display streams, clipboard staging, and UDP audio) associated with the specified peer device ID hex.
+    ///
+    /// Synchronous convenience wrapper for non-async execution contexts.
+    pub fn terminate_peer_connections(&self, device_id_hex: &str, target_generation: u64) {
+        let clean_id = device_id_hex.trim().to_ascii_lowercase();
+        tracing::info!("🛑 Terminating all active subsystem sessions for peer {} at gen {}", clean_id, target_generation);
+
+        // 1. Tear down active KVM session if connected to this peer
+        self.kvm.teardown_peer_if_connected(&clean_id);
+
+        // 2. Stop camera capture and reset consent specifically for this peer
+        self.camera.teardown_peer_stream(&clean_id);
+
+        // 3. Immediately evict all active UDP audio sessions for this peer
+        crate::audio::AudioManager::revoke_peer_audio_sessions(&clean_id);
+
+        // 4. Purge clipboard pending remote data and active drag sessions scoped to this peer and generation
+        self.clipboard.clear_peer_remote_state_bounded(&clean_id, target_generation);
+
+        // 5. Teardown active Display streams owned by this peer (Moonlight client or Sunshine host)
+        let display = self.display_ctrl.clone();
+        let cid = clean_id.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = display.teardown_peer_display(&cid).await {
+                tracing::warn!("Error tearing down display session for revoked peer {}: {}", cid, e);
+            }
+        });
     }
 
     /// Shuts down all active services, releasing system hooks and closing sockets.

@@ -230,20 +230,46 @@ impl StorageManager {
                     .and_then(|n| n.to_str())
                     .unwrap_or("Shared");
                 if let Ok(valid_name) = validate_smb_share_name(share_name) {
+                    #[cfg(target_os = "windows")]
+                    if let Some(old_name) = &prefs.smb_share_name {
+                        if old_name != &valid_name {
+                            use std::os::windows::process::CommandExt;
+                            let net_exe = system_info::system32_exe("net.exe");
+                            let _ = std::process::Command::new(net_exe)
+                                .creation_flags(0x08000000)
+                                .args(["share", old_name, "/delete"])
+                                .status();
+                        }
+                    }
                     prefs.smb_share_name = Some(valid_name.clone());
                     #[cfg(target_os = "windows")]
                     {
                         use std::os::windows::process::CommandExt;
                         let net_exe = system_info::system32_exe("net.exe");
+                        let username = std::env::var("USERNAME").unwrap_or_default();
+                        let grant_arg = if !username.is_empty() {
+                            format!("/grant:{},full", username)
+                        } else {
+                            "/grant:everyone,read".to_string()
+                        };
                         let _ = std::process::Command::new(net_exe)
                             .creation_flags(0x08000000)
-                            .args(["share", &format!("{}=\"{}\"", valid_name, path_str), "/grant:everyone,full"])
+                            .args(["share", &format!("{}=\"{}\"", valid_name, path_str), &grant_arg])
                             .status();
                     }
                 }
                 Some(path_str.to_string())
             }
             None => {
+                #[cfg(target_os = "windows")]
+                if let Some(old_name) = &prefs.smb_share_name {
+                    use std::os::windows::process::CommandExt;
+                    let net_exe = system_info::system32_exe("net.exe");
+                    let _ = std::process::Command::new(net_exe)
+                        .creation_flags(0x08000000)
+                        .args(["share", old_name, "/delete"])
+                        .status();
+                }
                 prefs.smb_share_name = None;
                 None
             }
@@ -396,7 +422,7 @@ impl StorageManager {
             let smb_url = format!("smb://{}/{}", clean_ip, encoded_share);
 
             tracing::info!("📂 Mounting macOS SMB volume via NetFS: {}", smb_url);
-            let output = Command::new(MACOS_OSASCRIPT_BIN)
+            let mut child = Command::new(MACOS_OSASCRIPT_BIN)
                 .args([
                     "-e",
                     "on run argv",
@@ -407,9 +433,37 @@ impl StorageManager {
                     "--",
                     &smb_url,
                 ])
-                .output()?;
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
 
-            if output.status.success() {
+            let start = std::time::Instant::now();
+            let mut mount_succeeded = false;
+            while start.elapsed() < std::time::Duration::from_secs(25) {
+                if let Ok(Some(status)) = child.try_wait() {
+                    mount_succeeded = status.success();
+                    break;
+                }
+                if detect_active_mount_matching(Some(clean_ip), Some(&share)).is_some() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    mount_succeeded = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+
+            let mut err = String::new();
+            if !mount_succeeded {
+                let _ = child.kill();
+                if let Ok(output) = child.wait_with_output() {
+                    err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                }
+                if err.is_empty() {
+                    err = "mount operation timed out after 25s".to_string();
+                }
+            }
+
+            if mount_succeeded {
                 // Query the live macOS mount table first so suffixed volume paths (e.g. /Volumes/Share-1)
                 // are captured accurately, falling back to MACOS_VOLUMES_PREFIX if not yet listed.
                 let detected = detect_active_mount_matching(Some(clean_ip), Some(&share))
@@ -428,7 +482,6 @@ impl StorageManager {
                 });
             }
 
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
             tracing::warn!("SMB mount failed for {}: {}", smb_url, err);
             anyhow::bail!(
                 "Failed to mount SMB share '{}' on {}: {}. Verify the share name in Settings and peer SMB sharing permissions.",

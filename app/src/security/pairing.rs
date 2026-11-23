@@ -555,7 +555,7 @@ impl PairingCoordinatorV2 {
     }
 
     /// Records an authentication failure for `ip` WITHOUT invalidating or rotating the active PIN.
-    fn record_ip_failure(&mut self, ip: IpAddr, now_secs: u64) {
+    pub(crate) fn record_ip_failure(&mut self, ip: IpAddr, now_secs: u64) {
         let entry = self.ensure_rate_limit_entry_mut(ip, now_secs);
         entry.last_touched = now_secs;
         if now_secs.saturating_sub(entry.window_started_at) > IP_ATTEMPT_WINDOW_SECS {
@@ -580,9 +580,18 @@ impl PairingCoordinatorV2 {
 
     /// Prunes in-flight handshake sessions exceeding `INFLIGHT_SESSION_TTL_SECS` (15s).
     fn prune_expired_sessions(&mut self, now_secs: u64) {
+        let mut expired_ips = Vec::new();
         self.inflight_sessions.retain(|_, s| {
-            now_secs.saturating_sub(s.created_at_secs) <= INFLIGHT_SESSION_TTL_SECS
+            if now_secs.saturating_sub(s.created_at_secs) > INFLIGHT_SESSION_TTL_SECS {
+                expired_ips.push(s.source_ip);
+                false
+            } else {
+                true
+            }
         });
+        for ip in expired_ips {
+            self.record_ip_failure(ip, now_secs);
+        }
     }
 
     /// Step 1 (Server B): Processes incoming `PairInitMsg` and responds with `PairServerShareMsg`.
@@ -618,13 +627,20 @@ impl PairingCoordinatorV2 {
         self.check_and_record_pair_init(source_ip, now_secs)?;
 
         let client_device_id: [u8; 16] = hex_decode_array(&init_msg.client_device_id_hex)
-            .ok_or_else(|| PairingError::MalformedMessage("invalid client_device_id_hex".into()))?;
+            .ok_or_else(|| {
+                self.record_ip_failure(source_ip, now_secs);
+                PairingError::MalformedMessage("invalid client_device_id_hex".into())
+            })?;
         let client_ed25519_pk: [u8; 32] = hex_decode_array(&init_msg.client_ed25519_pk_hex)
             .ok_or_else(|| {
+                self.record_ip_failure(source_ip, now_secs);
                 PairingError::MalformedMessage("invalid client_ed25519_pk_hex".into())
             })?;
         let client_nonce: [u8; 32] = hex_decode_array(&init_msg.client_nonce_hex)
-            .ok_or_else(|| PairingError::MalformedMessage("invalid client_nonce_hex".into()))?;
+            .ok_or_else(|| {
+                self.record_ip_failure(source_ip, now_secs);
+                PairingError::MalformedMessage("invalid client_nonce_hex".into())
+            })?;
 
         let clean_name = sanitize_label(&init_msg.device_name, MAX_NAME_LEN);
         let clean_platform = sanitize_label(&init_msg.platform, MAX_PLATFORM_LEN);
@@ -632,12 +648,15 @@ impl PairingCoordinatorV2 {
         // Verify client_device_id derivation and identity-key pinning before allocating session state.
         keystore
             .check_peer_identity_pinning(&client_device_id, &client_ed25519_pk, &clean_name)
-            .map_err(|e| match e {
-                KeystoreError::SpoofedDeviceId { .. } => PairingError::SpoofedDeviceId,
-                KeystoreError::PinnedIdentityKeyMismatch { .. } => {
-                    PairingError::IdentityKeyPinnedConflict(e.to_string())
+            .map_err(|e| {
+                self.record_ip_failure(source_ip, now_secs);
+                match e {
+                    KeystoreError::SpoofedDeviceId { .. } => PairingError::SpoofedDeviceId,
+                    KeystoreError::PinnedIdentityKeyMismatch { .. } => {
+                        PairingError::IdentityKeyPinnedConflict(e.to_string())
+                    }
+                    other => PairingError::KeystoreFailure(other),
                 }
-                other => PairingError::KeystoreFailure(other),
             })?;
 
         // Enforce at most 1 active in-flight session per source IP, and at most MAX_CONCURRENT_PAIRING_SESSIONS globally.
@@ -1200,7 +1219,17 @@ where
     let complete_msg: PairServerCompleteMsg = serde_json::from_slice(&payload_2)
         .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
 
-    awaiting.finalize_and_commit(keystore, &complete_msg, server_ip, via_direct_cable)
+    let res = awaiting.finalize_and_commit(keystore, &complete_msg, server_ip, via_direct_cable);
+    if let Ok((ref creds, _)) = res {
+        if let Some(core) = crate::core::GLOBAL_CORE.get() {
+            core.camera.revoke_peer_consent(&creds.device_id_hex);
+            core.clipboard.clear_peer_revocation(&creds.device_id_hex);
+        }
+        if let Some(clip) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+            clip.clear_peer_revocation(&creds.device_id_hex);
+        }
+    }
+    res
 }
 
 /// Executes the 4-message Client pairing flow using a shared `Mutex<KeystoreV2>` without holding locks across `.await`.
@@ -1258,8 +1287,20 @@ where
     let complete_msg: PairServerCompleteMsg = serde_json::from_slice(&payload_2)
         .map_err(|e| PairingError::MalformedMessage(e.to_string()))?;
 
-    let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
-    awaiting.finalize_and_commit(&mut ks, &complete_msg, server_ip, via_direct_cable)
+    let res = {
+        let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        awaiting.finalize_and_commit(&mut ks, &complete_msg, server_ip, via_direct_cable)
+    };
+    if let Ok((ref creds, _)) = res {
+        if let Some(core) = crate::core::GLOBAL_CORE.get() {
+            core.camera.revoke_peer_consent(&creds.device_id_hex);
+            core.clipboard.clear_peer_revocation(&creds.device_id_hex);
+        }
+        if let Some(clip) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+            clip.clear_peer_revocation(&creds.device_id_hex);
+        }
+    }
+    res
 }
 
 /// Executes the 4-message Server pairing flow using shared `Mutex` references without holding locks across `.await`.
@@ -1274,9 +1315,19 @@ pub async fn handle_server_pairing_with_shared_locks<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (msg_type, payload) =
-        recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await?;
+    let (msg_type, payload) = match recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await {
+        Ok(res) => res,
+        Err(e) => {
+            let mut coord = coordinator_mutex.lock().unwrap_or_else(|err| err.into_inner());
+            coord.record_ip_failure(source_ip, unix_epoch_secs());
+            return Err(e);
+        }
+    };
     if msg_type != PairingMsgType::PairInit {
+        {
+            let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            coord.record_ip_failure(source_ip, unix_epoch_secs());
+        }
         let err = PairingError::InvalidMessageType(msg_type as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
         return Err(err);
@@ -1285,6 +1336,10 @@ where
     let init_msg: PairInitMsg = match serde_json::from_slice(&payload) {
         Ok(m) => m,
         Err(e) => {
+            {
+                let mut coord = coordinator_mutex.lock().unwrap_or_else(|err| err.into_inner());
+                coord.record_ip_failure(source_ip, unix_epoch_secs());
+            }
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
                 send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1308,16 +1363,26 @@ where
     };
 
     if let Err(e) = send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await {
-        let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut coord = coordinator_mutex.lock().unwrap_or_else(|err| err.into_inner());
         coord.cancel_inflight_for_ip(source_ip);
+        coord.record_ip_failure(source_ip, unix_epoch_secs());
         return Err(e);
     }
 
-    let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
+    let (msg_type_2, payload_2) = match recv_pairing_frame(stream).await {
+        Ok(res) => res,
+        Err(e) => {
+            let mut coord = coordinator_mutex.lock().unwrap_or_else(|err| err.into_inner());
+            coord.cancel_inflight_for_ip(source_ip);
+            coord.record_ip_failure(source_ip, unix_epoch_secs());
+            return Err(e);
+        }
+    };
     if msg_type_2 != PairingMsgType::PairClientConfirm {
         {
             let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
             coord.cancel_inflight_for_ip(source_ip);
+            coord.record_ip_failure(source_ip, unix_epoch_secs());
         }
         let err = PairingError::InvalidMessageType(msg_type_2 as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1328,8 +1393,9 @@ where
         Ok(m) => m,
         Err(e) => {
             {
-                let mut coord = coordinator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                let mut coord = coordinator_mutex.lock().unwrap_or_else(|err| err.into_inner());
                 coord.cancel_inflight_for_ip(source_ip);
+                coord.record_ip_failure(source_ip, unix_epoch_secs());
             }
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
@@ -1363,10 +1429,22 @@ where
                 send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await
             {
                 if !was_already_paired {
-                    let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = ks.unpair_peer(&creds.device_id_hex);
+                    let unpair_gen = {
+                        let mut ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        ks.unpair_peer_ext(&creds.device_id_hex).map(|(_, g)| g).unwrap_or(0)
+                    };
+                    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                        let _ = core.terminate_peer_connections_async(&creds.device_id_hex, unpair_gen).await;
+                    }
                 }
                 return Err(e);
+            }
+            if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                core.camera.revoke_peer_consent(&creds.device_id_hex);
+                core.clipboard.clear_peer_revocation(&creds.device_id_hex);
+            }
+            if let Some(clip) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+                clip.clear_peer_revocation(&creds.device_id_hex);
             }
             Ok((creds, sas))
         }
@@ -1414,9 +1492,15 @@ pub async fn handle_server_pairing_with_prefixed_magic<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (msg_type, payload) =
-        recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await?;
+    let (msg_type, payload) = match recv_pairing_frame_with_prefixed_magic(stream, already_read_magic).await {
+        Ok(res) => res,
+        Err(e) => {
+            coordinator.record_ip_failure(source_ip, unix_epoch_secs());
+            return Err(e);
+        }
+    };
     if msg_type != PairingMsgType::PairInit {
+        coordinator.record_ip_failure(source_ip, unix_epoch_secs());
         let err = PairingError::InvalidMessageType(msg_type as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
         return Err(err);
@@ -1425,6 +1509,7 @@ where
     let init_msg: PairInitMsg = match serde_json::from_slice(&payload) {
         Ok(m) => m,
         Err(e) => {
+            coordinator.record_ip_failure(source_ip, unix_epoch_secs());
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
                 send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1444,12 +1529,21 @@ where
 
     if let Err(e) = send_pairing_frame(stream, PairingMsgType::PairServerShare, &share_msg).await {
         coordinator.cancel_inflight_for_ip(source_ip);
+        coordinator.record_ip_failure(source_ip, unix_epoch_secs());
         return Err(e);
     }
 
-    let (msg_type_2, payload_2) = recv_pairing_frame(stream).await?;
+    let (msg_type_2, payload_2) = match recv_pairing_frame(stream).await {
+        Ok(res) => res,
+        Err(e) => {
+            coordinator.cancel_inflight_for_ip(source_ip);
+            coordinator.record_ip_failure(source_ip, unix_epoch_secs());
+            return Err(e);
+        }
+    };
     if msg_type_2 != PairingMsgType::PairClientConfirm {
         coordinator.cancel_inflight_for_ip(source_ip);
+        coordinator.record_ip_failure(source_ip, unix_epoch_secs());
         let err = PairingError::InvalidMessageType(msg_type_2 as u8);
         let _ = send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
         return Err(err);
@@ -1459,6 +1553,7 @@ where
         Ok(m) => m,
         Err(e) => {
             coordinator.cancel_inflight_for_ip(source_ip);
+            coordinator.record_ip_failure(source_ip, unix_epoch_secs());
             let err = PairingError::MalformedMessage(e.to_string());
             let _ =
                 send_pairing_frame(stream, PairingMsgType::PairError, &err.to_wire_error()).await;
@@ -1485,9 +1580,19 @@ where
                 send_pairing_frame(stream, PairingMsgType::PairServerComplete, &complete_msg).await
             {
                 if !was_already_paired {
-                    let _ = keystore.unpair_peer(&creds.device_id_hex);
+                    let unpair_gen = keystore.unpair_peer_ext(&creds.device_id_hex).map(|(_, g)| g).unwrap_or(0);
+                    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                        let _ = core.terminate_peer_connections_async(&creds.device_id_hex, unpair_gen).await;
+                    }
                 }
                 return Err(e);
+            }
+            if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                core.camera.revoke_peer_consent(&creds.device_id_hex);
+                core.clipboard.clear_peer_revocation(&creds.device_id_hex);
+            }
+            if let Some(clip) = crate::clipboard::CLIPBOARD_INSTANCE.get() {
+                clip.clear_peer_revocation(&creds.device_id_hex);
             }
             Ok((creds, sas))
         }
@@ -2039,6 +2144,116 @@ mod tests {
             .finalize_and_commit(&mut ks_c, &complete_msg, "10.99.99.1", true)
             .unwrap();
         assert_eq!(*srv_creds.root_key, *cli_creds.root_key);
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_pairing_malformed_init_and_early_drop_locks_out_ip() {
+        let (dir_c, mut ks_c) = temp_keystore("malf_c", 0xB1);
+        let (dir_s, mut ks_s) = temp_keystore("malf_s", 0xB2);
+        let mut coordinator =
+            PairingCoordinatorV2::new("HP-Omen".to_string(), "Windows".to_string());
+        let now = unix_epoch_secs();
+        coordinator.open_pairing_window_with_pin("777888", now).unwrap();
+
+        let attacker_ip = IpAddr::V4(Ipv4Addr::new(10, 99, 99, 66));
+        let legit_ip = IpAddr::V4(Ipv4Addr::new(10, 99, 99, 77));
+
+        // Attempt 1: Attacker sends malformed frame magic / message type
+        let (mut c1, mut s1) = tokio::io::duplex(1024);
+        c1.write_all(b"GARBAGE_BYTES").await.unwrap();
+        drop(c1);
+        let res1 = handle_server_pairing_over_stream(&mut s1, &mut coordinator, &mut ks_s, attacker_ip, false).await;
+        assert!(res1.is_err());
+
+        // Attempt 2: Attacker sends valid frame wrapper with malformed JSON body
+        let (mut c2, mut s2) = tokio::io::duplex(1024);
+        send_pairing_frame(&mut c2, PairingMsgType::PairInit, &"not a valid PairInitMsg").await.unwrap();
+        drop(c2);
+        let res2 = handle_server_pairing_over_stream(&mut s2, &mut coordinator, &mut ks_s, attacker_ip, false).await;
+        assert!(res2.is_err());
+
+        // Attempt 3: Attacker sends valid PairInitMsg then drops before sending PairClientConfirm
+        let (mut c3, mut s3) = tokio::io::duplex(4096);
+        let (_, init_ok) = ClientPairingHandshakeV2::initiate(&ks_c, "777888", "AttackerMac", "macOS").unwrap();
+        send_pairing_frame(&mut c3, PairingMsgType::PairInit, &init_ok).await.unwrap();
+        // Server will send PairServerShare; attacker immediately closes stream
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let _ = c3.read(&mut buf).await;
+            drop(c3);
+        });
+        let res3 = handle_server_pairing_over_stream(&mut s3, &mut coordinator, &mut ks_s, attacker_ip, false).await;
+        assert!(res3.is_err());
+
+        // Attempt 4: Attacker is now locked out (3 strikes)
+        let (_hs4, init4) = ClientPairingHandshakeV2::initiate(&ks_c, "777888", "AttackerMac", "macOS").unwrap();
+        let lockout = coordinator.handle_pair_init(&ks_s, attacker_ip, &init4, now);
+        assert!(matches!(lockout, Err(PairingError::IpRateLimited { .. })));
+
+        // But legitimate client from legit_ip can still pair cleanly with the active PIN!
+        let (hs_legit, init_legit) = ClientPairingHandshakeV2::initiate(&ks_c, "777888", "LegitMac", "macOS").unwrap();
+        let share_legit = coordinator.handle_pair_init(&ks_s, legit_ip, &init_legit, now).unwrap();
+        let (await_legit, confirm_legit) = hs_legit.process_server_share(&ks_c, &share_legit).unwrap();
+        let (comp_legit, _, _) = coordinator
+            .handle_pair_client_confirm(&mut ks_s, legit_ip, &confirm_legit, false, now)
+            .expect("legitimate peer must succeed even when attacker IP is locked out");
+        assert!(await_legit.finalize_and_commit(&mut ks_c, &comp_legit, "10.99.99.1", false).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_pairing_server_complete_send_failure_rolls_back_and_cleans_up() {
+        let (dir_c, ks_c) = temp_keystore("rb_c", 0xD1);
+        let (dir_s, mut ks_s) = temp_keystore("rb_s", 0xD2);
+        let mut coordinator =
+            PairingCoordinatorV2::new("ServerPC".to_string(), "Windows".to_string());
+        let client_ip: IpAddr = "10.88.88.5".parse().unwrap();
+        let now = unix_epoch_secs();
+        coordinator.open_pairing_window_with_pin("555666", now).unwrap();
+
+        let (mut c_stream, mut s_stream) = tokio::io::duplex(4096);
+
+        // Production path: run handle_server_pairing_over_stream on the server side
+        let server_task = tokio::spawn(async move {
+            let res = handle_server_pairing_over_stream(
+                &mut s_stream,
+                &mut coordinator,
+                &mut ks_s,
+                client_ip,
+                false,
+            )
+            .await;
+            (res, ks_s)
+        });
+
+        // Client side executes:
+        // 1. Send PairInit
+        let (hs_c, init_msg) = ClientPairingHandshakeV2::initiate(&ks_c, "555666", "ClientMac", "macOS").unwrap();
+        send_pairing_frame(&mut c_stream, PairingMsgType::PairInit, &init_msg).await.unwrap();
+
+        // 2. Recv PairServerShare
+        let (msg_type, payload) = recv_pairing_frame(&mut c_stream).await.unwrap();
+        assert_eq!(msg_type, PairingMsgType::PairServerShare);
+        let share_msg: PairServerShareMsg = serde_json::from_slice(&payload).unwrap();
+
+        // 3. Send PairClientConfirm
+        let (_awaiting, confirm_msg) = hs_c.process_server_share(&ks_c, &share_msg).unwrap();
+        send_pairing_frame(&mut c_stream, PairingMsgType::PairClientConfirm, &confirm_msg).await.unwrap();
+
+        // 4. Immediately drop c_stream so server fails when sending PairServerComplete
+        drop(c_stream);
+
+        // Server task completes with error because PairServerComplete send failed
+        let (server_res, ks_s) = server_task.await.unwrap();
+        assert!(server_res.is_err(), "Server pairing must fail when complete frame cannot be delivered");
+
+        // Verify rollback: peer must NOT remain pinned in keystore (automatically unpinned by handle_server_pairing_over_stream)
+        assert_eq!(ks_s.list_peers().len(), 0, "Peer must be unpinned upon rollback in keystore");
 
         let _ = std::fs::remove_dir_all(&dir_c);
         let _ = std::fs::remove_dir_all(&dir_s);

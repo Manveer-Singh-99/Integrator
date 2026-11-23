@@ -408,8 +408,13 @@ pub fn observe_discovered_peer(
     is_paired && !is_blocked
 }
 
-/// Unpairs or blocks a device in `KeystoreV2`.
-pub fn untrust_or_block_device(device_id: &str, block: bool) {
+/// Unpairs or blocks a device in `KeystoreV2` and coordinates two-phase revocation asynchronously.
+///
+/// Phase A (Keystore persistence & transport invalidation) runs synchronously under the keystore lock.
+/// Phase B (Subsystems teardown) executes strictly outside the keystore lock and is awaited before returning.
+///
+/// Propagates persistence errors and teardown errors cleanly (SEC-1D-06, SEC-1D-07).
+pub async fn untrust_or_block_device(device_id: &str, block: bool) -> Result<(), crate::security::keystore::KeystoreError> {
     let clean_id = device_id.trim().to_ascii_lowercase();
     let rt = runtime_state();
     let known_ip = {
@@ -431,10 +436,113 @@ pub fn untrust_or_block_device(device_id: &str, block: bool) {
         hints.retain(|ip, id| id != &clean_id && known_ip.as_deref() != Some(ip.as_str()));
     }
 
-    let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = ks.untrust_or_block_peer(&clean_id, block, known_ip.as_deref()) {
-        warn!("Failed to persist untrust/block for {}: {}", clean_id, e);
+    // Phase A: Persist trust state to disk and invalidate active transport sessions under keystore lock.
+    // If persistence fails, fail closed immediately without running Phase B as if it succeeded (SEC-1D-07).
+    let unpair_gen = {
+        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+        ks.untrust_or_block_peer_ext(&clean_id, block, known_ip.as_deref())?
+    };
+    // Keystore lock dropped!
+
+    // Phase B: Teardown subsystems outside keystore lock with exact unpair generation (SEC-1D-06, SEC-1D-14)
+    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+        if let Err(e) = core.terminate_peer_connections_async(&clean_id, unpair_gen).await {
+            warn!("Subsystem teardown failed during untrust/block for {}: {}", clean_id, e);
+            return Err(crate::security::keystore::KeystoreError::IoFailure(e));
+        }
     }
+    Ok(())
+}
+
+/// Synchronous wrapper for `untrust_or_block_device` used in non-async contexts or sync tests.
+pub fn untrust_or_block_device_sync(device_id: &str, block: bool) -> Result<(), crate::security::keystore::KeystoreError> {
+    let clean_id = device_id.trim().to_ascii_lowercase();
+    let rt = runtime_state();
+    let known_ip = {
+        let mut pending = rt.pending_peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = pending.get_mut(&clean_id) {
+            p.trusted = false;
+            p.blocked = block;
+            Some(p.ip.clone())
+        } else {
+            None
+        }
+    };
+
+    {
+        let mut hints = rt
+            .ip_to_device_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hints.retain(|ip, id| id != &clean_id && known_ip.as_deref() != Some(ip.as_str()));
+    }
+
+    let unpair_gen = {
+        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+        ks.untrust_or_block_peer_ext(&clean_id, block, known_ip.as_deref())?
+    };
+
+    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+        core.terminate_peer_connections(&clean_id, unpair_gen);
+    }
+    Ok(())
+}
+
+/// Explicitly unpairs a device in `KeystoreV2` and coordinates two-phase revocation asynchronously.
+///
+/// Phase A runs under the keystore lock; Phase B executes outside the keystore lock and is awaited.
+pub async fn unpair_device(device_id_hex: &str) -> Result<bool, crate::security::keystore::KeystoreError> {
+    let clean_id = device_id_hex.trim().to_ascii_lowercase();
+    let rt = runtime_state();
+    {
+        let mut hints = rt
+            .ip_to_device_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hints.retain(|_, id| id != &clean_id);
+    }
+
+    // Phase A: Persist trust removal to disk and invalidate active transport sessions under keystore lock
+    let (removed, unpair_gen) = {
+        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+        ks.unpair_peer_ext(&clean_id)?
+    };
+    // Keystore lock dropped!
+
+    // Phase B: Teardown subsystems outside keystore lock with exact unpair generation (SEC-1D-06, SEC-1D-14)
+    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+        if let Err(e) = core.terminate_peer_connections_async(&clean_id, unpair_gen).await {
+            warn!("Subsystem teardown failed during unpair for {}: {}", clean_id, e);
+            return Err(crate::security::keystore::KeystoreError::IoFailure(e));
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Synchronous wrapper for `unpair_device` used in non-async contexts or sync tests.
+#[allow(dead_code)]
+pub fn unpair_device_sync(device_id_hex: &str) -> Result<bool, crate::security::keystore::KeystoreError> {
+    let clean_id = device_id_hex.trim().to_ascii_lowercase();
+    let rt = runtime_state();
+    {
+        let mut hints = rt
+            .ip_to_device_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hints.retain(|_, id| id != &clean_id);
+    }
+
+    let (removed, unpair_gen) = {
+        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+        ks.unpair_peer_ext(&clean_id)?
+    };
+
+    if let Some(core) = crate::core::GLOBAL_CORE.get() {
+        core.terminate_peer_connections(&clean_id, unpair_gen);
+    }
+
+    Ok(removed)
 }
 
 /// Policy setter retained for UI compatibility; in v1.0, cryptographic pairing is strictly mandatory
@@ -667,22 +775,26 @@ pub async fn pair_with_remote_peer_v2(
                 .find(|p| p.ip == canon_ip)
                 .map(|p| (p.hostname.clone(), p.device_id.clone()))
         };
-        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        let stale_ids: Vec<String> = ks
-            .list_peers()
-            .into_iter()
-            .filter(|p| {
-                let same_ip = p.last_ip == canon_ip;
-                let same_host = pending_host_and_id
-                    .as_ref()
-                    .map(|(h, id)| p.hostname.eq_ignore_ascii_case(h) && &p.device_id_hex != id)
-                    .unwrap_or(false);
-                same_ip || same_host
-            })
-            .map(|p| p.device_id_hex)
-            .collect();
+        let stale_ids: Vec<String> = {
+            let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.list_peers()
+                .into_iter()
+                .filter(|p| {
+                    let same_ip = p.last_ip == canon_ip;
+                    let same_host = pending_host_and_id
+                        .as_ref()
+                        .map(|(h, id)| p.hostname.eq_ignore_ascii_case(h) && &p.device_id_hex != id)
+                        .unwrap_or(false);
+                    same_ip || same_host
+                })
+                .map(|p| p.device_id_hex)
+                .collect()
+        };
+        // Keystore lock dropped! Execute complete Phase A + Phase B for each stale peer (SEC-1D-05)
         for sid in stale_ids {
-            let _ = ks.unpair_peer(&sid);
+            if let Err(e) = unpair_device(&sid).await {
+                warn!("Failed to unpair and tear down stale peer {}: {}", sid, e);
+            }
         }
     }
 
@@ -1532,7 +1644,7 @@ mod tests {
         ));
 
         // Block the device in keystore, then verify beacon is rejected, then clean up test keystore state.
-        untrust_or_block_device(&id_hex, true);
+        let _ = untrust_or_block_device_sync(&id_hex, true);
         assert!(!verify_discovery_beacon_v2(
             &id_hex,
             &pk_hex,
@@ -1542,7 +1654,7 @@ mod tests {
             58283,
             &sig_hex
         ));
-        untrust_or_block_device(&id_hex, false);
+        let _ = untrust_or_block_device_sync(&id_hex, false);
     }
 
     #[test]
@@ -1642,7 +1754,7 @@ mod tests {
         assert!(lookup_verified_peer_for_hint("10.145.1.70", None, Some("00000000")).is_none());
 
         // Clean up temporary test peer
-        untrust_or_block_device(&dev_id, false);
+        let _ = untrust_or_block_device_sync(&dev_id, false);
     }
 
     #[test]
@@ -1666,5 +1778,25 @@ mod tests {
         let mut tampered = assertion.clone();
         tampered.signer_hostname = "SpoofedMac".to_string();
         assert!(verify_touchid_assertion(&tampered, &nonce, &my_id, &my_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_untrust_or_block_device_returns_result_and_cleans_up() {
+        let test_id = "test_untrust_dev_000000000000001";
+        // Call untrust_or_block_device and verify it returns ResultOk
+        let res = untrust_or_block_device(test_id, true).await;
+        assert!(res.is_ok(), "untrust_or_block_device must return Ok on successful execution");
+
+        let res_unblock = untrust_or_block_device(test_id, false).await;
+        assert!(res_unblock.is_ok(), "untrust_or_block_device must return Ok on unblock");
+    }
+
+    #[tokio::test]
+    async fn test_unpair_device_returns_result_and_cleans_up() {
+        let test_id = "test_unpair_dev_0000000000000002";
+        // Unpairing an unknown peer returns Ok(false)
+        let res = unpair_device(test_id).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), false);
     }
 }

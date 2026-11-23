@@ -16,6 +16,7 @@
     <SatelliteResourceLanguages>en-US</SatelliteResourceLanguages>
     <Nullable>enable</Nullable>
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <DefaultItemExcludes>$(DefaultItemExcludes);PasskeyHost\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

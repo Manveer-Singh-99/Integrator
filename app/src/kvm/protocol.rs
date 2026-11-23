@@ -181,6 +181,10 @@ pub struct KvmLayoutConfig {
     /// Default fallback destination directory label (`"downloads"` | `"desktop"` | `"cache"`) for dropped items.
     pub drop_folder: String,
 
+    /// Allows the remote peer workstation to control the local mouse and keyboard.
+    /// When disabled, incoming EnterScreen requests are rejected and returned immediately.
+    pub allow_remote_control: bool,
+
     /// Monotonic last-modified timestamp (Unix epoch milliseconds) for layout synchronization conflict resolution.
     pub updated_at_ms: u64,
 }
@@ -205,6 +209,7 @@ impl Default for KvmLayoutConfig {
             ghost_thumbnail: true,
             qos_clamp: true,
             drop_folder: "downloads".to_string(),
+            allow_remote_control: true,
             updated_at_ms: 0,
         }
     }

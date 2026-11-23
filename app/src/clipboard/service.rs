@@ -95,7 +95,7 @@
 //!   (`FRAME_FILE_HASH`) and session-wide content verification. Missing or mismatched hashes cause
 //!   immediate abort and deletion of the temporary staging directory.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -625,6 +625,11 @@ pub struct ClipboardService {
     last_remote_ip: Arc<RwLock<Option<IpAddr>>>,
     is_pasting: Arc<std::sync::atomic::AtomicBool>,
     features: Arc<OnceLock<Arc<crate::features::FeatureManager>>>,
+    pending_remote_by_peer: Arc<std::sync::RwLock<HashMap<String, (LazyAnnouncement, IpAddr, u64)>>>,
+    drag_sessions_by_peer: Arc<std::sync::RwLock<HashMap<String, HashSet<String>>>>,
+    drag_session_generations: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    revoked_clipboard_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    clipboard_commit_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ClipboardService {
@@ -645,6 +650,11 @@ impl ClipboardService {
             last_remote_ip: Arc::new(RwLock::new(None)),
             is_pasting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             features: Arc::new(OnceLock::new()),
+            pending_remote_by_peer: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            drag_sessions_by_peer: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            drag_session_generations: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            revoked_clipboard_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            clipboard_commit_lock: Arc::new(tokio::sync::RwLock::new(())),
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -663,14 +673,14 @@ impl ClipboardService {
         self.features
             .get()
             .map(|f| f.is_enabled("clipboard"))
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     fn is_dragdrop_enabled(&self) -> bool {
         self.features
             .get()
             .map(|f| f.is_enabled("dragdrop"))
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub async fn clear_pending_state(&self) {
@@ -690,6 +700,396 @@ impl ClipboardService {
         unsafe {
             reset_touchbar_paste_progress();
         }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        unsafe {
+            set_has_pending_remote_file(false);
+        }
+    }
+
+    /// Immediately and unconditionally clears all clipboard staging state, pending announcements,
+    /// and active drag sessions associated specifically with `peer_device_id_hex` asynchronously.
+    pub async fn clear_peer_remote_state_async(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.clear_peer_remote_state_bounded_async(&clean_id, current_gen).await;
+    }
+
+    /// Asynchronously clears clipboard state for `peer_device_id_hex` bounded to `target_generation`.
+    /// If the peer's active trust generation has already advanced beyond `target_generation`, the
+    /// revocation mark and newer-generation resources are preserved to prevent races against re-pairing (SEC-1D-14).
+    pub async fn clear_peer_remote_state_bounded_async(&self, peer_device_id_hex: &str, target_generation: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+
+        // Acquire write lease on clipboard_commit_lock so in-flight OS clipboard commits finish
+        // and subsequent commits for the revoked peer are blocked (SEC-1D-14, SEC-1D-15).
+        let _commit_guard = self.clipboard_commit_lock.write().await;
+
+        let current_trans_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let current_ks_gen = crate::security::keystore::global_keystore()
+            .lock()
+            .ok()
+            .and_then(|ks| ks.peer_trust_generation(&clean_id))
+            .unwrap_or(0);
+        let active_current_gen = current_trans_gen.max(current_ks_gen);
+
+        let is_repaired = active_current_gen > target_generation;
+
+        if is_repaired {
+            tracing::info!(
+                "Preserving re-paired peer {} clipboard trust (bound gen {}, current active gen {})",
+                clean_id,
+                target_generation,
+                active_current_gen
+            );
+        } else {
+            // 1. Mark peer as revoked in clipboard service at target_generation
+            let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+            let entry = rev.entry(clean_id.clone()).or_insert(target_generation);
+            if target_generation > *entry {
+                *entry = target_generation;
+            }
+        }
+
+        // 2. Guaranteed blocking removal of peer's pending announcement if item generation <= target_generation
+        let removed_ann = {
+            let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, _, gen)) = remotes.get(&clean_id) {
+                if *gen <= target_generation {
+                    remotes.remove(&clean_id).map(|(ann, _, _)| ann)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // Also clean legacy single pending_remote if it was owned by this peer
+        if let Some(ref ann) = removed_ann {
+            let mut r = self.pending_remote.write().await;
+            if let Some(ref cur) = *r {
+                if cur.session_id == ann.session_id {
+                    *r = None;
+                }
+            }
+        }
+
+        // 3. Remove peer's drag sessions and staging files from disk if session_gen <= target_generation
+        let session_ids = {
+            let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(sessions) = drag_peers.get_mut(&clean_id) {
+                let mut removed = Vec::new();
+                sessions.retain(|sid| {
+                    let sgen = drag_gens.get(sid).copied().unwrap_or(0);
+                    if sgen <= target_generation {
+                        removed.push(sid.clone());
+                        drag_gens.remove(sid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if sessions.is_empty() {
+                    drag_peers.remove(&clean_id);
+                }
+                removed
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !session_ids.is_empty() {
+            {
+                let mut map = self.pending_drag_sessions.write().await;
+                for sid in &session_ids {
+                    map.remove(sid);
+                }
+            }
+            {
+                let mut order = self.pending_drag_order.write().await;
+                order.retain(|s| !session_ids.contains(s));
+            }
+            for sid in &session_ids {
+                let drag_dir = crate::system_info::app_data_dir()
+                    .join(DRAG_STAGING_DIR_NAME)
+                    .join(format!("drag_{}", sid));
+                let _ = std::fs::remove_dir_all(&drag_dir);
+            }
+        }
+
+        // Clear verified cache entries matching revoked session IDs
+        {
+            let mut cache = self.verified_cache.write().await;
+            cache.retain(|entry| !session_ids.contains(&entry.session_id));
+        }
+
+        tracing::info!("🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}", clean_id, target_generation);
+    }
+
+    /// Immediately and unconditionally clears all clipboard staging state, pending announcements,
+    /// and active drag sessions associated specifically with `peer_device_id_hex`.
+    pub fn clear_peer_remote_state(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.clear_peer_remote_state_bounded(&clean_id, current_gen);
+    }
+
+    /// Synchronously clears clipboard state for `peer_device_id_hex` bounded to `target_generation`.
+    pub fn clear_peer_remote_state_bounded(&self, peer_device_id_hex: &str, target_generation: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let current_trans_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        let current_ks_gen = crate::security::keystore::global_keystore()
+            .lock()
+            .ok()
+            .and_then(|ks| ks.peer_trust_generation(&clean_id))
+            .unwrap_or(0);
+        let active_current_gen = current_trans_gen.max(current_ks_gen);
+
+        if active_current_gen <= target_generation {
+            let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+            let entry = rev.entry(clean_id.clone()).or_insert(target_generation);
+            if target_generation > *entry {
+                *entry = target_generation;
+            }
+        }
+
+        let removed_ann = {
+            let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, _, gen)) = remotes.get(&clean_id) {
+                if *gen <= target_generation {
+                    remotes.remove(&clean_id).map(|(ann, _, _)| ann)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(ref ann) = removed_ann {
+            if let Ok(mut r) = self.pending_remote.try_write() {
+                if let Some(ref cur) = *r {
+                    if cur.session_id == ann.session_id {
+                        *r = None;
+                    }
+                }
+            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pr = Arc::clone(&self.pending_remote);
+                let ann_id = ann.session_id.clone();
+                handle.spawn(async move {
+                    let mut r = pr.write().await;
+                    if let Some(ref cur) = *r {
+                        if cur.session_id == ann_id {
+                            *r = None;
+                        }
+                    }
+                });
+            }
+        }
+
+        let session_ids = {
+            let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
+            let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(sessions) = drag_peers.get_mut(&clean_id) {
+                let mut removed = Vec::new();
+                sessions.retain(|sid| {
+                    let sgen = drag_gens.get(sid).copied().unwrap_or(0);
+                    if sgen <= target_generation {
+                        removed.push(sid.clone());
+                        drag_gens.remove(sid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if sessions.is_empty() {
+                    drag_peers.remove(&clean_id);
+                }
+                removed
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !session_ids.is_empty() {
+            let mut acquired_drag = false;
+            if let (Ok(mut map), Ok(mut order)) = (self.pending_drag_sessions.try_write(), self.pending_drag_order.try_write()) {
+                for sid in &session_ids {
+                    map.remove(sid);
+                }
+                order.retain(|s| !session_ids.contains(s));
+                acquired_drag = true;
+            }
+            if !acquired_drag {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let pds = Arc::clone(&self.pending_drag_sessions);
+                    let pdo = Arc::clone(&self.pending_drag_order);
+                    let sids = session_ids.clone();
+                    handle.spawn(async move {
+                        let mut map = pds.write().await;
+                        let mut order = pdo.write().await;
+                        for sid in &sids {
+                            map.remove(sid);
+                        }
+                        order.retain(|s| !sids.contains(s));
+                    });
+                }
+            }
+            for sid in &session_ids {
+                let drag_dir = crate::system_info::app_data_dir()
+                    .join(DRAG_STAGING_DIR_NAME)
+                    .join(format!("drag_{}", sid));
+                let _ = std::fs::remove_dir_all(&drag_dir);
+            }
+        }
+
+        tracing::info!("🛑 Cleared clipboard staging and drag sessions for peer {} at gen {}", clean_id, target_generation);
+    }
+
+    /// Authoritative check: returns true if `peer_device_id_hex` is revoked, unverified,
+    /// blocked, or unauthenticated, failing closed on missing authorization state (SEC-1D-15).
+    pub fn is_peer_revoked(&self, peer_device_id_hex: &str) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if clean_id.is_empty() {
+            return true;
+        }
+
+        // 1. Authoritative check in transport revocation registry (SEC-1D-15)
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return true;
+        }
+
+        // 2. Authoritative check against KeystoreV2 (fail closed if unknown or blocked)
+        let (ks_exists, is_blocked, ks_trust_gen) = {
+            if let Ok(ks_guard) = crate::security::keystore::global_keystore().lock() {
+                let blocked = ks_guard.is_device_blocked(&clean_id);
+                if let Some(peer) = ks_guard.get_peer(&clean_id) {
+                    (true, blocked, peer.trust_generation)
+                } else {
+                    (false, blocked, 0)
+                }
+            } else {
+                (false, false, 0)
+            }
+        };
+
+        if is_blocked {
+            return true;
+        }
+
+        // 3. Check in-memory clipboard revocation cache
+        let rev_gen_opt = {
+            let rev = self.revoked_clipboard_peers.read().unwrap_or_else(|e| e.into_inner());
+            rev.get(&clean_id).copied()
+        };
+
+        if let Some(rev_gen) = rev_gen_opt {
+            let cur_transport_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+            let active_gen = ks_trust_gen.max(cur_transport_gen);
+            // Re-pair requires that active trust generation strictly exceeds revocation generation
+            if active_gen <= rev_gen {
+                return true;
+            }
+        }
+
+        // 4. Fail-closed: peer must have active trust generation in transport or be registered in Keystore
+        let transport_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        if !ks_exists && transport_gen == 0 {
+            // Unpaired, unauthenticated, unknown peer: fail closed!
+            return true;
+        }
+
+        false
+    }
+
+    /// Clears the clipboard revocation mark for a peer upon successful re-pairing.
+    pub fn clear_peer_revocation(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let mut rev = self.revoked_clipboard_peers.write().unwrap_or_else(|e| e.into_inner());
+        rev.remove(&clean_id);
+    }
+
+    /// Associates a registered drag session with its owning peer device ID.
+    pub fn register_peer_drag_session(&self, peer_device_id_hex: &str, session_id: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.register_peer_drag_session_bounded(&clean_id, session_id, gen);
+    }
+
+    /// Checks if a drag session is actively registered for a specific peer.
+    pub fn is_peer_drag_session_registered(&self, peer_device_id_hex: &str, session_id: &str) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let drag_peers = self.drag_sessions_by_peer.read().unwrap_or_else(|e| e.into_inner());
+        drag_peers.get(&clean_id).map(|s| s.contains(session_id)).unwrap_or(false)
+    }
+
+    /// Associates a registered drag session with its owning peer device ID and generation.
+    pub fn register_peer_drag_session_bounded(&self, peer_device_id_hex: &str, session_id: &str, generation: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if self.is_peer_revoked(&clean_id) {
+            tracing::warn!("Rejected drag session registration for revoked peer {}", clean_id);
+            return;
+        }
+        let mut drag_peers = self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner());
+        let mut drag_gens = self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner());
+        if self.is_peer_revoked(&clean_id) {
+            return;
+        }
+        drag_peers.entry(clean_id).or_default().insert(session_id.to_string());
+        drag_gens.insert(session_id.to_string(), generation);
+    }
+
+    /// Retrieves pending lazy announcement for a specific peer device ID hex.
+    pub fn get_peer_pending_announcement(&self, peer_device_id_hex: &str) -> Option<LazyAnnouncement> {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let remotes = self.pending_remote_by_peer.read().unwrap_or_else(|e| e.into_inner());
+        remotes.get(&clean_id).map(|(ann, _, _)| ann.clone())
+    }
+
+    /// Sets pending lazy announcement for a specific peer device ID hex.
+    pub fn set_peer_pending_announcement(&self, peer_device_id_hex: &str, ann: LazyAnnouncement, ip: IpAddr) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.set_peer_pending_announcement_bounded(&clean_id, ann, ip, gen);
+    }
+
+    /// Sets pending lazy announcement for a specific peer device ID hex bound to its trust generation.
+    pub fn set_peer_pending_announcement_bounded(&self, peer_device_id_hex: &str, ann: LazyAnnouncement, ip: IpAddr, generation: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if self.is_peer_revoked(&clean_id) {
+            tracing::warn!("Rejected pending announcement for revoked peer {}", clean_id);
+            return;
+        }
+        let mut remotes = self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner());
+        if self.is_peer_revoked(&clean_id) {
+            return;
+        }
+        remotes.insert(clean_id, (ann, ip, generation));
+    }
+
+    /// Synchronously purges all remote clipboard staging, pending drag sessions, and cached verified metadata
+    /// upon peer revocation or emergency teardown.
+    pub fn clear_remote_state(&self) {
+        self.pending_remote_by_peer.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.drag_sessions_by_peer.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.drag_session_generations.write().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Ok(mut r) = self.pending_remote.try_write() {
+            *r = None;
+        }
+        if let Ok(mut ip) = self.last_remote_ip.try_write() {
+            *ip = None;
+        }
+        if let Ok(mut d) = self.pending_drag_sessions.try_write() {
+            d.clear();
+        }
+        if let Ok(mut o) = self.pending_drag_order.try_write() {
+            o.clear();
+        }
+        if let Ok(mut c) = self.verified_cache.try_write() {
+            c.clear();
+        }
+        self.is_pasting.store(false, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         unsafe {
             set_has_pending_remote_file(false);
@@ -1010,6 +1410,21 @@ impl ClipboardService {
                     ann.total_files,
                     ann.total_bytes as f64 / (1024.0 * 1024.0)
                 );
+                let peer_dev_id = session.peer_device_id_hex().to_string();
+                if self.is_peer_revoked(&peer_dev_id) {
+                    warn!("Ignoring clipboard announcement from revoked peer {}", peer_dev_id);
+                    return Ok(());
+                }
+                {
+                    let mut remotes = self.pending_remote_by_peer
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if self.is_peer_revoked(&peer_dev_id) {
+                        warn!("Ignoring clipboard announcement from revoked peer {}", peer_dev_id);
+                        return Ok(());
+                    }
+                    remotes.insert(peer_dev_id.clone(), (ann.clone(), peer_addr.ip(), session.trust_generation()));
+                }
                 {
                     let mut lock = self.pending_remote.write().await;
                     *lock = Some(ann.clone());
@@ -1246,6 +1661,11 @@ impl ClipboardService {
             let prev_hash = self.last_hash.read().await.clone();
             let helper = Arc::clone(&self.file_helper);
             let snapshot = tokio::task::spawn_blocking(move || -> LocalClipboardSnapshot {
+                if crate::clipboard::os_seq::is_clipboard_concealed() {
+                    debug!("Skipping clipboard sync: concealed/transient/password-manager content detected");
+                    return LocalClipboardSnapshot::Unchanged;
+                }
+
                 let copied_paths = helper.read_copied_files();
                 if !copied_paths.is_empty() {
                     let cache_dir = helper.get_cache_dir();
@@ -2374,6 +2794,12 @@ end run"#;
             }
         };
 
+        let peer_dev_id = session.peer_device_id_hex().to_string();
+        if self.is_peer_revoked(&peer_dev_id) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            anyhow::bail!("Peer {} was revoked before streaming; aborted staging", peer_dev_id);
+        }
+
         let stream_res = Self::receive_stream_frames_from_session(
             &mut session,
             &stage_dir,
@@ -2434,6 +2860,14 @@ end run"#;
         if cached_roots.is_empty() {
             let _ = std::fs::remove_dir_all(&session_cache_dir);
             anyhow::bail!("Verified clipboard cache commit produced zero root items");
+        }
+
+        // Acquire read lease on clipboard commit lock to serialize against peer revocation (SEC-1D-14, SEC-1D-15)
+        let _commit_guard = self.clipboard_commit_lock.read().await;
+
+        if self.is_peer_revoked(&peer_dev_id) {
+            let _ = std::fs::remove_dir_all(&session_cache_dir);
+            anyhow::bail!("Peer {} was revoked during staging; aborted clipboard commit", peer_dev_id);
         }
 
         // Only replace the native OS clipboard AFTER all staged items pass SHA-256 verification.
@@ -2651,6 +3085,12 @@ end run"#;
             }
         };
 
+        let peer_dev_id = session.peer_device_id_hex().to_string();
+        if self.is_peer_revoked(&peer_dev_id) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            anyhow::bail!("Peer {} was revoked before streaming; aborted staging", peer_dev_id);
+        }
+
         let stream_res = Self::receive_stream_frames_from_session(
             &mut session,
             &stage_dir,
@@ -2667,6 +3107,11 @@ end run"#;
                 return Err(e);
             }
         };
+
+        if self.is_peer_revoked(&peer_dev_id) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            anyhow::bail!("Peer {} was revoked during streaming; aborted transfer commit", peer_dev_id);
+        }
 
         let mut committed_paths = Vec::with_capacity(roots.len());
         for root in &roots {
@@ -2690,17 +3135,20 @@ end run"#;
         // Also register the committed destination paths on the native OS file clipboard (`CF_HDROP` / `NSPasteboard`)
         // so subsequent Right-Click -> Paste or Ctrl+V into another folder works without re-streaming over the network.
         {
-            let helper = Arc::clone(&self.file_helper);
-            let paths_for_cb = committed_paths.clone();
-            if let Ok(Ok(new_seq)) = tokio::task::spawn_blocking(move || -> Result<i64> {
-                helper.write_copied_files(&paths_for_cb)?;
-                Ok(os_seq::get_clipboard_sequence())
-            })
-            .await
-            {
-                if new_seq >= 0 {
-                    let mut seq_lock = self.last_seq.write().await;
-                    *seq_lock = new_seq;
+            let _commit_guard = self.clipboard_commit_lock.read().await;
+            if !self.is_peer_revoked(&peer_dev_id) {
+                let helper = Arc::clone(&self.file_helper);
+                let paths_for_cb = committed_paths.clone();
+                if let Ok(Ok(new_seq)) = tokio::task::spawn_blocking(move || -> Result<i64> {
+                    helper.write_copied_files(&paths_for_cb)?;
+                    Ok(os_seq::get_clipboard_sequence())
+                })
+                .await
+                {
+                    if new_seq >= 0 {
+                        let mut seq_lock = self.last_seq.write().await;
+                        *seq_lock = new_seq;
+                    }
                 }
             }
         }
@@ -2749,6 +3197,7 @@ end run"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::clipboard::protocol::MAX_IMAGE_DIMENSION;
     use crate::security::keystore::{FixedKekProvider, KeystoreV2};
     use zeroize::Zeroizing;
@@ -3115,5 +3564,328 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_peer_scoped_teardown_and_repopulation_prevention() {
+        let discovery = DiscoveryManager::new("test-clip");
+        let clip = ClipboardService::new(discovery).expect("clipboard service new");
+
+        let peer_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let peer_b = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+        crate::security::transport::register_peer_trust_generation(peer_a, 1);
+        crate::security::transport::register_peer_trust_generation(peer_b, 1);
+
+        let ann_a = LazyAnnouncement {
+            session_id: "session-a".into(),
+            root_name: "a.txt".into(),
+            roots: vec!["a.txt".into()],
+            total_files: 1,
+            total_bytes: 100,
+        };
+        let ann_b = LazyAnnouncement {
+            session_id: "session-b".into(),
+            root_name: "b.txt".into(),
+            roots: vec!["b.txt".into()],
+            total_files: 2,
+            total_bytes: 200,
+        };
+
+        clip.set_peer_pending_announcement(peer_a, ann_a.clone(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        clip.set_peer_pending_announcement(peer_b, ann_b.clone(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)));
+
+        clip.register_peer_drag_session(peer_a, "drag-a-1");
+        clip.register_peer_drag_session(peer_b, "drag-b-1");
+
+        assert_eq!(clip.get_peer_pending_announcement(peer_a).unwrap().session_id, "session-a");
+        assert_eq!(clip.get_peer_pending_announcement(peer_b).unwrap().session_id, "session-b");
+        assert!(!clip.is_peer_revoked(peer_a));
+        assert!(!clip.is_peer_revoked(peer_b));
+
+        // Revoke Peer A
+        clip.clear_peer_remote_state(peer_a);
+
+        // Peer A state must be purged and marked revoked
+        assert!(clip.get_peer_pending_announcement(peer_a).is_none());
+        assert!(clip.is_peer_revoked(peer_a));
+
+        // Peer B state must remain intact!
+        assert_eq!(clip.get_peer_pending_announcement(peer_b).unwrap().session_id, "session-b");
+        assert!(!clip.is_peer_revoked(peer_b));
+
+        // Attempting to repopulate staging / announcements for revoked Peer A must be blocked
+        assert!(clip.is_peer_revoked(peer_a), "Peer A must remain revoked");
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_clear_peer_remote_state_guaranteed_under_contention_and_no_repopulate() {
+        let discovery = DiscoveryManager::new("clip_contend");
+        let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
+        let peer_a = "1234567890abcdef1234567890abcdef";
+        crate::security::transport::register_peer_trust_generation(peer_a, 1);
+
+        let ann_a = LazyAnnouncement {
+            session_id: "session-contend".into(),
+            root_name: "test.dat".into(),
+            roots: vec!["test.dat".into()],
+            total_files: 1,
+            total_bytes: 50,
+        };
+
+        clip.set_peer_pending_announcement(peer_a, ann_a.clone(), "127.0.0.1".parse().unwrap());
+        clip.register_peer_drag_session(peer_a, "drag-contend");
+
+        // Spawn a background task holding a lock on pending_drag_sessions briefly
+        let clip_clone = Arc::clone(&clip);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b2 = Arc::clone(&barrier);
+        let holder = tokio::spawn(async move {
+            let _guard = clip_clone.pending_drag_sessions.write().await;
+            b2.wait().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        barrier.wait().await;
+
+        // Even under contention on pending_drag_sessions, clear_peer_remote_state_async awaits and guarantees cleanup
+        clip.clear_peer_remote_state_async(peer_a).await;
+        holder.await.unwrap();
+
+        // 1. Verify Peer A is marked revoked
+        assert!(clip.is_peer_revoked(peer_a));
+
+        // 2. Pending announcement is removed
+        assert!(clip.get_peer_pending_announcement(peer_a).is_none());
+
+        // 3. Background task repopulation is rejected
+        clip.set_peer_pending_announcement(peer_a, ann_a.clone(), "127.0.0.1".parse().unwrap());
+        assert!(clip.get_peer_pending_announcement(peer_a).is_none(), "Revoked peer must not repopulate announcements");
+
+        clip.register_peer_drag_session(peer_a, "drag-repopulate");
+        let drag_peers = clip.drag_sessions_by_peer.read().unwrap();
+        assert!(!drag_peers.contains_key(peer_a), "Revoked peer must not repopulate drag sessions");
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_repairing_clears_revocation_and_permits_transfers() {
+        let discovery = DiscoveryManager::new("clip_repair");
+        let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
+        let peer_a = "11112222333344445555666677778888";
+
+        // Initial generation 1
+        crate::security::transport::register_peer_trust_generation(peer_a, 1);
+        assert!(!clip.is_peer_revoked(peer_a));
+
+        // Revoke peer A
+        clip.clear_peer_remote_state(peer_a);
+        assert!(clip.is_peer_revoked(peer_a));
+
+        // Announcement rejected
+        let ann = LazyAnnouncement {
+            session_id: "sess-1".into(),
+            root_name: "test.txt".into(),
+            roots: vec!["test.txt".into()],
+            total_files: 1,
+            total_bytes: 42,
+        };
+        clip.set_peer_pending_announcement(peer_a, ann.clone(), "127.0.0.1".parse().unwrap());
+        assert!(clip.get_peer_pending_announcement(peer_a).is_none());
+
+        // Re-pairing succeeds: transport advances to gen 2 and pairing calls clear_peer_revocation
+        crate::security::transport::register_peer_trust_generation(peer_a, 2);
+        clip.clear_peer_revocation(peer_a);
+
+        assert!(!clip.is_peer_revoked(peer_a), "Re-pairing must clear revocation");
+
+        // Announcement accepted now
+        clip.set_peer_pending_announcement(peer_a, ann.clone(), "127.0.0.1".parse().unwrap());
+        assert_eq!(clip.get_peer_pending_announcement(peer_a).unwrap().session_id, "sess-1");
+
+        clip.register_peer_drag_session(peer_a, "drag-repaired");
+        let drag_peers = clip.drag_sessions_by_peer.read().unwrap();
+        assert!(drag_peers.get(peer_a).unwrap().contains("drag-repaired"));
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_delayed_teardown_race_against_repairing() {
+        let discovery = DiscoveryManager::new("clip_race");
+        let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
+        let peer_a = "aaaabbbbccccddddeeeeffff00001111";
+
+        // 1. Initial generation 1
+        crate::security::transport::register_peer_trust_generation(peer_a, 1);
+        assert!(!clip.is_peer_revoked(peer_a));
+
+        // 2. Peer is revoked at generation 2 (unpair)
+        crate::security::transport::invalidate_peer_trust(peer_a, 2);
+        let teardown_gen = 2u64;
+
+        // 3. Before delayed teardown runs, peer re-pairs at generation 3!
+        crate::security::transport::register_peer_trust_generation(peer_a, 3);
+        clip.clear_peer_revocation(peer_a);
+        assert!(!clip.is_peer_revoked(peer_a));
+
+        // 4. Delayed teardown for gen 2 finally executes:
+        clip.clear_peer_remote_state_bounded_async(peer_a, teardown_gen).await;
+
+        // 5. Must NOT re-revoke the newly paired peer!
+        assert!(!clip.is_peer_revoked(peer_a), "Delayed teardown from older generation must not blackhole re-paired peer");
+
+        let ann = LazyAnnouncement {
+            session_id: "sess-after-race".into(),
+            root_name: "race.txt".into(),
+            roots: vec!["race.txt".into()],
+            total_files: 1,
+            total_bytes: 84,
+        };
+        clip.set_peer_pending_announcement(peer_a, ann.clone(), "127.0.0.1".parse().unwrap());
+        assert!(clip.get_peer_pending_announcement(peer_a).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_production_unpair_and_repair_path_preserves_new_state() {
+        let discovery = DiscoveryManager::new("clip_prod_race");
+        let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
+        let peer_a = "99998888777766665555444433332222";
+
+        // Initial pairing at generation 1
+        crate::security::transport::register_peer_trust_generation(peer_a, 1);
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer_a, 1);
+        }
+        assert!(!clip.is_peer_revoked(peer_a));
+
+        // Add old generation announcement
+        let ann_old = LazyAnnouncement {
+            session_id: "sess-old-gen1".into(),
+            root_name: "old.txt".into(),
+            roots: vec!["old.txt".into()],
+            total_files: 1,
+            total_bytes: 10,
+        };
+        clip.set_peer_pending_announcement(peer_a, ann_old, "127.0.0.1".parse().unwrap());
+        assert!(clip.get_peer_pending_announcement(peer_a).is_some());
+
+        // Unpair peer: yields generation 2
+        let unpair_gen = {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let (_, gen) = ks.unpair_peer_ext(peer_a).unwrap();
+            gen
+        };
+        assert_eq!(unpair_gen, 2);
+        crate::security::transport::invalidate_peer_trust(peer_a, unpair_gen);
+
+        // Before Phase B teardown finishes, peer re-pairs at generation 3!
+        let repair_gen = 3u64;
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer_a, repair_gen);
+        }
+        crate::security::transport::register_peer_trust_generation(peer_a, repair_gen);
+        clip.clear_peer_revocation(peer_a);
+        assert!(!clip.is_peer_revoked(peer_a));
+
+        // New announcement arrives under generation 3
+        let ann_new = LazyAnnouncement {
+            session_id: "sess-new-gen3".into(),
+            root_name: "new.txt".into(),
+            roots: vec!["new.txt".into()],
+            total_files: 1,
+            total_bytes: 50,
+        };
+        clip.set_peer_pending_announcement(peer_a, ann_new.clone(), "127.0.0.1".parse().unwrap());
+        clip.register_peer_drag_session(peer_a, "drag-sess-3");
+
+        // Phase B delayed teardown for unpair_gen (2) now executes:
+        clip.clear_peer_remote_state_bounded_async(peer_a, unpair_gen).await;
+
+        // Assert: peer must NOT be revoked or blackholed (SEC-1D-14)
+        assert!(!clip.is_peer_revoked(peer_a), "Delayed teardown from gen 2 must not blackhole gen 3 peer");
+
+        // Assert: gen 3 announcement must be PRESERVED
+        let current_ann = clip.get_peer_pending_announcement(peer_a);
+        assert!(current_ann.is_some(), "Generation 3 announcement must be preserved");
+        assert_eq!(current_ann.unwrap().session_id, "sess-new-gen3");
+
+        // Assert: gen 3 drag session must be PRESERVED
+        assert!(clip.is_peer_drag_session_registered(peer_a, "drag-sess-3"));
+    }
+
+    #[test]
+    fn test_clipboard_fail_closed_authorization_on_unknown_or_blocked_peer() {
+        let discovery = DiscoveryManager::new("clip_fail_closed");
+        let clip = ClipboardService::new(discovery).expect("clipboard service new");
+
+        // 1. Completely unknown peer (no transport, no keystore) -> fails closed (revoked) (SEC-1D-15)
+        let unknown_peer = "deadbeef00000000deadbeef00000000";
+        assert!(clip.is_peer_revoked(unknown_peer), "Unknown peer must fail closed as revoked");
+
+        // 2. Peer with active transport generation 1
+        let valid_peer = "validpeer0000000validpeer0000000";
+        crate::security::transport::register_peer_trust_generation(valid_peer, 1);
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(valid_peer, 1);
+        }
+        assert!(!clip.is_peer_revoked(valid_peer), "Valid paired peer must be authorized");
+
+        // 3. Blocked peer in keystore -> fails closed even if transport has old generation
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.untrust_or_block_peer(valid_peer, true, "127.0.0.1".into());
+        }
+        assert!(clip.is_peer_revoked(valid_peer), "Blocked peer must fail closed as revoked");
+    }
+
+    #[tokio::test]
+    async fn test_clipboard_commit_lock_serializes_inflight_writes_against_teardown() {
+        let discovery = DiscoveryManager::new("clip_commit_lock");
+        let clip = Arc::new(ClipboardService::new(discovery).expect("clipboard service new"));
+        let peer = "commitlockpeer000commitlockpeer0";
+        crate::security::transport::register_peer_trust_generation(peer, 1);
+
+        let lock_acquired = Arc::new(AtomicBool::new(false));
+        let can_release = Arc::new(AtomicBool::new(false));
+
+        let clip_clone = Arc::clone(&clip);
+        let la = Arc::clone(&lock_acquired);
+        let cr = Arc::clone(&can_release);
+
+        // Simulate an in-flight OS clipboard commit holding read lock
+        let write_sim = tokio::spawn(async move {
+            let _guard = clip_clone.clipboard_commit_lock.read().await;
+            la.store(true, Ordering::SeqCst);
+            while !cr.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // Wait until in-flight write acquires read lock
+        while !lock_acquired.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Now initiate teardown in background
+        let clip_teardown = Arc::clone(&clip);
+        let teardown_done = Arc::new(AtomicBool::new(false));
+        let td = Arc::clone(&teardown_done);
+        let teardown_task = tokio::spawn(async move {
+            clip_teardown.clear_peer_remote_state_bounded_async(peer, 1).await;
+            td.store(true, Ordering::SeqCst);
+        });
+
+        // Verify teardown is blocked waiting for write lock (cannot finish while in-flight write holds read lock)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!teardown_done.load(Ordering::SeqCst), "Teardown must wait for in-flight clipboard commit to finish");
+
+        // Release in-flight write
+        can_release.store(true, Ordering::SeqCst);
+        write_sim.await.unwrap();
+
+        // Now teardown should complete
+        teardown_task.await.unwrap();
+        assert!(teardown_done.load(Ordering::SeqCst), "Teardown must finish after commit lock is released");
     }
 }

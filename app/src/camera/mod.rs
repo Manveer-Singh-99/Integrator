@@ -104,11 +104,23 @@
 //! - **FFI Pointer Invariants**: Raw pointer inputs from native platform libraries are checked
 //!   for nullity, valid buffer length, and expected dimensions prior to constructing Rust slices.
 
+pub mod authorization;
+pub mod distribution;
+
+#[allow(unused_imports)]
+use authorization::{
+    CameraConsentManager, CameraConsentScope, CameraConsentState, CameraDenialAction,
+    ConsentEvaluation, LeaseDirection, PersistentCameraConsent,
+};
+#[allow(unused_imports)]
+use distribution::{CameraFrameHub, SharedCameraFrame, SubscriberMailbox};
+
 #[cfg(target_os = "windows")]
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
@@ -168,6 +180,9 @@ pub const PIXEL_FMT_NV12: u8 = 1;
 /// Flag bit indicating a zero-payload standby keepalive datagram, maintaining the transport session
 /// when the camera is paused or idling without transferring full uncompressed video frames.
 pub const FLAG_STANDBY_KEEPALIVE: u8 = 0x01;
+
+/// Flag bit indicating an initial authorization lease redemption datagram bridging RPC to stream.
+pub const FLAG_AUTH_LEASE_REDEMPTION: u8 = 0x02;
 
 /// Maximum timeout duration when establishing an outbound encrypted camera stream connection.
 #[cfg(target_os = "macos")]
@@ -280,7 +295,7 @@ pub fn encode_camera_frame(
         ));
     }
     // Non-keepalive live frames must match the exact NV12 geometry size.
-    if (flags & FLAG_STANDBY_KEEPALIVE) == 0 && payload.len() != NV12_FRAME_BYTES {
+    if (flags & (FLAG_STANDBY_KEEPALIVE | FLAG_AUTH_LEASE_REDEMPTION)) == 0 && payload.len() != NV12_FRAME_BYTES {
         return Err(format!(
             "Expected {} NV12 bytes for {}x{}, got {}",
             NV12_FRAME_BYTES,
@@ -340,7 +355,7 @@ pub fn decode_camera_frame(raw: &[u8]) -> Result<DecodedCameraFrame<'_>, String>
             raw.len()
         ));
     }
-    if (flags & FLAG_STANDBY_KEEPALIVE) == 0 {
+    if (flags & (FLAG_STANDBY_KEEPALIVE | FLAG_AUTH_LEASE_REDEMPTION)) == 0 {
         if width as u32 != CAMERA_WIDTH || height as u32 != CAMERA_HEIGHT || pix_fmt != PIXEL_FMT_NV12 {
             return Err(format!(
                 "Unsupported frame geometry {}x{} fmt {}",
@@ -392,6 +407,7 @@ impl LatestFrameSlot {
     }
 
     /// Takes the currently pending frame datagram out of the slot, leaving it empty.
+    #[allow(dead_code)]
     fn take(&self) -> Option<Vec<u8>> {
         self.latest.lock().ok()?.take()
     }
@@ -412,6 +428,14 @@ fn global_frame_slot() -> &'static Arc<LatestFrameSlot> {
     GLOBAL_FRAME_SLOT.get_or_init(|| Arc::new(LatestFrameSlot::new()))
 }
 
+/// Global lazy-initialized singleton instance of [`CameraFrameHub`].
+static GLOBAL_FRAME_HUB: OnceLock<Arc<CameraFrameHub>> = OnceLock::new();
+
+/// Returns the static reference to the shared [`CameraFrameHub`].
+pub fn global_frame_hub() -> &'static Arc<CameraFrameHub> {
+    GLOBAL_FRAME_HUB.get_or_init(|| Arc::new(CameraFrameHub::new()))
+}
+
 #[cfg(target_os = "macos")]
 extern "C" {
     fn integrator_mac_camera_permission_state() -> i32;
@@ -420,6 +444,11 @@ extern "C" {
     fn integrator_mac_camera_start() -> i32;
     fn integrator_mac_camera_stop();
     fn integrator_mac_camera_is_running() -> i32;
+    #[allow(dead_code)]
+    fn integrator_mac_prompt_camera_consent(peer_name: *const std::os::raw::c_char) -> bool;
+    fn integrator_mac_prompt_camera_consent_scoped(peer_name: *const std::os::raw::c_char, timeout_sec: i32) -> i32;
+    #[allow(dead_code)]
+    fn integrator_mac_cancel_camera_consent_prompt();
 }
 
 /// C FFI callback invoked by `camera_macos.swift` upon capturing a new video sample buffer.
@@ -455,7 +484,8 @@ pub extern "C" fn integrator_on_mac_camera_frame(
         timestamp_us,
         slice,
     ) {
-        global_frame_slot().publish(encoded);
+        global_frame_slot().publish(encoded.clone());
+        global_frame_hub().publish_frame(encoded, false);
     }
 }
 
@@ -465,6 +495,1019 @@ extern "C" {
     fn integrator_win_vcam_push_nv12(data: *const u8, len: u32, timestamp_us: u64);
     fn integrator_win_vcam_stop();
     fn integrator_win_vcam_is_active() -> i32;
+    fn integrator_win_prompt_camera_consent_scoped(peer_name: *const std::os::raw::c_char, timeout_sec: u32) -> i32;
+    #[allow(dead_code)]
+    fn integrator_win_cancel_camera_consent_prompt();
+}
+
+/// Maximum duration to await camera streaming task termination during teardown before escalating to abort (2.5 seconds).
+pub const CAMERA_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Maximum duration to await task/native-operation drain after escalating to `JoinHandle::abort()` (500 ms).
+pub const CAMERA_ABORT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Abstraction over platform-native camera capture / virtual camera hardware lifecycle.
+///
+/// Production uses [`NativeCameraBackend`] (AVFoundation on macOS, Media Foundation Virtual Camera
+/// on Windows 11). Deterministic lifecycle tests inject a controllable backend to verify exact-once
+/// hardware shutdown and retention invariants without touching physical camera sensors.
+pub trait CameraHardwareBackend: Send + Sync {
+    /// Starts camera capture or virtual camera output.
+    /// Returns `Err((state_label, error_msg))` on failure.
+    fn start_capture(&self) -> Result<(), (String, String)>;
+    /// Stops camera capture or virtual camera output cleanly.
+    fn stop_capture(&self);
+    /// Returns true if the native hardware backend reports capture is currently running.
+    fn is_capture_running(&self) -> bool;
+}
+
+/// Production [`CameraHardwareBackend`] bridging to `camera_macos.swift` and `camera_windows.cpp`.
+struct NativeCameraBackend;
+
+impl CameraHardwareBackend for NativeCameraBackend {
+    fn start_capture(&self) -> Result<(), (String, String)> {
+        #[cfg(target_os = "windows")]
+        {
+            let mut err_buf = [0i8; 256];
+            let rc = unsafe {
+                integrator_win_vcam_start(err_buf.as_mut_ptr(), err_buf.len() as i32)
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(("Error".to_string(), msg));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let rc = unsafe { integrator_mac_camera_start() };
+            if rc == 0 {
+                return Ok(());
+            }
+            let (state_lbl, msg) = match rc {
+                -2 => (
+                    "Permission Needed",
+                    "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
+                ),
+                -1 => (
+                    "Permission Needed",
+                    "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
+                ),
+                -3 => (
+                    "No Camera Detected",
+                    "No Mac camera hardware detected (connect a USB webcam or Continuity Camera)".to_string(),
+                ),
+                _ => (
+                    "Error",
+                    format!("Failed to initialize AVFoundation camera capture (code {})", rc),
+                ),
+            };
+            return Err((state_lbl.to_string(), msg));
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            Err((
+                "Unsupported".to_string(),
+                "Shared Camera is supported on macOS and Windows 11".to_string(),
+            ))
+        }
+    }
+
+    fn stop_capture(&self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            integrator_mac_camera_stop();
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            integrator_win_vcam_stop();
+        }
+    }
+
+    fn is_capture_running(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { integrator_mac_camera_is_running() != 0 }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { integrator_win_vcam_is_active() != 0 }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            false
+        }
+    }
+}
+
+/// Represents an active peer camera stream with its stream ID, cancellation sender, optional task handle, and generation.
+pub struct ActivePeerStreamEntry {
+    pub stream_id: u64,
+    pub cancel_tx: tokio::sync::watch::Sender<bool>,
+    pub task_handle: Option<tokio::task::JoinHandle<()>>,
+    #[allow(dead_code)]
+    pub generation: u64,
+}
+
+/// Completion and reaping observability statistics for supervised lingering camera tasks and native operations.
+#[derive(Debug, Clone, Default)]
+pub struct CameraReapStats {
+    pub reaped_ok: u64,
+    pub reaped_cancelled: u64,
+    pub reaped_panicked: u64,
+    pub reaped_other_err: u64,
+    pub unexpected_failures: Vec<String>,
+}
+
+impl CameraReapStats {
+    /// Total number of lingering tasks or native operations whose completion was observed and reaped.
+    #[cfg(test)]
+    pub fn total_reaped(&self) -> u64 {
+        self.reaped_ok + self.reaped_cancelled + self.reaped_panicked + self.reaped_other_err
+    }
+}
+
+struct LingeringTaskEntry {
+    peer_id: String,
+    #[allow(dead_code)]
+    label: String,
+    /// Populated only when supervision was registered outside any Tokio runtime context.
+    fallback_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct ActiveNativeOpRecord {
+    peer_id: Option<String>,
+    stream_id: Option<u64>,
+    #[allow(dead_code)]
+    label: String,
+    /// Set to true if peer teardown timed out while this native resource operation remained active.
+    lingering: bool,
+}
+
+#[derive(Default)]
+struct LingeringRegistry {
+    /// Supervised lingering JoinHandles awaiting asynchronous completion.
+    tasks: HashMap<u64, LingeringTaskEntry>,
+    /// Currently executing native/blocking camera resource operations tracked by [`CameraNativeOpGuard`].
+    /// Even if an outer async JoinHandle is cancelled by `abort()`, an already-running `spawn_blocking`
+    /// thread holds its guard until the native operation genuinely returns or unwinds.
+    active_native_ops: HashMap<u64, ActiveNativeOpRecord>,
+    /// Count of peer teardowns currently draining an extracted task handle / native operation.
+    /// Prevents concurrent reapers from prematurely shutting down hardware mid-teardown.
+    in_flight_teardowns: usize,
+    /// Per-peer count of active in-flight teardowns so a concurrent second teardown for the
+    /// same peer waits instead of returning false `Ok(())` while the first is still draining.
+    in_flight_teardown_peers: HashMap<String, usize>,
+    /// Accumulated completion/failure counters.
+    stats: CameraReapStats,
+}
+
+impl LingeringRegistry {
+    fn lingering_count(&self) -> usize {
+        self.tasks.len()
+            + self
+                .active_native_ops
+                .values()
+                .filter(|op| op.lingering)
+                .count()
+    }
+
+    fn has_any_hardware_dependents(&self) -> bool {
+        !self.tasks.is_empty()
+            || !self.active_native_ops.is_empty()
+            || self.in_flight_teardowns > 0
+    }
+
+    fn peer_has_lingering_or_active_native(&self, clean_peer_id: &str) -> bool {
+        self.tasks.values().any(|t| t.peer_id == clean_peer_id)
+            || self
+                .active_native_ops
+                .values()
+                .any(|op| op.peer_id.as_deref() == Some(clean_peer_id))
+            || self
+                .in_flight_teardown_peers
+                .get(clean_peer_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+    }
+
+    fn stream_has_active_native_ops(&self, clean_peer_id: &str, stream_id: u64) -> bool {
+        self.active_native_ops.values().any(|op| {
+            op.peer_id.as_deref() == Some(clean_peer_id)
+                && (op.stream_id.is_none() || op.stream_id == Some(stream_id))
+        })
+    }
+
+    fn mark_stream_native_ops_lingering(&mut self, clean_peer_id: &str, stream_id: u64) -> usize {
+        let mut marked = 0usize;
+        for op in self.active_native_ops.values_mut() {
+            if op.peer_id.as_deref() == Some(clean_peer_id)
+                && (op.stream_id.is_none() || op.stream_id == Some(stream_id))
+            {
+                op.lingering = true;
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    fn dec_in_flight_teardown(&mut self, clean_peer_id: &str) {
+        self.in_flight_teardowns = self.in_flight_teardowns.saturating_sub(1);
+        if let Some(cnt) = self.in_flight_teardown_peers.get_mut(clean_peer_id) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                self.in_flight_teardown_peers.remove(clean_peer_id);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct HardwareState {
+    running: bool,
+}
+
+/// Shared lifecycle coordinator enforcing a strict total lock hierarchy across camera streams,
+/// lingering-task supervision, native operation tracking, and exact-once hardware shutdown (SEC-1D-17).
+///
+/// Strict Lock Order (NEVER inverted, NEVER held across `.await`):
+/// 0. `hardware_io_lock`
+/// 1. `active_peer_streams`
+/// 2. `peer_consent`
+/// 3. `lingering_tasks`
+/// 4. `hardware_state`
+struct CameraLifecycleCoordinator {
+    backend: Arc<dyn CameraHardwareBackend>,
+    active: Arc<AtomicBool>,
+    local_consent: Arc<AtomicBool>,
+    local_preview_active: Arc<AtomicBool>,
+    starting_streams: Arc<AtomicUsize>,
+    shutdown_executions: Arc<AtomicU64>,
+    shutdown_eval_count: Arc<AtomicU64>,
+    hardware_io_lock: Mutex<()>,
+    active_peer_streams: Arc<Mutex<HashMap<String, ActivePeerStreamEntry>>>,
+    lingering_tasks: Arc<Mutex<LingeringRegistry>>,
+    hardware_state: Mutex<HardwareState>,
+    state_label: Arc<Mutex<String>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    runtime_handle: Mutex<Option<tokio::runtime::Handle>>,
+    op_finished_notify: Arc<Notify>,
+    lifecycle_notify: Arc<Notify>,
+    next_id: AtomicU64,
+    teardown_timeout: Duration,
+    abort_drain_timeout: Duration,
+}
+
+/// RAII guard protecting an in-progress stream/hardware startup against premature shutdown
+/// triggered by a concurrently completing lingering task.
+struct StreamStartGuard {
+    coord: Arc<CameraLifecycleCoordinator>,
+    trigger_shutdown_on_drop: bool,
+}
+
+impl StreamStartGuard {
+    /// Marks startup complete without triggering a deferred idle shutdown check (e.g. caller
+    /// already inserted the active stream under `active_peer_streams` or enabled `local_preview_active`).
+    fn finish_without_shutdown(mut self) {
+        self.trigger_shutdown_on_drop = false;
+    }
+}
+
+impl Drop for StreamStartGuard {
+    fn drop(&mut self) {
+        self.coord.starting_streams.fetch_sub(1, Ordering::SeqCst);
+        if self.trigger_shutdown_on_drop {
+            if let Some(rt) = self.coord.resolve_runtime_handle() {
+                let coord = Arc::clone(&self.coord);
+                rt.spawn_blocking(move || {
+                    coord.try_shutdown_hardware_if_idle();
+                    coord.lifecycle_notify.notify_waiters();
+                });
+            } else {
+                self.coord.try_shutdown_hardware_if_idle();
+                self.coord.lifecycle_notify.notify_waiters();
+            }
+        }
+    }
+}
+
+/// Cancel-safe RAII guard keeping `in_flight_teardowns > 0` and owning the extracted stream
+/// `JoinHandle` while `teardown_peer_stream_async` awaits termination.
+///
+/// If the teardown future is dropped/cancelled mid-`.await`, `Drop` automatically aborts any
+/// remaining `JoinHandle`, marks active native operations lingering, transfers supervision into
+/// `lingering_tasks` atomically before decrementing `in_flight_teardowns`, and dispatches deferred
+/// hardware shutdown evaluation.
+struct TeardownInFlightGuard {
+    coord: Arc<CameraLifecycleCoordinator>,
+    peer_id: String,
+    stream_id: u64,
+    label: String,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    disarmed: bool,
+}
+
+impl TeardownInFlightGuard {
+    /// Atomically transitions this in-flight teardown into lingering supervision (if a handle
+    /// timed out and/or stream native operations remain active) under Level 3 lock, ensuring
+    /// zero gap where hardware could shut down prematurely.
+    fn handoff_to_lingering(mut self) -> (Option<(u64, tokio::task::JoinHandle<()>)>, usize) {
+        let lingering_handle = self.handle.take();
+        let (task_to_watch, native_cnt) = {
+            let mut reg = match self.coord.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            let native_cnt = reg.mark_stream_native_ops_lingering(&self.peer_id, self.stream_id);
+            let task_to_watch = if let Some(handle) = lingering_handle {
+                let task_id = self.coord.next_id();
+                let has_rt = self.coord.has_runtime_handle();
+                if has_rt {
+                    reg.tasks.insert(
+                        task_id,
+                        LingeringTaskEntry {
+                            peer_id: self.peer_id.clone(),
+                            label: self.label.clone(),
+                            fallback_handle: None,
+                        },
+                    );
+                    Some((task_id, handle))
+                } else {
+                    reg.tasks.insert(
+                        task_id,
+                        LingeringTaskEntry {
+                            peer_id: self.peer_id.clone(),
+                            label: self.label.clone(),
+                            fallback_handle: Some(handle),
+                        },
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+
+            reg.dec_in_flight_teardown(&self.peer_id);
+            self.disarmed = true;
+            (task_to_watch, native_cnt)
+        };
+        self.coord.op_finished_notify.notify_waiters();
+        (task_to_watch, native_cnt)
+    }
+}
+
+impl Drop for TeardownInFlightGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let leftover_handle = self.handle.take();
+            if let Some(ref h) = leftover_handle {
+                h.abort();
+            }
+            let task_to_watch = {
+                let mut reg = match self.coord.lingering_tasks.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let _ = reg.mark_stream_native_ops_lingering(&self.peer_id, self.stream_id);
+                let to_watch = if let Some(handle) = leftover_handle {
+                    let task_id = self.coord.next_id();
+                    let has_rt = self.coord.has_runtime_handle();
+                    if has_rt {
+                        reg.tasks.insert(
+                            task_id,
+                            LingeringTaskEntry {
+                                peer_id: self.peer_id.clone(),
+                                label: self.label.clone(),
+                                fallback_handle: None,
+                            },
+                        );
+                        Some((task_id, handle))
+                    } else {
+                        reg.tasks.insert(
+                            task_id,
+                            LingeringTaskEntry {
+                                peer_id: self.peer_id.clone(),
+                                label: self.label.clone(),
+                                fallback_handle: Some(handle),
+                            },
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
+                reg.dec_in_flight_teardown(&self.peer_id);
+                to_watch
+            };
+
+            if let Some((task_id, handle)) = task_to_watch {
+                self.coord.spawn_lingering_watcher(
+                    task_id,
+                    self.peer_id.clone(),
+                    self.label.clone(),
+                    handle,
+                );
+            }
+
+            self.coord.op_finished_notify.notify_waiters();
+
+            if let Some(rt) = self.coord.resolve_runtime_handle() {
+                let coord = Arc::clone(&self.coord);
+                rt.spawn_blocking(move || {
+                    coord.try_shutdown_hardware_if_idle();
+                    coord.lifecycle_notify.notify_waiters();
+                });
+            } else {
+                self.coord.try_shutdown_hardware_if_idle();
+                self.coord.lifecycle_notify.notify_waiters();
+            }
+        }
+    }
+}
+
+/// RAII guard tracking an in-flight blocking/native camera operation (e.g. `spawn_blocking` FFI call).
+///
+/// Aborting an outer Tokio task does NOT cancel an already-running `spawn_blocking` OS thread.
+/// Moving this guard into the blocking/native operation ensures `CameraService` tracks actual
+/// native resource completion, retains hardware while active, records panics on unwind, and
+/// automatically triggers hardware shutdown once the final resource-using operation completes.
+pub struct CameraNativeOpGuard {
+    coord: Arc<CameraLifecycleCoordinator>,
+    op_id: u64,
+    peer_id: Option<String>,
+    label: String,
+}
+
+impl Drop for CameraNativeOpGuard {
+    fn drop(&mut self) {
+        let panicked = std::thread::panicking();
+        let (err_to_record, was_lingering, no_dependents) = {
+            let mut reg = match self.coord.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let removed = reg.active_native_ops.remove(&self.op_id);
+            let was_lingering = removed.as_ref().map(|r| r.lingering).unwrap_or(false);
+            let err = if panicked {
+                reg.stats.reaped_panicked += 1;
+                let msg = format!(
+                    "Native camera operation #{} ({}) for peer {:?} panicked during execution",
+                    self.op_id, self.label, self.peer_id
+                );
+                tracing::error!("{}", msg);
+                reg.stats.unexpected_failures.push(msg.clone());
+                Some(msg)
+            } else if was_lingering {
+                reg.stats.reaped_ok += 1;
+                tracing::info!(
+                    "Reaped completed lingering native camera operation #{} ({}) for peer {:?}",
+                    self.op_id, self.label, self.peer_id
+                );
+                None
+            } else {
+                None
+            };
+            (err, was_lingering, !reg.has_any_hardware_dependents())
+        };
+
+        if let Some(msg) = err_to_record {
+            if let Ok(mut le) = self.coord.last_error.lock() {
+                *le = Some(msg);
+            }
+        }
+
+        self.coord.op_finished_notify.notify_waiters();
+
+        // Fast-path skip during steady-state high-FPS streaming when not lingering and streams remain active.
+        let streams_empty = if was_lingering {
+            true
+        } else {
+            self.coord
+                .active_peer_streams
+                .lock()
+                .map(|s| s.is_empty())
+                .unwrap_or(false)
+        };
+
+        if was_lingering || (no_dependents && streams_empty && self.coord.active.load(Ordering::SeqCst)) {
+            // Dispatch completion-driven hardware shutdown outside the Drop thread's locks
+            // to avoid any re-entrancy lock inversion and never block async worker threads.
+            if let Some(rt) = self.coord.resolve_runtime_handle() {
+                let coord = Arc::clone(&self.coord);
+                rt.spawn_blocking(move || {
+                    coord.try_shutdown_hardware_if_idle();
+                    coord.lifecycle_notify.notify_waiters();
+                });
+            } else {
+                self.coord.try_shutdown_hardware_if_idle();
+                self.coord.lifecycle_notify.notify_waiters();
+            }
+        } else {
+            self.coord.lifecycle_notify.notify_waiters();
+        }
+    }
+}
+
+impl CameraLifecycleCoordinator {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn capture_runtime_handle(&self) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if let Ok(mut slot) = self.runtime_handle.lock() {
+                *slot = Some(handle);
+            }
+        }
+    }
+
+    fn resolve_runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return Some(handle);
+        }
+        self.runtime_handle.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn has_runtime_handle(&self) -> bool {
+        self.resolve_runtime_handle().is_some()
+    }
+
+    fn begin_stream_start(self: &Arc<Self>) -> StreamStartGuard {
+        self.starting_streams.fetch_add(1, Ordering::SeqCst);
+        StreamStartGuard {
+            coord: Arc::clone(self),
+            trigger_shutdown_on_drop: true,
+        }
+    }
+
+    /// Registers a cancel-safe in-flight teardown while caller holds Level 1 (`active_peer_streams`).
+    /// Acquires Level 3 (`lingering_tasks`) strictly obeying lock order `1 < 3`.
+    fn begin_in_flight_teardown_locked(
+        self: &Arc<Self>,
+        clean_peer_id: &str,
+        stream_id: u64,
+        label: &str,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> TeardownInFlightGuard {
+        let mut reg = match self.lingering_tasks.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reg.in_flight_teardowns += 1;
+        *reg.in_flight_teardown_peers
+            .entry(clean_peer_id.to_string())
+            .or_insert(0) += 1;
+        TeardownInFlightGuard {
+            coord: Arc::clone(self),
+            peer_id: clean_peer_id.to_string(),
+            stream_id,
+            label: label.to_string(),
+            handle,
+            disarmed: false,
+        }
+    }
+
+    /// Registers an active native camera operation and returns its RAII [`CameraNativeOpGuard`].
+    fn begin_native_op(
+        self: &Arc<Self>,
+        peer_id: Option<&str>,
+        stream_id: Option<u64>,
+        label: &str,
+    ) -> CameraNativeOpGuard {
+        self.capture_runtime_handle();
+        let op_id = self.next_id();
+        let clean_peer = peer_id.map(|p| p.trim().to_ascii_lowercase());
+        {
+            let mut reg = match self.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            reg.active_native_ops.insert(
+                op_id,
+                ActiveNativeOpRecord {
+                    peer_id: clean_peer.clone(),
+                    stream_id,
+                    label: label.to_string(),
+                    lingering: false,
+                },
+            );
+        }
+        CameraNativeOpGuard {
+            coord: Arc::clone(self),
+            op_id,
+            peer_id: clean_peer,
+            label: label.to_string(),
+        }
+    }
+
+    /// Inserts a lingering task entry under Level 3 (callable while holding Level 1, obeying `1 < 3`)
+    /// and returns `(task_id, handle)` for spawning a completion watcher outside all locks.
+    fn register_lingering_handle_locked(
+        &self,
+        clean_peer_id: &str,
+        label: &str,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Option<(u64, tokio::task::JoinHandle<()>)> {
+        let task_id = self.next_id();
+        let has_rt = self.has_runtime_handle();
+        let mut reg = match self.lingering_tasks.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if has_rt {
+            reg.tasks.insert(
+                task_id,
+                LingeringTaskEntry {
+                    peer_id: clean_peer_id.to_string(),
+                    label: label.to_string(),
+                    fallback_handle: None,
+                },
+            );
+            Some((task_id, handle))
+        } else {
+            reg.tasks.insert(
+                task_id,
+                LingeringTaskEntry {
+                    peer_id: clean_peer_id.to_string(),
+                    label: label.to_string(),
+                    fallback_handle: Some(handle),
+                },
+            );
+            None
+        }
+    }
+
+    /// Spawns a completion-driven watcher task that awaits `handle` outside all mutexes,
+    /// observes its completion result (including panics), removes it from the registry,
+    /// and triggers hardware shutdown if no dependents remain.
+    fn spawn_lingering_watcher(
+        self: &Arc<Self>,
+        task_id: u64,
+        peer_id: String,
+        label: String,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        if let Some(rt) = self.resolve_runtime_handle() {
+            let coord = Arc::clone(self);
+            rt.spawn(async move {
+                let join_res = handle.await;
+                coord
+                    .on_lingering_handle_completed(task_id, &peer_id, &label, join_res)
+                    .await;
+            });
+        } else {
+            // Runtime disappeared between registration and spawn: keep handle in fallback slot.
+            let mut reg = match self.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(entry) = reg.tasks.get_mut(&task_id) {
+                entry.fallback_handle = Some(handle);
+            }
+        }
+    }
+
+    async fn on_lingering_handle_completed(
+        self: Arc<Self>,
+        task_id: u64,
+        peer_id: &str,
+        label: &str,
+        join_res: Result<(), tokio::task::JoinError>,
+    ) {
+        let err_to_record = {
+            let mut reg = match self.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            reg.tasks.remove(&task_id);
+            match join_res {
+                Ok(()) => {
+                    reg.stats.reaped_ok += 1;
+                    tracing::info!(
+                        "Reaped completed lingering camera task #{} ({}) for peer {}",
+                        task_id, label, peer_id
+                    );
+                    None
+                }
+                Err(e) if e.is_cancelled() => {
+                    reg.stats.reaped_cancelled += 1;
+                    tracing::info!(
+                        "Reaped cancelled lingering camera task #{} ({}) for peer {}",
+                        task_id, label, peer_id
+                    );
+                    None
+                }
+                Err(e) if e.is_panic() => {
+                    reg.stats.reaped_panicked += 1;
+                    let msg = format!(
+                        "Lingering camera task #{} ({}) for peer {} panicked: {}",
+                        task_id, label, peer_id, e
+                    );
+                    tracing::error!("{}", msg);
+                    reg.stats.unexpected_failures.push(msg.clone());
+                    Some(msg)
+                }
+                Err(e) => {
+                    reg.stats.reaped_other_err += 1;
+                    let msg = format!(
+                        "Lingering camera task #{} ({}) for peer {} failed: {}",
+                        task_id, label, peer_id, e
+                    );
+                    tracing::error!("{}", msg);
+                    reg.stats.unexpected_failures.push(msg.clone());
+                    Some(msg)
+                }
+            }
+        };
+
+        if let Some(msg) = err_to_record {
+            if let Ok(mut le) = self.last_error.lock() {
+                *le = Some(msg);
+            }
+        }
+
+        self.op_finished_notify.notify_waiters();
+
+        // Evaluate hardware shutdown on blocking pool outside all locks
+        let coord = Arc::clone(&self);
+        let _ = tokio::task::spawn_blocking(move || {
+            coord.try_shutdown_hardware_if_idle();
+        })
+        .await;
+
+        self.lifecycle_notify.notify_waiters();
+    }
+
+    fn record_completed_task_error(
+        &self,
+        peer_id: &str,
+        label: &str,
+        err: tokio::task::JoinError,
+    ) {
+        let err_to_record = {
+            let mut reg = match self.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if err.is_panic() {
+                reg.stats.reaped_panicked += 1;
+                let msg = format!(
+                    "Camera task ({}) for peer {} panicked: {}",
+                    label, peer_id, err
+                );
+                tracing::error!("{}", msg);
+                reg.stats.unexpected_failures.push(msg.clone());
+                Some(msg)
+            } else if err.is_cancelled() {
+                reg.stats.reaped_cancelled += 1;
+                None
+            } else {
+                reg.stats.reaped_other_err += 1;
+                let msg = format!(
+                    "Camera task ({}) for peer {} exited with error: {}",
+                    label, peer_id, err
+                );
+                tracing::warn!("{}", msg);
+                reg.stats.unexpected_failures.push(msg.clone());
+                Some(msg)
+            }
+        };
+
+        if let Some(msg) = err_to_record {
+            if let Ok(mut le) = self.last_error.lock() {
+                *le = Some(msg);
+            }
+        }
+    }
+
+    /// Upgrades any fallback handles to async completion watchers if a Tokio runtime is now available,
+    /// or reaps finished fallback handles synchronously when no runtime exists.
+    fn reap_fallback_handles(self: &Arc<Self>) -> usize {
+        if self.has_runtime_handle() {
+            let upgraded: Vec<(u64, String, String, tokio::task::JoinHandle<()>)> = {
+                let mut reg = match self.lingering_tasks.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let mut out = Vec::new();
+                for (&id, entry) in reg.tasks.iter_mut() {
+                    if let Some(h) = entry.fallback_handle.take() {
+                        out.push((id, entry.peer_id.clone(), entry.label.clone(), h));
+                    }
+                }
+                out
+            };
+            let count = upgraded.len();
+            for (task_id, peer_id, label, handle) in upgraded {
+                self.spawn_lingering_watcher(task_id, peer_id, label, handle);
+            }
+            return count;
+        }
+
+        let mut reg = match self.lingering_tasks.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let finished_ids: Vec<u64> = reg
+            .tasks
+            .iter()
+            .filter_map(|(&id, entry)| {
+                entry
+                    .fallback_handle
+                    .as_ref()
+                    .filter(|h| h.is_finished())
+                    .map(|_| id)
+            })
+            .collect();
+        let count = finished_ids.len();
+        for id in finished_ids {
+            reg.tasks.remove(&id);
+            reg.stats.reaped_ok += 1;
+        }
+        count
+    }
+
+    #[cfg(test)]
+    fn is_lingering_registry_poisoned(&self) -> bool {
+        self.lingering_tasks.is_poisoned()
+    }
+
+    /// Returns the name of the first poisoned lifecycle mutex across Levels 0, 1, 3, and 4, if any.
+    fn any_lifecycle_mutex_poisoned(&self) -> Option<&'static str> {
+        if self.hardware_io_lock.is_poisoned() {
+            Some("hardware_io_lock")
+        } else if self.active_peer_streams.is_poisoned() {
+            Some("active_peer_streams")
+        } else if self.lingering_tasks.is_poisoned() {
+            Some("lingering_tasks")
+        } else if self.hardware_state.is_poisoned() {
+            Some("hardware_state")
+        } else {
+            None
+        }
+    }
+
+    fn lingering_count(&self) -> usize {
+        let base = match self.lingering_tasks.lock() {
+            Ok(reg) => reg.lingering_count(),
+            Err(poisoned) => {
+                // Never report an empty registry when mutex is poisoned (SEC-1D-17)
+                poisoned.into_inner().lingering_count().max(1)
+            }
+        };
+        if self.any_lifecycle_mutex_poisoned().is_some() {
+            base.max(1)
+        } else {
+            base
+        }
+    }
+
+    fn stream_has_active_native_ops(&self, clean_peer_id: &str, stream_id: u64) -> bool {
+        match self.lingering_tasks.lock() {
+            Ok(reg) => reg.stream_has_active_native_ops(clean_peer_id, stream_id),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .stream_has_active_native_ops(clean_peer_id, stream_id),
+        }
+    }
+
+    fn peer_has_lingering_or_active_native(&self, clean_peer_id: &str) -> bool {
+        match self.lingering_tasks.lock() {
+            Ok(reg) => reg.peer_has_lingering_or_active_native(clean_peer_id),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .peer_has_lingering_or_active_native(clean_peer_id),
+        }
+    }
+
+    #[cfg(test)]
+    fn reap_stats(&self) -> CameraReapStats {
+        match self.lingering_tasks.lock() {
+            Ok(reg) => reg.stats.clone(),
+            Err(poisoned) => poisoned.into_inner().stats.clone(),
+        }
+    }
+
+    /// Evaluates all hardware retention invariants atomically under strict lock order `0 -> 1 -> 3 -> 4`,
+    /// and if completely idle, transitions hardware state `running: true -> false` and invokes
+    /// `backend.stop_capture()` **exact-once** while holding `hardware_io_lock` (Level 0).
+    ///
+    /// Does NOT wipe unrelated peers' `peer_consent` (eliminating concurrent `start_remote_request`
+    /// consent-wipe races). Conservatively refuses shutdown if ANY lifecycle mutex is poisoned,
+    /// if any stream is active or starting, if local preview is active, or if any lingering task,
+    /// in-flight teardown, or active native operation remains.
+    fn try_shutdown_hardware_if_idle(&self) -> bool {
+        let stopped = self.try_shutdown_hardware_if_idle_inner();
+        self.shutdown_eval_count.fetch_add(1, Ordering::SeqCst);
+        stopped
+    }
+
+    fn try_shutdown_hardware_if_idle_inner(&self) -> bool {
+        let _io_guard = match self.hardware_io_lock.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!(
+                    "CRITICAL: Camera hardware_io_lock is poisoned; refusing hardware shutdown"
+                );
+                return false;
+            }
+        };
+
+        let should_stop = {
+            // Level 1: active_peer_streams
+            let streams = match self.active_peer_streams.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!(
+                        "CRITICAL: Camera active_peer_streams mutex is poisoned; conservatively refusing hardware shutdown"
+                    );
+                    return false;
+                }
+            };
+            if !streams.is_empty() {
+                return false;
+            }
+
+            // Check starting_streams BEFORE local_preview_active (SeqCst ordering proof):
+            // start() sets local_preview_active = true BEFORE decrementing starting_streams.
+            if self.starting_streams.load(Ordering::SeqCst) > 0 {
+                return false;
+            }
+            if self.local_preview_active.load(Ordering::SeqCst) {
+                return false;
+            }
+
+            // Level 3: lingering_tasks (NEVER treat poisoned lock as empty!)
+            let reg = match self.lingering_tasks.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!(
+                        "CRITICAL: Camera lingering_tasks mutex is poisoned; conservatively refusing hardware shutdown (SEC-1D-17)"
+                    );
+                    return false;
+                }
+            };
+            if reg.has_any_hardware_dependents() {
+                tracing::warn!(
+                    "Retaining camera hardware: {} lingering task(s), {} active native op(s), {} in-flight teardown(s)",
+                    reg.tasks.len(),
+                    reg.active_native_ops.len(),
+                    reg.in_flight_teardowns
+                );
+                return false;
+            }
+
+            // Level 4: hardware_state
+            let mut hw = match self.hardware_state.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!(
+                        "CRITICAL: Camera hardware_state mutex is poisoned; conservatively refusing hardware shutdown"
+                    );
+                    return false;
+                }
+            };
+            if !hw.running {
+                false
+            } else {
+                hw.running = false;
+                self.active.store(false, Ordering::SeqCst);
+                self.local_consent.store(false, Ordering::SeqCst);
+                true
+            }
+        };
+
+        if !should_stop {
+            return false;
+        }
+
+        global_frame_slot().clear();
+        global_frame_slot().notify.notify_waiters();
+
+        self.backend.stop_capture();
+        self.shutdown_executions.fetch_add(1, Ordering::SeqCst);
+
+        if let Ok(mut s) = self.state_label.lock() {
+            *s = "Standby".to_string();
+        }
+        tracing::info!("📷 Camera hardware shut down cleanly after all streams and operations completed");
+        true
+    }
+
+    async fn try_shutdown_hardware_if_idle_async(self: &Arc<Self>) -> bool {
+        let coord = Arc::clone(self);
+        let stopped = tokio::task::spawn_blocking(move || coord.try_shutdown_hardware_if_idle())
+            .await
+            .unwrap_or(false);
+        self.lifecycle_notify.notify_waiters();
+        stopped
+    }
 }
 
 /// Central controller service for the Camera subsystem.
@@ -473,6 +1516,7 @@ extern "C" {
 /// macOS (capture sender) and Windows 11 (virtual camera receiver).
 pub struct CameraService {
     /// Peer discovery manager for resolving counterpart device IP addresses.
+    #[allow(dead_code)]
     discovery: DiscoveryManager,
     /// Dynamic feature flags manager governing subsystem activation.
     features: Arc<FeatureManager>,
@@ -480,22 +1524,117 @@ pub struct CameraService {
     active: Arc<AtomicBool>,
     /// Running counter of frames successfully transmitted or received.
     frames_transferred: Arc<AtomicU64>,
+    /// Explicit session-scoped local user consent flag for camera streaming.
+    local_consent: Arc<AtomicBool>,
+    /// Explicit session-scoped local user consent granted per peer device ID hex bound to trust generation.
+    peer_consent: Arc<Mutex<HashMap<String, u64>>>,
+    /// Formal consent state machine and authorization lease manager.
+    pub authorization: Arc<CameraConsentManager>,
+    /// Isolated multi-peer frame distribution hub.
+    pub frame_hub: Arc<CameraFrameHub>,
+    /// Atomic flag indicating whether local camera preview is actively running.
+    local_preview_active: Arc<AtomicBool>,
+    /// Active remote peer camera streams mapped by peer device ID hex to their stream entries.
+    active_peer_streams: Arc<Mutex<HashMap<String, ActivePeerStreamEntry>>>,
+    /// Serializes concurrent user consent prompt dialogs across threads/requests.
+    prompt_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Tracks the timestamp of the last displayed consent prompt per peer device ID to enforce rate limiting.
+    #[allow(dead_code)]
+    last_prompt_times: Arc<Mutex<HashMap<String, Instant>>>,
     /// Human-readable operational status label.
     state_label: Arc<Mutex<String>>,
     /// Most recent error message, if any.
     last_error: Arc<Mutex<Option<String>>>,
+    /// Unified lifecycle supervisor managing lingering tasks, native operation guards, and exact-once hardware shutdown.
+    lifecycle: Arc<CameraLifecycleCoordinator>,
 }
 
 impl CameraService {
     /// Instantiates a new [`CameraService`] with associated discovery and feature flag managers.
     pub fn new(discovery: DiscoveryManager, features: Arc<FeatureManager>) -> Arc<Self> {
+        Self::new_with_backend_and_timeouts(
+            discovery,
+            features,
+            Arc::new(NativeCameraBackend),
+            CAMERA_TEARDOWN_TIMEOUT,
+            CAMERA_ABORT_DRAIN_TIMEOUT,
+        )
+    }
+
+    /// Internal constructor accepting a controllable [`CameraHardwareBackend`] and teardown timeouts.
+    fn new_with_backend_and_timeouts(
+        discovery: DiscoveryManager,
+        features: Arc<FeatureManager>,
+        backend: Arc<dyn CameraHardwareBackend>,
+        teardown_timeout: Duration,
+        abort_drain_timeout: Duration,
+    ) -> Arc<Self> {
+        let active = Arc::new(AtomicBool::new(false));
+        let local_consent = Arc::new(AtomicBool::new(false));
+        let peer_consent = Arc::new(Mutex::new(HashMap::new()));
+        let authorization = Arc::new(CameraConsentManager::new());
+        let frame_hub = Arc::clone(global_frame_hub());
+        let local_preview_active = Arc::new(AtomicBool::new(false));
+
+        // Synchronize persistent permissions from global keystore
+        {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let all_consents = ks.all_camera_consents();
+            let mut parsed_consents = HashMap::new();
+            for (id, val) in all_consents {
+                if val == "blocked" {
+                    parsed_consents.insert(id, PersistentCameraConsent::Blocked);
+                } else if let Some(gen_str) = val.strip_prefix("always_allow:") {
+                    if let Ok(gen) = gen_str.parse::<u64>() {
+                        parsed_consents.insert(id, PersistentCameraConsent::AlwaysAllow { generation: gen });
+                    }
+                }
+            }
+            authorization.load_persistent_consents(parsed_consents);
+        }
+        let active_peer_streams = Arc::new(Mutex::new(HashMap::new()));
+        let state_label = Arc::new(Mutex::new("Standby".to_string()));
+        let last_error = Arc::new(Mutex::new(None));
+        let runtime_handle = tokio::runtime::Handle::try_current().ok();
+
+        let lifecycle = Arc::new(CameraLifecycleCoordinator {
+            backend,
+            active: Arc::clone(&active),
+            local_consent: Arc::clone(&local_consent),
+            local_preview_active: Arc::clone(&local_preview_active),
+            starting_streams: Arc::new(AtomicUsize::new(0)),
+            shutdown_executions: Arc::new(AtomicU64::new(0)),
+            shutdown_eval_count: Arc::new(AtomicU64::new(0)),
+            hardware_io_lock: Mutex::new(()),
+            active_peer_streams: Arc::clone(&active_peer_streams),
+            lingering_tasks: Arc::new(Mutex::new(LingeringRegistry::default())),
+            hardware_state: Mutex::new(HardwareState::default()),
+            state_label: Arc::clone(&state_label),
+            last_error: Arc::clone(&last_error),
+            runtime_handle: Mutex::new(runtime_handle),
+            op_finished_notify: Arc::new(Notify::new()),
+            lifecycle_notify: Arc::new(Notify::new()),
+            next_id: AtomicU64::new(1),
+            teardown_timeout,
+            abort_drain_timeout,
+        });
+
         Arc::new(Self {
             discovery,
             features,
-            active: Arc::new(AtomicBool::new(false)),
+            active,
             frames_transferred: Arc::new(AtomicU64::new(0)),
-            state_label: Arc::new(Mutex::new("Standby".to_string())),
-            last_error: Arc::new(Mutex::new(None)),
+            local_consent,
+            peer_consent,
+            authorization,
+            frame_hub,
+            local_preview_active,
+            active_peer_streams,
+            prompt_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            last_prompt_times: Arc::new(Mutex::new(HashMap::new())),
+            state_label,
+            last_error,
+            lifecycle,
         })
     }
 
@@ -551,7 +1690,8 @@ impl CameraService {
     /// Handles an incoming camera connection on Windows from an authenticated Mac peer.
     ///
     /// Establishes `TransportSessionV2` mutual authentication for [`ServiceId::CameraStream`],
-    /// ensures the virtual camera driver is running, and streams raw NV12 frames into shared memory.
+    /// enforces receiver-side user consent policy, ensures the virtual camera driver is running,
+    /// verifies lease tokens, and streams raw NV12 frames into shared memory.
     #[cfg(target_os = "windows")]
     async fn handle_incoming_stream(
         self: &Arc<Self>,
@@ -573,234 +1713,1734 @@ impl CameraService {
             }
         };
 
-        info!("📷 Authenticated Mac camera stream connected from {}", peer_ip);
-        if !self.active.load(Ordering::Relaxed) {
-            if let Err(e) = self.start().await {
-                warn!("Failed to start virtual camera for incoming stream: {}", e);
+        let peer_dev_id = session.peer_device_id_hex().to_string();
+        let session_generation = session.trust_generation();
+        if crate::security::transport::is_peer_revoked(&peer_dev_id)
+            || crate::security::transport::get_peer_trust_generation(&peer_dev_id)
+                != Some(session_generation)
+        {
+            warn!(
+                "Rejected stale or revoked camera stream from {} (session gen {})",
+                peer_dev_id, session_generation
+            );
+            let _ = session.close_notify().await;
+            return;
+        }
+
+        // Enforce Windows receiver consent before publishing frames to virtual camera
+        let eval = self.authorization.evaluate_receiver_consent(&peer_dev_id, session_generation);
+        match eval {
+            crate::camera::authorization::ConsentEvaluation::Granted => {}
+            crate::camera::authorization::ConsentEvaluation::DeniedPersistent => {
+                warn!("🚫 Rejected incoming camera stream from {}: peer is permanently blocked on receiver", peer_dev_id);
+                let _ = session.close_notify().await;
                 return;
             }
-        }
-        self.set_state("Receiving 720p30", None);
-
-        loop {
-            if !self.features.is_enabled("camera") || !self.active.load(Ordering::Relaxed) {
+            crate::camera::authorization::ConsentEvaluation::DeniedTemporary { remaining, .. } => {
+                warn!("🚫 Rejected incoming camera stream from {}: in denial cooldown ({:.1}s remaining)", peer_dev_id, remaining.as_secs_f32());
                 let _ = session.close_notify().await;
-                break;
+                return;
             }
-            match tokio::time::timeout(Duration::from_secs(5), session.recv_message()).await {
-                Ok(Ok(raw)) => match decode_camera_frame(&raw) {
-                    Ok(frame) => {
-                        if (frame.flags & FLAG_STANDBY_KEEPALIVE) == 0 && frame.payload.len() == NV12_FRAME_BYTES {
-                            // Forward uncompressed NV12 buffer directly into Windows virtual camera shared memory.
-                            unsafe {
-                                integrator_win_vcam_push_nv12(
-                                    frame.payload.as_ptr(),
-                                    frame.payload.len() as u32,
-                                    frame.timestamp_us,
-                                );
-                            }
-                            self.frames_transferred.fetch_add(1, Ordering::Relaxed);
+            crate::camera::authorization::ConsentEvaluation::Revoking => {
+                warn!("🚫 Rejected incoming camera stream from {}: receiver session is revoking", peer_dev_id);
+                let _ = session.close_notify().await;
+                return;
+            }
+            crate::camera::authorization::ConsentEvaluation::RequiresPrompt => {
+                let _prompt_guard = self.prompt_mutex.lock().await;
+                let re_eval = self.authorization.evaluate_receiver_consent(&peer_dev_id, session_generation);
+                if re_eval != crate::camera::authorization::ConsentEvaluation::Granted {
+                    let target_display_name = {
+                        let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+                        ks.get_peer(&peer_dev_id).map(|p| p.hostname.clone()).unwrap_or_else(|| peer_dev_id.clone())
+                    };
+
+                    let choice = tokio::task::spawn_blocking(move || {
+                        let c_name = std::ffi::CString::new(target_display_name).unwrap_or_default();
+                        unsafe { integrator_win_prompt_camera_consent_scoped(c_name.as_ptr(), 30) }
+                    })
+                    .await
+                    .unwrap_or(0);
+
+                    match choice {
+                        1 => {
+                            self.grant_receiver_consent(&peer_dev_id, session_generation, crate::camera::authorization::CameraConsentScope::AllowOnce);
+                        }
+                        2 => {
+                            self.grant_receiver_consent(&peer_dev_id, session_generation, crate::camera::authorization::CameraConsentScope::ActiveSession);
+                        }
+                        3 => {
+                            self.grant_receiver_consent(&peer_dev_id, session_generation, crate::camera::authorization::CameraConsentScope::AlwaysAllow);
+                        }
+                        -1 => {
+                            self.record_peer_denial(
+                                crate::camera::authorization::LeaseDirection::InboundReceiver,
+                                &peer_dev_id,
+                                crate::camera::authorization::CameraDenialAction::DenyAndBlock,
+                            );
+                            let _ = session.close_notify().await;
+                            return;
+                        }
+                        _ => {
+                            self.record_peer_denial(
+                                crate::camera::authorization::LeaseDirection::InboundReceiver,
+                                &peer_dev_id,
+                                crate::camera::authorization::CameraDenialAction::Temporary,
+                            );
+                            let _ = session.close_notify().await;
+                            return;
                         }
                     }
-                    Err(e) => {
-                        warn!("Malformed camera frame from {}: {}", peer_ip, e);
-                        break;
-                    }
-                },
-                Ok(Err(_)) => break,
-                Err(_) => continue,
+                }
             }
         }
 
-        if self.active.load(Ordering::Relaxed) {
-            self.set_state("Virtual Camera Active", None);
-        } else {
-            self.set_state("Standby", None);
+        // Mandatory initial authorization lease redemption on Windows receiver
+        let init_raw = match tokio::time::timeout(Duration::from_secs(5), session.recv_message()).await {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => {
+                warn!("🚫 Rejected incoming camera stream from {}: failed to receive initial frame: {}", peer_dev_id, e);
+                let _ = session.close_notify().await;
+                return;
+            }
+            Err(_) => {
+                warn!("🚫 Rejected incoming camera stream from {}: initial authorization handshake timed out", peer_dev_id);
+                let _ = session.close_notify().await;
+                return;
+            }
+        };
+
+        let init_frame = match decode_camera_frame(&init_raw) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("🚫 Rejected incoming camera stream from {}: malformed initial frame: {}", peer_dev_id, e);
+                let _ = session.close_notify().await;
+                return;
+            }
+        };
+
+        if (init_frame.flags & FLAG_AUTH_LEASE_REDEMPTION) == 0 || init_frame.payload.len() != 32 {
+            warn!(
+                "🚫 Rejected incoming camera stream from {}: missing or malformed FLAG_AUTH_LEASE_REDEMPTION (flags={:#x}, payload_len={})",
+                peer_dev_id, init_frame.flags, init_frame.payload.len()
+            );
+            let _ = session.close_notify().await;
+            return;
+        }
+
+        let mut token = [0u8; 32];
+        token.copy_from_slice(&init_frame.payload);
+
+        let redeemed_lease = match self.authorization.redeem_authorization_lease(
+            &token,
+            &peer_dev_id,
+            session_generation,
+            crate::camera::authorization::LeaseDirection::InboundReceiver,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("🚫 Rejected incoming camera stream from {}: authorization lease redemption failed: {}", peer_dev_id, e);
+                let _ = session.close_notify().await;
+                return;
+            }
+        };
+
+        info!(
+            "📷 Successfully redeemed single-use authorization lease for peer {} (request ID {})",
+            peer_dev_id, redeemed_lease.request_id
+        );
+
+        info!(
+            "📷 Authenticated Mac camera stream connected from {} (gen {})",
+            peer_ip, session_generation
+        );
+
+        // Atomically start virtual camera hardware and register + spawn the peer-bound receiver loop
+        // with an attached JoinHandle under Level 1 (`active_peer_streams`), preventing both
+        // stale-generation eviction and Windows SHM use-after-unmap during teardown (SEC-1D-17).
+        if let Err(e) = self
+            .start_managed_peer_stream_replacing(
+                &peer_dev_id,
+                session_generation,
+                move |svc, pid, _gen, stream_id, mut stream_cancel_rx| async move {
+                    svc.set_state("Receiving 720p30", None);
+
+                    loop {
+                        if !svc.features.is_enabled("camera")
+                            || !svc.active.load(Ordering::SeqCst)
+                            || *stream_cancel_rx.borrow()
+                            || !svc.has_receiver_consent(&pid, session_generation)
+                        {
+                            let _ = session.close_notify().await;
+                            break;
+                        }
+                        let read_fut = session.recv_message();
+                        let read_res = tokio::select! {
+                            r = tokio::time::timeout(Duration::from_secs(5), read_fut) => r,
+                            _ = stream_cancel_rx.changed() => {
+                                let _ = session.close_notify().await;
+                                break;
+                            }
+                        };
+                        match read_res {
+                            Ok(Ok(raw)) => match decode_camera_frame(&raw) {
+                                Ok(frame) => {
+                                    if (frame.flags & FLAG_STANDBY_KEEPALIVE) == 0
+                                        && frame.payload.len() == NV12_FRAME_BYTES
+                                    {
+                                        // Acquire RAII native-op guard BEFORE re-checking cancel/active state
+                                        // so `integrator_win_vcam_stop()` cannot unmap SHM mid-push (SEC-1D-17).
+                                        let _native_op = svc.lifecycle.begin_native_op(
+                                            Some(&pid),
+                                            Some(stream_id),
+                                            "win_vcam_push_nv12",
+                                        );
+                                        if *stream_cancel_rx.borrow()
+                                            || !svc.active.load(Ordering::SeqCst)
+                                            || !svc.has_receiver_consent(&pid, session_generation)
+                                        {
+                                            drop(_native_op);
+                                            let _ = session.close_notify().await;
+                                            break;
+                                        }
+                                        // Forward uncompressed NV12 buffer directly into Windows virtual camera shared memory.
+                                        unsafe {
+                                            integrator_win_vcam_push_nv12(
+                                                frame.payload.as_ptr(),
+                                                frame.payload.len() as u32,
+                                                frame.timestamp_us,
+                                            );
+                                        }
+                                        svc.frames_transferred.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Malformed camera frame from {}: {}", peer_ip, e);
+                                    break;
+                                }
+                            },
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                warn!(
+                                    "Camera stream read timeout from {}, closing session to prevent framing desync",
+                                    peer_ip
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // Unregister strictly by unique stream_id so a same-generation reconnect is never clobbered.
+                    svc.unregister_peer_stream_by_id(&pid, stream_id);
+                    svc.authorization.on_stream_closed(&pid, stream_id);
+                    let _ = svc.lifecycle.try_shutdown_hardware_if_idle_async().await;
+
+                    if svc.active.load(Ordering::Relaxed) {
+                        svc.set_state("Virtual Camera Active", None);
+                    } else {
+                        svc.set_state("Standby", None);
+                    }
+                },
+            )
+            .await
+        {
+            warn!("Failed to start or register Windows incoming camera stream: {}", e);
         }
     }
 
-    /// Activates the camera pipeline on the local machine.
+    /// Returns true if camera capture or virtual camera service is currently active.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Returns true if local user consent is active for the current camera session.
+    pub fn has_local_consent(&self) -> bool {
+        self.local_consent.load(Ordering::SeqCst)
+    }
+
+    /// Explicitly grants local user consent for the active camera session.
+    pub fn grant_local_consent(&self) {
+        self.local_consent.store(true, Ordering::SeqCst);
+    }
+
+    /// Resets session-scoped local camera consent without affecting remote peers' authorizations.
+    pub fn reset_session_consent(&self) {
+        self.local_consent.store(false, Ordering::SeqCst);
+    }
+
+    /// Registers an active camera stream for a given peer device ID hex bound to `generation`
+    /// and returns a cancellation watch receiver.
+    ///
+    /// Rejects stale generations (returning an immediately-cancelled watch receiver) if a newer
+    /// trust generation is already actively registered for this peer.
+    pub fn register_peer_stream(&self, peer_device_id_hex: &str, generation: u64) -> tokio::sync::watch::Receiver<bool> {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let stream_id = self.lifecycle.next_id();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let (rejected_stale, replaced_handle) = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = streams.get(&clean_id) {
+                if existing.generation > generation {
+                    tracing::warn!(
+                        "Rejected stale-generation camera stream registration for {} (got gen {}, active gen {})",
+                        clean_id,
+                        generation,
+                        existing.generation
+                    );
+                    (true, None)
+                } else {
+                    let prev = streams.insert(
+                        clean_id.clone(),
+                        ActivePeerStreamEntry {
+                            stream_id,
+                            cancel_tx: tx,
+                            task_handle: None,
+                            generation,
+                        },
+                    );
+                    let to_watch = if let Some(mut old) = prev {
+                        let _ = old.cancel_tx.send(true);
+                        let mut reg = match self.lifecycle.lingering_tasks.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let _ = reg.mark_stream_native_ops_lingering(&clean_id, old.stream_id);
+                        drop(reg);
+                        if let Some(h) = old.task_handle.take() {
+                            h.abort();
+                            self.lifecycle.register_lingering_handle_locked(
+                                &clean_id,
+                                "replaced_stream_handle",
+                                h,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (false, to_watch)
+                }
+            } else {
+                streams.insert(
+                    clean_id.clone(),
+                    ActivePeerStreamEntry {
+                        stream_id,
+                        cancel_tx: tx,
+                        task_handle: None,
+                        generation,
+                    },
+                );
+                (false, None)
+            }
+        };
+        if rejected_stale {
+            let (_cancel_tx, cancelled_rx) = tokio::sync::watch::channel(true);
+            return cancelled_rx;
+        }
+        if let Some((task_id, h)) = replaced_handle {
+            self.lifecycle.spawn_lingering_watcher(
+                task_id,
+                clean_id,
+                "replaced_stream_handle".to_string(),
+                h,
+            );
+        }
+        rx
+    }
+
+    /// Attaches the streaming task handle to an already registered peer stream entry.
+    /// If the entry was already removed (e.g. teardown raced ahead), or if an existing handle
+    /// is overwritten, the displaced/orphaned handle is aborted and atomically transferred into
+    /// supervised lingering tracking under Level 1 -> Level 3 so no task is ever detached or
+    /// orphaned and every handle is reaped upon completion (SEC-1D-17, SEC-1D-18).
+    pub fn attach_stream_handle(&self, peer_device_id_hex: &str, handle: tokio::task::JoinHandle<()>) {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let handle_to_watch = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = streams.get_mut(&clean_id) {
+                if let Some(old_handle) = entry.task_handle.replace(handle) {
+                    tracing::warn!(
+                        "Replaced existing attached stream handle for {}; aborting and supervising previous handle",
+                        clean_id
+                    );
+                    old_handle.abort();
+                    self.lifecycle
+                        .register_lingering_handle_locked(&clean_id, "replaced_attached_handle", old_handle)
+                        .map(|(id, h)| (id, "replaced_attached_handle".to_string(), h))
+                } else {
+                    None
+                }
+            } else {
+                tracing::warn!(
+                    "Stream entry for {} removed before task handle attachment; aborting and supervising to avoid orphan (SEC-1D-18)",
+                    clean_id
+                );
+                handle.abort();
+                // Register atomically under Level 1 -> Level 3 so hardware cannot shut down before supervision starts.
+                self.lifecycle
+                    .register_lingering_handle_locked(&clean_id, "orphaned_stream_handle", handle)
+                    .map(|(id, h)| (id, "orphaned_stream_handle".to_string(), h))
+            }
+        };
+        if let Some((task_id, label, handle)) = handle_to_watch {
+            self.lifecycle.spawn_lingering_watcher(
+                task_id,
+                clean_id,
+                label,
+                handle,
+            );
+        }
+    }
+
+    /// Begins tracking an active blocking/native camera operation tied to a peer stream.
+    /// Moving the returned [`CameraNativeOpGuard`] into `spawn_blocking` / native FFI ensures
+    /// hardware remains retained even if an enclosing async task is cancelled via `abort()`.
+    pub fn begin_peer_native_op(
+        &self,
+        peer_device_id_hex: &str,
+        stream_id: Option<u64>,
+        label: &str,
+    ) -> CameraNativeOpGuard {
+        self.lifecycle.begin_native_op(Some(peer_device_id_hex), stream_id, label)
+    }
+
+    /// Returns the number of supervised lingering camera tasks and lingering native operations.
+    /// Never interprets a poisoned registry mutex as zero (returns at least 1 if poisoned).
+    pub fn lingering_tasks_count(&self) -> usize {
+        self.lifecycle.lingering_count()
+    }
+
+    /// Explicitly reaps any synchronous fallback lingering handles and evaluates deferred
+    /// hardware shutdown if all streams, previews, and operations are idle. Idempotent.
+    pub fn reap_lingering_tasks(&self) -> usize {
+        self.lifecycle.reap_fallback_handles();
+        self.lifecycle.try_shutdown_hardware_if_idle();
+        self.lifecycle.lingering_count()
+    }
+
+    /// Returns true if any camera lifecycle mutex has been poisoned.
+    #[cfg(test)]
+    pub fn is_lingering_registry_poisoned(&self) -> bool {
+        self.lifecycle.is_lingering_registry_poisoned()
+    }
+
+    /// Returns a snapshot of completion/reaping statistics for supervised lingering tasks.
+    #[cfg(test)]
+    pub fn reap_stats(&self) -> CameraReapStats {
+        self.lifecycle.reap_stats()
+    }
+
+    /// Returns how many times `CameraHardwareBackend::stop_capture()` has been executed.
+    #[cfg(test)]
+    pub fn shutdown_execution_count(&self) -> u64 {
+        self.lifecycle.shutdown_executions.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many times `try_shutdown_hardware_if_idle()` has completed an evaluation.
+    #[cfg(test)]
+    pub fn shutdown_eval_count(&self) -> u64 {
+        self.lifecycle.shutdown_eval_count.load(Ordering::SeqCst)
+    }
+
+    /// Unregisters an active camera stream when its stream task terminates.
+    pub fn unregister_peer_stream(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+        streams.remove(&clean_id);
+    }
+
+    /// Unregisters an active camera stream only if its stored trust generation matches `generation`,
+    /// preventing an exiting stale stream from evicting a newly re-paired stream entry.
+    pub fn unregister_peer_stream_for_generation(&self, peer_device_id_hex: &str, generation: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+        if streams.get(&clean_id).map(|e| e.generation == generation).unwrap_or(false) {
+            streams.remove(&clean_id);
+        }
+    }
+
+    /// Unregisters an active camera stream strictly by its unique `stream_id`, preventing a
+    /// same-generation reconnect from being clobbered by a departing earlier connection.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+    fn unregister_peer_stream_by_id(&self, peer_device_id_hex: &str, stream_id: u64) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+        if streams.get(&clean_id).map(|e| e.stream_id == stream_id).unwrap_or(false) {
+            streams.remove(&clean_id);
+        }
+    }
+
+    /// Checks if a camera stream is currently active for a specific peer.
+    pub fn is_peer_stream_active(&self, peer_device_id_hex: &str) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+        streams.contains_key(&clean_id)
+    }
+
+    /// Explicitly grants session-scoped local user consent specifically for the given peer device ID hex
+    /// bound to the specified trust generation.
+    ///
+    /// Fails closed (returns false) if the peer is actively revoked or if the peer's current keystore
+    /// or transport trust generation does not match `generation`.
+    pub fn grant_peer_consent(&self, peer_device_id_hex: &str, generation: u64) -> bool {
+        self.grant_peer_consent_scoped(
+            peer_device_id_hex,
+            generation,
+            crate::camera::authorization::CameraConsentScope::ActiveSession,
+            0,
+        )
+    }
+
+    /// Grants sender-side camera consent for `peer_device_id_hex` with an explicit duration/scope.
+    pub fn grant_peer_consent_scoped(
+        &self,
+        peer_device_id_hex: &str,
+        generation: u64,
+        scope: crate::camera::authorization::CameraConsentScope,
+        stream_id: u64,
+    ) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return false;
+        }
+        let ks_gen = {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.peer_trust_generation(&clean_id)
+        };
+        if ks_gen != Some(generation) {
+            return false;
+        }
+
+        // Commit boundary under peer_consent lock: re-verify revocation and transport generation atomically
+        let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return false;
+        }
+        if let Some(trans_gen) = crate::security::transport::get_peer_trust_generation(&clean_id) {
+            if trans_gen != generation {
+                return false;
+            }
+        }
+        if scope == crate::camera::authorization::CameraConsentScope::AlwaysAllow {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.set_camera_consent(&clean_id, format!("always_allow:{}", generation));
+        }
+        self.authorization.grant_consent(
+            crate::camera::authorization::LeaseDirection::OutboundSender,
+            &clean_id,
+            generation,
+            scope,
+            stream_id,
+        );
+        consent.insert(clean_id, generation);
+        true
+    }
+
+    /// Checks whether local receiver-side user consent has been granted for an incoming camera stream.
+    pub fn has_receiver_consent(&self, peer_device_id_hex: &str, expected_generation: u64) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return false;
+        }
+        if let Some(trans_gen) = crate::security::transport::get_peer_trust_generation(&clean_id) {
+            if trans_gen != expected_generation {
+                return false;
+            }
+        }
+        self.authorization.evaluate_receiver_consent(&clean_id, expected_generation)
+            == crate::camera::authorization::ConsentEvaluation::Granted
+    }
+
+    /// Grants receiver-side consent on Windows for an incoming stream from `peer_device_id_hex`.
+    pub fn grant_receiver_consent(
+        &self,
+        peer_device_id_hex: &str,
+        generation: u64,
+        scope: crate::camera::authorization::CameraConsentScope,
+    ) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return false;
+        }
+        if scope == crate::camera::authorization::CameraConsentScope::AlwaysAllow {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.set_camera_consent(&clean_id, format!("always_allow:{}", generation));
+        }
+        self.authorization.grant_consent(
+            crate::camera::authorization::LeaseDirection::InboundReceiver,
+            &clean_id,
+            generation,
+            scope,
+            0,
+        )
+    }
+
+    /// Records a denial on sender or receiver side.
+    pub fn record_peer_denial(
+        &self,
+        direction: crate::camera::authorization::LeaseDirection,
+        peer_device_id_hex: &str,
+        action: crate::camera::authorization::CameraDenialAction,
+    ) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if action == crate::camera::authorization::CameraDenialAction::DenyAndBlock {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.set_camera_consent(&clean_id, "blocked".to_string());
+        }
+        self.authorization.record_denial(direction, &clean_id, action);
+        let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+        consent.remove(&clean_id);
+    }
+
+    /// Unblocks a peer from persistent block or temporary cooldown.
+    pub fn unblock_peer_camera(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.remove_camera_consent(&clean_id);
+        }
+        self.authorization.unblock_peer(&clean_id);
+    }
+
+    /// Queries consent status for `peer_device_id_hex` to return via RPC.
+    pub fn query_consent_status(&self, peer_device_id_hex: &str) -> crate::camera::authorization::CameraConsentStatusWire {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let gen = crate::security::transport::get_peer_trust_generation(&clean_id).or_else(|| {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.peer_trust_generation(&clean_id)
+        }).unwrap_or(0);
+        self.authorization.get_consent_status_wire(crate::camera::authorization::LeaseDirection::OutboundSender, &clean_id, gen)
+    }
+
+    /// Checks whether local user consent has been granted specifically for the given peer device ID hex
+    /// and matches the expected trust generation.
+    ///
+    /// Fails closed if the peer is actively revoked or if the active trust generation has changed.
+    /// Does not hold keystore mutex during frame-rate checks.
+    pub fn has_peer_consent(&self, peer_device_id_hex: &str, expected_generation: u64) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return false;
+        }
+        if let Some(trans_gen) = crate::security::transport::get_peer_trust_generation(&clean_id) {
+            if trans_gen != expected_generation {
+                return false;
+            }
+        }
+        let eval = self.authorization.evaluate_sender_consent(&clean_id, expected_generation);
+        if eval == crate::camera::authorization::ConsentEvaluation::Granted {
+            return true;
+        }
+        let consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+        consent.get(&clean_id).copied() == Some(expected_generation)
+    }
+
+    /// Checks whether local user consent has been granted for the peer's current active trust generation.
+    pub fn has_active_peer_consent(&self, peer_device_id_hex: &str) -> bool {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).or_else(|| {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.peer_trust_generation(&clean_id)
+        });
+        match current_gen {
+            Some(gen) => self.has_peer_consent(&clean_id, gen),
+            None => false,
+        }
+    }
+
+    /// Sets whether local camera preview is actively running.
+    pub fn set_local_preview_active(&self, active: bool) {
+        self.local_preview_active.store(active, Ordering::SeqCst);
+    }
+
+    /// Returns true if local camera preview is actively running.
+    pub fn is_local_preview_active(&self) -> bool {
+        self.local_preview_active.load(Ordering::SeqCst)
+    }
+
+    /// Explicitly revokes session-scoped consent for `peer_device_id_hex` and terminates any active stream.
+    pub fn revoke_peer_consent(&self, peer_device_id_hex: &str) {
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let current_gen = crate::security::transport::get_peer_trust_generation(&clean_id).unwrap_or(0);
+        self.authorization.revoke_consent(&clean_id, current_gen);
+        self.frame_hub.unsubscribe(&clean_id);
+        {
+            let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+            consent.remove(&clean_id);
+        }
+        self.teardown_peer_stream(&clean_id);
+    }
+
+    /// Asynchronously tears down the camera stream for `peer_device_id_hex`, signaling cancellation,
+    /// awaiting task termination with bounded timeout, escalating to `.abort()` if needed, supervising
+    /// any lingering tasks or in-flight native operations until completion, and honestly reporting
+    /// termination results while retaining hardware resources until all dependents finish (SEC-1D-17).
+    ///
+    /// Fully cancel-safe: `TeardownInFlightGuard` retains ownership of any extracted `JoinHandle`,
+    /// automatically aborting, supervising, and dispatching deferred hardware shutdown if this future
+    /// is dropped mid-`.await`.
+    pub async fn teardown_peer_stream_async(&self, peer_device_id_hex: &str) -> Result<(), String> {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+
+        let (cancel_tx, mut in_flight_guard) = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+            consent.remove(&clean_id);
+            self.authorization.revoke_consent(&clean_id, 0);
+            self.frame_hub.unsubscribe(&clean_id);
+            if let Some(mut entry) = streams.remove(&clean_id) {
+                let stream_id = entry.stream_id;
+                let handle = entry.task_handle.take();
+                // Atomically register cancel-safe in-flight teardown under Level 1 -> Level 3 BEFORE dropping Level 1
+                // so concurrent reapers cannot shut down hardware mid-drain and cancellation cannot detach `handle`.
+                let guard = self.lifecycle.begin_in_flight_teardown_locked(
+                    &clean_id,
+                    stream_id,
+                    "stream_task",
+                    handle,
+                );
+                (Some(entry.cancel_tx), Some(guard))
+            } else {
+                (None, None)
+            }
+        };
+
+        let mut teardown_err: Option<String> = None;
+
+        if let Some(mut guard) = in_flight_guard.take() {
+            let stream_id = guard.stream_id;
+            if let Some(tx) = cancel_tx {
+                let _ = tx.send(true);
+            }
+            global_frame_slot().notify.notify_waiters();
+
+            if let Some(ref mut handle) = guard.handle {
+                match tokio::time::timeout(self.lifecycle.teardown_timeout, handle).await {
+                    Ok(join_res) => {
+                        guard.handle = None;
+                        if let Err(e) = join_res {
+                            self.lifecycle.record_completed_task_error(&clean_id, "stream_task", e);
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Camera streaming task for peer {} did not terminate within {:?}; escalating to abort()",
+                            clean_id,
+                            self.lifecycle.teardown_timeout
+                        );
+                        if let Some(ref mut handle) = guard.handle {
+                            handle.abort();
+                            match tokio::time::timeout(self.lifecycle.abort_drain_timeout, handle).await {
+                                Ok(join_res) => {
+                                    guard.handle = None;
+                                    if let Err(e) = join_res {
+                                        if e.is_panic() {
+                                            self.lifecycle.record_completed_task_error(
+                                                &clean_id,
+                                                "aborted_stream_task",
+                                                e,
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "Aborted camera streaming task for peer {} exited with: {}",
+                                                clean_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    tracing::error!(
+                                        "CRITICAL: Camera streaming task for peer {} did not terminate after abort escalation (hung in native call)",
+                                        clean_id
+                                    );
+                                    teardown_err = Some(format!(
+                                        "Camera streaming task for peer {} did not terminate within timeout after abort escalation",
+                                        clean_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Even if the outer async JoinHandle was cancelled immediately upon `abort()`,
+            // an inner `spawn_blocking` / native FFI operation holding a `CameraNativeOpGuard`
+            // may still be actively executing! Drain up to `abort_drain_timeout` before handing off.
+            if guard.handle.is_none()
+                && self.lifecycle.stream_has_active_native_ops(&clean_id, stream_id)
+            {
+                let deadline = Instant::now() + self.lifecycle.abort_drain_timeout;
+                while self.lifecycle.stream_has_active_native_ops(&clean_id, stream_id) {
+                    let notified = self.lifecycle.op_finished_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !self.lifecycle.stream_has_active_native_ops(&clean_id, stream_id) {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    if tokio::time::timeout(remaining, notified).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // Atomic handoff from `in_flight_teardowns` -> lingering supervision under Level 3 (ZERO gap!)
+            let (task_to_watch, lingering_native_count) = guard.handoff_to_lingering();
+            if let Some((task_id, handle)) = task_to_watch {
+                self.lifecycle.spawn_lingering_watcher(
+                    task_id,
+                    clean_id.clone(),
+                    "stream_task".to_string(),
+                    handle,
+                );
+            }
+
+            if lingering_native_count > 0 && teardown_err.is_none() {
+                tracing::error!(
+                    "CRITICAL: {} native camera operation(s) for peer {} remained active after outer task cancellation; retaining hardware",
+                    lingering_native_count,
+                    clean_id
+                );
+                teardown_err = Some(format!(
+                    "{} native camera operation(s) for peer {} remained active after task cancellation",
+                    lingering_native_count, clean_id
+                ));
+            }
+
+            if teardown_err.is_none() {
+                tracing::info!("🛑 Camera stream terminated and task awaited for peer {}", clean_id);
+            }
+        } else if self.lifecycle.peer_has_lingering_or_active_native(&clean_id) {
+            // Teardown retry or concurrent teardown while a prior teardown for this peer is still draining
+            // or has lingering tasks/native ops: wait up to abort_drain_timeout and report Err honestly.
+            let deadline = Instant::now() + self.lifecycle.abort_drain_timeout;
+            while self.lifecycle.peer_has_lingering_or_active_native(&clean_id) {
+                let notified = self.lifecycle.op_finished_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.lifecycle.peer_has_lingering_or_active_native(&clean_id) {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    break;
+                }
+            }
+            if self.lifecycle.peer_has_lingering_or_active_native(&clean_id) {
+                teardown_err = Some(format!(
+                    "Peer {} still has lingering camera task(s) or native operation(s) that have not terminated",
+                    clean_id
+                ));
+            }
+        }
+
+        // Reap or upgrade any synchronous fallback handles (no-op when watcher-supervised)
+        self.lifecycle.reap_fallback_handles();
+
+        // Conservatively fail teardown if ANY lifecycle mutex is poisoned
+        if let Some(lock_name) = self.lifecycle.any_lifecycle_mutex_poisoned() {
+            if teardown_err.is_none() {
+                teardown_err = Some(format!(
+                    "Camera lifecycle mutex '{}' is poisoned; hardware conservatively retained",
+                    lock_name
+                ));
+            }
+        }
+
+        // Only shut down camera hardware if all streams are terminated, no stream is starting,
+        // no local preview is active, no lingering tasks or active native ops remain,
+        // and no lifecycle mutex is poisoned (SEC-1D-17).
+        let _ = self.lifecycle.try_shutdown_hardware_if_idle_async().await;
+
+        if let Some(err) = teardown_err {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Tears down only the camera session and consent belonging to `peer_device_id_hex`.
+    ///
+    /// If other peers still maintain active camera sessions, their streams continue unaffected
+    /// and the local camera hardware is NOT stopped. Any aborted task handle (even if already
+    /// finished, so panics are observed) is transferred into completion-driven lingering supervision,
+    /// active native operations are marked lingering, and deferred hardware shutdown is offloaded
+    /// to the Tokio blocking pool when called from an async worker thread.
+    pub fn teardown_peer_stream(&self, peer_device_id_hex: &str) {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let (entry_signaled, handle_to_watch) = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+            consent.remove(&clean_id);
+            self.authorization.revoke_consent(&clean_id, 0);
+            self.frame_hub.unsubscribe(&clean_id);
+            if let Some(mut entry) = streams.remove(&clean_id) {
+                let _ = entry.cancel_tx.send(true);
+                global_frame_slot().notify.notify_waiters();
+                {
+                    let mut reg = match self.lifecycle.lingering_tasks.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let _ = reg.mark_stream_native_ops_lingering(&clean_id, entry.stream_id);
+                }
+                let to_watch = if let Some(handle) = entry.task_handle.take() {
+                    handle.abort();
+                    // Always supervise the handle (even if already finished) so panics are observed
+                    // and recorded in reap_stats / last_error.
+                    self.lifecycle.register_lingering_handle_locked(
+                        &clean_id,
+                        "sync_teardown_stream",
+                        handle,
+                    )
+                } else {
+                    None
+                };
+                (true, to_watch)
+            } else {
+                (false, None)
+            }
+        };
+
+        if let Some((task_id, handle)) = handle_to_watch {
+            self.lifecycle.spawn_lingering_watcher(
+                task_id,
+                clean_id.clone(),
+                "sync_teardown_stream".to_string(),
+                handle,
+            );
+        }
+
+        if entry_signaled {
+            tracing::info!("🛑 Camera stream signaled for revoked peer {}", clean_id);
+        }
+
+        self.lifecycle.reap_fallback_handles();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let coord = Arc::clone(&self.lifecycle);
+            rt.spawn_blocking(move || {
+                coord.try_shutdown_hardware_if_idle();
+                coord.lifecycle_notify.notify_waiters();
+            });
+        } else {
+            self.lifecycle.try_shutdown_hardware_if_idle();
+            self.lifecycle.lifecycle_notify.notify_waiters();
+        }
+    }
+
+    /// Activates the camera pipeline initiated by a remote paired peer.
+    ///
+    /// Requires explicit, session-scoped local user consent specific to the requesting peer and bound
+    /// to the peer's current trust generation. Resolves the authenticated peer identity strictly against
+    /// verified keystore records, rejects unverified or revoked peers, serializes prompt dialogs,
+    /// enforces prompt rate-limiting, and spawns a peer-bound encrypted transport stream.
+    pub async fn start_remote_request(self: &Arc<Self>, peer_identifier: Option<&str>) -> Result<(String, [u8; 32]), String> {
+        if !self.features.is_enabled("camera") {
+            return Err("Rejected: Camera feature disabled".into());
+        }
+
+        let clean_id = match peer_identifier.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(id) => id.to_ascii_lowercase(),
+            None => return Err("Rejected: Camera request requires authenticated peer identity".into()),
+        };
+
+        // 1. Resolve requesting peer strictly using verified keystore record (never use unverified names or discovery)
+        let (target_device_id_hex, target_display_name, target_ip, target_generation) = {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let peer = ks.get_peer(&clean_id).ok_or_else(|| {
+                format!("Rejected: Peer '{}' is not a verified paired identity", clean_id)
+            })?;
+            if peer.last_ip.trim().is_empty() {
+                return Err(format!("Rejected: Verified peer '{}' has no known network endpoint", clean_id));
+            }
+            (
+                peer.device_id_hex.clone(),
+                peer.hostname.clone(),
+                peer.last_ip.trim().to_string(),
+                peer.trust_generation,
+            )
+        };
+
+        // 2. Fail closed if peer is revoked in transport registry
+        if crate::security::transport::is_peer_revoked(&target_device_id_hex) {
+            return Err(format!("Rejected: Peer {} trust has been revoked", target_device_id_hex));
+        }
+
+        let direction = if cfg!(target_os = "windows") {
+            crate::camera::authorization::LeaseDirection::InboundReceiver
+        } else {
+            crate::camera::authorization::LeaseDirection::OutboundSender
+        };
+
+        // 3. Evaluate consent state machine (checking both sender and receiver denials)
+        let eval_sender = self.authorization.evaluate_sender_consent(&target_device_id_hex, target_generation);
+        let eval_receiver = self.authorization.evaluate_receiver_consent(&target_device_id_hex, target_generation);
+
+        let eval = match (&eval_sender, &eval_receiver) {
+            (ConsentEvaluation::DeniedPersistent, _) | (_, ConsentEvaluation::DeniedPersistent) => {
+                ConsentEvaluation::DeniedPersistent
+            }
+            (ConsentEvaluation::DeniedTemporary { remaining: r1, consecutive_denials: _c1 },
+             ConsentEvaluation::DeniedTemporary { remaining: r2, consecutive_denials: _c2 }) => {
+                if r1 >= r2 { eval_sender.clone() } else { eval_receiver.clone() }
+            }
+            (ConsentEvaluation::DeniedTemporary { .. }, _) => eval_sender.clone(),
+            (_, ConsentEvaluation::DeniedTemporary { .. }) => eval_receiver.clone(),
+            (ConsentEvaluation::Revoking, _) | (_, ConsentEvaluation::Revoking) => {
+                ConsentEvaluation::Revoking
+            }
+            (ConsentEvaluation::Granted, _) if cfg!(not(target_os = "windows")) => ConsentEvaluation::Granted,
+            (_, ConsentEvaluation::Granted) if cfg!(target_os = "windows") => ConsentEvaluation::Granted,
+            _ => ConsentEvaluation::RequiresPrompt,
+        };
+
+        match eval {
+            ConsentEvaluation::Granted => {
+                // Pre-authorized or remembered consent
+            }
+            ConsentEvaluation::DeniedPersistent => {
+                return Err(format!("Rejected: Camera access is permanently blocked for peer {}", target_display_name));
+            }
+            ConsentEvaluation::DeniedTemporary { remaining, consecutive_denials } => {
+                return Err(format!(
+                    "Rejected: Camera request denied; cooldown active ({:.1}s remaining, {} consecutive denials)",
+                    remaining.as_secs_f32(),
+                    consecutive_denials
+                ));
+            }
+            ConsentEvaluation::Revoking => {
+                return Err("Rejected: Camera stream is currently revoking".into());
+            }
+            ConsentEvaluation::RequiresPrompt => {
+                let _prompt_guard = self.prompt_mutex.lock().await;
+
+                // Re-evaluate under prompt lock to avoid racing duplicate prompts
+                #[cfg(target_os = "windows")]
+                let re_eval = self.authorization.evaluate_receiver_consent(&target_device_id_hex, target_generation);
+                #[cfg(not(target_os = "windows"))]
+                let re_eval = self.authorization.evaluate_sender_consent(&target_device_id_hex, target_generation);
+
+                if re_eval != ConsentEvaluation::Granted {
+                    let _req_id = self.authorization.try_begin_prompt(
+                        direction,
+                        &target_device_id_hex,
+                    )?;
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
+                        let choice = tokio::task::spawn_blocking(move || {
+                            unsafe { integrator_win_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        match choice {
+                            1 => {
+                                self.grant_receiver_consent(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::AllowOnce,
+                                );
+                            }
+                            2 => {
+                                self.grant_receiver_consent(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::ActiveSession,
+                                );
+                            }
+                            3 => {
+                                self.grant_receiver_consent(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::AlwaysAllow,
+                                );
+                            }
+                            -1 => {
+                                self.record_peer_denial(
+                                    direction,
+                                    &target_device_id_hex,
+                                    CameraDenialAction::DenyAndBlock,
+                                );
+                                return Err("Rejected: User denied and blocked camera access".into());
+                            }
+                            _ => {
+                                self.record_peer_denial(
+                                    direction,
+                                    &target_device_id_hex,
+                                    CameraDenialAction::Temporary,
+                                );
+                                return Err("Rejected: User denied camera access".into());
+                            }
+                        }
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
+                        let choice = tokio::task::spawn_blocking(move || {
+                            unsafe { integrator_mac_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        match choice {
+                            1 => {
+                                // Allow Once (Single continuous stream)
+                                self.grant_peer_consent_scoped(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::AllowOnce,
+                                    _req_id,
+                                );
+                            }
+                            2 => {
+                                // Allow for this Session
+                                self.grant_peer_consent_scoped(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::ActiveSession,
+                                    0,
+                                );
+                            }
+                            3 => {
+                                // Always Allow
+                                self.grant_peer_consent_scoped(
+                                    &target_device_id_hex,
+                                    target_generation,
+                                    CameraConsentScope::AlwaysAllow,
+                                    0,
+                                );
+                            }
+                            -1 => {
+                                // Deny and Block persistently
+                                self.record_peer_denial(
+                                    direction,
+                                    &target_device_id_hex,
+                                    CameraDenialAction::DenyAndBlock,
+                                );
+                                return Err("Rejected: Local user denied and blocked remote camera access".into());
+                            }
+                            _ => {
+                                // Deny / Timeout
+                                self.record_peer_denial(
+                                    direction,
+                                    &target_device_id_hex,
+                                    CameraDenialAction::Temporary,
+                                );
+                                return Err("Rejected: Local user denied remote camera access".into());
+                            }
+                        }
+                    }
+
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    {
+                        let _ = &target_display_name;
+                        return Err("Rejected: Local camera consent required on camera host".into());
+                    }
+                }
+            }
+        }
+
+        // 4. Create single-use authorization lease bridging RPC and camera streaming socket
+        let lease = self.authorization.create_authorization_lease(
+            &target_device_id_hex,
+            target_generation,
+            &clean_id,
+            self.authorization.next_request_id(),
+            direction,
+            crate::camera::authorization::DEFAULT_LEASE_TTL,
+        );
+        let lease_token = lease.lease_token;
+
+        // 5. Start capture hardware (without forcing local_preview_active) and atomically spawn
+        //    and register the peer-bound streaming task under StreamStartGuard (SEC-1D-17, SEC-1D-18).
+        #[cfg(target_os = "macos")]
+        {
+            let tip = target_ip.clone();
+            self.start_managed_peer_stream(
+                &target_device_id_hex,
+                target_generation,
+                move |svc, tid, tgen, stream_id, rx| async move {
+                    svc.run_mac_sender_for_peer(tid, tgen, stream_id, tip, lease_token, rx).await;
+                },
+            )
+            .await?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (&target_device_id_hex, &target_ip, target_generation);
+            let start_guard = self.lifecycle.begin_stream_start();
+            self.ensure_capture_hardware_started().await?;
+            start_guard.finish_without_shutdown();
+        }
+
+        let msg = if cfg!(target_os = "windows") {
+            format!("Camera streaming session authorized on Windows Virtual Camera for peer {}", target_display_name)
+        } else {
+            format!("Streaming Mac Camera (720p30) to Windows Virtual Camera for peer {}", target_display_name)
+        };
+
+        Ok((msg, lease_token))
+    }
+
+    /// Production-path peer stream startup that atomically replaces any older or same-generation
+    /// connection for `peer_device_id_hex` (aborting and supervising its prior handle/native ops)
+    /// while rejecting stale generations (`existing.generation > generation`).
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+    pub(crate) async fn start_managed_peer_stream_replacing<F, Fut>(
+        self: &Arc<Self>,
+        peer_device_id_hex: &str,
+        generation: u64,
+        task_factory: F,
+    ) -> Result<u64, String>
+    where
+        F: FnOnce(Arc<Self>, String, u64, u64, tokio::sync::watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let start_guard = self.lifecycle.begin_stream_start();
+
+        self.ensure_capture_hardware_started().await?;
+
+        let (res, replaced_to_watch) = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = streams.get(&clean_id) {
+                if existing.generation > generation {
+                    (
+                        Err(format!(
+                            "Rejected stale camera stream for {} (session gen {}, active gen {})",
+                            clean_id, generation, existing.generation
+                        )),
+                        None,
+                    )
+                } else {
+                    let stream_id = self.lifecycle.next_id();
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    let svc = Arc::clone(self);
+                    let tid = clean_id.clone();
+                    let fut = task_factory(svc, tid, generation, stream_id, rx);
+                    let handle = tokio::spawn(fut);
+                    let prev = streams.insert(
+                        clean_id.clone(),
+                        ActivePeerStreamEntry {
+                            stream_id,
+                            cancel_tx: tx,
+                            task_handle: Some(handle),
+                            generation,
+                        },
+                    );
+                    let to_watch = if let Some(mut old) = prev {
+                        let _ = old.cancel_tx.send(true);
+                        let mut reg = match self.lifecycle.lingering_tasks.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let _ = reg.mark_stream_native_ops_lingering(&clean_id, old.stream_id);
+                        drop(reg);
+                        if let Some(h) = old.task_handle.take() {
+                            h.abort();
+                            self.lifecycle.register_lingering_handle_locked(
+                                &clean_id,
+                                "replaced_stream_handle",
+                                h,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    start_guard.finish_without_shutdown();
+                    (Ok(stream_id), to_watch)
+                }
+            } else {
+                let stream_id = self.lifecycle.next_id();
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let svc = Arc::clone(self);
+                let tid = clean_id.clone();
+                let fut = task_factory(svc, tid, generation, stream_id, rx);
+                let handle = tokio::spawn(fut);
+                streams.insert(
+                    clean_id.clone(),
+                    ActivePeerStreamEntry {
+                        stream_id,
+                        cancel_tx: tx,
+                        task_handle: Some(handle),
+                        generation,
+                    },
+                );
+                start_guard.finish_without_shutdown();
+                (Ok(stream_id), None)
+            }
+        };
+
+        if let Some((task_id, h)) = replaced_to_watch {
+            self.lifecycle.spawn_lingering_watcher(
+                task_id,
+                clean_id,
+                "replaced_stream_handle".to_string(),
+                h,
+            );
+        }
+
+        res
+    }
+
+    /// Production-path peer stream startup: acquires `StreamStartGuard`, ensures camera capture
+    /// hardware is running without enabling local preview, and atomically spawns + registers
+    /// the peer's stream task under `active_peer_streams` (zero spawn-to-attachment orphan window
+    /// and zero startup-vs-reap shutdown race).
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) async fn start_managed_peer_stream<F, Fut>(
+        self: &Arc<Self>,
+        peer_device_id_hex: &str,
+        generation: u64,
+        task_factory: F,
+    ) -> Result<u64, String>
+    where
+        F: FnOnce(Arc<Self>, String, u64, u64, tokio::sync::watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.lifecycle.capture_runtime_handle();
+        let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let start_guard = self.lifecycle.begin_stream_start();
+
+        self.ensure_capture_hardware_started().await?;
+
+        let stream_id = {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = streams.get(&clean_id) {
+                let existing_id = existing.stream_id;
+                start_guard.finish_without_shutdown();
+                existing_id
+            } else {
+                let stream_id = self.lifecycle.next_id();
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let svc = Arc::clone(self);
+                let tid = clean_id.clone();
+                let fut = task_factory(svc, tid, generation, stream_id, rx);
+                let handle = tokio::spawn(fut);
+                streams.insert(
+                    clean_id,
+                    ActivePeerStreamEntry {
+                        stream_id,
+                        cancel_tx: tx,
+                        task_handle: Some(handle),
+                        generation,
+                    },
+                );
+                // Release StreamStartGuard WHILE holding Level 1 so hardware stays continuously owned!
+                start_guard.finish_without_shutdown();
+                stream_id
+            }
+        };
+
+        Ok(stream_id)
+    }
+
+    /// Ensures the camera capture / virtual camera hardware backend is running without enabling
+    /// `local_preview_active`. Serialized under Level 0 (`hardware_io_lock`).
+    async fn ensure_capture_hardware_started(&self) -> Result<bool, String> {
+        self.lifecycle.capture_runtime_handle();
+        let coord = Arc::clone(&self.lifecycle);
+        let frames_transferred = Arc::clone(&self.frames_transferred);
+        let start_res = tokio::task::spawn_blocking(move || -> Result<bool, (String, String)> {
+            let _io_guard = coord.hardware_io_lock.lock().unwrap_or_else(|e| e.into_inner());
+            {
+                let hw = coord.hardware_state.lock().unwrap_or_else(|e| e.into_inner());
+                if hw.running {
+                    return Ok(false);
+                }
+            }
+
+            frames_transferred.store(0, Ordering::Relaxed);
+            global_frame_slot().clear();
+
+            if let Err(err) = coord.backend.start_capture() {
+                coord.active.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+
+            {
+                let mut hw = coord.hardware_state.lock().unwrap_or_else(|e| e.into_inner());
+                hw.running = true;
+                coord.active.store(true, Ordering::SeqCst);
+            }
+            Ok(true)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match start_res {
+            Ok(started_fresh) => {
+                if started_fresh {
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.set_state("Virtual Camera Active", None);
+                        info!("📷 Virtual camera '{}' active", DEFAULT_CAMERA_FRIENDLY_NAME);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.set_state("Camera Active", None);
+                        info!("📷 Mac camera capture started (720p30 NV12)");
+                    }
+                }
+                Ok(started_fresh)
+            }
+            Err((state_lbl, msg)) => {
+                self.set_state(&state_lbl, Some(msg.clone()));
+                Err(msg)
+            }
+        }
+    }
+
+    /// Toggles the camera pipeline initiated by a remote paired peer, enforcing local consent if transitioning to active.
+    pub async fn toggle_remote_request(self: &Arc<Self>, peer_identifier: Option<&str>) -> Result<String, String> {
+        if self.is_active() {
+            self.stop().await;
+            self.local_consent.store(false, Ordering::SeqCst);
+            Ok("Camera stopped".into())
+        } else {
+            self.start_remote_request(peer_identifier).await.map(|(msg, _)| msg)
+        }
+    }
+
+    /// Activates the camera pipeline on the local machine (enables local preview).
     ///
     /// - **On Windows**: Installs and registers the virtual camera DLL (`integrator_vcam.dll`),
     ///   creates the shared memory mapping, and invokes `MFCreateVirtualCamera`.
     /// - **On macOS**: Validates TCC camera permissions and bundle descriptors, starts AVFoundation
-    ///   720p30 capture via `camera_macos.swift`, and spawns the network sender loop.
+    ///   720p30 capture via `camera_macos.swift`, and enables local capture hardware.
     pub async fn start(self: &Arc<Self>) -> Result<String, String> {
+        self.lifecycle.capture_runtime_handle();
         if !self.features.is_enabled("camera") {
             self.features.set_flag_checked("camera", true)?;
         }
 
+        let start_guard = self.lifecycle.begin_stream_start();
+        let started_fresh = self.ensure_capture_hardware_started().await?;
+        // Set local_preview_active BEFORE dropping StreamStartGuard (SeqCst ordering guarantees
+        // concurrent reapers cannot shut down hardware during local preview activation).
+        self.local_preview_active.store(true, Ordering::SeqCst);
+        start_guard.finish_without_shutdown();
+
         #[cfg(target_os = "windows")]
         {
-            let res = tokio::task::spawn_blocking(|| {
-                let mut err_buf = [0i8; 256];
-                let rc = unsafe { integrator_win_vcam_start(err_buf.as_mut_ptr(), err_buf.len() as i32) };
-                if rc == 0 {
-                    Ok(())
-                } else {
-                    let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
-                        .to_string_lossy()
-                        .into_owned();
-                    Err(msg)
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-            match res {
-                Ok(()) => {
-                    self.active.store(true, Ordering::Relaxed);
-                    self.set_state("Virtual Camera Active", None);
-                    info!("📷 Virtual camera '{}' active", DEFAULT_CAMERA_FRIENDLY_NAME);
-                    return Ok(format!(
-                        "Windows Virtual Camera '{}' started",
-                        DEFAULT_CAMERA_FRIENDLY_NAME
-                    ));
-                }
-                Err(e) => {
-                    self.active.store(false, Ordering::Relaxed);
-                    self.set_state("Error", Some(e.clone()));
-                    return Err(e);
-                }
-            }
+            let _ = started_fresh;
+            return Ok(format!(
+                "Windows Virtual Camera '{}' started",
+                DEFAULT_CAMERA_FRIENDLY_NAME
+            ));
         }
 
         #[cfg(target_os = "macos")]
         {
-            if self.active.swap(true, Ordering::SeqCst) {
+            if started_fresh {
+                return Ok("Mac Camera capture started".into());
+            } else {
                 return Ok("Mac camera stream is already running".into());
             }
-            self.frames_transferred.store(0, Ordering::Relaxed);
-            global_frame_slot().clear();
-
-            let rc = tokio::task::spawn_blocking(|| unsafe { integrator_mac_camera_start() })
-                .await
-                .map_err(|e| e.to_string())?;
-            if rc != 0 {
-                self.active.store(false, Ordering::SeqCst);
-                let (state_lbl, msg) = match rc {
-                    -2 => (
-                        "Permission Needed",
-                        "Launch Integrator.app bundle (NSCameraUsageDescription required for camera capture)".to_string(),
-                    ),
-                    -1 => (
-                        "Permission Needed",
-                        "macOS Camera permission denied — allow in System Settings > Privacy & Security > Camera".to_string(),
-                    ),
-                    -3 => (
-                        "No Camera Detected",
-                        "No Mac camera hardware detected (connect a USB webcam or Continuity Camera)".to_string(),
-                    ),
-                    _ => (
-                        "Error",
-                        format!("Failed to initialize AVFoundation camera capture (code {})", rc),
-                    ),
-                };
-                self.set_state(state_lbl, Some(msg.clone()));
-                return Err(msg);
-            }
-
-            self.set_state("Streaming 720p30", None);
-            let svc = Arc::clone(self);
-            tokio::spawn(async move {
-                svc.run_mac_sender_loop().await;
-            });
-            info!("📷 Mac camera capture started (720p30 NV12)");
-            return Ok("Streaming Mac Camera (720p30) to Windows Virtual Camera".into());
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        Err("Shared Camera is supported on macOS and Windows 11".into())
+        {
+            let _ = started_fresh;
+            Ok("Camera capture started".into())
+        }
     }
 
-    /// Background async loop on macOS polling frames from [`LatestFrameSlot`] and streaming to Windows.
+    /// Background async loop on macOS polling frames from [`CameraFrameHub`] and streaming to an authenticated peer.
+    ///
+    /// Cryptographically binds to `target_peer_id` and `target_generation`, redeems single-use authorization lease,
+    /// connects to `target_ip:CAMERA_PORT`, verifies mutual authentication, checks generation-bound consent on every
+    /// frame, and streams NV12 frames from an isolated per-peer subscriber mailbox.
     #[cfg(target_os = "macos")]
-    async fn run_mac_sender_loop(&self) {
-        let slot = global_frame_slot();
-        while self.active.load(Ordering::Relaxed) && self.features.is_enabled("camera") {
-            let Some(peer) = self.discovery.get_best_peer().await else {
-                self.set_state("Waiting for Peer", None);
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                continue;
-            };
-            let peer_ip = peer.addr.ip().to_string();
+    async fn run_mac_sender_for_peer(
+        self: Arc<Self>,
+        target_peer_id: String,
+        target_generation: u64,
+        stream_id: u64,
+        target_ip: String,
+        lease_token: [u8; 32],
+        mut stream_cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mailbox = self.frame_hub.subscribe(&target_peer_id);
+        struct HubSubscriptionGuard {
+            hub: Arc<CameraFrameHub>,
+            peer: String,
+        }
+        impl Drop for HubSubscriptionGuard {
+            fn drop(&mut self) {
+                self.hub.unsubscribe(&self.peer);
+            }
+        }
+        let _sub_guard = HubSubscriptionGuard {
+            hub: Arc::clone(&self.frame_hub),
+            peer: target_peer_id.clone(),
+        };
 
-            let mut session = match trust::connect_transport_to_ip(
-                &peer_ip,
-                CAMERA_PORT,
-                ServiceId::CameraStream,
-                CAMERA_CONNECT_TIMEOUT,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    self.set_state("Waiting for Windows Camera", Some(e));
-                    tokio::time::sleep(Duration::from_millis(900)).await;
+        let mut lease_redeemed = false;
+
+        while self.active.load(Ordering::Relaxed)
+            && self.features.is_enabled("camera")
+            && !*stream_cancel_rx.borrow()
+            && self.has_peer_consent(&target_peer_id, target_generation)
+        {
+            let mut session = tokio::select! {
+                res = trust::connect_transport_to_hinted_ip(
+                    &target_ip,
+                    CAMERA_PORT,
+                    ServiceId::CameraStream,
+                    CAMERA_CONNECT_TIMEOUT,
+                    Some(&target_peer_id),
+                    None,
+                ) => match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.set_state("Waiting for Windows Camera", Some(e));
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(900)) => {},
+                            _ = stream_cancel_rx.changed() => break,
+                        }
+                        continue;
+                    }
+                },
+                _ = stream_cancel_rx.changed() => break,
+            };
+
+            // Cryptographically verify destination identity matches target_peer_id
+            if !session.peer_device_id_hex().eq_ignore_ascii_case(&target_peer_id) {
+                tracing::error!(
+                    "🚫 Outbound camera stream destination identity mismatch: expected {}, got {}",
+                    target_peer_id,
+                    session.peer_device_id_hex()
+                );
+                let _ = tokio::time::timeout(Duration::from_millis(500), session.close_notify()).await;
+                break;
+            }
+
+            // Verify generation and consent still valid
+            if !self.has_peer_consent(&target_peer_id, target_generation) {
+                tracing::warn!("🚫 Camera stream stopped: consent revoked for peer {}", target_peer_id);
+                let _ = tokio::time::timeout(Duration::from_millis(500), session.close_notify()).await;
+                break;
+            }
+
+            // Atomically redeem the single-use authorization lease on first successful connection
+            if !lease_redeemed {
+                if let Err(e) = self.authorization.redeem_authorization_lease(
+                    &lease_token,
+                    &target_peer_id,
+                    target_generation,
+                    crate::camera::authorization::LeaseDirection::OutboundSender,
+                ) {
+                    tracing::error!("🚫 Single-use authorization lease redemption failed for peer {}: {:?}", target_peer_id, e);
+                    let _ = tokio::time::timeout(Duration::from_millis(500), session.close_notify()).await;
+                    break;
+                }
+                lease_redeemed = true;
+            }
+
+            // Transmit initial frame carrying FLAG_AUTH_LEASE_REDEMPTION
+            if let Ok(init_frame) = encode_camera_frame(
+                0,
+                0,
+                PIXEL_FMT_NV12,
+                FLAG_STANDBY_KEEPALIVE | FLAG_AUTH_LEASE_REDEMPTION,
+                0,
+                &lease_token,
+            ) {
+                let send_res = tokio::time::timeout(
+                    CAMERA_FRAME_SEND_TIMEOUT,
+                    session.send_message(&init_frame),
+                ).await;
+                if let Err(e) = send_res {
+                    tracing::warn!("Failed to send lease redemption frame: {:?}", e);
+                    let _ = tokio::time::timeout(Duration::from_millis(500), session.close_notify()).await;
                     continue;
                 }
-            };
+            }
 
             self.set_state("Streaming 720p30", None);
-            while self.active.load(Ordering::Relaxed) && self.features.is_enabled("camera") {
-                if let Some(frame_bytes) = slot.take() {
-                    if let Err(e) = tokio::time::timeout(
-                        CAMERA_FRAME_SEND_TIMEOUT,
-                        session.send_message(&frame_bytes),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(crate::security::transport::TransportError::IoFailure("send timeout".into())))
-                    {
+            let mut last_send_instant = std::time::Instant::now();
+
+            while self.active.load(Ordering::Relaxed)
+                && self.features.is_enabled("camera")
+                && !*stream_cancel_rx.borrow()
+                && self.has_peer_consent(&target_peer_id, target_generation)
+            {
+                if let Some(frame_bytes) = mailbox.take() {
+                    let send_res = tokio::select! {
+                        res = tokio::time::timeout(
+                            CAMERA_FRAME_SEND_TIMEOUT,
+                            session.send_message(&frame_bytes),
+                        ) => res.unwrap_or_else(|_| Err(crate::security::transport::TransportError::IoFailure("send timeout".into()))),
+                        _ = stream_cancel_rx.changed() => {
+                            tracing::info!("Camera stream send aborted by cancellation signal for peer {}", target_peer_id);
+                            break;
+                        }
+                    };
+                    if let Err(e) = send_res {
                         self.set_state("Reconnecting...", Some(e.to_string()));
                         break;
                     }
+                    last_send_instant = std::time::Instant::now();
                     self.frames_transferred.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(250),
-                        slot.notify.notified(),
-                    )
-                    .await;
+                    let notified_res = tokio::select! {
+                        r = tokio::time::timeout(Duration::from_millis(250), mailbox.notify.notified()) => r.is_ok(),
+                        _ = stream_cancel_rx.changed() => break,
+                    };
+                    if !notified_res && last_send_instant.elapsed() > Duration::from_secs(2) {
+                        if let Ok(keepalive) = encode_camera_frame(
+                            0,
+                            0,
+                            PIXEL_FMT_NV12,
+                            FLAG_STANDBY_KEEPALIVE,
+                            0,
+                            &[],
+                        ) {
+                            let ka_res = tokio::select! {
+                                res = tokio::time::timeout(
+                                    CAMERA_FRAME_SEND_TIMEOUT,
+                                    session.send_message(&keepalive),
+                                ) => res.unwrap_or_else(|_| Err(crate::security::transport::TransportError::IoFailure("send timeout".into()))),
+                                _ = stream_cancel_rx.changed() => {
+                                    tracing::info!("Camera stream keepalive aborted by cancellation signal for peer {}", target_peer_id);
+                                    break;
+                                }
+                            };
+                            if let Err(e) = ka_res {
+                                self.set_state("Reconnecting...", Some(e.to_string()));
+                                break;
+                            }
+                            last_send_instant = std::time::Instant::now();
+                        }
+                    }
                 }
             }
-            let _ = session.close_notify().await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), session.close_notify()).await;
         }
+
+        self.unregister_peer_stream_by_id(&target_peer_id, stream_id);
+        self.authorization.on_stream_closed(&target_peer_id, stream_id);
+        let _ = self.lifecycle.try_shutdown_hardware_if_idle_async().await;
     }
 
     /// Stops camera streaming or virtual camera publication cleanly.
+    /// Cancels active peer streams, clears local preview and consent, and shuts down capture
+    /// hardware once all active/lingering native operations have exited.
     pub async fn stop(self: &Arc<Self>) {
-        let was_active = self.active.swap(false, Ordering::SeqCst);
+        self.lifecycle.capture_runtime_handle();
+        self.local_consent.store(false, Ordering::SeqCst);
+        self.local_preview_active.store(false, Ordering::SeqCst);
+
+        let peer_ids: Vec<String> = {
+            let streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            streams.keys().cloned().collect()
+        };
+        for peer_id in peer_ids {
+            let _ = self.teardown_peer_stream_async(&peer_id).await;
+        }
+
+        {
+            let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+            consent.clear();
+        }
         global_frame_slot().clear();
         global_frame_slot().notify.notify_waiters();
 
-        #[cfg(target_os = "macos")]
-        if was_active || unsafe { integrator_mac_camera_is_running() } != 0 {
-            let _ = tokio::task::spawn_blocking(|| unsafe { integrator_mac_camera_stop() }).await;
-        }
-
-        #[cfg(target_os = "windows")]
-        if was_active || unsafe { integrator_win_vcam_is_active() } != 0 {
-            let _ = tokio::task::spawn_blocking(|| unsafe { integrator_win_vcam_stop() }).await;
-        }
-
-        self.set_state("Standby", None);
-        if was_active {
+        let stopped = self.lifecycle.try_shutdown_hardware_if_idle_async().await;
+        if stopped {
+            self.set_state("Standby", None);
             info!("📷 Shared camera stopped cleanly");
         }
     }
 
     /// Synchronous shutdown routine invoked during application termination or emergency teardown.
+    ///
+    /// Signals all active streams to stop, drains short in-flight native operations up to a bounded
+    /// budget so native shared-memory mappings are not unmapped mid-write, and conservatively skips
+    /// `stop_capture()` if a native operation remains stuck or lifecycle locks are poisoned.
     pub fn shutdown_sync(&self) {
-        self.active.store(false, Ordering::SeqCst);
+        self.local_consent.store(false, Ordering::SeqCst);
+        self.local_preview_active.store(false, Ordering::SeqCst);
+        let _io_guard = match self.lifecycle.hardware_io_lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        // Level 1 -> Level 2: cancel all active streams and clear consent
+        {
+            let mut streams = self.active_peer_streams.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, mut entry) in streams.drain() {
+                let _ = entry.cancel_tx.send(true);
+                if let Some(h) = entry.task_handle.take() {
+                    h.abort();
+                }
+            }
+            let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
+            consent.clear();
+        }
         global_frame_slot().clear();
         global_frame_slot().notify.notify_waiters();
-        #[cfg(target_os = "macos")]
-        unsafe {
-            integrator_mac_camera_stop();
+
+        // Bounded drain for short-lived in-flight native FFI writes (e.g. Windows NV12 SHM memcpy)
+        let drain_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let has_native = match self.lifecycle.lingering_tasks.lock() {
+                Ok(reg) => !reg.active_native_ops.is_empty(),
+                Err(_) => {
+                    tracing::error!(
+                        "CRITICAL: lingering_tasks poisoned during shutdown_sync; skipping backend.stop_capture()"
+                    );
+                    return;
+                }
+            };
+            if !has_native {
+                break;
+            }
+            if Instant::now() >= drain_deadline {
+                tracing::warn!(
+                    "Active native camera operation still executing during shutdown_sync; skipping backend.stop_capture() to prevent native UAF"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            integrator_win_vcam_stop();
+
+        let was_running = {
+            let mut hw = self
+                .lifecycle
+                .hardware_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = hw.running;
+            hw.running = false;
+            prev
+        };
+        self.active.store(false, Ordering::SeqCst);
+        if was_running || self.lifecycle.backend.is_capture_running() {
+            self.lifecycle.backend.stop_capture();
+            self.lifecycle
+                .shutdown_executions
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -969,5 +3609,1687 @@ mod tests {
         assert!(roundtrip.camera_available);
         assert_eq!(roundtrip.port, CAMERA_PORT);
         assert_eq!(roundtrip.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
+    }
+
+    #[tokio::test]
+    async fn test_camera_session_consent_lifecycle() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_test_dev");
+        let svc = CameraService::new(discovery, features);
+
+        // 1. Initial state: consent is false
+        assert!(!svc.has_local_consent());
+
+        // 2. Granting local consent
+        svc.grant_local_consent();
+        assert!(svc.has_local_consent());
+
+        // 3. Resetting session consent returns to false
+        svc.reset_session_consent();
+        assert!(!svc.has_local_consent());
+
+        // 4. Stopping camera clears consent
+        svc.grant_local_consent();
+        assert!(svc.has_local_consent());
+        svc.stop().await;
+        assert!(!svc.has_local_consent());
+    }
+
+    #[tokio::test]
+    async fn test_camera_peer_scoped_teardown_multi_peer() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_multi_peer");
+        let svc = CameraService::new(discovery, features);
+
+        let peer_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer_a, 1);
+            ks.register_test_peer_with_generation(peer_b, 1);
+        }
+
+        let rx_a = svc.register_peer_stream(peer_a, 1);
+        let rx_b = svc.register_peer_stream(peer_b, 1);
+
+        assert!(svc.grant_peer_consent(peer_a, 1));
+        assert!(svc.grant_peer_consent(peer_b, 1));
+
+        assert!(svc.is_peer_stream_active(peer_a));
+        assert!(svc.is_peer_stream_active(peer_b));
+        assert!(svc.has_peer_consent(peer_a, 1));
+        assert!(svc.has_peer_consent(peer_b, 1));
+        assert!(!*rx_a.borrow());
+        assert!(!*rx_b.borrow());
+
+        // Teardown Peer A
+        svc.teardown_peer_stream(peer_a);
+
+        // Peer A stream must be canceled and consent removed
+        assert!(!svc.is_peer_stream_active(peer_a));
+        assert!(!svc.has_peer_consent(peer_a, 1));
+        assert!(*rx_a.borrow(), "Peer A stream cancellation watch must be notified");
+
+        // Peer B must remain active and unaffected!
+        assert!(svc.is_peer_stream_active(peer_b));
+        assert!(svc.has_peer_consent(peer_b, 1));
+        assert!(!*rx_b.borrow(), "Peer B stream cancellation watch must not be signaled");
+
+        // Teardown Peer B
+        svc.teardown_peer_stream(peer_b);
+        assert!(!svc.is_peer_stream_active(peer_b));
+        assert!(!svc.has_peer_consent(peer_b, 1));
+        assert!(*rx_b.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_rejects_unconsented_peer_even_if_other_peer_consented() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_consent_isolation");
+        let svc = CameraService::new(discovery, features);
+
+        let peer_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+        let peer_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer_a, 1);
+            ks.register_test_peer_with_generation(peer_b, 1);
+        }
+
+        // Explicitly grant consent only to Peer A
+        assert!(svc.grant_peer_consent(peer_a, 1));
+
+        // Peer A must have consent
+        assert!(svc.has_peer_consent(peer_a, 1));
+
+        // Peer B must NOT have consent even though Peer A was consented (no global bool leak)
+        assert!(
+            !svc.has_peer_consent(peer_b, 1),
+            "Peer B must remain unconsented when consent was only granted to Peer A"
+        );
+        assert!(!svc.has_active_peer_consent(peer_b));
+    }
+
+    #[tokio::test]
+    async fn test_camera_local_preview_does_not_grant_remote_consent() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_local_preview_test");
+        let svc = CameraService::new(discovery, features);
+
+        let remote_peer = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        // Starting local camera / preview must NOT grant remote consent
+        let _ = svc.start().await;
+
+        assert!(
+            !svc.has_peer_consent(remote_peer, 1),
+            "Local camera start must not grant remote camera consent"
+        );
+        assert!(!svc.has_active_peer_consent(remote_peer));
+    }
+
+    #[tokio::test]
+    async fn test_camera_request_uses_authenticated_peer_identity() {
+        let features = Arc::new(FeatureManager::new());
+        let _ = features.set_flag_checked("camera", true);
+        let discovery = DiscoveryManager::new("cam_auth_identity_test");
+        let svc = CameraService::new(discovery, features);
+
+        // An unverified or unauthenticated peer name/id must be rejected
+        let res = svc.start_remote_request(Some("attacker_unverified_device")).await;
+        assert!(
+            res.is_err(),
+            "start_remote_request must reject unverified peer identities"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("is not a verified paired identity") || err.contains("Unverified"),
+            "Error must identify unverified peer rejection: {}",
+            err
+        );
+
+        // A None or empty peer identifier must also be strictly rejected
+        let res_none = svc.start_remote_request(None).await;
+        assert!(res_none.is_err());
+        assert!(res_none.unwrap_err().contains("requires authenticated peer identity"));
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_revocation_stops_active_peer_stream() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_consent_revocation_test");
+        let svc = CameraService::new(discovery, features);
+
+        let peer = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        let cancel_rx = svc.register_peer_stream(peer, 1);
+        assert!(svc.grant_peer_consent(peer, 1));
+
+        assert!(svc.has_peer_consent(peer, 1));
+        assert!(svc.is_peer_stream_active(peer));
+        assert!(!*cancel_rx.borrow());
+
+        // Revoke consent specifically for this peer
+        svc.revoke_peer_consent(peer);
+
+        // Consent must be revoked and stream watch receiver canceled
+        assert!(!svc.has_peer_consent(peer, 1));
+        assert!(!svc.is_peer_stream_active(peer));
+        assert!(
+            *cancel_rx.borrow(),
+            "Revoking consent must notify stream cancellation receiver immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_revocation_race_before_insertion() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_race_before");
+        let svc = CameraService::new(discovery, features);
+
+        let peer = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        // Revocation intervenes before grant_peer_consent is called
+        crate::security::transport::invalidate_peer_trust(peer, 2);
+
+        // grant_peer_consent must fail closed and return false
+        let granted = svc.grant_peer_consent(peer, 1);
+        assert!(!granted, "grant_peer_consent must fail closed when peer is revoked");
+
+        // Peer must have no consent
+        assert!(!svc.has_peer_consent(peer, 1));
+        assert!(!svc.has_active_peer_consent(peer));
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_revocation_race_after_insertion() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_race_after");
+        let svc = CameraService::new(discovery, features);
+
+        let peer = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        // Consent was granted for generation 1
+        assert!(svc.grant_peer_consent(peer, 1));
+        assert!(svc.has_peer_consent(peer, 1));
+
+        // Revocation/unpair occurs: trust generation updated to 2 and peer marked revoked
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.unpair_peer(peer);
+        }
+
+        // has_peer_consent for generation 1 MUST immediately fail closed
+        assert!(
+            !svc.has_peer_consent(peer, 1),
+            "Consent for stale generation 1 must be immediately invalid after unpair"
+        );
+        assert!(
+            !svc.has_active_peer_consent(peer),
+            "Active consent must be false after peer unpair"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_camera_repair_invalidates_stale_consent_request() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_repair_test");
+        let svc = CameraService::new(discovery, features);
+
+        let peer = "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        // Grant consent for initial pairing generation 1
+        assert!(svc.grant_peer_consent(peer, 1));
+        assert!(svc.has_peer_consent(peer, 1));
+
+        // Peer is re-paired with generation 2 (simulated by updating generation)
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 2);
+        }
+        svc.revoke_peer_consent(peer);
+
+        // Previous generation consent is completely invalid
+        assert!(!svc.has_peer_consent(peer, 1));
+        // New generation does not inherit old consent
+        assert!(!svc.has_peer_consent(peer, 2));
+        assert!(!svc.has_active_peer_consent(peer));
+
+        // New consent for generation 2 must be explicitly granted
+        assert!(svc.grant_peer_consent(peer, 2));
+        assert!(svc.has_peer_consent(peer, 2));
+        assert!(!svc.has_peer_consent(peer, 1));
+    }
+
+    #[tokio::test]
+    async fn test_camera_peer_scoped_stream_isolation_and_preview_preservation() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_isolation_test");
+        let svc = CameraService::new(discovery, features);
+
+        let peer_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer_a, 1);
+            ks.register_test_peer_with_generation(peer_b, 1);
+        }
+
+        // 1. Enable local preview
+        svc.set_local_preview_active(true);
+        assert!(svc.is_local_preview_active());
+
+        // 2. Grant consent and register streams for both Peer A and Peer B
+        assert!(svc.grant_peer_consent(peer_a, 1));
+        assert!(svc.grant_peer_consent(peer_b, 1));
+        let cancel_a = svc.register_peer_stream(peer_a, 1);
+        let cancel_b = svc.register_peer_stream(peer_b, 1);
+
+        assert!(svc.has_peer_consent(peer_a, 1));
+        assert!(svc.has_peer_consent(peer_b, 1));
+        assert!(svc.is_peer_stream_active(peer_a));
+        assert!(svc.is_peer_stream_active(peer_b));
+        assert!(!*cancel_a.borrow());
+        assert!(!*cancel_b.borrow());
+
+        // 3. Teardown Peer A's stream (simulating peer_scoped StopCamera or revocation)
+        svc.teardown_peer_stream(peer_a);
+
+        // Peer A is torn down
+        assert!(!svc.has_peer_consent(peer_a, 1));
+        assert!(!svc.is_peer_stream_active(peer_a));
+        assert!(*cancel_a.borrow(), "Peer A's stream must be cancelled");
+
+        // Peer B is completely unaffected!
+        assert!(svc.has_peer_consent(peer_b, 1), "Peer B consent must remain valid");
+        assert!(svc.is_peer_stream_active(peer_b), "Peer B stream must remain active");
+        assert!(!*cancel_b.borrow(), "Peer B cancellation must NOT fire");
+
+        // Local preview remains active
+        assert!(svc.is_local_preview_active(), "Local preview must remain active");
+
+        // 4. Teardown Peer B's stream
+        svc.teardown_peer_stream(peer_b);
+        assert!(!svc.has_peer_consent(peer_b, 1));
+        assert!(!svc.is_peer_stream_active(peer_b));
+        assert!(*cancel_b.borrow());
+
+        // Local preview still protected
+        assert!(svc.is_local_preview_active());
+        svc.set_local_preview_active(false);
+        assert!(!svc.is_local_preview_active());
+    }
+
+    #[tokio::test]
+    async fn test_camera_no_abba_deadlock_concurrent_pairing_and_consent() {
+        let features = Arc::new(FeatureManager::new());
+        let discovery = DiscoveryManager::new("cam_abba_test");
+        let svc = CameraService::new(discovery, features);
+
+        let peer = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        // Task 1: Repeatedly grants peer consent (locks peer_consent, reads transport generation)
+        let svc_1 = Arc::clone(&svc);
+        let b_1 = Arc::clone(&barrier);
+        let t1 = tokio::spawn(async move {
+            for i in 1..=50u64 {
+                b_1.wait().await;
+                let _ = svc_1.grant_peer_consent(peer, i);
+            }
+        });
+
+        // Task 2: Repeatedly updates peer generation in keystore and revokes consent
+        let svc_2 = Arc::clone(&svc);
+        let b_2 = Arc::clone(&barrier);
+        let t2 = tokio::spawn(async move {
+            for i in 1..=50u64 {
+                b_2.wait().await;
+                {
+                    let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+                    ks.register_test_peer_with_generation(peer, i);
+                }
+                // Revoke consent outside keystore lock
+                svc_2.revoke_peer_consent(peer);
+            }
+        });
+
+        // Both tasks must complete cleanly without deadlocking
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (r1, r2) = tokio::join!(t1, t2);
+            r1.unwrap();
+            r2.unwrap();
+        }).await;
+
+        assert!(res.is_ok(), "Concurrent consent and keystore operations must never deadlock");
+    }
+
+    #[tokio::test]
+    async fn test_camera_teardown_awaits_streaming_task_termination() {
+        let disc = DiscoveryManager::new("cam_teardown_test");
+        let fm = Arc::new(FeatureManager::new());
+        let svc = CameraService::new(disc, fm);
+        let peer = "ffff0000ffff0000ffff0000ffff0000";
+
+        // Register stream and attach a mock task that respects cancellation
+        let mut cancel_rx = svc.register_peer_stream(peer, 1);
+        let task_completed = Arc::new(AtomicBool::new(false));
+        let tc = Arc::clone(&task_completed);
+
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel_rx.changed() => {
+                    tc.store(true, Ordering::SeqCst);
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
+        });
+        svc.attach_stream_handle(peer, handle);
+
+        assert!(svc.is_peer_stream_active(peer));
+
+        // Teardown should signal cancellation and await completion
+        let teardown_res = svc.teardown_peer_stream_async(peer).await;
+        assert!(teardown_res.is_ok());
+
+        assert!(task_completed.load(Ordering::SeqCst), "Streaming task must have completed upon teardown return");
+        assert!(!svc.is_peer_stream_active(peer));
+    }
+
+    #[tokio::test]
+    async fn test_camera_teardown_escalates_to_abort_on_hung_task() {
+        let disc = DiscoveryManager::new("cam_hung_test");
+        let fm = Arc::new(FeatureManager::new());
+        let svc = CameraService::new(disc, fm);
+        let peer = "11110000111100001111000011110000";
+
+        // Register stream and attach a hung task that ignores cancel_rx
+        let _cancel_rx = svc.register_peer_stream(peer, 1);
+        let handle = tokio::spawn(async move {
+            // Hung task: sleep without listening to cancel
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        svc.attach_stream_handle(peer, handle);
+
+        assert!(svc.is_peer_stream_active(peer));
+
+        // Teardown should hit bounded timeout and abort the task
+        let start = Instant::now();
+        let teardown_res = svc.teardown_peer_stream_async(peer).await;
+        assert!(teardown_res.is_ok());
+        let elapsed = start.elapsed();
+
+        // Must have completed within bounded timeout (~2.5s + 0.5s)
+        assert!(elapsed < Duration::from_secs(4), "Teardown must abort hung task within bounded timeout");
+        assert!(!svc.is_peer_stream_active(peer));
+    }
+
+    #[tokio::test]
+    async fn test_camera_teardown_hung_native_task_reports_err_and_retains_hardware() {
+        let disc = DiscoveryManager::new("cam_hung_native_test");
+        let fm = Arc::new(FeatureManager::new());
+        let svc = CameraService::new(disc, fm);
+        let peer = "22220000222200002222000022220000";
+
+        let _cancel_rx = svc.register_peer_stream(peer, 1);
+
+        let stop_blocking = Arc::new(AtomicBool::new(false));
+        let sb = Arc::clone(&stop_blocking);
+
+        // Spawn a native blocking task via spawn_blocking that DOES NOT exit on abort()
+        let handle = tokio::task::spawn_blocking(move || {
+            while !sb.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        svc.attach_stream_handle(peer, handle);
+        assert!(svc.is_peer_stream_active(peer));
+
+        // Teardown should attempt cancellation, escalate to abort, timeout on post-abort drain,
+        // report Err honestly, and retain the task in lingering_tasks (SEC-1D-17).
+        let teardown_res = svc.teardown_peer_stream_async(peer).await;
+        assert!(teardown_res.is_err(), "Teardown must report Err on hung native task (SEC-1D-17)");
+        assert!(svc.lingering_tasks_count() >= 1, "Hung task must be retained in lingering_tasks");
+
+        // Hardware must NOT be shutdown while tasks linger
+        assert!(!svc.is_peer_stream_active(peer));
+
+        // Unblock native thread to prevent test leak
+        stop_blocking.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_camera_atomic_registration_and_orphaned_handle_safety() {
+        let disc = DiscoveryManager::new("cam_orphan_test");
+        let fm = Arc::new(FeatureManager::new());
+        let svc = CameraService::new(disc, fm);
+        let peer = "33330000333300003333000033330000";
+
+        // Attempt to attach handle to a peer stream that was NOT registered or was already removed
+        let task_ran = Arc::new(AtomicBool::new(false));
+        let tr = Arc::clone(&task_ran);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tr.store(true, Ordering::SeqCst);
+        });
+
+        svc.attach_stream_handle(peer, handle);
+
+        // The handle must have been aborted and added to lingering_tasks (SEC-1D-18)
+        assert!(svc.lingering_tasks_count() >= 1, "Orphaned handle must be retained in lingering_tasks");
+    }
+
+    /// Controllable test camera backend for deterministic hardware start/stop verification.
+    struct MockCameraBackend {
+        start_calls: AtomicU64,
+        stop_calls: AtomicU64,
+        running: AtomicBool,
+        stop_notify: Arc<Notify>,
+    }
+
+    impl MockCameraBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                start_calls: AtomicU64::new(0),
+                stop_calls: AtomicU64::new(0),
+                running: AtomicBool::new(false),
+                stop_notify: Arc::new(Notify::new()),
+            })
+        }
+
+        fn start_calls(&self) -> u64 {
+            self.start_calls.load(Ordering::SeqCst)
+        }
+
+        fn stop_calls(&self) -> u64 {
+            self.stop_calls.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_stop_count(&self, expected: u64) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let notified = self.stop_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.stop_calls() >= expected {
+                    return;
+                }
+                let rem = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !rem.is_zero(),
+                    "Timed out waiting for hardware stop_calls >= {} (got {})",
+                    expected,
+                    self.stop_calls()
+                );
+                let _ = tokio::time::timeout(rem, notified).await;
+            }
+        }
+    }
+
+    impl CameraHardwareBackend for MockCameraBackend {
+        fn start_capture(&self) -> Result<(), (String, String)> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            self.running.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn stop_capture(&self) {
+            self.running.store(false, Ordering::SeqCst);
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            self.stop_notify.notify_waiters();
+        }
+
+        fn is_capture_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+    }
+
+    fn new_test_camera_service(
+        label: &str,
+        backend: Arc<MockCameraBackend>,
+        cancel_timeout: Duration,
+        abort_drain_timeout: Duration,
+    ) -> Arc<CameraService> {
+        let disc = DiscoveryManager::new(label);
+        let fm = Arc::new(FeatureManager::new());
+        let _ = fm.set_flag_checked("camera", true);
+        CameraService::new_with_backend_and_timeouts(
+            disc,
+            fm,
+            backend,
+            cancel_timeout,
+            abort_drain_timeout,
+        )
+    }
+
+    async fn wait_for_lingering_count(svc: &CameraService, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let notified = svc.lifecycle.lifecycle_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if svc.lingering_tasks_count() == expected {
+                return;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "Timed out waiting for lingering_tasks_count == {} (got {})",
+                expected,
+                svc.lingering_tasks_count()
+            );
+            let _ = tokio::time::timeout(rem, notified).await;
+        }
+    }
+
+    async fn wait_for_reaped_total(svc: &CameraService, expected_min: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let notified = svc.lifecycle.lifecycle_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if svc.reap_stats().total_reaped() >= expected_min {
+                return;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "Timed out waiting for total_reaped >= {} (got {})",
+                expected_min,
+                svc.reap_stats().total_reaped()
+            );
+            let _ = tokio::time::timeout(rem, notified).await;
+        }
+    }
+
+    async fn wait_for_shutdown_eval_after(svc: &CameraService, prev_eval: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let notified = svc.lifecycle.lifecycle_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if svc.shutdown_eval_count() > prev_eval {
+                return;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "Timed out waiting for shutdown_eval_count > {} (got {})",
+                prev_eval,
+                svc.shutdown_eval_count()
+            );
+            let _ = tokio::time::timeout(rem, notified).await;
+        }
+    }
+
+    /// Required SEC-1D-17 production-path regression test:
+    /// Exercises both (A) an outer async stream task with an inner blocking native operation guarded by
+    /// `CameraNativeOpGuard` (where aborting the outer task cancels the outer future while the native
+    /// thread remains active behind a barrier), and (B) a direct blocking `JoinHandle` that refuses abort.
+    /// Verifies teardown reports Err, hardware stays active while blocked, and upon barrier release the
+    /// completion-driven reaper observes completion, empties the lingering registry, and shuts down
+    /// hardware exactly once with NO additional teardown call.
+    #[tokio::test]
+    async fn test_camera_lingering_task_reaped_and_hardware_eventually_shutdown() {
+        // --- Part A: Production-path stream (`start_managed_peer_stream`) with outer async task + inner blocking native op ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_reap_native_op",
+                Arc::clone(&backend),
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+            );
+            let peer = "a1000000000000000000000000000001";
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let release_barrier = Arc::new(std::sync::Barrier::new(2));
+            let barrier_worker = Arc::clone(&release_barrier);
+
+            // 1. Start a real production-path camera stream using the controllable capture backend
+            let _stream_id = svc
+                .start_managed_peer_stream(peer, 1, move |svc_inner, pid, _gen, sid, _rx| async move {
+                    // 2. Hold a simulated native operation behind a synchronization barrier on a blocking OS thread
+                    let op_guard = svc_inner.begin_peer_native_op(&pid, Some(sid), "avfoundation_capture_op");
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _guard = op_guard;
+                        let _ = entered_tx.send(());
+                        barrier_worker.wait();
+                    })
+                    .await;
+                })
+                .await
+                .expect("start_managed_peer_stream must succeed");
+
+            // Deterministically wait until the native operation is actively executing behind the barrier
+            entered_rx.await.expect("native op entered");
+            assert_eq!(backend.start_calls(), 1);
+            assert_eq!(backend.stop_calls(), 0);
+            assert!(svc.is_active());
+
+            // 3-5. Initiate peer teardown -> forces initial cancellation timeout -> abort escalation -> native drain timeout
+            let teardown_res = svc.teardown_peer_stream_async(peer).await;
+
+            // 6. Verify teardown returns an error (outer task was cancelled by abort, but native op is STILL active!)
+            assert!(
+                teardown_res.is_err(),
+                "Teardown must fail honestly while inner blocking native operation remains active"
+            );
+            // 7. Verify the outstanding operation remains supervised
+            assert_eq!(svc.lingering_tasks_count(), 1, "Outstanding native operation must remain supervised");
+            // 8. Verify camera hardware is NOT shut down while the operation remains active
+            assert_eq!(backend.stop_calls(), 0, "Camera hardware must NOT shut down while native op is active");
+            assert!(svc.is_active(), "CameraService must remain active while native op holds hardware");
+
+            // 9-10. Release the barrier so the former native operation finishes
+            release_barrier.wait();
+
+            // 11-13. Without ANY additional teardown call, verify the reaper observes completion,
+            // empties the lingering registry, and shuts down hardware EXACTLY ONCE!
+            backend.wait_for_stop_count(1).await;
+            wait_for_lingering_count(&svc, 0).await;
+            wait_for_reaped_total(&svc, 1).await;
+
+            assert_eq!(svc.lingering_tasks_count(), 0, "Lingering registry must become empty");
+            assert_eq!(backend.stop_calls(), 1, "Hardware shutdown must execute exactly once");
+            assert_eq!(svc.shutdown_execution_count(), 1);
+            assert!(!svc.is_active(), "CameraService must transition to inactive after hardware shutdown");
+        }
+
+        // --- Part B: Direct blocking `JoinHandle` lingering past abort escalation ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_reap_blocking_jh",
+                Arc::clone(&backend),
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+            );
+            let peer = "a1000000000000000000000000000002";
+
+            // Start hardware cleanly without enabling local preview
+            svc.ensure_capture_hardware_started()
+                .await
+                .expect("start hardware");
+            assert_eq!(backend.start_calls(), 1);
+            assert_eq!(backend.stop_calls(), 0);
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let release_barrier = Arc::new(std::sync::Barrier::new(2));
+            let barrier_worker = Arc::clone(&release_barrier);
+
+            let _cancel_rx = svc.register_peer_stream(peer, 1);
+            let handle = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                barrier_worker.wait();
+            });
+            svc.attach_stream_handle(peer, handle);
+
+            entered_rx.await.expect("blocking task entered");
+
+            let teardown_res = svc.teardown_peer_stream_async(peer).await;
+            assert!(teardown_res.is_err(), "Teardown must return Err on hung blocking JoinHandle");
+            assert_eq!(svc.lingering_tasks_count(), 1);
+            assert_eq!(backend.stop_calls(), 0);
+
+            // Release barrier -> completion watcher awaits JoinHandle, reaps it, and shuts down hardware once
+            release_barrier.wait();
+
+            backend.wait_for_stop_count(1).await;
+            wait_for_lingering_count(&svc, 0).await;
+            wait_for_reaped_total(&svc, 1).await;
+
+            assert_eq!(svc.lingering_tasks_count(), 0);
+            assert_eq!(svc.reap_stats().reaped_ok, 1);
+            assert_eq!(backend.stop_calls(), 1);
+            assert_eq!(svc.shutdown_execution_count(), 1);
+            assert!(!svc.is_active());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_camera_two_lingering_tasks_completing_out_of_order_and_simultaneously() {
+        // --- Subcase 1: Reverse completion order (Peer B finishes before Peer A) ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_two_out_of_order",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let peer_a = "b1000000000000000000000000000001";
+            let peer_b = "b1000000000000000000000000000002";
+
+            let (enter_a_tx, enter_a_rx) = tokio::sync::oneshot::channel::<()>();
+            let (enter_b_tx, enter_b_rx) = tokio::sync::oneshot::channel::<()>();
+            let barrier_a = Arc::new(std::sync::Barrier::new(2));
+            let barrier_b = Arc::new(std::sync::Barrier::new(2));
+
+            let ba = Arc::clone(&barrier_a);
+            svc.start_managed_peer_stream(peer_a, 1, move |s, pid, _g, sid, _rx| async move {
+                let g = s.begin_peer_native_op(&pid, Some(sid), "native_a");
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = g;
+                    let _ = enter_a_tx.send(());
+                    ba.wait();
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+
+            let bb = Arc::clone(&barrier_b);
+            svc.start_managed_peer_stream(peer_b, 1, move |s, pid, _g, sid, _rx| async move {
+                let g = s.begin_peer_native_op(&pid, Some(sid), "native_b");
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = g;
+                    let _ = enter_b_tx.send(());
+                    bb.wait();
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+
+            enter_a_rx.await.unwrap();
+            enter_b_rx.await.unwrap();
+            assert_eq!(backend.start_calls(), 1);
+
+            assert!(svc.teardown_peer_stream_async(peer_a).await.is_err());
+            assert_eq!(svc.lingering_tasks_count(), 1);
+            assert_eq!(backend.stop_calls(), 0);
+
+            assert!(svc.teardown_peer_stream_async(peer_b).await.is_err());
+            assert_eq!(svc.lingering_tasks_count(), 2);
+            assert_eq!(backend.stop_calls(), 0);
+
+            // Release Peer B first (reverse order) -> Peer A still holds hardware
+            let eval_before = svc.shutdown_eval_count();
+            barrier_b.wait();
+            wait_for_lingering_count(&svc, 1).await;
+            wait_for_shutdown_eval_after(&svc, eval_before).await;
+            assert_eq!(backend.stop_calls(), 0, "Hardware must remain active while Peer A still lingers");
+            assert!(svc.is_active());
+
+            // Now release Peer A -> hardware shuts down exactly once
+            barrier_a.wait();
+            backend.wait_for_stop_count(1).await;
+            wait_for_lingering_count(&svc, 0).await;
+            assert_eq!(backend.stop_calls(), 1);
+            assert_eq!(svc.shutdown_execution_count(), 1);
+        }
+
+        // --- Subcase 2: Simultaneous completion on shared barrier -> exact-once shutdown, no lock inversion ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_two_simultaneous",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let peer_1 = "b2000000000000000000000000000001";
+            let peer_2 = "b2000000000000000000000000000002";
+
+            svc.ensure_capture_hardware_started().await.unwrap();
+
+            let (e1_tx, e1_rx) = tokio::sync::oneshot::channel::<()>();
+            let (e2_tx, e2_rx) = tokio::sync::oneshot::channel::<()>();
+            let shared_release = Arc::new(std::sync::Barrier::new(3));
+
+            let r1 = Arc::clone(&shared_release);
+            let _rx1 = svc.register_peer_stream(peer_1, 1);
+            svc.attach_stream_handle(
+                peer_1,
+                tokio::task::spawn_blocking(move || {
+                    let _ = e1_tx.send(());
+                    r1.wait();
+                }),
+            );
+
+            let r2 = Arc::clone(&shared_release);
+            let _rx2 = svc.register_peer_stream(peer_2, 1);
+            svc.attach_stream_handle(
+                peer_2,
+                tokio::task::spawn_blocking(move || {
+                    let _ = e2_tx.send(());
+                    r2.wait();
+                }),
+            );
+
+            e1_rx.await.unwrap();
+            e2_rx.await.unwrap();
+
+            assert!(svc.teardown_peer_stream_async(peer_1).await.is_err());
+            assert!(svc.teardown_peer_stream_async(peer_2).await.is_err());
+            assert_eq!(svc.lingering_tasks_count(), 2);
+            assert_eq!(backend.stop_calls(), 0);
+
+            // Release BOTH tasks simultaneously
+            shared_release.wait();
+
+            backend.wait_for_stop_count(1).await;
+            wait_for_lingering_count(&svc, 0).await;
+            wait_for_reaped_total(&svc, 2).await;
+
+            assert_eq!(
+                backend.stop_calls(),
+                1,
+                "Simultaneous lingering completions must execute hardware shutdown exactly once"
+            );
+            assert_eq!(svc.shutdown_execution_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_camera_new_peer_registering_while_old_lingering_task_completes() {
+        // --- Subcase 1: Active new peer stream registered before old task finishes ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_new_peer_race",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let old_peer = "c1000000000000000000000000000001";
+            let new_peer = "c1000000000000000000000000000002";
+
+            let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let b_w = Arc::clone(&barrier);
+
+            svc.start_managed_peer_stream(old_peer, 1, move |s, pid, _g, sid, _rx| async move {
+                let g = s.begin_peer_native_op(&pid, Some(sid), "old_native");
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = g;
+                    let _ = enter_tx.send(());
+                    b_w.wait();
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+            enter_rx.await.unwrap();
+
+            assert!(svc.teardown_peer_stream_async(old_peer).await.is_err());
+            assert_eq!(svc.lingering_tasks_count(), 1);
+
+            // New peer starts a cooperative stream while old_peer is lingering
+            svc.start_managed_peer_stream(new_peer, 1, move |_s, _pid, _g, _sid, mut rx| async move {
+                let _ = rx.changed().await;
+            })
+            .await
+            .unwrap();
+            assert!(svc.is_peer_stream_active(new_peer));
+            assert_eq!(backend.start_calls(), 1, "New peer should reuse already-running hardware");
+
+            // Old task completes while new_peer is active -> MUST NOT shut down hardware!
+            let eval_before = svc.shutdown_eval_count();
+            barrier.wait();
+            wait_for_lingering_count(&svc, 0).await;
+            wait_for_reaped_total(&svc, 1).await;
+            wait_for_shutdown_eval_after(&svc, eval_before).await;
+
+            assert_eq!(backend.stop_calls(), 0, "Hardware must NOT shut down while new_peer is active");
+            assert!(svc.is_active());
+
+            // Now tear down new_peer cleanly -> hardware shuts down exactly once
+            assert!(svc.teardown_peer_stream_async(new_peer).await.is_ok());
+            assert_eq!(backend.stop_calls(), 1);
+            assert!(!svc.is_active());
+        }
+
+        // --- Subcase 2: New stream in mid-startup (`StreamStartGuard` held) while old task completes ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_mid_start_race",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let old_peer = "c2000000000000000000000000000001";
+
+            let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let b_w = Arc::clone(&barrier);
+
+            svc.start_managed_peer_stream(old_peer, 1, move |s, pid, _g, sid, _rx| async move {
+                let g = s.begin_peer_native_op(&pid, Some(sid), "old_native_mid_start");
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = g;
+                    let _ = enter_tx.send(());
+                    b_w.wait();
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+            enter_rx.await.unwrap();
+
+            assert!(svc.teardown_peer_stream_async(old_peer).await.is_err());
+            assert_eq!(svc.lingering_tasks_count(), 1);
+
+            // Hold StreamStartGuard (simulating a new stream mid-initialization before insertion)
+            let start_guard = svc.lifecycle.begin_stream_start();
+
+            // Old task completes while new stream is starting -> hardware MUST NOT shut down!
+            let eval_before = svc.shutdown_eval_count();
+            barrier.wait();
+            wait_for_lingering_count(&svc, 0).await;
+            wait_for_reaped_total(&svc, 1).await;
+            wait_for_shutdown_eval_after(&svc, eval_before).await;
+            assert_eq!(
+                backend.stop_calls(),
+                0,
+                "Hardware must NOT shut down while a new stream startup guard is active"
+            );
+            assert!(svc.is_active());
+
+            // Simulate aborted startup: dropping start_guard triggers deferred shutdown cleanly once
+            drop(start_guard);
+            backend.wait_for_stop_count(1).await;
+            assert_eq!(backend.stop_calls(), 1);
+            assert!(!svc.is_active());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_camera_local_preview_prevents_shutdown_during_lingering_task_completion() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_preview_lingering",
+            Arc::clone(&backend),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let peer = "d1000000000000000000000000000001";
+
+        // Enable local preview via production `start()`
+        svc.start().await.expect("local preview start");
+        assert!(svc.is_local_preview_active());
+        assert_eq!(backend.start_calls(), 1);
+
+        let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_w = Arc::clone(&barrier);
+
+        svc.start_managed_peer_stream(peer, 1, move |s, pid, _g, sid, _rx| async move {
+            let g = s.begin_peer_native_op(&pid, Some(sid), "preview_peer_native");
+            let _ = tokio::task::spawn_blocking(move || {
+                let _guard = g;
+                let _ = enter_tx.send(());
+                b_w.wait();
+            })
+            .await;
+        })
+        .await
+        .unwrap();
+        enter_rx.await.unwrap();
+
+        assert!(svc.teardown_peer_stream_async(peer).await.is_err());
+        assert_eq!(svc.lingering_tasks_count(), 1);
+
+        // Old task completes while local preview is active -> hardware MUST remain active!
+        let eval_before = svc.shutdown_eval_count();
+        barrier.wait();
+        wait_for_lingering_count(&svc, 0).await;
+        wait_for_reaped_total(&svc, 1).await;
+        wait_for_shutdown_eval_after(&svc, eval_before).await;
+        assert_eq!(
+            backend.stop_calls(),
+            0,
+            "Hardware must NOT shut down while local preview remains active"
+        );
+        assert!(svc.is_active());
+        assert!(svc.is_local_preview_active());
+
+        // Stopping local preview shuts down hardware cleanly once
+        svc.stop().await;
+        assert_eq!(backend.stop_calls(), 1);
+        assert!(!svc.is_active());
+        assert!(!svc.is_local_preview_active());
+    }
+
+    #[tokio::test]
+    async fn test_camera_repeated_reaping_and_teardown_retry_after_failure() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_retry_reap",
+            Arc::clone(&backend),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let peer = "e1000000000000000000000000000001";
+
+        let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_w = Arc::clone(&barrier);
+
+        svc.start_managed_peer_stream(peer, 1, move |s, pid, _g, sid, _rx| async move {
+            let g = s.begin_peer_native_op(&pid, Some(sid), "retry_native");
+            let _ = tokio::task::spawn_blocking(move || {
+                let _guard = g;
+                let _ = enter_tx.send(());
+                b_w.wait();
+            })
+            .await;
+        })
+        .await
+        .unwrap();
+        enter_rx.await.unwrap();
+
+        // Initial teardown fails
+        assert!(svc.teardown_peer_stream_async(peer).await.is_err());
+        assert_eq!(svc.lingering_tasks_count(), 1);
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Repeated reaping calls while still running must report 1 and keep hardware active
+        assert_eq!(svc.reap_lingering_tasks(), 1);
+        assert_eq!(svc.reap_lingering_tasks(), 1);
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Teardown RETRY while peer's native op is still stuck MUST STILL return Err (no false Ok!)
+        let retry_while_stuck = svc.teardown_peer_stream_async(peer).await;
+        assert!(
+            retry_while_stuck.is_err(),
+            "Teardown retry while peer's lingering operation is still running must return Err"
+        );
+        assert_eq!(svc.lingering_tasks_count(), 1);
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Release barrier -> automatic reap + hardware shutdown
+        barrier.wait();
+        backend.wait_for_stop_count(1).await;
+        wait_for_lingering_count(&svc, 0).await;
+
+        // Teardown retry AFTER completion succeeds cleanly and does NOT double-shutdown
+        let retry_after_done = svc.teardown_peer_stream_async(peer).await;
+        assert!(retry_after_done.is_ok(), "Teardown retry after completion must return Ok");
+
+        // Repeated reaping calls after idle must be idempotent with exact-once hardware shutdown
+        assert_eq!(svc.reap_lingering_tasks(), 0);
+        assert_eq!(svc.reap_lingering_tasks(), 0);
+        assert_eq!(backend.stop_calls(), 1);
+        assert_eq!(svc.shutdown_execution_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_camera_lingering_task_panic_observed_reaped_and_hardware_shutdown() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_panic_reap",
+            Arc::clone(&backend),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let peer = "f1000000000000000000000000000001";
+
+        svc.ensure_capture_hardware_started().await.unwrap();
+        let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_w = Arc::clone(&barrier);
+
+        let _cancel_rx = svc.register_peer_stream(peer, 1);
+        let handle = tokio::task::spawn_blocking(move || {
+            let _ = enter_tx.send(());
+            b_w.wait();
+            panic!("simulated native driver abnormal panic");
+        });
+        svc.attach_stream_handle(peer, handle);
+
+        enter_rx.await.unwrap();
+
+        assert!(svc.teardown_peer_stream_async(peer).await.is_err());
+        assert_eq!(svc.lingering_tasks_count(), 1);
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Release barrier -> blocking task panics -> watcher observes panic, records it, reaps handle, shuts down hardware!
+        barrier.wait();
+
+        backend.wait_for_stop_count(1).await;
+        wait_for_lingering_count(&svc, 0).await;
+        wait_for_reaped_total(&svc, 1).await;
+
+        let stats = svc.reap_stats();
+        assert_eq!(stats.reaped_panicked, 1, "Reaper must observe and count panicked lingering task");
+        assert!(
+            !stats.unexpected_failures.is_empty(),
+            "Reaper must record unexpected panic details"
+        );
+        assert!(
+            svc.status().last_error.is_some(),
+            "Unexpected lingering task panic must be recorded in CameraService last_error"
+        );
+        assert_eq!(backend.stop_calls(), 1, "Hardware must shut down once after panicked task exits");
+        assert!(!svc.is_active());
+    }
+
+    #[tokio::test]
+    async fn test_camera_poisoned_lingering_registry_refuses_hardware_shutdown() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_poison_registry",
+            Arc::clone(&backend),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let peer = "f2000000000000000000000000000001";
+
+        svc.ensure_capture_hardware_started().await.unwrap();
+        assert_eq!(backend.start_calls(), 1);
+        assert!(svc.is_active());
+
+        // Deterministically poison the lingering_tasks mutex on a separate thread
+        let lingering_mutex = Arc::clone(&svc.lifecycle.lingering_tasks);
+        let join_res = std::thread::spawn(move || {
+            let _guard = lingering_mutex.lock().unwrap();
+            panic!("intentional poison of lingering_tasks mutex");
+        })
+        .join();
+        assert!(join_res.is_err());
+
+        assert!(svc.is_lingering_registry_poisoned());
+        // Must NEVER interpret a poisoned lingering-task mutex as an empty registry!
+        assert!(
+            svc.lingering_tasks_count() >= 1,
+            "Poisoned lingering registry must never report 0 tasks"
+        );
+
+        // Teardown must return Err and conservatively REFUSE hardware shutdown
+        let td = svc.teardown_peer_stream_async(peer).await;
+        assert!(td.is_err(), "Teardown must fail when lingering registry is poisoned");
+        assert_eq!(
+            backend.stop_calls(),
+            0,
+            "Hardware shutdown MUST be conservatively refused when lingering registry is poisoned"
+        );
+        assert!(svc.is_active());
+
+        // Explicit reaping must also refuse shutdown and never report 0
+        assert!(svc.reap_lingering_tasks() >= 1);
+        assert_eq!(backend.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_camera_inflight_teardown_prevents_premature_shutdown_on_concurrent_reap() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_inflight_td_race",
+            Arc::clone(&backend),
+            Duration::from_millis(400),
+            Duration::from_millis(40),
+        );
+        let peer_a = "f3000000000000000000000000000001";
+        let peer_b = "f3000000000000000000000000000002";
+
+        // Peer B: lingering native task behind barrier
+        let (enter_b_tx, enter_b_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier_b = Arc::new(std::sync::Barrier::new(2));
+        let bb = Arc::clone(&barrier_b);
+
+        svc.start_managed_peer_stream(peer_b, 1, move |s, pid, _g, sid, _rx| async move {
+            let g = s.begin_peer_native_op(&pid, Some(sid), "peer_b_native");
+            let _ = tokio::task::spawn_blocking(move || {
+                let _guard = g;
+                let _ = enter_b_tx.send(());
+                bb.wait();
+            })
+            .await;
+        })
+        .await
+        .unwrap();
+        enter_b_rx.await.unwrap();
+
+        // Peer A: cooperative task that pauses at a deterministic channel after seeing cancel
+        let (a_cancel_seen_tx, a_cancel_seen_rx) = tokio::sync::oneshot::channel::<()>();
+        let (a_allow_exit_tx, a_allow_exit_rx) = tokio::sync::oneshot::channel::<()>();
+        svc.start_managed_peer_stream(peer_a, 1, move |_s, _pid, _g, _sid, mut rx| async move {
+            let _ = rx.changed().await;
+            let _ = a_cancel_seen_tx.send(());
+            let _ = a_allow_exit_rx.await;
+        })
+        .await
+        .unwrap();
+
+        // Peer B times out and transitions into lingering supervision while Peer A stays active
+        assert!(svc.teardown_peer_stream_async(peer_b).await.is_err());
+        assert_eq!(svc.lingering_tasks_count(), 1);
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Start Peer A teardown in background: removes Peer A from active_peer_streams and awaits Peer A's task
+        let svc_a = Arc::clone(&svc);
+        let td_a_task = tokio::spawn(async move { svc_a.teardown_peer_stream_async(peer_a).await });
+
+        // Wait deterministically until Peer A is mid-teardown (active_peer_streams is now EMPTY, in_flight_teardowns == 1!)
+        a_cancel_seen_rx.await.expect("Peer A saw cancel");
+        assert!(!svc.is_peer_stream_active(peer_a));
+
+        // Release Peer B while Peer A is STILL draining mid-teardown!
+        let eval_before = svc.shutdown_eval_count();
+        barrier_b.wait();
+        wait_for_lingering_count(&svc, 0).await;
+        wait_for_reaped_total(&svc, 1).await;
+        wait_for_shutdown_eval_after(&svc, eval_before).await;
+
+        // Hardware MUST NOT shut down yet because Peer A's teardown is still in-flight!
+        assert_eq!(
+            backend.stop_calls(),
+            0,
+            "Concurrent lingering task reap MUST NOT shut down hardware while another peer teardown is in-flight"
+        );
+        assert!(svc.is_active());
+
+        // Now allow Peer A's task to finish -> Peer A teardown completes Ok and shuts down hardware once
+        let _ = a_allow_exit_tx.send(());
+        let td_a_res = td_a_task.await.unwrap();
+        assert!(td_a_res.is_ok());
+        assert_eq!(backend.stop_calls(), 1);
+        assert_eq!(svc.shutdown_execution_count(), 1);
+        assert!(!svc.is_active());
+    }
+
+    #[tokio::test]
+    async fn test_camera_teardown_future_cancellation_supervises_handle_and_reaps_hardware() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_td_cancel_safe",
+            Arc::clone(&backend),
+            Duration::from_secs(5),
+            Duration::from_millis(40),
+        );
+        let peer = "f4000000000000000000000000000001";
+
+        let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_seen_tx, cancel_seen_rx) = tokio::sync::oneshot::channel::<()>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_w = Arc::clone(&barrier);
+
+        svc.start_managed_peer_stream(peer, 1, move |s, pid, _g, sid, mut rx| async move {
+            let g = s.begin_peer_native_op(&pid, Some(sid), "cancel_safe_native_op");
+            let blocking = tokio::task::spawn_blocking(move || {
+                let _guard = g;
+                let _ = enter_tx.send(());
+                b_w.wait();
+            });
+            let _ = rx.changed().await;
+            let _ = cancel_seen_tx.send(());
+            let _ = blocking.await;
+        })
+        .await
+        .unwrap();
+        enter_rx.await.unwrap();
+
+        // Launch teardown_peer_stream_async in a task and cancel/abort the teardown future mid-await!
+        let svc_td = Arc::clone(&svc);
+        let td_handle = tokio::spawn(async move {
+            let _ = svc_td.teardown_peer_stream_async(peer).await;
+        });
+
+        cancel_seen_rx.await.expect("stream saw cancel from teardown");
+        // Drop/abort the teardown future while it is still awaiting the stream task!
+        td_handle.abort();
+        let _ = td_handle.await;
+
+        // Cancel-safe TeardownInFlightGuard::drop must have marked native op lingering and supervised the stream handle!
+        assert!(
+            svc.lingering_tasks_count() >= 1,
+            "Cancelling teardown future mid-await must transfer remaining handle/native op to lingering supervision"
+        );
+        assert_eq!(backend.stop_calls(), 0, "Hardware must remain retained while native op is blocked");
+        assert!(svc.is_active());
+
+        // Release barrier -> completion-driven reaper finishes reaping and shuts down hardware exact-once!
+        barrier.wait();
+        backend.wait_for_stop_count(1).await;
+        wait_for_lingering_count(&svc, 0).await;
+        assert_eq!(backend.stop_calls(), 1);
+        assert_eq!(svc.shutdown_execution_count(), 1);
+        assert!(!svc.is_active());
+    }
+
+    #[tokio::test]
+    async fn test_camera_unscoped_native_op_and_non_lingering_poisoned_mutex_protection() {
+        // --- Subcase 1: Peer native op registered with stream_id == None still blocks false Ok and retains hardware ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_none_stream_id_op",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let peer = "f5000000000000000000000000000001";
+
+            let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let b_w = Arc::clone(&barrier);
+
+            svc.start_managed_peer_stream(peer, 1, move |s, pid, _g, _sid, _rx| async move {
+                // Deliberately pass stream_id = None
+                let g = s.begin_peer_native_op(&pid, None, "unscoped_native_op");
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = g;
+                    let _ = enter_tx.send(());
+                    b_w.wait();
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+            enter_rx.await.unwrap();
+
+            let td = svc.teardown_peer_stream_async(peer).await;
+            assert!(
+                td.is_err(),
+                "Teardown must fail honestly when a peer native op with stream_id=None remains active"
+            );
+            assert_eq!(svc.lingering_tasks_count(), 1);
+            assert_eq!(backend.stop_calls(), 0);
+
+            barrier.wait();
+            backend.wait_for_stop_count(1).await;
+            wait_for_lingering_count(&svc, 0).await;
+            assert_eq!(backend.stop_calls(), 1);
+        }
+
+        // --- Subcase 2: Poisoned non-lingering lifecycle mutex (`active_peer_streams`) returns Err and refuses shutdown ---
+        {
+            let backend = MockCameraBackend::new();
+            let svc = new_test_camera_service(
+                "cam_poison_streams_mutex",
+                Arc::clone(&backend),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            );
+            let peer = "f5000000000000000000000000000002";
+
+            svc.ensure_capture_hardware_started().await.unwrap();
+
+            let streams_mutex = Arc::clone(&svc.active_peer_streams);
+            let join_res = std::thread::spawn(move || {
+                let _g = streams_mutex.lock().unwrap();
+                panic!("intentional poison of active_peer_streams");
+            })
+            .join();
+            assert!(join_res.is_err());
+
+            assert!(svc.lingering_tasks_count() >= 1);
+            let td = svc.teardown_peer_stream_async(peer).await;
+            assert!(
+                td.is_err(),
+                "Teardown must return Err when active_peer_streams mutex is poisoned"
+            );
+            assert_eq!(backend.stop_calls(), 0, "Hardware shutdown must be conservatively refused");
+            assert!(svc.is_active());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_camera_same_generation_reconnect_and_stale_generation_rejection() {
+        let backend = MockCameraBackend::new();
+        let svc = new_test_camera_service(
+            "cam_reconnect_gen",
+            Arc::clone(&backend),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let peer = "f6000000000000000000000000000001";
+
+        let (conn1_exited_tx, conn1_exited_rx) = tokio::sync::oneshot::channel::<()>();
+        // Conn 1 starts at generation 3
+        let stream1_id = svc
+            .start_managed_peer_stream_replacing(peer, 3, move |s, pid, _g, sid, mut rx| async move {
+                let _ = rx.changed().await;
+                s.unregister_peer_stream_by_id(&pid, sid);
+                let _ = s.lifecycle.try_shutdown_hardware_if_idle_async().await;
+                let _ = conn1_exited_tx.send(());
+            })
+            .await
+            .expect("conn1 start");
+
+        // Stale generation 1 MUST be rejected without disturbing active generation 3!
+        let stale_res = svc
+            .start_managed_peer_stream_replacing(peer, 1, move |_s, _pid, _g, _sid, _rx| async move {})
+            .await;
+        assert!(stale_res.is_err(), "Stale generation 1 must not evict active generation 3 stream");
+        assert!(svc.is_peer_stream_active(peer));
+        assert_eq!(backend.stop_calls(), 0);
+
+        // Same-generation reconnect (Conn 2 at generation 3) replaces Conn 1 cleanly
+        let eval_before = svc.shutdown_eval_count();
+        let stream2_id = svc
+            .start_managed_peer_stream_replacing(peer, 3, move |_s, _pid, _g, _sid, mut rx| async move {
+                let _ = rx.changed().await;
+            })
+            .await
+            .expect("conn2 reconnect");
+        assert_ne!(stream1_id, stream2_id);
+
+        // Wait for Conn 1's watcher / exit to complete -> Conn 2 MUST remain active and hardware MUST stay running!
+        let _ = conn1_exited_rx.await;
+        wait_for_lingering_count(&svc, 0).await;
+        wait_for_shutdown_eval_after(&svc, eval_before).await;
+
+        assert!(
+            svc.is_peer_stream_active(peer),
+            "Departing Conn 1 must NOT clobber same-generation reconnect Conn 2"
+        );
+        assert_eq!(backend.stop_calls(), 0, "Hardware must NOT shut down while Conn 2 is active");
+        assert!(svc.is_active());
+
+        // Tear down Conn 2 cleanly -> hardware shuts down exact-once
+        assert!(svc.teardown_peer_stream_async(peer).await.is_ok());
+        assert_eq!(backend.stop_calls(), 1);
+        assert!(!svc.is_active());
+    }
+
+    fn make_test_camera_svc(label: &str) -> Arc<CameraService> {
+        let features = Arc::new(FeatureManager::new());
+        let _ = features.set_flag_checked("camera", true);
+        let discovery = DiscoveryManager::new(label);
+        CameraService::new(discovery, features)
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_rejects_unpaired_or_unknown_peer() {
+        let svc = make_test_camera_svc("cam_unknown_test");
+
+        // 1. Unpaired peer ID must be rejected by start_remote_request
+        let unknown_peer = "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000";
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ks.unpair_peer(unknown_peer);
+            crate::security::transport::clear_peer_revocation(unknown_peer);
+        }
+        let res = svc.start_remote_request(Some(unknown_peer)).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not a verified paired identity"));
+
+        // 2. None peer identifier must fail closed
+        let res_none = svc.start_remote_request(None).await;
+        assert!(res_none.is_err());
+        assert!(res_none.unwrap_err().contains("requires authenticated peer identity"));
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_pairing_alone_does_not_grant_access() {
+        let svc = make_test_camera_svc("cam_pairing_alone");
+        let peer = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap();
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        // Pairing alone must NEVER automatically grant camera permission
+        assert!(!svc.has_peer_consent(peer, 1), "Pairing alone must not grant camera consent");
+        assert_eq!(
+            svc.query_consent_status(peer),
+            crate::camera::authorization::CameraConsentStatusWire::RequiresPrompt
+        );
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_denial_enters_temporary_cooldown_integration() {
+        let svc = make_test_camera_svc("cam_denial_cooldown");
+        let peer = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap();
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        // Record temporary denial
+        svc.record_peer_denial(
+            crate::camera::authorization::LeaseDirection::OutboundSender,
+            peer,
+            crate::camera::authorization::CameraDenialAction::Temporary,
+        );
+
+        // Subsequent remote request must fail immediately due to active cooldown
+        let res = svc.start_remote_request(Some(peer)).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err();
+        assert!(err_msg.contains("cooldown active") && err_msg.contains("consecutive denials"));
+
+        // Unblock device clears cooldown
+        svc.unblock_peer_camera(peer);
+        assert_eq!(
+            svc.query_consent_status(peer),
+            crate::camera::authorization::CameraConsentStatusWire::RequiresPrompt
+        );
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_windows_receiver_consent_lifecycle() {
+        let svc = make_test_camera_svc("cam_receiver_consent");
+        let peer = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap();
+            ks.register_test_peer_with_generation(peer, 2);
+        }
+
+        // Initially receiver consent is NOT granted
+        assert!(!svc.has_receiver_consent(peer, 2));
+
+        // Grant receiver consent for active session
+        assert!(svc.grant_receiver_consent(
+            peer,
+            2,
+            crate::camera::authorization::CameraConsentScope::ActiveSession
+        ));
+        assert!(svc.has_receiver_consent(peer, 2));
+
+        // Mismatched generation fails closed
+        assert!(!svc.has_receiver_consent(peer, 1));
+        assert!(!svc.has_receiver_consent(peer, 3));
+
+        // Revoking peer in transport registry immediately fails closed
+        crate::security::transport::terminate_active_sessions_for_peer(peer);
+        assert!(!svc.has_receiver_consent(peer, 2));
+        crate::security::transport::clear_peer_revocation(peer);
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_always_allow_persists_in_keystore_and_reloads() {
+        let peer = "99887766554433221100aabbccddeeff99887766554433221100aabbccddeeff";
+        let gen = 5;
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap();
+            ks.register_test_peer_with_generation(peer, gen);
+        }
+
+        let svc = make_test_camera_svc("cam_always_allow_test");
+
+        // Grant AlwaysAllow
+        assert!(svc.grant_peer_consent_scoped(
+            peer,
+            gen,
+            crate::camera::authorization::CameraConsentScope::AlwaysAllow,
+            0
+        ));
+        assert!(svc.has_peer_consent(peer, gen));
+
+        // Verify it was persisted into Keystore
+        {
+            let ks = crate::security::keystore::global_keystore().lock().unwrap();
+            assert_eq!(
+                ks.get_camera_consent(peer),
+                Some(format!("always_allow:{}", gen))
+            );
+        }
+
+        // Simulate daemon restart: create a new CameraService instance
+        let svc_restarted = make_test_camera_svc("cam_always_allow_reloaded");
+
+        // Must still have consent for generation 5
+        assert!(
+            svc_restarted.has_peer_consent(peer, gen),
+            "AlwaysAllow must persist and load into newly initialized CameraService"
+        );
+        // But NOT for older or newer generation
+        assert!(!svc_restarted.has_peer_consent(peer, gen + 1));
+
+        // Clean up: unblock peer
+        svc_restarted.unblock_peer_camera(peer);
+        assert!(!svc_restarted.has_peer_consent(peer, gen));
+    }
+
+    #[tokio::test]
+    async fn test_camera_consent_midstream_revocation_stops_frame_dispatch() {
+        let svc = make_test_camera_svc("cam_midstream_revocation");
+        let peer = "cafebeefcafebeefcafebeefcafebeefcafebeefcafebeefcafebeefcafebeef";
+
+        {
+            let mut ks = crate::security::keystore::global_keystore().lock().unwrap();
+            ks.register_test_peer_with_generation(peer, 1);
+        }
+
+        let rx = svc.register_peer_stream(peer, 1);
+        assert!(svc.grant_peer_consent(peer, 1));
+        assert!(svc.has_peer_consent(peer, 1));
+        assert!(!*rx.borrow());
+
+        let mailbox = svc.frame_hub.subscribe(peer);
+        svc.frame_hub.publish_frame(vec![1, 2, 3], false);
+        assert_eq!(*mailbox.take().unwrap(), vec![1, 2, 3]);
+
+        // Revoke consent midstream
+        svc.revoke_peer_consent(peer);
+
+        // Consent immediately revoked, stream signaled, hub unsubscribed
+        assert!(!svc.has_peer_consent(peer, 1));
+        assert!(*rx.borrow(), "Revocation must signal stream cancellation watch");
+        assert_eq!(svc.frame_hub.active_subscriber_count(), 0);
     }
 }

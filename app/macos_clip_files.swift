@@ -1,3 +1,31 @@
+// ============================================================================
+// Module: macos_clip_files.swift
+// Description: macOS Native Pasteboard File URL Serialization & Ingestion Bridge
+//
+// Upstream Callers:
+//   - Integrator Rust Clipboard Subsystem (`app/src/clipboard/service.rs`)
+//   - Cross-screen Drag & Drop / File Transfer Pipeline (`app/src/clipboard/file_transfer.rs`)
+//
+// Downstream Callees:
+//   - AppKit NSPasteboard (`NSPasteboard.general`)
+//   - Foundation NSURL / URL serialization APIs
+//
+// Cross-Platform / Cross-Device Flow:
+//   - Read: Ingests macOS Finder copied file URLs (`NSPasteboard.PasteboardType.fileURL`)
+//     and serializes them as newline or NUL-delimited POSIX paths for transmission across
+//     TransportV2 to Windows 11 explorer drop targets.
+//   - Write: Receives file paths staged from Windows 11 SMB shares or direct transport,
+//     and publishes them to NSPasteboard as `public.file-url` objects for macOS Finder pasting.
+//
+// Threading & Concurrency Model:
+//   - Short-lived standalone native command line utility executed synchronously via
+//     `std::process::Command` by the Tokio worker thread pool in Rust core.
+//
+// Security & Safety Invariants:
+//   - Validates all input paths against NUL-byte injection (`\0`) and path traversal hazards.
+//   - Rejects non-file URL objects; enforces deduplication via Set tracking.
+// ============================================================================
+
 import Cocoa
 import Foundation
 

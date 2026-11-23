@@ -1840,7 +1840,7 @@ pub fn find_sunshine_conf() -> Option<PathBuf> {
         }
     }
 
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "windows")]
     {
         for env_key in WINDOWS_CONF_ENV_KEYS {
@@ -1877,6 +1877,22 @@ pub fn find_sunshine_conf() -> Option<PathBuf> {
         for sys_dir in MACOS_SUNSHINE_CONF_SYSTEM_DIRS {
             candidates.push(PathBuf::from(sys_dir).join(config::SUNSHINE_CONF_FILENAME));
         }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("sunshine")
+                    .join(config::SUNSHINE_CONF_FILENAME),
+            );
+        }
+        candidates.push(
+            PathBuf::from("/etc")
+                .join("sunshine")
+                .join(config::SUNSHINE_CONF_FILENAME),
+        );
     }
 
     candidates.into_iter().find(|p| p.is_file())
@@ -3446,6 +3462,13 @@ mod tests {
         assert_eq!(sanitize_adapter_link_speed(LinkTransport::DirectUsb, Some(100)), None);
         assert_eq!(sanitize_adapter_link_speed(LinkTransport::DirectUsb, Some(5_000)), Some(5_000));
         assert_eq!(sanitize_adapter_link_speed(LinkTransport::Ethernet, Some(100)), Some(100));
+    }
+
+    #[test]
+    fn test_find_sunshine_conf_runs_safely() {
+        use super::find_sunshine_conf;
+        // Verify that candidate search completes without panic across all target OS platforms
+        let _ = find_sunshine_conf();
     }
 
     #[test]

@@ -215,6 +215,10 @@ pub enum AudioUdpError {
     UnknownSession([u8; 8]),
     /// Session has expired past its 15-minute TTL or 60-second idle inactivity timeout.
     SessionExpired,
+    /// Peer associated with this audio session has been actively revoked.
+    SessionRevoked,
+    /// Peer trust generation has changed (re-paired or invalidated); session is stale.
+    SessionStaleGeneration,
     /// Packet sequence number is older than the 64-packet anti-replay sliding window.
     PacketTooOld { pkt_seq: u64, highest_seq: u64 },
     /// Packet sequence number has already been received within the active 64-packet window (replay detected).
@@ -245,6 +249,8 @@ impl fmt::Display for AudioUdpError {
                 write!(f, "Unknown UDP audio session {:02x?}", id)
             }
             Self::SessionExpired => write!(f, "UDP audio session expired"),
+            Self::SessionRevoked => write!(f, "UDP audio session peer revoked"),
+            Self::SessionStaleGeneration => write!(f, "UDP audio session trust generation is stale"),
             Self::PacketTooOld {
                 pkt_seq,
                 highest_seq,
@@ -553,6 +559,8 @@ pub struct AudioSessionReceiver {
     session_id: [u8; 8],
     /// 16-byte raw device UUID of the authenticated remote peer.
     peer_device_id: [u8; 16],
+    /// Authoritative keystore/transport trust generation active during negotiation.
+    pub trust_generation: u64,
     /// 32-byte ChaCha20-Poly1305 symmetric audio decryption key.
     k_audio: Zeroizing<[u8; 32]>,
     /// 4-byte static IV salt prefix for nonce derivation.
@@ -574,6 +582,7 @@ impl AudioSessionReceiver {
     pub fn new(
         session_id: [u8; 8],
         peer_device_id: [u8; 16],
+        trust_generation: u64,
         k_audio: Zeroizing<[u8; 32]>,
         nonce_salt: [u8; 4],
         channels: u8,
@@ -583,6 +592,7 @@ impl AudioSessionReceiver {
         Self {
             session_id,
             peer_device_id,
+            trust_generation,
             k_audio,
             nonce_salt,
             channels,
@@ -709,6 +719,7 @@ impl AudioSessionRegistry {
     pub fn negotiate_receiver_session(
         &mut self,
         peer_device_id: [u8; 16],
+        trust_generation: u64,
         k_root: &[u8; 32],
         sender_nonce: &[u8; 32],
         sample_rate: u32,
@@ -716,6 +727,16 @@ impl AudioSessionRegistry {
         bit_depth: u8,
         now_secs: u64,
     ) -> Result<NegotiatedAudioSessionWire, AudioUdpError> {
+        let clean_id = crate::security::hex_encode(&peer_device_id);
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            return Err(AudioUdpError::SessionRevoked);
+        }
+        if let Some(cur_gen) = crate::security::transport::get_peer_trust_generation(&clean_id) {
+            if cur_gen != trust_generation {
+                return Err(AudioUdpError::SessionStaleGeneration);
+            }
+        }
+
         if constant_time_eq(sender_nonce, &[0u8; 32]) {
             return Err(AudioUdpError::InvalidHandshakeParam(
                 "sender_nonce must be non-zero",
@@ -785,6 +806,7 @@ impl AudioSessionRegistry {
         let receiver = AudioSessionReceiver::new(
             session_id,
             peer_device_id,
+            trust_generation,
             k_audio,
             nonce_salt,
             channels,
@@ -798,6 +820,13 @@ impl AudioSessionRegistry {
             receiver_nonce_hex: crate::security::hex_encode(&receiver_nonce),
             expires_in_secs: AUDIO_SESSION_TTL_SECS,
         })
+    }
+
+    /// Immediately and unconditionally evicts all active audio sessions associated with the given peer.
+    pub fn revoke_peer_sessions(&mut self, peer_device_id: &[u8; 16]) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, s| s.peer_device_id != *peer_device_id);
+        before - self.sessions.len()
     }
 
     /// Verifies and decrypts an incoming `IUA2` UDP datagram against the matching session.
@@ -818,6 +847,21 @@ impl AudioSessionRegistry {
             self.sessions.remove(&expired_id);
             return Err(AudioUdpError::SessionExpired);
         }
+
+        let clean_id = crate::security::hex_encode(&session.peer_device_id);
+        if crate::security::transport::is_peer_revoked(&clean_id) {
+            let expired_id = header.session_id;
+            self.sessions.remove(&expired_id);
+            return Err(AudioUdpError::SessionRevoked);
+        }
+        if let Some(cur_gen) = crate::security::transport::get_peer_trust_generation(&clean_id) {
+            if cur_gen != session.trust_generation {
+                let stale_id = header.session_id;
+                self.sessions.remove(&stale_id);
+                return Err(AudioUdpError::SessionStaleGeneration);
+            }
+        }
+
         let peer_id = session.peer_device_id;
         let (hdr, plain) = session.open_datagram(datagram, now_secs)?;
         Ok((peer_id, hdr, plain))
@@ -843,9 +887,10 @@ mod tests {
         let k_root = [0x77u8; 32];
         let sender_nonce = [0x11u8; 32];
 
+        crate::security::transport::register_peer_trust_generation(&crate::security::hex_encode(&peer_id), 1);
         let mut registry = AudioSessionRegistry::new();
         let wire = registry
-            .negotiate_receiver_session(peer_id, &k_root, &sender_nonce, 48_000, 2, 24, now)
+            .negotiate_receiver_session(peer_id, 1, &k_root, &sender_nonce, 48_000, 2, 24, now)
             .expect("negotiate session");
 
         let session_id = crate::security::hex_decode_array::<8>(&wire.session_id_hex).unwrap();
@@ -990,11 +1035,12 @@ mod tests {
         let now = 1_750_000_000u64;
         let peer_id = [0x42u8; 16];
         let k_root = [0x77u8; 32];
+        crate::security::transport::register_peer_trust_generation(&crate::security::hex_encode(&peer_id), 1);
         let mut reg = AudioSessionRegistry::new();
 
         // Zero sender_nonce rejected
         assert_eq!(
-            reg.negotiate_receiver_session(peer_id, &k_root, &[0u8; 32], 48_000, 2, 24, now)
+            reg.negotiate_receiver_session(peer_id, 1, &k_root, &[0u8; 32], 48_000, 2, 24, now)
                 .unwrap_err(),
             AudioUdpError::InvalidHandshakeParam("sender_nonce must be non-zero")
         );
@@ -1002,7 +1048,7 @@ mod tests {
         // Per-peer session limit enforced cleanly
         let sender_nonce = [0x11u8; 32];
         for i in 0..4 {
-            reg.negotiate_receiver_session(peer_id, &k_root, &sender_nonce, 48_000, 2, 24, now + i)
+            reg.negotiate_receiver_session(peer_id, 1, &k_root, &sender_nonce, 48_000, 2, 24, now + i)
                 .unwrap();
         }
         assert_eq!(reg.active_session_count_at(now + 3), MAX_PER_PEER_AUDIO_SESSIONS);
@@ -1020,5 +1066,76 @@ mod tests {
             reg2.open_incoming_datagram(&bad_pcm, now2),
             Err(AudioUdpError::PayloadLengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_audio_udp_immediate_revocation_and_generation_invalidation() {
+        let now = 1_750_000_000u64;
+        let peer_id = [0x77u8; 16];
+        let peer_hex = crate::security::hex_encode(&peer_id);
+        let k_root = [0x88u8; 32];
+        let sender_nonce = [0x22u8; 32];
+
+        crate::security::transport::clear_peer_revocation(&peer_hex);
+        crate::security::transport::register_peer_trust_generation(&peer_hex, 1);
+
+        let mut reg = AudioSessionRegistry::new();
+        let wire = reg
+            .negotiate_receiver_session(peer_id, 1, &k_root, &sender_nonce, 48_000, 2, 24, now)
+            .expect("negotiate session for generation 1");
+
+        let session_id = crate::security::hex_decode_array::<8>(&wire.session_id_hex).unwrap();
+        let receiver_nonce =
+            crate::security::hex_decode_array::<32>(&wire.receiver_nonce_hex).unwrap();
+        let (k_audio, nonce_salt) =
+            derive_audio_session_keys(&k_root, &sender_nonce, &receiver_nonce, &session_id);
+
+        let mut sender = AudioSessionSender::new(
+            session_id,
+            k_audio,
+            nonce_salt,
+            now + wire.expires_in_secs,
+        );
+
+        let pcm = vec![0x12u8; 576];
+        let dgram = sender
+            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 1_000, 96, &pcm, now)
+            .expect("seal packet");
+
+        // Before revocation: datagram verifies and decrypts cleanly
+        let (out_peer, _, decrypted) = reg
+            .open_incoming_datagram(&dgram, now)
+            .expect("datagram must open successfully");
+        assert_eq!(out_peer, peer_id);
+        assert_eq!(decrypted, pcm);
+
+        // Revocation Phase A: Invalidate trust generation to 2 in transport registry
+        crate::security::transport::invalidate_peer_trust(&peer_hex, 2);
+
+        // Next datagram for generation 1 must be IMMEDIATELY rejected and evicted without waiting 300s TTL
+        let dgram2 = sender
+            .seal_datagram(AUDIO_FLAG_PCM_FRAME, 2_000, 96, &pcm, now)
+            .expect("seal packet 2");
+
+        let err = reg.open_incoming_datagram(&dgram2, now).unwrap_err();
+        assert!(
+            err == AudioUdpError::SessionRevoked || err == AudioUdpError::SessionStaleGeneration,
+            "Revoked peer datagram must be rejected immediately"
+        );
+
+        // Session was removed from registry on rejection
+        assert_eq!(reg.active_session_count_at(now), 0);
+
+        // Test explicit peer-scoped revocation
+        crate::security::transport::clear_peer_revocation(&peer_hex);
+        crate::security::transport::register_peer_trust_generation(&peer_hex, 3);
+        let _wire2 = reg
+            .negotiate_receiver_session(peer_id, 3, &k_root, &sender_nonce, 48_000, 2, 24, now)
+            .expect("negotiate for generation 3");
+        assert_eq!(reg.active_session_count_at(now), 1);
+
+        let evicted_count = reg.revoke_peer_sessions(&peer_id);
+        assert_eq!(evicted_count, 1, "Must evict exactly 1 session for peer");
+        assert_eq!(reg.active_session_count_at(now), 0);
     }
 }

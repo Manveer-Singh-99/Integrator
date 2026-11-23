@@ -429,6 +429,8 @@ struct FeatureFlagsModel: Codable, Hashable {
     var benchmark: Bool? = true
     /// Mac -> PC shared virtual camera streaming flag.
     var camera: Bool? = false
+    /// Windows 11 remote Touch ID biometrics and Passkey authentication flag.
+    var touchid: Bool? = true
 }
 
 /// User-configured desk layout configuration for multi-monitor cursor transitions.
@@ -1544,6 +1546,7 @@ struct MainDashboardView: View {
                             if show(.input) {
                                 kvmLayoutCard
                                 clipboardCard
+                                dragDropCard
                             }
                             if show(.network) {
                                 discoveryTrustCard
@@ -2726,8 +2729,17 @@ struct MainDashboardView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 6) {
-                Label("Touch ID Biometric Gate (Mac → Windows 11)", systemImage: "touchid")
-                    .font(.subheadline.weight(.semibold))
+                HStack {
+                    Label("Touch ID Biometric Gate (Mac → Windows 11)", systemImage: "touchid")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { flags.touchid ?? true },
+                        set: { vm.toggleFeature("touchid", enabled: $0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
                 Text("Authenticates local or remote Windows 11 Touch ID challenges via Apple Secure Enclave over encrypted TransportV2.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -3176,6 +3188,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         win.titleVisibility = .hidden
         win.isOpaque = false
         win.backgroundColor = .clear
+        win.sharingType = .none
         win.center()
         win.delegate = self
         mainWindow = win

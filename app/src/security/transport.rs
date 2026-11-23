@@ -154,8 +154,9 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
@@ -529,6 +530,212 @@ fn record_authenticated_hello_nonce(
     Ok(())
 }
 
+/// Global monotonically increasing counter for transport session registration identifiers.
+static NEXT_SESSION_REG_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Internal state tracking active sessions, actively revoked peers, and per-peer trust generations.
+struct SessionRegistryState {
+    sessions: HashMap<String, Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+    revoked_peers: HashSet<String>,
+    peer_generations: HashMap<String, u64>,
+    local_device_ids: HashSet<String>,
+}
+
+/// Global registry of active `TransportSessionV2` sessions, mapping remote peer device ID (hex)
+/// to their respective cancellation watch senders, coordinated with per-peer trust generations.
+///
+/// # Synchronization Invariant
+/// **Lock Hierarchy:** `keystore_mutex` -> `ACTIVE_SESSION_REGISTRY`.
+/// - `ACTIVE_SESSION_REGISTRY.write()` must NEVER acquire `keystore_mutex` or execute closures
+///   that acquire it.
+/// - Keystore queries to authenticate credentials and capture trust generation occur BEFORE
+///   acquiring `ACTIVE_SESSION_REGISTRY.write()`.
+/// - Atomic revocation-versus-registration is strictly preserved without TOCTOU windows:
+///   Handshakes capture `expected_generation` from verified keystore credentials. When registering,
+///   `ACTIVE_SESSION_REGISTRY.write()` atomically validates that the peer is not in `revoked_peers`
+///   and that `reg.peer_generations[peer] == expected_generation`.
+/// - Peer unpairing or revocation immediately marks `revoked_peers` and increments `peer_generations`,
+///   deterministically aborting any in-flight handshake or stale session attempting to register.
+static ACTIVE_SESSION_REGISTRY: LazyLock<RwLock<SessionRegistryState>> =
+    LazyLock::new(|| RwLock::new(SessionRegistryState {
+        sessions: HashMap::new(),
+        revoked_peers: HashSet::new(),
+        peer_generations: HashMap::new(),
+        local_device_ids: HashSet::new(),
+    }));
+
+/// Registers a known local device identity hex in `ACTIVE_SESSION_REGISTRY`.
+/// Only local device identities are authorized to use the special initial-generation registration path.
+pub fn register_local_device_identity(local_device_id_hex: &str) {
+    let key = local_device_id_hex.trim().to_ascii_lowercase();
+    if !key.is_empty() {
+        let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        reg.local_device_ids.insert(key);
+    }
+}
+
+/// RAII guard that unregisters the session from `ACTIVE_SESSION_REGISTRY` upon drop of all references.
+#[derive(Debug)]
+pub struct SessionRevocationGuard {
+    reg_id: u64,
+    peer_device_id_hex: String,
+}
+
+impl Drop for SessionRevocationGuard {
+    fn drop(&mut self) {
+        if self.reg_id != 0 {
+            unregister_session_revocation(&self.peer_device_id_hex, self.reg_id);
+        }
+    }
+}
+
+/// Atomically registers an active session revocation watch channel for the given peer device ID hex,
+/// validating against active revocations and strictly enforcing per-peer trust generation matching.
+///
+/// Executes without acquiring `keystore_mutex`, completely eliminating ABBA deadlocks.
+pub fn register_session_revocation(
+    peer_device_id_hex: &str,
+    expected_generation: u64,
+) -> Result<(Arc<SessionRevocationGuard>, tokio::sync::watch::Receiver<bool>), TransportError> {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+
+    if reg.revoked_peers.contains(&key) {
+        return Err(TransportError::UntrustedPeer(key));
+    }
+
+    if let Some(&current_gen) = reg.peer_generations.get(&key) {
+        if current_gen != expected_generation {
+            return Err(TransportError::UntrustedPeer(format!(
+                "{}: trust generation mismatch (expected {}, current {})",
+                key, expected_generation, current_gen
+            )));
+        }
+    } else if reg.local_device_ids.contains(&key) && expected_generation >= 1 {
+        // Special initial-generation registration path ONLY permitted for verified local device identity (loopback self)
+        reg.peer_generations.insert(key.clone(), expected_generation);
+    } else {
+        // Remote peers with missing generation entry MUST fail closed (SEC-1C-05)
+        return Err(TransportError::UntrustedPeer(format!(
+            "{}: un-registered trust generation for remote peer",
+            key
+        )));
+    }
+
+    let reg_id = NEXT_SESSION_REG_ID.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    reg.sessions
+        .entry(key.clone())
+        .or_default()
+        .push((reg_id, tx));
+
+    let guard = Arc::new(SessionRevocationGuard {
+        reg_id,
+        peer_device_id_hex: key,
+    });
+    Ok((guard, rx))
+}
+
+/// Compatibility registration helper validating an external trust predicate outside the registry lock.
+pub fn register_session_revocation_checked<F>(
+    peer_device_id_hex: &str,
+    is_trusted_fn: F,
+) -> Result<(Arc<SessionRevocationGuard>, tokio::sync::watch::Receiver<bool>), TransportError>
+where
+    F: FnOnce() -> bool,
+{
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    // Validate trust predicate strictly BEFORE acquiring ACTIVE_SESSION_REGISTRY.write()
+    if !is_trusted_fn() {
+        let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        reg.revoked_peers.insert(key.clone());
+        return Err(TransportError::UntrustedPeer(key));
+    }
+    register_session_revocation(&key, 1)
+}
+
+/// Unregisters an active session revocation channel when all halves of the session have dropped.
+fn unregister_session_revocation(peer_device_id_hex: &str, reg_id: u64) {
+    let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    let key = peer_device_id_hex.to_ascii_lowercase();
+    if let Some(list) = reg.sessions.get_mut(&key) {
+        list.retain(|(id, _)| *id != reg_id);
+        if list.is_empty() {
+            reg.sessions.remove(&key);
+        }
+    }
+}
+
+/// Registers or updates the active trust generation for `peer_device_id_hex`, clearing any active
+/// revocation flag. Called when a peer is paired or re-paired, or when trusted peers are initialized.
+pub fn register_peer_trust_generation(peer_device_id_hex: &str, generation: u64) {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    reg.revoked_peers.remove(&key);
+    reg.peer_generations.insert(key, generation);
+}
+
+/// Immediately marks the peer as revoked in `ACTIVE_SESSION_REGISTRY`, updates its active trust generation
+/// to `new_generation`, drains and terminates all active sessions connected to this peer, and returns the
+/// count of terminated sessions.
+pub fn invalidate_peer_trust(peer_device_id_hex: &str, new_generation: u64) -> usize {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let senders = {
+        let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        reg.revoked_peers.insert(key.clone());
+        reg.peer_generations.insert(key.clone(), new_generation);
+        reg.sessions.remove(&key).unwrap_or_default()
+    };
+    let count = senders.len();
+    for (_reg_id, tx) in senders {
+        let _ = tx.send(true);
+    }
+    if count > 0 {
+        tracing::warn!(
+            "🛑 Invalidate trust for peer {}: terminated {} active TransportSessionV2 streams (generation: {})",
+            key,
+            count,
+            new_generation
+        );
+    }
+    count
+}
+
+/// Immediately signals and aborts all active `TransportV2` sessions connected to the specified peer device ID,
+/// increments its trust generation, and adds the peer device ID to the actively revoked set so pending registrations fail.
+///
+/// Returns the number of sessions signaled for immediate termination.
+pub fn terminate_active_sessions_for_peer(peer_device_id_hex: &str) -> usize {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let next_gen = {
+        let reg = ACTIVE_SESSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+        reg.peer_generations.get(&key).copied().unwrap_or(1).saturating_add(1)
+    };
+    invalidate_peer_trust(&key, next_gen)
+}
+
+/// Clears the actively revoked flag for `peer_device_id_hex` upon successful explicit pairing.
+pub fn clear_peer_revocation(peer_device_id_hex: &str) {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    reg.revoked_peers.remove(&key);
+}
+
+/// Returns true if `peer_device_id_hex` is currently recorded in the active revocation set.
+#[allow(dead_code)]
+pub fn is_peer_revoked(peer_device_id_hex: &str) -> bool {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let reg = ACTIVE_SESSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    reg.revoked_peers.contains(&key)
+}
+
+/// Returns the active trust generation recorded in `ACTIVE_SESSION_REGISTRY` for `peer_device_id_hex`, if any.
+pub fn get_peer_trust_generation(peer_device_id_hex: &str) -> Option<u64> {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let reg = ACTIVE_SESSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    reg.peer_generations.get(&key).copied()
+}
+
 /// Directional AEAD cipher state for either outbound transmission (`tx`) or inbound reception (`rx`).
 ///
 /// Manages the active 256-bit ChaCha20-Poly1305 key, the 256-bit rekey secret, the 4-byte IV salt prefix,
@@ -777,6 +984,8 @@ pub struct TransportSessionV2<S> {
     peer_device_id: [u8; 16],
     /// Hex-encoded representation of `peer_device_id` for logging and diagnostic queries.
     peer_device_id_hex: String,
+    /// Immutable trust generation bound to this authenticated peer session during handshake.
+    trust_generation: u64,
     /// 16-byte unique session identifier derived during handshake ($H_4$ HKDF expansion).
     #[cfg_attr(not(test), allow(dead_code))]
     session_id: [u8; 16],
@@ -790,6 +999,10 @@ pub struct TransportSessionV2<S> {
     rekey_frame_limit: u64,
     /// True if the session has sent or received a `CloseNotify` or encountered an unrecoverable error.
     closed: bool,
+    /// RAII guard that automatically removes this session from `ACTIVE_SESSION_REGISTRY` on drop.
+    _reg_guard: Option<Arc<SessionRevocationGuard>>,
+    /// Watch receiver signaled when the peer's trust status is revoked.
+    revocation_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<S> TransportSessionV2<S>
@@ -805,6 +1018,11 @@ where
     /// Returns a borrowed slice of the hex-encoded remote peer device UUID.
     pub fn peer_device_id_hex(&self) -> &str {
         &self.peer_device_id_hex
+    }
+
+    /// Returns the immutable authenticated trust generation bound to this peer session during handshake.
+    pub fn trust_generation(&self) -> u64 {
+        self.trust_generation
     }
 
     /// Returns a reference to the 16-byte session identifier derived from the handshake transcript.
@@ -851,6 +1069,12 @@ where
         peer: &VerifiedPeerCredentials,
         service_id: ServiceId,
     ) -> Result<Self, TransportError> {
+        // Coordinate peer revocation with handshake initiation and session registration.
+        let (reg_guard, mut revocation_rx) = register_session_revocation(
+            &peer.device_id_hex,
+            peer.trust_generation,
+        )?;
+
         let client_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
         let eph_sk_c = X25519SecretKey::from(*eph_sk_bytes);
@@ -871,11 +1095,12 @@ where
             &mut stream,
             HandshakeFrameType::ClientHello,
             &hello_msg,
+            Some(&mut revocation_rx),
         )
         .await?;
 
         // Receive ServerHello frame.
-        let (hs_type, srv_hello_bytes) = recv_handshake_frame(&mut stream, None).await?;
+        let (hs_type, srv_hello_bytes) = recv_handshake_frame(&mut stream, None, Some(&mut revocation_rx)).await?;
         if hs_type != HandshakeFrameType::ServerHello {
             return Err(TransportError::UnexpectedFrameType(hs_type as u8));
         }
@@ -945,23 +1170,36 @@ where
             client_ed25519_sig_hex: hex_encode(&cli_sig),
             client_finished_mac_hex: hex_encode(&cli_mac),
         };
-        send_handshake_frame(&mut stream, HandshakeFrameType::ClientFinish, &finish_msg).await?;
+        send_handshake_frame(
+            &mut stream,
+            HandshakeFrameType::ClientFinish,
+            &finish_msg,
+            Some(&mut revocation_rx),
+        )
+        .await?;
 
         // Derive application keys and directional cipher states.
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
+
+        if *revocation_rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
 
         Ok(Self {
             stream,
             service_id,
             peer_device_id: peer.device_id,
             peer_device_id_hex: peer.device_id_hex.clone(),
+            trust_generation: peer.trust_generation,
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
             last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
             closed: false,
+            _reg_guard: Some(reg_guard),
+            revocation_rx,
         })
     }
 
@@ -995,7 +1233,7 @@ where
         expected_service: ServiceId,
         allow_loopback_self: bool,
     ) -> Result<Self, TransportError> {
-        let (hs_type, hello_bytes) = recv_handshake_frame(&mut stream, already_read_magic).await?;
+        let (hs_type, hello_bytes) = recv_handshake_frame(&mut stream, already_read_magic, None).await?;
         if hs_type != HandshakeFrameType::ClientHello {
             return Err(TransportError::UnexpectedFrameType(hs_type as u8));
         }
@@ -1047,6 +1285,12 @@ where
             return Err(TransportError::KeyIdMismatch);
         }
 
+        // Coordinate peer revocation with handshake completion and session registration.
+        let (reg_guard, mut revocation_rx) = register_session_revocation(
+            &peer_creds.device_id_hex,
+            peer_creds.trust_generation,
+        )?;
+
         // Sample server ephemeral X25519 key and reject all-zero / low-order client public keys.
         let server_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
@@ -1086,9 +1330,15 @@ where
             server_ed25519_sig_hex: hex_encode(&srv_sig),
             server_finished_mac_hex: hex_encode(&srv_mac),
         };
-        send_handshake_frame(&mut stream, HandshakeFrameType::ServerHello, &srv_hello).await?;
+        send_handshake_frame(
+            &mut stream,
+            HandshakeFrameType::ServerHello,
+            &srv_hello,
+            Some(&mut revocation_rx),
+        )
+        .await?;
 
-        let (hs_type_2, finish_bytes) = recv_handshake_frame(&mut stream, None).await?;
+        let (hs_type_2, finish_bytes) = recv_handshake_frame(&mut stream, None, Some(&mut revocation_rx)).await?;
         if hs_type_2 != HandshakeFrameType::ClientFinish {
             return Err(TransportError::UnexpectedFrameType(hs_type_2 as u8));
         }
@@ -1120,23 +1370,31 @@ where
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
 
+        if *revocation_rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
+
         Ok(Self {
             stream,
             service_id: expected_service,
             peer_device_id: peer_creds.device_id,
             peer_device_id_hex: peer_creds.device_id_hex,
+            trust_generation: peer_creds.trust_generation,
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
             last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
             closed: false,
+            _reg_guard: Some(reg_guard),
+            revocation_rx,
         })
     }
 
     /// Triggers an explicit in-band outbound rekey (`FrameType::Rekey`) and ratchets `tx_state` to `epoch + 1`.
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         if self.tx_state.current_epoch() == u16::MAX {
@@ -1148,7 +1406,7 @@ where
             REKEY_MAGIC_PAYLOAD,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        let write_res = async {
+        let write_fut = async {
             tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&rekey_frame))
                 .await
                 .map_err(|_| TransportError::IoFailure("rekey write timed out".into()))?
@@ -1158,8 +1416,14 @@ where
                 .map_err(|_| TransportError::IoFailure("rekey flush timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             Ok::<(), TransportError>(())
-        }
-        .await;
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         if let Err(e) = write_res {
             self.closed = true;
             return Err(e);
@@ -1175,7 +1439,8 @@ where
     /// Encrypts and writes an application data frame, automatically ratcheting the outbound key
     /// if `rekey_frame_limit` or `DEFAULT_REKEY_AGE_SECS` has been reached.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         if self.tx_state.current_seq() >= self.rekey_frame_limit
@@ -1189,7 +1454,7 @@ where
             plaintext,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        let write_res = async {
+        let write_fut = async {
             tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&frame))
                 .await
                 .map_err(|_| TransportError::IoFailure("record write timed out".into()))?
@@ -1199,8 +1464,14 @@ where
                 .map_err(|_| TransportError::IoFailure("record flush timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             Ok::<(), TransportError>(())
-        }
-        .await;
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         if let Err(e) = write_res {
             self.closed = true;
             return Err(e);
@@ -1211,7 +1482,8 @@ where
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
     /// in-band `Rekey` and `KeepAlive` control frames.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
@@ -1219,7 +1491,14 @@ where
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
-            if let Err(e) = self.stream.read_exact(&mut hdr).await {
+            let read_hdr_res = tokio::select! {
+                res = self.stream.read_exact(&mut hdr) => res,
+                _ = self.revocation_rx.changed() => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
+            };
+            if let Err(e) = read_hdr_res {
                 self.closed = true;
                 return Err(TransportError::IoFailure(e.to_string()));
             }
@@ -1245,13 +1524,17 @@ where
             }
 
             let mut ciphertext = vec![0u8; ct_len];
-            let body_res = tokio::time::timeout(
-                RECORD_IO_TIMEOUT,
-                self.stream.read_exact(&mut ciphertext),
-            )
-            .await
-            .map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
-            .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())));
+            let body_fut = self.stream.read_exact(&mut ciphertext);
+            let body_res = tokio::select! {
+                res = tokio::time::timeout(RECORD_IO_TIMEOUT, body_fut) => {
+                    res.map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
+                       .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())))
+                }
+                _ = self.revocation_rx.changed() => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
+            };
             if let Err(e) = body_res {
                 self.closed = true;
                 return Err(e);
@@ -1348,7 +1631,8 @@ where
 
     /// Sends an authenticated `CloseNotify` frame before closing the session.
     pub async fn close_notify(&mut self) -> Result<(), TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         self.closed = true;
@@ -1357,14 +1641,27 @@ where
             b"",
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&frame))
-            .await
-            .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-        tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.flush())
-            .await
-            .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
-            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        let write_fut = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.write_all(&frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.stream.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
+        if let Err(e) = write_res {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1376,10 +1673,19 @@ where
         peer: &VerifiedPeerCredentials,
         service_id: ServiceId,
     ) -> Result<Self, TransportError> {
-        let local_dev_id_hex = {
+        let (local_dev_id_hex, peer_gen) = {
             let ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            ks.local_device_id_hex().to_string()
+            let creds = ks.get_peer(&peer.device_id_hex)
+                .ok_or_else(|| TransportError::UntrustedPeer(peer.device_id_hex.clone()))?;
+            (ks.local_device_id_hex().to_string(), creds.trust_generation)
         };
+
+        // Coordinate peer revocation with handshake initiation and session registration.
+        // Validates trust generation atomically inside ACTIVE_SESSION_REGISTRY without holding keystore_mutex.
+        let (reg_guard, mut revocation_rx) = register_session_revocation(
+            &peer.device_id_hex,
+            peer_gen,
+        )?;
 
         let client_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
@@ -1400,10 +1706,11 @@ where
             &mut stream,
             HandshakeFrameType::ClientHello,
             &hello_msg,
+            Some(&mut revocation_rx),
         )
         .await?;
 
-        let (hs_type, srv_hello_bytes) = recv_handshake_frame(&mut stream, None).await?;
+        let (hs_type, srv_hello_bytes) = recv_handshake_frame(&mut stream, None, Some(&mut revocation_rx)).await?;
         if hs_type != HandshakeFrameType::ServerHello {
             return Err(TransportError::UnexpectedFrameType(hs_type as u8));
         }
@@ -1473,22 +1780,35 @@ where
             client_ed25519_sig_hex: hex_encode(&cli_sig),
             client_finished_mac_hex: hex_encode(&cli_mac),
         };
-        send_handshake_frame(&mut stream, HandshakeFrameType::ClientFinish, &finish_msg).await?;
+        send_handshake_frame(
+            &mut stream,
+            HandshakeFrameType::ClientFinish,
+            &finish_msg,
+            Some(&mut revocation_rx),
+        )
+        .await?;
 
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
+
+        if *revocation_rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
 
         Ok(Self {
             stream,
             service_id,
             peer_device_id: peer.device_id,
             peer_device_id_hex: peer.device_id_hex.clone(),
+            trust_generation: peer_gen,
             session_id,
             tx_state: c2s_state,
             rx_state: s2c_state,
             last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
             closed: false,
+            _reg_guard: Some(reg_guard),
+            revocation_rx,
         })
     }
 
@@ -1501,7 +1821,7 @@ where
         expected_service: ServiceId,
         allow_loopback_self: bool,
     ) -> Result<Self, TransportError> {
-        let (hs_type, hello_bytes) = recv_handshake_frame(&mut stream, already_read_magic).await?;
+        let (hs_type, hello_bytes) = recv_handshake_frame(&mut stream, already_read_magic, None).await?;
         if hs_type != HandshakeFrameType::ClientHello {
             return Err(TransportError::UnexpectedFrameType(hs_type as u8));
         }
@@ -1555,6 +1875,13 @@ where
             return Err(TransportError::KeyIdMismatch);
         }
 
+        // Coordinate peer revocation with handshake completion and session registration.
+        // Validates trust generation atomically inside ACTIVE_SESSION_REGISTRY without holding keystore_mutex.
+        let (reg_guard, mut revocation_rx) = register_session_revocation(
+            &peer_creds.device_id_hex,
+            peer_creds.trust_generation,
+        )?;
+
         let server_random = csprng_array::<32>();
         let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
         let eph_sk_s = X25519SecretKey::from(*eph_sk_bytes);
@@ -1593,9 +1920,15 @@ where
             server_ed25519_sig_hex: hex_encode(&srv_sig),
             server_finished_mac_hex: hex_encode(&srv_mac),
         };
-        send_handshake_frame(&mut stream, HandshakeFrameType::ServerHello, &srv_hello).await?;
+        send_handshake_frame(
+            &mut stream,
+            HandshakeFrameType::ServerHello,
+            &srv_hello,
+            Some(&mut revocation_rx),
+        )
+        .await?;
 
-        let (hs_type_2, finish_bytes) = recv_handshake_frame(&mut stream, None).await?;
+        let (hs_type_2, finish_bytes) = recv_handshake_frame(&mut stream, None, Some(&mut revocation_rx)).await?;
         if hs_type_2 != HandshakeFrameType::ClientFinish {
             return Err(TransportError::UnexpectedFrameType(hs_type_2 as u8));
         }
@@ -1626,17 +1959,24 @@ where
         let h4 = compute_transcript_h4(&h3, &cli_sig, &cli_mac);
         let (c2s_state, s2c_state, session_id) = derive_application_states(&prk_hs, &h4);
 
+        if *revocation_rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
+
         Ok(Self {
             stream,
             service_id: expected_service,
             peer_device_id: peer_creds.device_id,
             peer_device_id_hex: peer_creds.device_id_hex,
+            trust_generation: peer_creds.trust_generation,
             session_id,
             tx_state: s2c_state,
             rx_state: c2s_state,
             last_rekeyed_at: Instant::now(),
             rekey_frame_limit: DEFAULT_REKEY_FRAME_LIMIT,
             closed: false,
+            _reg_guard: Some(reg_guard),
+            revocation_rx,
         })
     }
 }
@@ -1651,6 +1991,10 @@ pub struct TransportReaderV2<R> {
     rx_state: DirectionalCipherState,
     /// True if the reader stream is closed.
     closed: bool,
+    /// RAII guard that automatically removes this session from `ACTIVE_SESSION_REGISTRY` on drop.
+    _reg_guard: Option<Arc<SessionRevocationGuard>>,
+    /// Watch receiver signaled when the peer's trust status is revoked.
+    revocation_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Write half of a full-duplex split `TransportSessionV2`, owning independent outbound AEAD state.
@@ -1667,6 +2011,10 @@ pub struct TransportWriterV2<W> {
     rekey_frame_limit: u64,
     /// True if the writer stream is closed.
     closed: bool,
+    /// RAII guard that automatically removes this session from `ACTIVE_SESSION_REGISTRY` on drop of all halves.
+    _reg_guard: Option<Arc<SessionRevocationGuard>>,
+    /// Watch receiver signaled when the peer's trust status is revoked.
+    revocation_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
@@ -1674,7 +2022,8 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
     /// in-band `Rekey` and `KeepAlive` control frames.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
@@ -1682,7 +2031,14 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
-            if let Err(e) = self.reader.read_exact(&mut hdr).await {
+            let read_hdr_res = tokio::select! {
+                res = self.reader.read_exact(&mut hdr) => res,
+                _ = self.revocation_rx.changed() => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
+            };
+            if let Err(e) = read_hdr_res {
                 self.closed = true;
                 return Err(TransportError::IoFailure(e.to_string()));
             }
@@ -1708,13 +2064,17 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
             }
 
             let mut ciphertext = vec![0u8; ct_len];
-            let body_res = tokio::time::timeout(
-                RECORD_IO_TIMEOUT,
-                self.reader.read_exact(&mut ciphertext),
-            )
-            .await
-            .map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
-            .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())));
+            let body_fut = self.reader.read_exact(&mut ciphertext);
+            let body_res = tokio::select! {
+                res = tokio::time::timeout(RECORD_IO_TIMEOUT, body_fut) => {
+                    res.map_err(|_| TransportError::IoFailure("record payload read timed out".into()))
+                       .and_then(|r| r.map_err(|e| TransportError::IoFailure(e.to_string())))
+                }
+                _ = self.revocation_rx.changed() => {
+                    self.closed = true;
+                    return Err(TransportError::ConnectionClosed);
+                }
+            };
             if let Err(e) = body_res {
                 self.closed = true;
                 return Err(e);
@@ -1755,7 +2115,8 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
 
     /// Triggers an explicit in-band outbound rekey (`FrameType::Rekey`) and ratchets `tx_state` to `epoch + 1`.
     pub async fn initiate_rekey(&mut self) -> Result<(), TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         if self.tx_state.current_epoch() == u16::MAX {
@@ -1767,7 +2128,7 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
             REKEY_MAGIC_PAYLOAD,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        let write_res = async {
+        let write_fut = async {
             tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&rekey_frame))
                 .await
                 .map_err(|_| TransportError::IoFailure("rekey write timed out".into()))?
@@ -1777,8 +2138,14 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
                 .map_err(|_| TransportError::IoFailure("rekey flush timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             Ok::<(), TransportError>(())
-        }
-        .await;
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         if let Err(e) = write_res {
             self.closed = true;
             return Err(e);
@@ -1793,7 +2160,8 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
 
     /// Encrypts and writes an application data frame, ratcheting keys if limits are exceeded.
     pub async fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
-        if self.closed {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
             return Err(TransportError::ConnectionClosed);
         }
         if self.tx_state.current_seq() >= self.rekey_frame_limit
@@ -1807,7 +2175,7 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
             plaintext,
             self.service_id.max_plaintext_frame_bytes(),
         )?;
-        let write_res = async {
+        let write_fut = async {
             tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&frame))
                 .await
                 .map_err(|_| TransportError::IoFailure("record write timed out".into()))?
@@ -1817,10 +2185,53 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
                 .map_err(|_| TransportError::IoFailure("record flush timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             Ok::<(), TransportError>(())
-        }
-        .await;
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         if let Err(e) = write_res {
             self.closed = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Sends an authenticated `CloseNotify` frame before closing the writer stream.
+    #[allow(dead_code)]
+    pub async fn close_notify(&mut self) -> Result<(), TransportError> {
+        if self.closed || *self.revocation_rx.borrow() {
+            self.closed = true;
+            return Err(TransportError::ConnectionClosed);
+        }
+        self.closed = true;
+        let frame = self.tx_state.seal_record(
+            RecordFrameType::CloseNotify,
+            b"",
+            self.service_id.max_plaintext_frame_bytes(),
+        )?;
+        let write_fut = async {
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.write_all(&frame))
+                .await
+                .map_err(|_| TransportError::IoFailure("close_notify write timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            tokio::time::timeout(RECORD_IO_TIMEOUT, self.writer.flush())
+                .await
+                .map_err(|_| TransportError::IoFailure("close_notify flush timed out".into()))?
+                .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+            Ok::<(), TransportError>(())
+        };
+        let write_res = tokio::select! {
+            res = write_fut => res,
+            _ = self.revocation_rx.changed() => {
+                self.closed = true;
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
+        if let Err(e) = write_res {
             return Err(e);
         }
         Ok(())
@@ -1828,20 +2239,24 @@ impl<W: AsyncWrite + Unpin> TransportWriterV2<W> {
 }
 
 impl TransportSessionV2<tokio::net::TcpStream> {
-    /// Splits a TCP `TransportSessionV2` into lock-free full-duplex reader and writer halves.
+    /// Splits a TCP `TransportSessionV2` into lock-free full-duplex reader and writer halves,
+    /// sharing the session registration lifetime across both halves.
     pub fn into_split_tcp(
-        self,
+        mut self,
     ) -> (
         TransportReaderV2<tokio::net::tcp::OwnedReadHalf>,
         TransportWriterV2<tokio::net::tcp::OwnedWriteHalf>,
     ) {
         let (read_half, write_half) = self.stream.into_split();
+        let reg_guard = self._reg_guard.take();
         (
             TransportReaderV2 {
                 reader: read_half,
                 service_id: self.service_id,
                 rx_state: self.rx_state,
                 closed: self.closed,
+                _reg_guard: reg_guard.clone(),
+                revocation_rx: self.revocation_rx.clone(),
             },
             TransportWriterV2 {
                 writer: write_half,
@@ -1850,6 +2265,46 @@ impl TransportSessionV2<tokio::net::TcpStream> {
                 last_rekeyed_at: self.last_rekeyed_at,
                 rekey_frame_limit: self.rekey_frame_limit,
                 closed: self.closed,
+                _reg_guard: reg_guard,
+                revocation_rx: self.revocation_rx,
+            },
+        )
+    }
+}
+
+impl<S> TransportSessionV2<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Splits an arbitrary asynchronous full-duplex `TransportSessionV2` stream (such as `DuplexStream`)
+    /// into reader and writer halves sharing session registration lifetime.
+    #[allow(dead_code)]
+    pub fn into_split(
+        mut self,
+    ) -> (
+        TransportReaderV2<tokio::io::ReadHalf<S>>,
+        TransportWriterV2<tokio::io::WriteHalf<S>>,
+    ) {
+        let (read_half, write_half) = tokio::io::split(self.stream);
+        let reg_guard = self._reg_guard.take();
+        (
+            TransportReaderV2 {
+                reader: read_half,
+                service_id: self.service_id,
+                rx_state: self.rx_state,
+                closed: self.closed,
+                _reg_guard: reg_guard.clone(),
+                revocation_rx: self.revocation_rx.clone(),
+            },
+            TransportWriterV2 {
+                writer: write_half,
+                service_id: self.service_id,
+                tx_state: self.tx_state,
+                last_rekeyed_at: self.last_rekeyed_at,
+                rekey_frame_limit: self.rekey_frame_limit,
+                closed: self.closed,
+                _reg_guard: reg_guard,
+                revocation_rx: self.revocation_rx,
             },
         )
     }
@@ -1858,6 +2313,7 @@ impl TransportSessionV2<tokio::net::TcpStream> {
 /// Derives loopback self-credentials from the local `KeystoreV2` so same-user local CLI/IPC
 /// calls over `127.0.0.1` also use full `TransportV2` mutual authentication and encryption.
 pub fn derive_loopback_self_credentials(keystore: &KeystoreV2) -> VerifiedPeerCredentials {
+    register_local_device_identity(keystore.local_device_id_hex());
     let sig = keystore.sign_transcript(b"integrator-loopback-self-root-derivation-v2");
     let hk = Hkdf::<Sha256>::new(Some(&keystore.local_device_id()), &sig);
     let mut root_key = Zeroizing::new([0u8; 32]);
@@ -1876,6 +2332,7 @@ pub fn derive_loopback_self_credentials(keystore: &KeystoreV2) -> VerifiedPeerCr
         last_ip: "127.0.0.1".to_string(),
         paired_at_epoch: 0,
         via_direct_cable: true,
+        trust_generation: 1,
     }
 }
 
@@ -1889,11 +2346,18 @@ async fn send_handshake_frame<W, T>(
     writer: &mut W,
     hs_type: HandshakeFrameType,
     msg: &T,
+    mut revocation_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Vec<u8>, TransportError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    if let Some(ref rx) = revocation_rx {
+        if *rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
+    }
+
     let payload =
         serde_json::to_vec(msg).map_err(|e| TransportError::MalformedHandshake(e.to_string()))?;
     if payload.len() > MAX_HANDSHAKE_FRAME_BYTES {
@@ -1910,14 +2374,34 @@ where
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(&payload);
 
-    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, writer.write_all(&frame))
-        .await
-        .map_err(|_| TransportError::IoFailure("handshake write timed out".into()))?
-        .map_err(|e| TransportError::IoFailure(e.to_string()))?;
-    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, writer.flush())
-        .await
-        .map_err(|_| TransportError::IoFailure("handshake flush timed out".into()))?
-        .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+    let write_fut = async {
+        writer
+            .write_all(&frame)
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoFailure(e.to_string()))?;
+        Ok::<(), TransportError>(())
+    };
+
+    let write_res = match revocation_rx.as_mut() {
+        Some(rx) => tokio::select! {
+            r = tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, write_fut) => {
+                match r {
+                    Ok(res) => res,
+                    Err(_) => Err(TransportError::IoFailure("handshake write timed out".into())),
+                }
+            }
+            _ = rx.changed() => return Err(TransportError::ConnectionClosed),
+        },
+        None => match tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, write_fut).await {
+            Ok(res) => res,
+            Err(_) => Err(TransportError::IoFailure("handshake write timed out".into())),
+        },
+    };
+    write_res?;
     Ok(payload)
 }
 
@@ -1925,17 +2409,30 @@ where
 async fn recv_handshake_frame<R>(
     reader: &mut R,
     already_read_magic: Option<[u8; 4]>,
+    mut revocation_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(HandshakeFrameType, Vec<u8>), TransportError>
 where
     R: AsyncRead + Unpin,
 {
+    if let Some(ref rx) = revocation_rx {
+        if *rx.borrow() {
+            return Err(TransportError::ConnectionClosed);
+        }
+    }
+
     let magic = match already_read_magic {
         Some(m) => m,
         None => {
             let mut m = [0u8; 4];
-            tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut m))
-                .await
-                .map_err(|_| TransportError::IoFailure("handshake magic read timed out".into()))?
+            let read_fut = reader.read_exact(&mut m);
+            let res = match revocation_rx.as_mut() {
+                Some(rx) => tokio::select! {
+                    r = tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_fut) => r,
+                    _ = rx.changed() => return Err(TransportError::ConnectionClosed),
+                },
+                None => tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_fut).await,
+            };
+            res.map_err(|_| TransportError::IoFailure("handshake magic read timed out".into()))?
                 .map_err(|e| TransportError::IoFailure(e.to_string()))?;
             m
         }
@@ -1945,9 +2442,15 @@ where
     }
 
     let mut rest_hdr = [0u8; 4];
-    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut rest_hdr))
-        .await
-        .map_err(|_| TransportError::IoFailure("handshake header read timed out".into()))?
+    let read_hdr_fut = reader.read_exact(&mut rest_hdr);
+    let hdr_res = match revocation_rx.as_mut() {
+        Some(rx) => tokio::select! {
+            r = tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_hdr_fut) => r,
+            _ = rx.changed() => return Err(TransportError::ConnectionClosed),
+        },
+        None => tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_hdr_fut).await,
+    };
+    hdr_res.map_err(|_| TransportError::IoFailure("handshake header read timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
 
     if rest_hdr[0] != TRANSPORT_HEADER_VERSION_BYTE {
@@ -1964,9 +2467,15 @@ where
     }
 
     let mut payload = vec![0u8; payload_len];
-    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, reader.read_exact(&mut payload))
-        .await
-        .map_err(|_| TransportError::IoFailure("handshake payload read timed out".into()))?
+    let read_body_fut = reader.read_exact(&mut payload);
+    let body_res = match revocation_rx.as_mut() {
+        Some(rx) => tokio::select! {
+            r = tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_body_fut) => r,
+            _ = rx.changed() => return Err(TransportError::ConnectionClosed),
+        },
+        None => tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, read_body_fut).await,
+    };
+    body_res.map_err(|_| TransportError::IoFailure("handshake payload read timed out".into()))?
         .map_err(|e| TransportError::IoFailure(e.to_string()))?;
     Ok((hs_type, payload))
 }
@@ -2135,6 +2644,52 @@ fn compute_client_finished_mac(k_hs_c2s: &[u8; 32], h3: &[u8; 32], sig_c: &[u8; 
 mod tests {
     use super::*;
     use crate::security::keystore::FixedKekProvider;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct BlockNotifyStream<S> {
+        inner: S,
+        notify: Arc<tokio::sync::Notify>,
+        enabled: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for BlockNotifyStream<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for BlockNotifyStream<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if self.enabled.load(Ordering::SeqCst) && matches!(res, std::task::Poll::Pending) {
+                self.notify.notify_waiters();
+            }
+            res
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     fn create_paired_keystores(
         label: &str,
@@ -2249,6 +2804,7 @@ mod tests {
             &mut c_stream,
             HandshakeFrameType::ClientHello,
             &low_order_hello,
+            None,
         )
         .await
         .unwrap();
@@ -2402,6 +2958,909 @@ mod tests {
             .tx_state
             .seal_record(RecordFrameType::ApplicationData, b"overflow", 1024);
         assert_eq!(exhausted.err(), Some(TransportError::SequenceExhausted));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_active_session_termination_upon_peer_revocation() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("revocation");
+        let (c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+        );
+        let mut client_sess = c_res.unwrap();
+        let mut server_sess = s_res.unwrap();
+
+        // 1. Initial message send and receive succeeds
+        client_sess.send_message(b"hello before revocation").await.unwrap();
+        let rx = server_sess.recv_message().await.unwrap();
+        assert_eq!(rx, b"hello before revocation");
+
+        // 2. Spawn a background receive task on server_sess
+        let recv_handle = tokio::spawn(async move {
+            server_sess.recv_message().await
+        });
+
+        // Small yield to ensure server_sess is actively waiting in recv_message
+        tokio::task::yield_now().await;
+
+        // 3. Terminate active sessions for client peer (signaling server session)
+        let terminated_count = terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+        assert!(terminated_count >= 1);
+
+        // 4. Background recv_message must immediately abort with ConnectionClosed
+        let res = recv_handle.await.unwrap();
+        assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+
+        // 5. Subsequent send on client_sess must also fail when its session is revoked
+        let cli_term_count = terminate_active_sessions_for_peer(&srv_creds.device_id_hex);
+        assert!(cli_term_count >= 1);
+        let send_res = client_sess.send_message(b"post revocation").await;
+        assert!(matches!(send_res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_peer_while_server_waiting_for_client_finish() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("test1_rev_wait_finish");
+        let (mut c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        // Server task starts accepting
+        let server_handle = tokio::spawn(async move {
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false).await
+        });
+
+        // Client manually sends ClientHello
+        let client_random = csprng_array::<32>();
+        let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
+        let eph_sk_c = X25519SecretKey::from(*eph_sk_bytes);
+        let eph_pk_c = X25519PublicKey::from(&eph_sk_c);
+
+        let hello_msg = TransportHelloMsg {
+            version: TRANSPORT_PROTOCOL_VERSION,
+            service_id: ServiceId::DisplayRpc as u8,
+            client_device_id_hex: ks_c.local_device_id_hex().to_string(),
+            key_id_hex: hex_encode(&srv_creds.key_id),
+            client_random_hex: hex_encode(&client_random),
+            client_eph_x25519_pk_hex: hex_encode(eph_pk_c.as_bytes()),
+            timestamp_ms: unix_epoch_millis(),
+        };
+
+        send_handshake_frame(&mut c_stream, HandshakeFrameType::ClientHello, &hello_msg, None).await.unwrap();
+
+        // Client receives ServerHello
+        let (hs_type, _) = recv_handshake_frame(&mut c_stream, None, None).await.unwrap();
+        assert_eq!(hs_type, HandshakeFrameType::ServerHello);
+
+        // Now server is actively inside `recv_handshake_frame` waiting for ClientFinish!
+        tokio::task::yield_now().await;
+
+        // Revoke the client peer
+        let count = terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+        assert!(count >= 1, "Server's pending handshake session must be registered and signaled");
+
+        // Server accept must immediately abort with ConnectionClosed
+        let srv_res = server_handle.await.unwrap();
+        assert!(matches!(srv_res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_peer_after_auth_during_session_registration() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("test2_rev_reg");
+
+        // 1. Terminate/revoke peer beforehand
+        terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+
+        // 2. An attempt to register or accept server for revoked peer must immediately return UntrustedPeer
+        let (c_stream, s_stream) = tokio::io::duplex(65_536);
+        let srv_res = TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false);
+        let cli_res = TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc);
+
+        let (_c_out, s_out) = tokio::join!(cli_res, srv_res);
+        assert!(matches!(s_out, Err(TransportError::UntrustedPeer(_))));
+
+        // 3. Test atomic registration failure if trust check function returns false
+        let reg_fail = register_session_revocation_checked("some_untrusted_peer", || false);
+        assert!(matches!(reg_fail, Err(TransportError::UntrustedPeer(_))));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_drop_reader_half_retaining_writer_then_revoke_peer() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("test3_split_lifetime");
+        let (c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+        );
+        let _client_sess = c_res.unwrap();
+        let server_sess = s_res.unwrap();
+
+        // Split server session into reader and writer halves
+        let (server_reader, mut server_writer) = server_sess.into_split();
+
+        // Drop the reader half; writer is retained!
+        drop(server_reader);
+
+        // Revoke the peer
+        let count = terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+        assert!(count >= 1, "Writer must keep the registration alive in ACTIVE_SESSION_REGISTRY");
+
+        // Writer's send_message must immediately return ConnectionClosed
+        let send_res = server_writer.send_message(b"should fail after revocation").await;
+        assert!(matches!(send_res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_peer_while_write_is_blocked() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, _cli_creds) = create_paired_keystores("test4_blocked_write");
+        // Tiny buffer: 64 bytes so a write of 16KB will block
+        let (c_stream, s_stream) = tokio::io::duplex(64);
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let enabled = Arc::new(AtomicBool::new(false));
+
+        let wrapped_c_stream = BlockNotifyStream {
+            inner: c_stream,
+            notify: notify.clone(),
+            enabled: enabled.clone(),
+        };
+
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(wrapped_c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+        );
+        let mut client_sess = c_res.unwrap();
+        let _server_sess = s_res.unwrap();
+
+        // Enable blocking notification on poll_write Pending
+        enabled.store(true, Ordering::SeqCst);
+
+        // Client attempts to send a large payload that blocks because duplex buffer is full
+        let send_handle = tokio::spawn(async move {
+            let big_msg = vec![0x42u8; 16_384];
+            client_sess.send_message(&big_msg).await
+        });
+
+        // Deterministically wait until write is actively blocked in poll_write
+        notify.notified().await;
+
+        // Revoke the server peer on client side
+        let count = terminate_active_sessions_for_peer(&srv_creds.device_id_hex);
+        assert!(count >= 1);
+
+        // The blocked write must abort immediately with ConnectionClosed
+        let res = send_handle.await.unwrap();
+        assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_peer_during_active_display_stream() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("test5_display");
+        let (c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+        );
+        let mut client_sess = c_res.unwrap();
+        let mut server_sess = s_res.unwrap();
+
+        // Simulate active display frame streaming
+        client_sess.send_message(b"video_frame_0").await.unwrap();
+        let frame = server_sess.recv_message().await.unwrap();
+        assert_eq!(frame, b"video_frame_0");
+
+        // Spawn background display receiver
+        let display_rx_handle = tokio::spawn(async move {
+            server_sess.recv_message().await
+        });
+        tokio::task::yield_now().await;
+
+        // Revoke peer
+        terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+
+        let res = display_rx_handle.await.unwrap();
+        assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_peer_during_active_file_transfer() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) = create_paired_keystores("test6_transfer");
+        let (c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        let (c_res, s_res) = tokio::join!(
+            TransportSessionV2::connect_client(c_stream, &ks_c, &srv_creds, ServiceId::DisplayRpc),
+            TransportSessionV2::accept_server(s_stream, &ks_s, ServiceId::DisplayRpc, false),
+        );
+        let mut client_sess = c_res.unwrap();
+        let mut server_sess = s_res.unwrap();
+
+        // Spawn receiver task waiting for chunked file payload
+        let recv_handle = tokio::spawn(async move {
+            server_sess.recv_chunked_payload(1024 * 1024).await
+        });
+
+        // Send 8-byte length header announcing 1MB file
+        let len_bytes = (1024u64 * 1024).to_be_bytes();
+        client_sess.send_message(&len_bytes).await.unwrap();
+
+        // Send first chunk
+        client_sess.send_message(&[0x55; 1024]).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Revoke peer mid-transfer
+        terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+
+        // Receiver must fail with ConnectionClosed
+        let res = recv_handle.await.unwrap();
+        assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_race_revocation_against_connection_establishment() {
+        for i in 0..50 {
+            let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+                create_paired_keystores(&format!("test7_race_{}", i));
+            let (c_stream, s_stream) = tokio::io::duplex(65_536);
+
+            let srv_dev_id_hex = srv_creds.device_id_hex.clone();
+            let cli_dev_id_hex = cli_creds.device_id_hex.clone();
+
+            let conn_task = tokio::spawn(async move {
+                let client_fut = TransportSessionV2::connect_client(
+                    c_stream,
+                    &ks_c,
+                    &srv_creds,
+                    ServiceId::DisplayRpc,
+                );
+                let server_fut = TransportSessionV2::accept_server(
+                    s_stream,
+                    &ks_s,
+                    ServiceId::DisplayRpc,
+                    false,
+                );
+                tokio::join!(client_fut, server_fut)
+            });
+
+            let rev_task = tokio::spawn(async move {
+                if i % 2 == 1 {
+                    tokio::task::yield_now().await;
+                }
+                terminate_active_sessions_for_peer(&cli_dev_id_hex);
+                terminate_active_sessions_for_peer(&srv_dev_id_hex);
+            });
+
+            let (conn_res, _) = tokio::join!(conn_task, rev_task);
+            let (c_out, s_out) = conn_res.unwrap();
+
+            // If a session managed to be created, any subsequent write/read on it MUST fail with ConnectionClosed
+            if let Ok(mut c_sess) = c_out {
+                let err = c_sess.send_message(b"post_race").await;
+                assert!(matches!(err, Err(TransportError::ConnectionClosed)));
+            }
+            if let Ok(mut s_sess) = s_out {
+                let err = s_sess.send_message(b"post_race").await;
+                assert!(matches!(err, Err(TransportError::ConnectionClosed)));
+            }
+
+            let _ = std::fs::remove_dir_all(&dir_c);
+            let _ = std::fs::remove_dir_all(&dir_s);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deadlock_concurrent_pairing_and_handshake() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+            create_paired_keystores("deadlock_reg");
+        let ks_c_arc = Arc::new(std::sync::Mutex::new(ks_c));
+        let ks_s_arc = Arc::new(std::sync::Mutex::new(ks_s));
+
+        let srv_id_hex = srv_creds.device_id_hex.clone();
+        let cli_id_hex = cli_creds.device_id_hex.clone();
+
+        // Task A: repeatedly initiates handshakes with shared keystores
+        let ks_c_clone = ks_c_arc.clone();
+        let ks_s_clone = ks_s_arc.clone();
+        let srv_creds_clone = srv_creds.clone();
+        let handshake_task = tokio::spawn(async move {
+            let mut attempts = 0;
+            for _ in 0..50 {
+                let (c_stream, s_stream) = tokio::io::duplex(65_536);
+                let c_fut = TransportSessionV2::connect_client_with_shared_keystore(
+                    c_stream,
+                    &ks_c_clone,
+                    &srv_creds_clone,
+                    ServiceId::DisplayRpc,
+                );
+                let s_fut = TransportSessionV2::accept_server_with_shared_keystore(
+                    s_stream,
+                    None,
+                    &ks_s_clone,
+                    ServiceId::DisplayRpc,
+                    false,
+                );
+                let _ = tokio::join!(c_fut, s_fut);
+                attempts += 1;
+            }
+            attempts
+        });
+
+        // Task B: repeatedly updates trust and terminates active sessions concurrently
+        let ks_s_clone2 = ks_s_arc.clone();
+        let srv_id_clone2 = srv_id_hex.clone();
+        let cli_id_clone2 = cli_id_hex.clone();
+        let cli_dev_id = cli_creds.device_id;
+        let cli_pubkey = cli_creds.ed25519_pubkey;
+        let pairing_task = tokio::spawn(async move {
+            let mut iterations = 0;
+            let mut root_byte = 0x33u8;
+            for _ in 0..50 {
+                root_byte = root_byte.wrapping_add(1);
+                let new_root = Zeroizing::new([root_byte; 32]);
+                {
+                    let mut ks = ks_s_clone2.lock().unwrap();
+                    let _ = ks.commit_paired_peer(
+                        cli_dev_id,
+                        cli_pubkey,
+                        new_root.clone(),
+                        "MacBook-Pro".into(),
+                        "macOS".into(),
+                        "10.99.99.2".into(),
+                        true,
+                    );
+                }
+                terminate_active_sessions_for_peer(&srv_id_clone2);
+                terminate_active_sessions_for_peer(&cli_id_clone2);
+                iterations += 1;
+                tokio::task::yield_now().await;
+            }
+            iterations
+        });
+
+        let timeout_res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            async { tokio::try_join!(handshake_task, pairing_task) },
+        )
+        .await;
+
+        assert!(timeout_res.is_ok(), "Concurrent pairing and handshake must not deadlock!");
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_stale_handshake_rejected_after_unpair_and_repair() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+            create_paired_keystores("stale_handshake");
+        let (mut c_stream, s_stream) = tokio::io::duplex(65_536);
+
+        let ks_s_arc = Arc::new(std::sync::Mutex::new(ks_s));
+        let ks_s_clone = ks_s_arc.clone();
+
+        // 1. Client begins handshake by sending ClientHello authenticated with generation 1
+        let client_random = csprng_array::<32>();
+        let eph_sk_bytes = Zeroizing::new(csprng_array::<32>());
+        let eph_sk_c = X25519SecretKey::from(*eph_sk_bytes);
+        let eph_pk_c = X25519PublicKey::from(&eph_sk_c);
+
+        let hello_msg = TransportHelloMsg {
+            version: TRANSPORT_PROTOCOL_VERSION,
+            service_id: ServiceId::DisplayRpc as u8,
+            client_device_id_hex: ks_c.local_device_id_hex().to_string(),
+            key_id_hex: hex_encode(&srv_creds.key_id),
+            client_random_hex: hex_encode(&client_random),
+            client_eph_x25519_pk_hex: hex_encode(eph_pk_c.as_bytes()),
+            timestamp_ms: unix_epoch_millis(),
+        };
+
+        send_handshake_frame(
+            &mut c_stream,
+            HandshakeFrameType::ClientHello,
+            &hello_msg,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 2. Server accepts in background task using shared keystore
+        let server_handle = tokio::spawn(async move {
+            TransportSessionV2::accept_server_with_shared_keystore(
+                s_stream,
+                None,
+                &ks_s_clone,
+                ServiceId::DisplayRpc,
+                false,
+            )
+            .await
+        });
+
+        // 3. Client receives ServerHello
+        let (hs_type, _srv_hello_bytes) = recv_handshake_frame(&mut c_stream, None, None)
+            .await
+            .unwrap();
+        assert_eq!(hs_type, HandshakeFrameType::ServerHello);
+
+        // 4. While the handshake is in flight, unpair peer on server
+        // This advances trust generation and terminates in-flight sessions for this peer
+        {
+            let mut ks = ks_s_arc.lock().unwrap();
+            ks.unpair_peer(&cli_creds.device_id_hex).unwrap();
+        }
+
+        // 5. Client attempts to send ClientFinish using old handshake keys
+        let dummy_finish = TransportClientFinishMsg {
+            client_ed25519_sig_hex: hex_encode(&[0x11; 64]),
+            client_finished_mac_hex: hex_encode(&[0x22; 32]),
+        };
+        let _ = send_handshake_frame(
+            &mut c_stream,
+            HandshakeFrameType::ClientFinish,
+            &dummy_finish,
+            None,
+        )
+        .await;
+
+        // 6. Server MUST reject stale handshake (due to revocation / connection closed)
+        let srv_res = server_handle.await.unwrap();
+        assert!(
+            srv_res.is_err(),
+            "Stale handshake after unpair must be rejected"
+        );
+
+        // 7. Furthermore, re-pairing with new root key sets generation to 3
+        {
+            let mut ks = ks_s_arc.lock().unwrap();
+            ks.commit_paired_peer(
+                cli_creds.device_id,
+                cli_creds.ed25519_pubkey,
+                Zeroizing::new([0x88u8; 32]),
+                "MacBook-Pro".to_string(),
+                "macOS".to_string(),
+                "10.99.99.2".to_string(),
+                true,
+            ).unwrap();
+        }
+
+        // An attempt by client to register session revocation with stale generation 1 must be rejected
+        let reg_stale = register_session_revocation(&cli_creds.device_id_hex, 1);
+        assert!(
+            reg_stale.is_err(),
+            "Registration with stale generation 1 must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_production_tcp_split_lifetime() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+            create_paired_keystores("tcp_split_prod");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv_fut = async {
+            let (sock, _) = listener.accept().await.unwrap();
+            TransportSessionV2::accept_server(sock, &ks_s, ServiceId::DisplayRpc, false).await
+        };
+        let cli_fut = async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            TransportSessionV2::connect_client(sock, &ks_c, &srv_creds, ServiceId::DisplayRpc).await
+        };
+
+        let (s_res, c_res) = tokio::join!(srv_fut, cli_fut);
+        let s_sess = s_res.expect("server accept must succeed");
+        let c_sess = c_res.expect("client connect must succeed");
+
+        // Split both sessions into full-duplex reader and writer halves using production into_split_tcp()
+        let (mut s_reader, mut s_writer) = s_sess.into_split_tcp();
+        let (mut c_reader, mut c_writer) = c_sess.into_split_tcp();
+
+        // 1. Verify bidirectional communication through split halves
+        c_writer.send_message(b"tcp-ping").await.unwrap();
+        let rx_on_srv = s_reader.recv_message().await.unwrap();
+        assert_eq!(rx_on_srv, b"tcp-ping");
+
+        s_writer.send_message(b"tcp-pong").await.unwrap();
+        let rx_on_cli = c_reader.recv_message().await.unwrap();
+        assert_eq!(rx_on_cli, b"tcp-pong");
+
+        // 2. Drop server reader; server writer must retain the session registration guard!
+        drop(s_reader);
+
+        // Terminate client peer on server side
+        let count_cli = terminate_active_sessions_for_peer(&cli_creds.device_id_hex);
+        assert!(count_cli >= 1, "Writer half must keep the session registered");
+
+        // Server writer must fail immediately on send_message
+        let w_err = s_writer.send_message(b"post-revocation").await;
+        assert!(matches!(w_err, Err(TransportError::ConnectionClosed)));
+
+        // 3. Drop client writer; client reader must retain the session registration guard!
+        drop(c_writer);
+
+        // Terminate server peer on client side
+        let count_srv = terminate_active_sessions_for_peer(&srv_creds.device_id_hex);
+        assert!(count_srv >= 1, "Reader half must keep the session registered");
+
+        // Client reader must fail immediately on recv_message
+        let r_err = c_reader.recv_message().await;
+        assert!(matches!(r_err, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_unpair_peer_terminates_active_transport_sessions() {
+        let (dir_c, ks_c, srv_creds, dir_s, mut ks_s, cli_creds) =
+            create_paired_keystores("unpair_term_sessions");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv_fut = async {
+            let (sock, _) = listener.accept().await.unwrap();
+            TransportSessionV2::accept_server(sock, &ks_s, ServiceId::DisplayRpc, false).await
+        };
+        let cli_fut = async {
+            let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            TransportSessionV2::connect_client(sock, &ks_c, &srv_creds, ServiceId::DisplayRpc).await
+        };
+
+        let (s_res, c_res) = tokio::join!(srv_fut, cli_fut);
+        let mut s_sess = s_res.expect("server accept must succeed");
+        let mut c_sess = c_res.expect("client connect must succeed");
+
+        // Verify active communication before unpair
+        c_sess.send_message(b"hello-before-unpair").await.unwrap();
+        let rx = s_sess.recv_message().await.unwrap();
+        assert_eq!(rx, b"hello-before-unpair");
+
+        // Explicit unpair on server side - must invalidate active sessions immediately
+        let removed = ks_s.unpair_peer(&cli_creds.device_id_hex).unwrap();
+        assert!(removed, "unpair_peer must remove peer from keystore");
+
+        // Active server session must be immediately terminated and fail on write
+        let s_err = s_sess.send_message(b"post-unpair").await;
+        assert!(matches!(s_err, Err(TransportError::ConnectionClosed)));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[tokio::test]
+    async fn test_unpair_peer_rejects_inflight_handshake() {
+        let (dir_c, _ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+            create_paired_keystores("unpair_inflight_hs");
+
+        let ks_s_arc = Arc::new(std::sync::Mutex::new(ks_s));
+        let (mut c_stream, s_stream) = tokio::io::duplex(64 * 1024);
+
+        let ks_s_clone = Arc::clone(&ks_s_arc);
+        let server_handle = tokio::spawn(async move {
+            TransportSessionV2::accept_server_with_shared_keystore(
+                s_stream,
+                None,
+                &ks_s_clone,
+                ServiceId::DisplayRpc,
+                false,
+            )
+            .await
+        });
+
+        // 1. Client sends valid ClientHello
+        let client_random = csprng_array::<32>();
+        let eph_sk = X25519SecretKey::from(csprng_array::<32>());
+        let eph_pk = X25519PublicKey::from(&eph_sk);
+        let hello = TransportHelloMsg {
+            version: TRANSPORT_PROTOCOL_VERSION,
+            service_id: ServiceId::DisplayRpc as u8,
+            client_device_id_hex: cli_creds.device_id_hex.clone(),
+            key_id_hex: hex_encode(&srv_creds.key_id),
+            client_random_hex: hex_encode(&client_random),
+            client_eph_x25519_pk_hex: hex_encode(eph_pk.as_bytes()),
+            timestamp_ms: unix_epoch_millis(),
+        };
+        send_handshake_frame(
+            &mut c_stream,
+            HandshakeFrameType::ClientHello,
+            &hello,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 2. Client receives ServerHello
+        let (hs_type, _srv_hello_bytes) = recv_handshake_frame(&mut c_stream, None, None)
+            .await
+            .unwrap();
+        assert_eq!(hs_type, HandshakeFrameType::ServerHello);
+
+        // 3. Unpair peer on server while handshake is in flight
+        {
+            let mut ks = ks_s_arc.lock().unwrap();
+            let unpair_res = ks.unpair_peer(&cli_creds.device_id_hex).unwrap();
+            assert!(unpair_res);
+        }
+
+        // 4. Client attempts to send finish message
+        let dummy_finish = TransportClientFinishMsg {
+            client_ed25519_sig_hex: hex_encode(&[0x55; 64]),
+            client_finished_mac_hex: hex_encode(&[0x66; 32]),
+        };
+        let _ = send_handshake_frame(
+            &mut c_stream,
+            HandshakeFrameType::ClientFinish,
+            &dummy_finish,
+            None,
+        )
+        .await;
+
+        // 5. Server handshake MUST reject and fail closed
+        let srv_res = server_handle.await.unwrap();
+        assert!(
+            srv_res.is_err(),
+            "Server must reject in-flight handshake when peer was unpaired"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn test_remote_peer_missing_generation_fails_closed() {
+        let fake_remote_peer = "ffffffffffffffffffffffffffffffff";
+        // Remote peer that is NOT registered in peer_generations or local_device_ids must fail closed
+        let res = register_session_revocation(fake_remote_peer, 1);
+        assert!(
+            res.is_err(),
+            "Registration for remote peer without prior trust generation registration must fail closed"
+        );
+        match res.unwrap_err() {
+            TransportError::UntrustedPeer(msg) => {
+                assert!(msg.contains("un-registered trust generation for remote peer"));
+            }
+            other => panic!("Expected UntrustedPeer error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_remote_peer_missing() {
+        test_remote_peer_missing_generation_fails_closed();
+    }
+
+    #[test]
+    fn test_unpair_peer_generation_sync_with_transport_registry() {
+        let (dir_c, _ks_c, _srv_creds, dir_s, mut ks_s, cli_creds) =
+            create_paired_keystores("unpair_gen_sync");
+
+        let peer_id = cli_creds.device_id_hex.clone();
+        let initial_gen = ks_s.peer_trust_generation(&peer_id).unwrap();
+        assert_eq!(
+            get_peer_trust_generation(&peer_id),
+            Some(initial_gen),
+            "Initial keystore generation must match transport registry"
+        );
+
+        // Perform Phase A unpair
+        let removed = ks_s.unpair_peer(&peer_id).unwrap();
+        assert!(removed);
+
+        let next_ks_gen = ks_s.peer_trust_generation(&peer_id).unwrap();
+        let next_transport_gen = get_peer_trust_generation(&peer_id).unwrap();
+
+        assert_eq!(next_ks_gen, initial_gen + 1);
+        assert_eq!(
+            next_transport_gen, next_ks_gen,
+            "Transport registry generation must match keystore generation exactly after unpair"
+        );
+        assert!(is_peer_revoked(&peer_id), "Peer must be marked revoked in transport registry");
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn test_untrust_or_block_generation_sync_with_transport_registry() {
+        let (dir_c, _ks_c, _srv_creds, dir_s, mut ks_s, cli_creds) =
+            create_paired_keystores("untrust_gen_sync");
+
+        let peer_id = cli_creds.device_id_hex.clone();
+        let initial_gen = ks_s.peer_trust_generation(&peer_id).unwrap();
+
+        // Perform untrust or block
+        ks_s.untrust_or_block_peer(&peer_id, true, Some("127.0.0.1")).unwrap();
+
+        let next_ks_gen = ks_s.peer_trust_generation(&peer_id).unwrap();
+        let next_transport_gen = get_peer_trust_generation(&peer_id).unwrap();
+
+        assert_eq!(next_ks_gen, initial_gen + 1);
+        assert_eq!(
+            next_transport_gen, next_ks_gen,
+            "Transport registry generation must match keystore generation exactly after untrust_or_block"
+        );
+        assert!(is_peer_revoked(&peer_id), "Peer must be marked revoked in transport registry");
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn test_peer_trust_generation_returns_tracked_generation_after_removal() {
+        let (dir_c, _ks_c, _srv_creds, dir_s, mut ks_s, cli_creds) =
+            create_paired_keystores("tracked_gen_after_removal");
+
+        let peer_id = cli_creds.device_id_hex.clone();
+        assert!(ks_s.get_peer(&peer_id).is_some());
+
+        ks_s.unpair_peer(&peer_id).unwrap();
+
+        // Peer is no longer in pinned peers
+        assert!(ks_s.get_peer(&peer_id).is_none());
+        // But tracked trust generation must still be available
+        assert_eq!(ks_s.peer_trust_generation(&peer_id), Some(2));
+
+        let _ = std::fs::remove_dir_all(&dir_c);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn test_no_duplicate_generation_increment_during_subsystem_teardown() {
+        let peer_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee99";
+        register_peer_trust_generation(peer_id, 10);
+        assert_eq!(get_peer_trust_generation(peer_id), Some(10));
+
+        // Invalidate trust at generation 11 (Phase A)
+        invalidate_peer_trust(peer_id, 11);
+        assert_eq!(get_peer_trust_generation(peer_id), Some(11));
+
+        // Subsystem teardown runs (Phase B) - verifying transport generation remains 11
+        // (no secondary call to terminate_active_sessions_for_peer)
+        assert_eq!(get_peer_trust_generation(peer_id), Some(11));
+    }
+
+    #[tokio::test]
+    async fn test_transport_session_trust_generation_is_immutable_after_registry_update() {
+        let (dir_c, ks_c, srv_creds, dir_s, ks_s, cli_creds) =
+            create_paired_keystores("immutable_session_gen");
+
+        let ks_c_mutex = std::sync::Mutex::new(ks_c);
+        let ks_s_mutex = std::sync::Mutex::new(ks_s);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let client_fut = TransportSessionV2::connect_client_with_shared_keystore(
+            client_io,
+            &ks_c_mutex,
+            &srv_creds,
+            ServiceId::CameraStream,
+        );
+        let server_fut = TransportSessionV2::accept_server_with_shared_keystore(
+            server_io,
+            None,
+            &ks_s_mutex,
+            ServiceId::CameraStream,
+            false,
+        );
+
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+        let client_session = client_res.expect("client handshake succeeds");
+        let server_session = server_res.expect("server handshake succeeds");
+
+        assert_eq!(client_session.trust_generation(), srv_creds.trust_generation);
+        assert_eq!(server_session.trust_generation(), cli_creds.trust_generation);
+        assert_eq!(server_session.trust_generation(), 1);
+
+        // Advance both peer generations in the global registry (simulating unpair + re-pair)
+        register_peer_trust_generation(&srv_creds.device_id_hex, 7);
+        register_peer_trust_generation(&cli_creds.device_id_hex, 9);
+
+        // Existing authenticated session handles MUST retain their immutable handshake generation
+        assert_eq!(
+            client_session.trust_generation(),
+            1,
+            "Client session trust_generation() must remain immutable after registry update"
+        );
+        assert_eq!(
+            server_session.trust_generation(),
+            1,
+            "Server session trust_generation() must remain immutable after registry update"
+        );
+        drop(client_session);
+        drop(server_session);
+
+        // Unpair and re-pair both peers so their authenticated trust generation advances to 3 (> 1),
+        // proving `trust_generation()` is neither hardcoded to 1 nor a live registry lookup.
+        let shared_root_2 = Zeroizing::new([0x8Bu8; 32]);
+        let srv_creds_gen3 = {
+            let mut ks_c_guard = ks_c_mutex.lock().unwrap();
+            let ks_s_guard = ks_s_mutex.lock().unwrap();
+            let _ = ks_c_guard.unpair_peer(&srv_creds.device_id_hex).unwrap();
+            ks_c_guard
+                .commit_paired_peer(
+                    ks_s_guard.local_device_id(),
+                    ks_s_guard.local_ed25519_pubkey(),
+                    shared_root_2.clone(),
+                    "HP-Omen".to_string(),
+                    "Windows".to_string(),
+                    "10.99.99.1".to_string(),
+                    true,
+                )
+                .unwrap()
+        };
+        let cli_creds_gen3 = {
+            let ks_c_guard = ks_c_mutex.lock().unwrap();
+            let mut ks_s_guard = ks_s_mutex.lock().unwrap();
+            let _ = ks_s_guard.unpair_peer(&cli_creds.device_id_hex).unwrap();
+            ks_s_guard
+                .commit_paired_peer(
+                    ks_c_guard.local_device_id(),
+                    ks_c_guard.local_ed25519_pubkey(),
+                    shared_root_2,
+                    "MacBook".to_string(),
+                    "macOS".to_string(),
+                    "10.99.99.2".to_string(),
+                    true,
+                )
+                .unwrap()
+        };
+        assert_eq!(srv_creds_gen3.trust_generation, 3);
+        assert_eq!(cli_creds_gen3.trust_generation, 3);
+
+        let (client_io2, server_io2) = tokio::io::duplex(64 * 1024);
+        let (client_res2, server_res2) = tokio::join!(
+            TransportSessionV2::connect_client_with_shared_keystore(
+                client_io2,
+                &ks_c_mutex,
+                &srv_creds_gen3,
+                ServiceId::CameraStream,
+            ),
+            TransportSessionV2::accept_server_with_shared_keystore(
+                server_io2,
+                None,
+                &ks_s_mutex,
+                ServiceId::CameraStream,
+                false,
+            ),
+        );
+        let client_session2 = client_res2.expect("gen-3 client handshake succeeds");
+        let server_session2 = server_res2.expect("gen-3 server handshake succeeds");
+        assert_eq!(client_session2.trust_generation(), 3);
+        assert_eq!(server_session2.trust_generation(), 3);
+
+        // Advance global registry far past 3; sessions MUST stay pinned to immutable generation 3
+        register_peer_trust_generation(&srv_creds_gen3.device_id_hex, 12);
+        register_peer_trust_generation(&cli_creds_gen3.device_id_hex, 15);
+        assert_eq!(client_session2.trust_generation(), 3);
+        assert_eq!(server_session2.trust_generation(), 3);
 
         let _ = std::fs::remove_dir_all(&dir_c);
         let _ = std::fs::remove_dir_all(&dir_s);

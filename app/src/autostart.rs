@@ -13,11 +13,12 @@
 //! - **macOS**: Manages a per-user `LaunchAgent` property list (`com.manveersingh.integrator.plist`)
 //!   located in `~/Library/LaunchAgents/`, registered with macOS `launchd` via `launchctl bootstrap`
 //!   and `launchctl bootout` targeting the user's active GUI domain (`gui/<UID>`).
-//! - **Windows 11**: Uses Windows Task Scheduler (`schtasks.exe`) to configure an elevated scheduled task
-//!   (`"IntegratorAutostart"`) with `<RunLevel>HighestAvailable</RunLevel>`. This ensures the application
-//!   runs with necessary administrator privileges to hook low-level keyboard/mouse events (`WH_KEYBOARD_LL`)
-//!   and communicate with virtual camera drivers without triggering disruptive User Account Control (UAC) prompts
-//!   at every login. It also removes legacy, non-elevated registry entries (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+//! - **Windows 11**: Uses Windows Task Scheduler (`schtasks.exe`) to configure a standard user scheduled task
+//!   (`"IntegratorAutostart"`) with `<RunLevel>LeastPrivilege</RunLevel>`. This adheres strictly to the
+//!   principle of least privilege, aligning with the `asInvoker` application manifest. It prevents high-integrity
+//!   execution of the network-facing GUI, eliminates UIPI restrictions on OLE drag-and-drop with Windows Explorer,
+//!   and avoids disruptive User Account Control (UAC) prompts at login. Privileged setup tasks (driver installation,
+//!   firewall configuration) remain strictly isolated to explicit setup steps. It also cleans up legacy registry entries.
 //!
 //! ## 2. Architectural Linkages & Dependencies
 //! ### Upstream Callers:
@@ -231,7 +232,7 @@ pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
 
 /// Constructs a valid Windows Task Scheduler Task definition XML.
 ///
-/// Configures `<LogonTrigger>`, `<RunLevel>HighestAvailable</RunLevel>`,
+/// Configures `<LogonTrigger>`, `<RunLevel>LeastPrivilege</RunLevel>`,
 /// and passes `--minimized` to suppress the main window on startup.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> Result<String> {
@@ -251,7 +252,7 @@ pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> 
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Integrator auto-start elevated service</Description>
+    <Description>Integrator auto-start service</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -263,7 +264,7 @@ pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> 
     <Principal id="Author">
       {user_xml}
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
+      <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -564,6 +565,62 @@ fn set_enabled_windows(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Inspects an existing Windows scheduled task XML for `WIN_TASK_NAME`.
+/// If the task exists and contains `<RunLevel>HighestAvailable</RunLevel>`,
+/// automatically migrates it to `<RunLevel>LeastPrivilege</RunLevel>`.
+///
+/// Returns `Ok(true)` if an elevated task was migrated to standard user privileges,
+/// `Ok(false)` if no migration was necessary or task does not exist.
+#[cfg(target_os = "windows")]
+pub fn migrate_task_to_least_privilege_windows() -> Result<bool> {
+    use std::os::windows::process::CommandExt;
+    let schtasks = crate::system_info::system32_exe("schtasks.exe");
+    let out = match Command::new(&schtasks)
+        .args(["/Query", "/TN", WIN_TASK_NAME, "/XML"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Ok(false),
+    };
+
+    if !out.status.success() {
+        return Ok(false);
+    }
+
+    let xml = String::from_utf8_lossy(&out.stdout);
+    if task_xml_needs_least_privilege_migration(&xml) {
+        tracing::warn!("⚠️ Existing Windows scheduled task '{}' is configured as HighestAvailable; migrating to LeastPrivilege...", WIN_TASK_NAME);
+        set_enabled_windows(true)?;
+        tracing::info!("✅ Successfully migrated scheduled task '{}' to LeastPrivilege", WIN_TASK_NAME);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Checks whether a Windows Task Scheduler XML string contains `HighestAvailable` run level.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn task_xml_needs_least_privilege_migration(xml: &str) -> bool {
+    xml.contains("<RunLevel>HighestAvailable</RunLevel>")
+}
+
+/// Transforms task XML content with `HighestAvailable` into `LeastPrivilege`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn migrate_task_xml_content_to_least_privilege(xml: &str) -> (String, bool) {
+    if xml.contains("<RunLevel>HighestAvailable</RunLevel>") {
+        (
+            xml.replace(
+                "<RunLevel>HighestAvailable</RunLevel>",
+                "<RunLevel>LeastPrivilege</RunLevel>",
+            ),
+            true,
+        )
+    } else {
+        (xml.to_string(), false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,12 +648,12 @@ mod tests {
     }
 
     #[test]
-    fn build_windows_task_xml_configures_highest_available_and_battery_options() {
+    fn build_windows_task_xml_configures_least_privilege_and_battery_options() {
         let path = Path::new(r"C:\Program Files\Integrator & Co\IntegratorUI.exe");
         let xml = build_windows_task_xml(path, Some("S-1-5-21-123456-7890")).unwrap();
         assert!(xml.contains("encoding=\"UTF-16\""));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
-        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
@@ -618,5 +675,30 @@ mod tests {
     fn utf16_le_bom_encoding_matches_expected_bytes() {
         let bytes = encode_utf16_le_with_bom("AB");
         assert_eq!(bytes, vec![0xFF, 0xFE, b'A', 0x00, b'B', 0x00]);
+    }
+
+    #[test]
+    fn test_migration_of_existing_highest_available_task() {
+        let legacy_xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+</Task>"#;
+
+        assert!(task_xml_needs_least_privilege_migration(legacy_xml));
+        let (migrated_xml, modified) = migrate_task_xml_content_to_least_privilege(legacy_xml);
+        assert!(modified);
+        assert!(migrated_xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!migrated_xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(!task_xml_needs_least_privilege_migration(&migrated_xml));
+
+        // Already migrated XML should not be modified
+        let (re_migrated, re_modified) = migrate_task_xml_content_to_least_privilege(&migrated_xml);
+        assert!(!re_modified);
+        assert_eq!(re_migrated, migrated_xml);
     }
 }

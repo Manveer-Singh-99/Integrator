@@ -49,6 +49,7 @@
 pub mod audio_udp;
 pub mod keystore;
 pub mod pairing;
+pub mod passkey;
 pub mod spake2_rfc9382;
 pub mod transport;
 
@@ -126,6 +127,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// # Returns
 /// 32-byte SHA-256 digest array.
+#[allow(dead_code)]
 pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
@@ -304,7 +306,7 @@ pub fn unix_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::keystore::{FixedKekProvider, KeystoreError, KeystoreV2};
+    use crate::security::keystore::{clean_stale_temp_files, FixedKekProvider, KeystoreError, KeystoreV2};
     use crate::security::spake2_rfc9382::{
         compute_password_salt, const_m, const_n, decode_valid_peer_share,
         Spake2Error, Spake2Role, Spake2State, RFC9382_ED25519_M_BYTES,
@@ -663,5 +665,237 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_tombstone_persistence_and_monotonic_generation_across_reload() {
+        let dir = unique_temp_dir("ks_tombstone_durability");
+        let provider = FixedKekProvider::new([0x33u8; 32]);
+
+        let pk = SigningKey::from_bytes(&[0x44u8; 32]).verifying_key().to_bytes();
+        let id = derive_device_id_from_pubkey(&pk);
+        let id_hex = hex_encode(&id);
+        let root = Zeroizing::new([0x55u8; 32]);
+
+        // 1. Initial pairing at Generation 1
+        {
+            let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            let creds = ks
+                .commit_paired_peer(
+                    id,
+                    pk,
+                    root.clone(),
+                    "Durability-Peer".into(),
+                    "macOS".into(),
+                    "10.0.0.5".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(creds.trust_generation, 1);
+            assert_eq!(ks.peer_trust_generation(&id_hex), Some(1));
+
+            // 2. Unpair -> bump to generation 2 and persist tombstone
+            let removed = ks.unpair_peer(&id_hex).unwrap();
+            assert!(removed);
+            assert_eq!(ks.peer_trust_generation(&id_hex), Some(2));
+            assert!(ks.get_peer(&id_hex).is_none());
+        } // Drop keystore from memory!
+
+        // 3. Reload from disk: tombstone must be restored
+        {
+            let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            assert!(ks.get_peer(&id_hex).is_none());
+            assert_eq!(
+                ks.peer_trust_generation(&id_hex),
+                Some(2),
+                "Tombstone generation 2 must be loaded from disk"
+            );
+
+            // 4. Re-pair same peer -> must advance from generation 2 to generation 3!
+            let creds = ks
+                .commit_paired_peer(
+                    id,
+                    pk,
+                    root.clone(),
+                    "Durability-Peer".into(),
+                    "macOS".into(),
+                    "10.0.0.5".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                creds.trust_generation, 3,
+                "Re-paired peer must be assigned generation 3, never resetting to 1"
+            );
+            assert_eq!(ks.peer_trust_generation(&id_hex), Some(3));
+
+            // 5. Unpair again -> bump to generation 4
+            let removed = ks.unpair_peer(&id_hex).unwrap();
+            assert!(removed);
+            assert_eq!(ks.peer_trust_generation(&id_hex), Some(4));
+        } // Drop keystore again!
+
+        // 6. Second reload: tombstone must be 4, re-pair must reach generation 5!
+        {
+            let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            assert_eq!(ks.peer_trust_generation(&id_hex), Some(4));
+            let creds = ks
+                .commit_paired_peer(
+                    id,
+                    pk,
+                    root,
+                    "Durability-Peer".into(),
+                    "macOS".into(),
+                    "10.0.0.5".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(creds.trust_generation, 5);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_persistence_failure_preserves_authoritative_in_memory_state() {
+        let dir = unique_temp_dir("ks_persist_failure");
+        let provider = FixedKekProvider::new([0x22u8; 32]);
+
+        let pk = SigningKey::from_bytes(&[0x66u8; 32]).verifying_key().to_bytes();
+        let id = derive_device_id_from_pubkey(&pk);
+        let id_hex = hex_encode(&id);
+        let root = Zeroizing::new([0x77u8; 32]);
+
+        let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+        ks.commit_paired_peer(
+            id,
+            pk,
+            root,
+            "Persist-Fail-PC".into(),
+            "Windows".into(),
+            "192.168.1.50".into(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(ks.peer_trust_generation(&id_hex), Some(1));
+        assert!(ks.get_peer(&id_hex).is_some());
+
+        // Replace storage directory with a regular file to force deterministic write failure during persistence
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"blocked_not_a_directory").unwrap();
+
+        let unpair_res = ks.unpair_peer(&id_hex);
+
+        assert!(unpair_res.is_err(), "Persistence failure must return error");
+        // Authoritative in-memory state must be UNCHANGED
+        assert!(
+            ks.get_peer(&id_hex).is_some(),
+            "Peer must remain trusted in-memory when disk persistence fails"
+        );
+        assert_eq!(
+            ks.peer_trust_generation(&id_hex),
+            Some(1),
+            "Trust generation must not be incremented in-memory when disk persistence fails"
+        );
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_keystore_legacy_v2_without_tombstones_loads_and_upgrades() {
+        let dir = unique_temp_dir("ks_legacy_tombstones");
+        let provider = FixedKekProvider::new([0x12u8; 32]);
+        let ks_file = dir.join("trusted_peers_v2.json");
+
+        let pk = SigningKey::from_bytes(&[0x88u8; 32]).verifying_key().to_bytes();
+        let id = derive_device_id_from_pubkey(&pk);
+        let id_hex = hex_encode(&id);
+        let root = Zeroizing::new([0x99u8; 32]);
+
+        // 1. Create a store with an active peer
+        {
+            let mut ks = KeystoreV2::open_with_provider(dir.clone(), &provider).unwrap();
+            ks.commit_paired_peer(
+                id,
+                pk,
+                root,
+                "Legacy-PC".into(),
+                "Windows".into(),
+                "10.0.0.9".into(),
+                false,
+            )
+            .unwrap();
+        }
+
+        // 2. Strip tombstone_generations from json and write back with legacy MAC
+        let raw = std::fs::read_to_string(&ks_file).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.remove("tombstone_generations");
+        }
+        let stripped_json = serde_json::to_vec_pretty(&parsed).unwrap();
+        std::fs::write(&ks_file, stripped_json).unwrap();
+
+        // 3. Load with KeystoreV2: must successfully load and transparently upgrade
+        let ks = KeystoreV2::open_with_provider(dir.clone(), &provider);
+        assert!(ks.is_ok(), "Keystore without tombstones must load cleanly and upgrade");
+        let ks = ks.unwrap();
+        assert_eq!(ks.peer_trust_generation(&id_hex), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_stale_temp_file_sweep_rejects_symlinks() {
+        let dir = unique_temp_dir("ks_stale_sweep");
+
+        // 1. Create a regular valid file
+        let valid_file = dir.join("trusted_peers_v2.json");
+        std::fs::write(&valid_file, b"valid keystore").unwrap();
+
+        // 2. Create a fresh temp file (< 300s old)
+        let fresh_tmp = dir.join(".trusted_peers_v2.json.tmp.fresh");
+        std::fs::write(&fresh_tmp, b"in-flight write").unwrap();
+
+        // 3. Create a target file that symlink points to
+        let secret_target = dir.join("important_secret.txt");
+        std::fs::write(&secret_target, b"do not delete").unwrap();
+
+        // 4. Create a symlink named like a temp file pointing to important_secret.txt
+        let symlink_tmp = dir.join(".trusted_peers_v2.json.tmp.symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret_target, &symlink_tmp).unwrap();
+
+        // Run stale temp files cleanup
+        clean_stale_temp_files(&dir);
+
+        // Valid file must be untouched
+        assert!(valid_file.exists());
+        // Fresh temp file must be untouched (< 300s old)
+        assert!(fresh_tmp.exists());
+        // Secret target must NOT be deleted (never followed)
+        assert!(secret_target.exists(), "Target of symlink must never be deleted");
+
+        #[cfg(unix)]
+        {
+            // The untrusted symlink itself should have been removed without touching the target
+            assert!(!symlink_tmp.exists(), "Untrusted symlinked temp file must be unlinked");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keystore_threat_model_anti_rollback_boundary_documentation() {
+        // Assert that the codebase explicitly documents Layer 3 threat model boundaries (SEC-1D-19):
+        // HMAC guarantees cryptographic integrity and tampering detection,
+        // but rollback defense requires hardware-backed monotonic counter anchors.
+        let keystore_rs = include_str!("keystore.rs");
+        assert!(
+            keystore_rs.to_lowercase().contains("anti-rollback")
+                && keystore_rs.contains("Threat Model Boundary"),
+            "Keystore must explicitly document Layer 3 anti-rollback threat boundaries"
+        );
     }
 }

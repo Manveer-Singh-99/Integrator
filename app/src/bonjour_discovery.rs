@@ -118,7 +118,7 @@ pub fn sanitize_dns_label(raw: &str, fallback: &str) -> String {
 /// Collects active, non-virtual local IPv4 addresses sorted by transport priority for mDNS registration.
 fn collect_bonjour_local_ipv4s() -> Vec<Ipv4Addr> {
     let mut ifaces = system_info::list_local_ipv4_interfaces();
-    ifaces.sort_by(|a, b| b.transport.route_priority().cmp(&a.transport.route_priority()));
+    ifaces.sort_by(|a, b| a.transport.route_priority().cmp(&b.transport.route_priority()));
     let mut ips = Vec::new();
     for iface in ifaces {
         if let Ok(ip) = iface.ip.parse::<Ipv4Addr>() {
@@ -421,5 +421,28 @@ mod tests {
         // Must never publish Apple AirPlay / AirDrop service types
         assert!(!info.get_type().contains("airplay"));
         assert!(!info.get_type().contains("raop"));
+    }
+
+    #[test]
+    fn transport_priority_sort_prefers_thunderbolt_over_wifi() {
+        use crate::system_info::{LinkTransport, LocalInterfaceInfo};
+        let make_iface = |name: &str, ip: &str, transport: LinkTransport| LocalInterfaceInfo {
+            name: name.to_string(),
+            friendly_name: name.to_string(),
+            ip: ip.to_string(),
+            netmask: "255.255.255.0".to_string(),
+            broadcast: "192.168.1.255".to_string(),
+            cidr_prefix: 24,
+            transport,
+            link_speed_mbps: None,
+            description: String::new(),
+        };
+        let mut ifaces = vec![
+            make_iface("en0", "192.168.1.50", LinkTransport::Wifi),
+            make_iface("bridge0", "10.0.0.1", LinkTransport::Thunderbolt),
+        ];
+        ifaces.sort_by(|a, b| a.transport.route_priority().cmp(&b.transport.route_priority()));
+        assert_eq!(ifaces[0].transport, LinkTransport::Thunderbolt);
+        assert_eq!(ifaces[1].transport, LinkTransport::Wifi);
     }
 }

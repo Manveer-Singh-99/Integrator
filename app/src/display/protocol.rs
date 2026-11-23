@@ -148,6 +148,9 @@ pub enum DisplayRpcRequest {
     /// Starts the Shared Camera pipeline (AVFoundation capture on Mac / FrameServer virtual webcam on PC).
     StartCamera,
 
+    /// Queries camera consent status for the requesting peer without granting consent or showing prompts.
+    CheckCameraConsent,
+
     /// Toggles the Shared Camera pipeline between active and standby states.
     ToggleCamera,
 
@@ -165,6 +168,12 @@ pub enum DisplayRpcRequest {
         /// Hostname of the requesting peer displayed in the native macOS Touch ID prompt.
         requester_hostname: String,
     },
+
+    /// Requests WebAuthn passkey credential creation on the remote peer, verified by Touch ID.
+    PasskeyMakeCredential(crate::security::passkey::PasskeyMakeCredentialRequest),
+
+    /// Requests WebAuthn passkey assertion signing on the remote peer, verified by Touch ID.
+    PasskeyGetAssertion(crate::security::passkey::PasskeyGetAssertionRequest),
 }
 
 impl fmt::Debug for DisplayRpcRequest {
@@ -232,6 +241,7 @@ impl fmt::Debug for DisplayRpcRequest {
                 .finish(),
             Self::GetBridgeStatus => f.write_str("GetBridgeStatus"),
             Self::StartCamera => f.write_str("StartCamera"),
+            Self::CheckCameraConsent => f.write_str("CheckCameraConsent"),
             Self::ToggleCamera => f.write_str("ToggleCamera"),
             Self::StopCamera => f.write_str("StopCamera"),
             Self::GetCameraStatus => f.write_str("GetCameraStatus"),
@@ -242,6 +252,15 @@ impl fmt::Debug for DisplayRpcRequest {
                 .debug_struct("VerifyTouchId")
                 .field("challenge_nonce_hex", challenge_nonce_hex)
                 .field("requester_hostname", requester_hostname)
+                .finish(),
+            Self::PasskeyMakeCredential(req) => f
+                .debug_struct("PasskeyMakeCredential")
+                .field("rp_id", &req.rp_id)
+                .field("user_name", &req.user_name)
+                .finish(),
+            Self::PasskeyGetAssertion(req) => f
+                .debug_struct("PasskeyGetAssertion")
+                .field("rp_id", &req.rp_id)
                 .finish(),
         }
     }
@@ -288,6 +307,21 @@ pub struct DisplayRpcResponse {
     /// Signed Touch ID Secure Enclave biometric assertion returned by [`DisplayRpcRequest::VerifyTouchId`].
     #[serde(default)]
     pub touchid_assertion: Option<crate::trust::TouchIdSignedAssertion>,
+    /// Camera consent status returned by [`DisplayRpcRequest::CheckCameraConsent`].
+    #[serde(default)]
+    pub camera_consent_status: Option<crate::camera::authorization::CameraConsentStatusWire>,
+    /// Hex-encoded 32-byte authorization lease token returned upon successful camera consent approval.
+    #[serde(default)]
+    pub camera_lease_token_hex: Option<String>,
+    /// Unique lease request identifier.
+    #[serde(default)]
+    pub camera_lease_id: Option<u64>,
+    /// Passkey credential creation response returned by [`DisplayRpcRequest::PasskeyMakeCredential`].
+    #[serde(default)]
+    pub passkey_credential: Option<crate::security::passkey::PasskeyMakeCredentialResponse>,
+    /// Passkey assertion signature response returned by [`DisplayRpcRequest::PasskeyGetAssertion`].
+    #[serde(default)]
+    pub passkey_assertion: Option<crate::security::passkey::PasskeyGetAssertionResponse>,
 }
 
 impl fmt::Debug for DisplayRpcResponse {
@@ -305,10 +339,16 @@ impl fmt::Debug for DisplayRpcResponse {
                 "pairing_token",
                 &self.pairing_token.as_ref().map(|_| "<REDACTED>"),
             )
+            .field(
+                "camera_lease_token_hex",
+                &self.camera_lease_token_hex.as_ref().map(|_| "<REDACTED>"),
+            )
             .field("host_device_id", &self.host_device_id)
             .field("host_name", &self.host_name)
             .field("audio_session", &self.audio_session)
             .field("touchid_assertion", &self.touchid_assertion)
+            .field("passkey_credential", &self.passkey_credential)
+            .field("passkey_assertion", &self.passkey_assertion)
             .finish()
     }
 }
@@ -328,6 +368,14 @@ pub(crate) fn required_feature_for_rpc(req: &DisplayRpcRequest) -> Option<&'stat
         DisplayRpcRequest::SyncTrueTone { .. } => Some("truetone"),
         DisplayRpcRequest::MountStorage | DisplayRpcRequest::UnmountStorage => Some("storage"),
         DisplayRpcRequest::NegotiateAudioSession { .. } => Some("audio"),
+        DisplayRpcRequest::StartCamera
+        | DisplayRpcRequest::CheckCameraConsent
+        | DisplayRpcRequest::ToggleCamera
+        | DisplayRpcRequest::StopCamera
+        | DisplayRpcRequest::GetCameraStatus => Some("camera"),
+        DisplayRpcRequest::VerifyTouchId { .. }
+        | DisplayRpcRequest::PasskeyMakeCredential(_)
+        | DisplayRpcRequest::PasskeyGetAssertion(_) => Some("touchid"),
         DisplayRpcRequest::Ping
         | DisplayRpcRequest::GetHardwareProfile
         | DisplayRpcRequest::GetStatus
@@ -335,12 +383,7 @@ pub(crate) fn required_feature_for_rpc(req: &DisplayRpcRequest) -> Option<&'stat
         | DisplayRpcRequest::ShowWindow
         | DisplayRpcRequest::GetPairingPin
         | DisplayRpcRequest::PairWithPeer { .. }
-        | DisplayRpcRequest::GetBridgeStatus
-        | DisplayRpcRequest::StartCamera
-        | DisplayRpcRequest::ToggleCamera
-        | DisplayRpcRequest::StopCamera
-        | DisplayRpcRequest::GetCameraStatus
-        | DisplayRpcRequest::VerifyTouchId { .. } => None,
+        | DisplayRpcRequest::GetBridgeStatus => None,
     }
 }
 

@@ -680,6 +680,7 @@ private func ensureGhostPanel() -> NSPanel {
     panel.hasShadow = true
     panel.ignoresMouseEvents = true
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    panel.sharingType = .none
 
     let glass = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 256, height: 54))
     glass.material = .hudWindow
@@ -883,6 +884,7 @@ public func integrator_kvm_macos_begin_native_drag(
             // Crucial on macOS Sequoia: non-zero alpha required or WindowServer marks window click-through!
             win.backgroundColor = NSColor(white: 0.5, alpha: 0.01)
             win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            win.sharingType = .none
             view = IntegratorDragSourceView(frame: NSRect(x: 0, y: 0, width: 96, height: 96))
             view.hostWindow = win
             win.contentView = view

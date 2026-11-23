@@ -110,6 +110,9 @@ namespace IntegratorUI
                 return 1;
             }
 
+            // 5.1 Passkey COM hosting runs in dedicated Medium-IL packaged IntegratorPasskeyHost.exe
+            // (registered via Integrator.PasskeyProvider sparse MSIX windows.comServer).
+
             // 6. Enter the WinUI 3 XAML Application message pump with an STA dispatcher context.
             try
             {
@@ -123,7 +126,8 @@ namespace IntegratorUI
             }
             finally
             {
-                // Ensure native core shutdown and mutex release on process termination.
+                // Ensure passkey plugin revocation, native core shutdown and mutex release on process termination.
+                PasskeyAuthenticatorPlugin.Shutdown();
                 CoreBridge.Shutdown();
                 try { singleInstanceMutex.ReleaseMutex(); } catch { }
             }

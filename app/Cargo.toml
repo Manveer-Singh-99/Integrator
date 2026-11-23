@@ -1,6 +1,6 @@
 [package]
 name = "integrator"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Manveer Singh"]
 license = "MIT"
@@ -26,6 +26,8 @@ subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
 getrandom = "0.3"
 mdns-sd = "0.13"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "arithmetic", "std", "pem"] }
+ciborium = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
