@@ -65,9 +65,9 @@
 
 use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::config::{
@@ -112,10 +112,22 @@ pub fn is_ble_active() -> bool {
 }
 
 /// Generates a fresh 2-byte CSPRNG nonce for BLE magic-packet obfuscation.
+///
+/// Falls back to a monotonic counter mixed with sub-second system time if `getrandom::fill`
+/// ever fails transiently so repeated packets never reuse the same XOR keystream.
 fn random_nonce_2() -> [u8; 2] {
+    static FALLBACK_NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
     let mut nonce = [0u8; 2];
-    let _ = getrandom::fill(&mut nonce);
-    nonce
+    if getrandom::fill(&mut nonce).is_ok() {
+        return nonce;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let mixed = nanos ^ FALLBACK_NONCE_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9);
+    let le = (mixed as u16).to_le_bytes();
+    [le[0], le[1]]
 }
 
 /// Parses the first 4 bytes (8 hex chars) of a device ID hex string.
@@ -210,7 +222,55 @@ fn is_valid_ble_endpoint(ip: Ipv4Addr, port: u16) -> bool {
         && port >= 1024
 }
 
+/// Masks a 6-byte `(IPv4 || port_be)` endpoint and computes its 2-byte domain-separated SHA-256 tag.
+fn mask_endpoint_6(
+    dev_prefix: &[u8; 4],
+    ip: Ipv4Addr,
+    port: u16,
+    nonce: [u8; 2],
+    mode_tag: u8,
+) -> ([u8; 6], [u8; 2]) {
+    let ks = derive_mask_keystream(dev_prefix, &nonce);
+    let octets = ip.octets();
+    let port_be = port.to_be_bytes();
+    let plain = [octets[0], octets[1], octets[2], octets[3], port_be[0], port_be[1]];
+    let mut masked = [0u8; 6];
+    for i in 0..6 {
+        masked[i] = plain[i] ^ ks[i];
+    }
+    let tag = compute_integrity_tag(mode_tag, dev_prefix, &nonce, &masked);
+    (masked, tag)
+}
+
+/// Verifies the 2-byte integrity tag and unmasks a 6-byte `(IPv4 || port_be)` endpoint payload.
+fn unmask_endpoint_6(
+    dev_prefix: &[u8; 4],
+    nonce: [u8; 2],
+    masked: &[u8],
+    tag: &[u8],
+    mode_tag: u8,
+) -> Option<(Ipv4Addr, u16)> {
+    if masked.len() != 6 || tag.len() != 2 {
+        return None;
+    }
+    let expected_tag = compute_integrity_tag(mode_tag, dev_prefix, &nonce, masked);
+    if tag != expected_tag {
+        return None;
+    }
+    let ks = derive_mask_keystream(dev_prefix, &nonce);
+    let mut plain = [0u8; 6];
+    for i in 0..6 {
+        plain[i] = masked[i] ^ ks[i];
+    }
+    let ip = Ipv4Addr::new(plain[0], plain[1], plain[2], plain[3]);
+    let port = u16::from_be_bytes([plain[4], plain[5]]);
+    is_valid_ble_endpoint(ip, port).then_some((ip, port))
+}
+
 /// Encodes a 17-byte binary Integrator v2 BLE magic packet (used in Windows ManufacturerData & macOS GATT).
+///
+/// # Returns
+/// `Some([u8; 17])` on success, or `None` if `ip`/`port` fails validation or `device_id_hex` has < 8 hex chars.
 pub fn encode_ble_binary_packet(
     device_id_hex: &str,
     ip: Ipv4Addr,
@@ -221,16 +281,7 @@ pub fn encode_ble_binary_packet(
         return None;
     }
     let dev_prefix = parse_device_prefix_4(device_id_hex)?;
-    let ks = derive_mask_keystream(&dev_prefix, &nonce);
-
-    let octets = ip.octets();
-    let port_be = port.to_be_bytes();
-    let plain = [octets[0], octets[1], octets[2], octets[3], port_be[0], port_be[1]];
-    let mut masked = [0u8; 6];
-    for i in 0..6 {
-        masked[i] = plain[i] ^ ks[i];
-    }
-    let tag = compute_integrity_tag(0x01, &dev_prefix, &nonce, &masked);
+    let (masked, tag) = mask_endpoint_6(&dev_prefix, ip, port, nonce, 0x01);
 
     let mut pkt = [0u8; BLE_BINARY_PACKET_LEN];
     pkt[0..3].copy_from_slice(&BLE_PACKET_MAGIC);
@@ -242,6 +293,8 @@ pub fn encode_ble_binary_packet(
 }
 
 /// Decodes and validates a 17-byte binary Integrator v2 BLE magic packet.
+///
+/// Returns `None` if magic bytes, SHA-256 integrity tag, or decoded endpoint bounds fail validation.
 pub fn decode_ble_binary_packet(data: &[u8], rssi: i16) -> Option<BleDiscoveryHint> {
     if data.len() < BLE_BINARY_PACKET_LEN || data[0..3] != BLE_PACKET_MAGIC {
         return None;
@@ -250,22 +303,7 @@ pub fn decode_ble_binary_packet(data: &[u8], rssi: i16) -> Option<BleDiscoveryHi
     dev_prefix.copy_from_slice(&data[3..7]);
     let mut nonce = [0u8; 2];
     nonce.copy_from_slice(&data[7..9]);
-    let masked = &data[9..15];
-    let expected_tag = compute_integrity_tag(0x01, &dev_prefix, &nonce, masked);
-    if data[15..17] != expected_tag {
-        return None;
-    }
-
-    let ks = derive_mask_keystream(&dev_prefix, &nonce);
-    let mut plain = [0u8; 6];
-    for i in 0..6 {
-        plain[i] = masked[i] ^ ks[i];
-    }
-    let ip = Ipv4Addr::new(plain[0], plain[1], plain[2], plain[3]);
-    let port = u16::from_be_bytes([plain[4], plain[5]]);
-    if !is_valid_ble_endpoint(ip, port) {
-        return None;
-    }
+    let (ip, port) = unmask_endpoint_6(&dev_prefix, nonce, &data[9..15], &data[15..17], 0x01)?;
 
     Some(BleDiscoveryHint {
         device_id_prefix: bytes_to_hex_lower(&dev_prefix),
@@ -295,16 +333,7 @@ pub fn encode_ble_service_uuid_bytes(
         return None;
     }
     let dev_prefix = parse_device_prefix_4(device_id_hex)?;
-    let ks = derive_mask_keystream(&dev_prefix, &nonce);
-
-    let octets = ip.octets();
-    let port_be = port.to_be_bytes();
-    let plain = [octets[0], octets[1], octets[2], octets[3], port_be[0], port_be[1]];
-    let mut masked = [0u8; 6];
-    for i in 0..6 {
-        masked[i] = plain[i] ^ ks[i];
-    }
-    let tag = compute_integrity_tag(0x03, &dev_prefix, &nonce, &masked);
+    let (masked, tag) = mask_endpoint_6(&dev_prefix, ip, port, nonce, 0x03);
 
     let mut out = [0u8; BLE_UUID_PACKET_LEN];
     out[0..2].copy_from_slice(&BLE_UUID_MAGIC_PREFIX);
@@ -355,22 +384,7 @@ pub fn decode_ble_service_uuid_bytes(
     dev_prefix.copy_from_slice(&data[2..6]);
     let mut nonce = [0u8; 2];
     nonce.copy_from_slice(&data[6..8]);
-    let masked = &data[8..14];
-    let expected_tag = compute_integrity_tag(0x03, &dev_prefix, &nonce, masked);
-    if data[14..16] != expected_tag {
-        return None;
-    }
-
-    let ks = derive_mask_keystream(&dev_prefix, &nonce);
-    let mut plain = [0u8; 6];
-    for i in 0..6 {
-        plain[i] = masked[i] ^ ks[i];
-    }
-    let ip = Ipv4Addr::new(plain[0], plain[1], plain[2], plain[3]);
-    let port = u16::from_be_bytes([plain[4], plain[5]]);
-    if !is_valid_ble_endpoint(ip, port) {
-        return None;
-    }
+    let (ip, port) = unmask_endpoint_6(&dev_prefix, nonce, &data[8..14], &data[14..16], 0x03)?;
 
     Some(BleDiscoveryHint {
         device_id_prefix: bytes_to_hex_lower(&dev_prefix),
@@ -382,7 +396,7 @@ pub fn decode_ble_service_uuid_bytes(
 }
 
 /// Decodes an Integrator v2 128-bit Service UUID string (with or without hyphens).
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", test))]
 pub fn decode_ble_service_uuid_str(uuid_str: &str, rssi: i16) -> Option<BleDiscoveryHint> {
     let compact: String = uuid_str
         .trim()
@@ -498,10 +512,12 @@ pub fn select_best_advertisable_ipv4() -> Option<Ipv4Addr> {
 static BLE_HINT_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<BleDiscoveryHint>>>> =
     OnceLock::new();
 
+/// Returns the global mutex guarding the active BLE discovery hint channel sender.
 fn ble_hint_tx_slot() -> &'static Mutex<Option<mpsc::UnboundedSender<BleDiscoveryHint>>> {
     BLE_HINT_TX.get_or_init(|| Mutex::new(None))
 }
 
+/// Forwards a verified BLE reachability hint to the currently registered discovery listener, if any.
 fn dispatch_ble_hint(hint: BleDiscoveryHint) {
     if let Ok(guard) = ble_hint_tx_slot().lock() {
         if let Some(ref tx) = *guard {
@@ -510,32 +526,40 @@ fn dispatch_ble_hint(hint: BleDiscoveryHint) {
     }
 }
 
+/// macOS `CoreBluetooth` FFI bridge wrapping `src/ble_macos.swift`.
 #[cfg(target_os = "macos")]
 mod macos_ble {
     use super::*;
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
 
+    /// Callback invoked by CoreBluetooth with binary manufacturer/service-UUID magic-packet bytes and RSSI.
     type BinaryCb = extern "C" fn(*const u8, usize, i16);
+    /// Callback invoked by CoreBluetooth with advertised LocalName UTF-8 C strings and RSSI.
     type NameCb = extern "C" fn(*const c_char, i16);
 
     extern "C" {
+        /// Starts CoreBluetooth scanning and/or peripheral advertising with Rust callbacks.
         fn integrator_mac_ble_start(
             enable_scan: bool,
             enable_advertise: bool,
             binary_cb: Option<BinaryCb>,
             name_cb: Option<NameCb>,
         ) -> bool;
+        /// Updates the rotating CoreBluetooth advertisement Service UUID, LocalName, and binary characteristic.
         fn integrator_mac_ble_update_advertisement(
             service_uuid_ptr: *const c_char,
             local_name_ptr: *const c_char,
             bin_ptr: *const u8,
             bin_len: usize,
         );
+        /// Stops CoreBluetooth scanning and peripheral advertising cleanly.
         fn integrator_mac_ble_stop();
+        /// Returns macOS `CBManager.authorization` raw status code.
         pub(crate) fn integrator_mac_ble_auth_status() -> i32;
     }
 
+    /// FFI callback receiving raw binary BLE discovery payloads from CoreBluetooth.
     extern "C" fn on_binary_packet(ptr: *const u8, len: usize, rssi: i16) {
         if ptr.is_null() || len < BLE_UUID_PACKET_LEN || len > 64 {
             return;
@@ -555,6 +579,7 @@ mod macos_ble {
         }
     }
 
+    /// FFI callback receiving advertised `CBAdvertisementDataLocalNameKey` / UUID strings from CoreBluetooth.
     extern "C" fn on_local_name(ptr: *const c_char, rssi: i16) {
         if ptr.is_null() {
             return;
@@ -569,6 +594,7 @@ mod macos_ble {
         }
     }
 
+    /// Starts CoreBluetooth scanning and/or advertising on macOS.
     pub fn start_platform(enable_scan: bool, enable_advertise: bool) -> bool {
         unsafe {
             integrator_mac_ble_start(
@@ -588,6 +614,7 @@ mod macos_ble {
         }
     }
 
+    /// Pushes updated rotating BLE advertisement strings and binary GATT bytes to macOS CoreBluetooth.
     pub fn update_platform_advertisement(
         service_uuid: &str,
         local_name: &str,
@@ -605,6 +632,7 @@ mod macos_ble {
         }
     }
 
+    /// Stops macOS CoreBluetooth scanning and advertising.
     pub fn stop_platform() {
         unsafe {
             integrator_mac_ble_stop();
@@ -612,6 +640,7 @@ mod macos_ble {
     }
 }
 
+/// Queries the macOS CoreBluetooth TCC authorization status (`CBManager.authorization` raw value).
 #[cfg(target_os = "macos")]
 pub fn macos_bluetooth_auth_status() -> i32 {
     unsafe { macos_ble::integrator_mac_ble_auth_status() }
@@ -646,10 +675,12 @@ mod windows_ble {
 
     static WIN_BLE: OnceLock<Mutex<Option<WinBleHandles>>> = OnceLock::new();
 
+    /// Returns the global mutex guarding the active WinRT BLE publisher/watcher handles.
     fn win_ble_slot() -> &'static Mutex<Option<WinBleHandles>> {
         WIN_BLE.get_or_init(|| Mutex::new(None))
     }
 
+    /// Initializes and starts Windows WinRT BLE scanning (`Active` mode) and prepares advertisement publishing.
     pub fn start_platform(enable_scan: bool, enable_advertise: bool) -> bool {
         let mut watcher_opt = None;
         if enable_scan {
@@ -741,6 +772,15 @@ mod windows_ble {
 
         let started_ok = watcher_opt.is_some() || enable_advertise;
         if let Ok(mut guard) = win_ble_slot().lock() {
+            // Stop any previously active WinRT watcher/publisher before replacing the handle slot.
+            if let Some(prev) = guard.take() {
+                if let Some(p) = prev.publisher {
+                    let _ = p.Stop();
+                }
+                if let Some(w) = prev.watcher {
+                    let _ = w.Stop();
+                }
+            }
             *guard = Some(WinBleHandles {
                 publisher: None,
                 watcher: watcher_opt,
@@ -749,6 +789,7 @@ mod windows_ble {
         started_ok
     }
 
+    /// Replaces the active WinRT BLE publisher with a fresh rotating ManufacturerData payload.
     pub fn update_platform_advertisement(
         _service_uuid: &str,
         _local_name: &str,
@@ -797,6 +838,7 @@ mod windows_ble {
         handles.publisher = Some(publisher);
     }
 
+    /// Stops any active Windows WinRT BLE publisher and advertisement watcher.
     pub fn stop_platform() {
         if let Ok(mut guard) = win_ble_slot().lock() {
             if let Some(handles) = guard.take() {
@@ -811,6 +853,7 @@ mod windows_ble {
     }
 }
 
+/// No-op BLE platform adapter for platforms other than macOS and Windows.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod fallback_ble {
     use super::*;
@@ -842,12 +885,16 @@ pub fn start_ble_discovery(
     enable_advertise: bool,
 ) -> Option<mpsc::UnboundedReceiver<BleDiscoveryHint>> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let rx_closed_probe = tx.clone();
     if let Ok(mut slot) = ble_hint_tx_slot().lock() {
         *slot = Some(tx);
     }
 
     if !platform_ble::start_platform(enable_scan, enable_advertise) {
         tracing::warn!("BLE magic-packet discovery could not initialize on this host");
+        if let Ok(mut slot) = ble_hint_tx_slot().lock() {
+            *slot = None;
+        }
         BLE_ACTIVE.store(false, Ordering::Release);
         return None;
     }
@@ -862,6 +909,9 @@ pub fn start_ble_discovery(
     if enable_advertise {
         tokio::spawn(async move {
             loop {
+                if !is_ble_active() {
+                    break;
+                }
                 let dev_id = local_device_id.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Some(best_ip) = select_best_advertisable_ipv4() {
@@ -881,7 +931,14 @@ pub fn start_ble_discovery(
                     }
                 })
                 .await;
-                tokio::time::sleep(Duration::from_secs(BLE_PAYLOAD_REFRESH_SECS)).await;
+                tokio::select! {
+                    _ = rx_closed_probe.closed() => {
+                        BLE_ACTIVE.store(false, Ordering::Release);
+                        platform_ble::stop_platform();
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(BLE_PAYLOAD_REFRESH_SECS)) => {}
+                }
             }
         });
     }
@@ -889,8 +946,35 @@ pub fn start_ble_discovery(
     Some(rx)
 }
 
+/// Cancel-safe RAII guard ensuring one-shot BLE scanning stops the platform radio and restores
+/// the previous hint channel sender even if the awaiting future is dropped/cancelled early.
+struct OneShotBleScanGuard {
+    prev_tx: Option<mpsc::UnboundedSender<BleDiscoveryHint>>,
+    active: bool,
+}
+
+impl Drop for OneShotBleScanGuard {
+    fn drop(&mut self) {
+        if self.active {
+            platform_ble::stop_platform();
+            if let Ok(mut slot) = ble_hint_tx_slot().lock() {
+                *slot = self.prev_tx.take();
+            }
+            self.active = false;
+        }
+    }
+}
+
 /// Performs an isolated one-shot BLE scan (zero UDP, zero Bonjour) waiting up to `timeout`
 /// for a nearby non-self Integrator BLE magic packet.
+///
+/// # Arguments
+/// * `own_device_id` - Local device ID hex string whose 8-hex-char prefix is filtered out.
+/// * `timeout` - Maximum wait window before returning a timeout error.
+///
+/// # Errors
+/// Returns an error if the platform BLE scanner fails to start, the hint channel closes unexpectedly,
+/// or `timeout` elapses before a valid remote BLE magic packet is decoded.
 pub async fn scan_once_for_ble_hint(
     own_device_id: &str,
     timeout: Duration,
@@ -915,6 +999,11 @@ pub async fn scan_once_for_ble_hint(
         anyhow::bail!("Bluetooth LE scanner failed to start (ensure Bluetooth is powered on and permitted)");
     }
 
+    let _cleanup_guard = OneShotBleScanGuard {
+        prev_tx,
+        active: true,
+    };
+
     let res = tokio::time::timeout(timeout, async {
         while let Some(hint) = rx.recv().await {
             if hint.device_id_prefix == own_prefix {
@@ -925,11 +1014,6 @@ pub async fn scan_once_for_ble_hint(
         Err(anyhow::anyhow!("BLE hint channel closed unexpectedly"))
     })
     .await;
-
-    platform_ble::stop_platform();
-    if let Ok(mut slot) = ble_hint_tx_slot().lock() {
-        *slot = prev_tx;
-    }
 
     match res {
         Ok(inner) => inner,

@@ -6,54 +6,83 @@
 //  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
 //  ========================================================================================
 //  This file provides the native macOS TouchBar (`NSTouchBar`) HUD controller for MacBook Pro
-//  models, implementing tactile hardware-level monitoring, remote clipboard paste interception,
-//  and interactive liquid-glass controls.
+//  models, implementing tactile hardware-level GPU monitoring, expanded Windows media playback
+//  controls with a rounded Liquid Glass scrubber, Visual Touch ID biometric prompts, a Hardware
+//  Camera Privacy Killswitch pill, remote clipboard paste interception, and a persistent `∫`
+//  Control Strip tray button.
 //
 //  Key Subsystem Capabilities:
-//  - Viscous Liquid Glass Pill Views (`GoopyLiquidGlassPillView`): Implements squishy, rubber-band
-//    drag-stretch physics with Spring animations, Frosted HUD blur materials (`NSVisualEffectView`
-//    with `.hudWindow`), and continuous corner curves.
-//  - Live Telemetry Streamer: Displays real-time GPU metrics from the connected Windows 11 host
-//    (GPU temperature °C, clock speed MHz, power consumption W, VRAM utilization %, display latency ms,
-//    and frame rates).
-//  - Remote File Paste Interceptor (`PasteboardShortcutInterceptor`): Installs a passive `CGEventTap`
-//    listening for `Cmd+V`. When a remote file announcement is pending, it intercepts the shortcut,
-//    updates the TouchBar with a haptic pulse, and triggers asynchronous zero-RAM streaming via
-//    `trigger_rust_remote_paste()`.
-//  - In-App Pasteboard Native File Helper: Implements `read_pasteboard_files_in_app` and
-//    `write_pasteboard_files_in_app` using `\0`-delimited UTF-8 byte arrays directly on the main
-//    AppKit thread, avoiding external helper process spawn latency.
+//  - Viscous Liquid Glass Pill Views (`GoopyLiquidGlassPillView`): Implements critically-damped
+//    tactile spring physics, Frosted HUD blur materials (`NSVisualEffectView` with `.hudWindow`),
+//    and continuous corner curves.
+//  - Rounded Liquid Glass Media Scrubber (`LiquidGlassMediaScrubPillView`): Capsule progress bar
+//    with glowing circular thumb, elapsed/total timestamps (`mm:ss`), and zero-snap-back direct
+//    touch scrubbing for Windows GSMTC / browser / Spotify / VLC sessions.
+//  - Visual Touch ID Passkey & UAC Animated Sensor Pointer (`TouchIdPromptGlowView`): Illuminated
+//    emerald/teal strip pinned to the far-right corner pointing directly toward the physical
+//    MacBook Pro Touch ID sensor (`───────▶ 👆 Touch ID`).
+//  - Hardware Camera Privacy Killswitch (`camera_privacy`): One-tap hardware privacy shutter
+//    pill (`🟢 FaceTime HD` / `🚫 Cam Muted`) visible whenever the Mac camera is streaming.
+//  - Live GPU Telemetry Streamer (`gpu` pill + `.gpu` detail strip): Displays real-time GPU
+//    metrics from the connected Windows 11 host (GPU name, temperature °C, power draw W, core
+//    clock MHz, VRAM usage GB, and GPU utilization %).
+//  - Persistent Control Strip System Tray (`∫`): Registers a persistent `NSCustomTouchBarItem`
+//    in the macOS Control Strip and observes `NSTouchBar.isVisible` via KVO so dismissing the
+//    modal bar via the system `X` close button cleans up timers and allows instant 1-tap restore.
+//  - Remote File Paste Interceptor (`PasteboardShortcutInterceptor`): Installs a `CGEventTap`
+//    listening for `Cmd+V` in Finder. When a remote file announcement is pending, it intercepts
+//    the shortcut, updates the TouchBar with a haptic pulse, and triggers asynchronous zero-RAM
+//    streaming via `trigger_rust_remote_paste()`.
+//  - In-App Pasteboard Native File Helper: Implements `clear_pasteboard_in_app`,
+//    `read_pasteboard_files_in_app`, and `write_pasteboard_files_in_app` using `\0`-delimited
+//    UTF-8 byte arrays directly on the main AppKit thread.
 //
 //  ========================================================================================
 //  2. ARCHITECTURAL LINKAGES & CALL FLOW
 //  ========================================================================================
 //  Upstream Callers:
+//  - `src/core.rs`: Invokes C-ABI lifecycle and notification entry points:
+//    - `set_touchbar_rpc_port_in_app`, `init_touchbar_in_app`, `dismiss_touchbar_in_app`,
+//      `is_touchbar_active_in_app`, `set_touchbar_tray_enabled_in_app`, `run_touchbar_cli_loop`.
+//    - `notify_touchbar_touchid_prompt_in_app`, `notify_touchbar_camera_state_in_app`,
+//      `notify_touchbar_kvm_lock_state_in_app`, `notify_touchbar_display_mode_in_app`.
 //  - `src/clipboard/service.rs`: Invokes C-ABI functions:
 //    - `notify_touchbar_remote_file`: Announces pending remote files on TouchBar.
 //    - `update_touchbar_paste_progress`: Telemeters transfer % and MB/s stream velocity.
 //    - `reset_touchbar_paste_progress`: Clears transfer indicators upon completion.
-//  - `src/clipboard/file_helper.rs`: Calls `read_pasteboard_files_in_app` and `write_pasteboard_files_in_app`.
+//    - `init_shortcut_interceptor`, `set_has_pending_remote_file`.
+//  - `src/clipboard/file_helper.rs`: Calls `clear_pasteboard_in_app`,
+//    `read_pasteboard_files_in_app`, and `write_pasteboard_files_in_app`.
 //
 //  Downstream Callees:
-//  - AppKit TouchBar Framework (`NSTouchBar`, `NSTouchBarItem`, `NSCustomTouchBarItem`).
-//  - Quartz Core Graphics (`CGEventTapCreate`, `CGEventPost`).
-//  - Rust FFI: Calls `trigger_rust_remote_paste()` to initiate asynchronous file streaming.
+//  - AppKit TouchBar Framework (`NSTouchBar`, `NSTouchBarItem`, `NSCustomTouchBarItem`) &
+//    private `DFRFoundation.framework` (`DFRSystemModalShowsCloseBoxWhenFrontMost`,
+//    `DFRElementSetControlStripPresenceForIdentifier`, `DFRGetScreenSize`).
+//  - Quartz Core Graphics (`CGEventTapCreate`, `CGEvent.tapEnable`).
+//  - Rust FFI Callbacks: `trigger_rust_remote_paste`, `fetch_rust_touchbar_snapshot_json`,
+//    `fetch_rust_gpu_telemetry_json`, `toggle_rust_camera_privacy_mute`,
+//    `send_rust_windows_media_cmd`.
 //
 //  ========================================================================================
 //  3. THREADING & CONCURRENCY MODEL
 //  ========================================================================================
-//  - AppKit Main Thread: All TouchBar UI item creation and label updates execute on `DispatchQueue.main`.
-//  - Shortcut Interceptor RunLoop: The `CGEventTap` executes on a dedicated Mach port `Thread`.
-//  - Async Rust Handoff: Shortcut triggers dispatch to `DispatchQueue.global(qos: .userInitiated)`
-//    before invoking `trigger_rust_remote_paste()`, ensuring the UI thread is never blocked.
+//  - AppKit Main Thread: All TouchBar UI item creation, KVO callbacks, and label updates execute
+//    strictly on `DispatchQueue.main`.
+//  - Telemetry Poll Worker: 1 Hz timer dispatches `fetch_rust_touchbar_snapshot_json` to
+//    `DispatchQueue.global(qos: .userInitiated)` guarded by `_generation` and `isPollingInFlight`
+//    under `stateLock` (`NSLock`) so stale responses from a dismissed session are discarded.
+//  - Async Rust Handoff: Touch actions dispatch to `DispatchQueue.global(qos: .userInitiated)`
+//    before invoking Rust C-ABI callbacks, ensuring the main UI thread is never blocked.
 //
 //  ========================================================================================
 //  4. SECURITY & SAFETY INVARIANTS
 //  ========================================================================================
-//  - Stale Paste Expiration: In-flight paste sessions automatically expire after 60 seconds if
-//    the remote host fails to stream data, unblocking future paste shortcuts.
-//  - Buffer Capacity Verification: `read_pasteboard_files_in_app` strictly verifies output buffer
-//    capacities before copying NUL-delimited bytes, returning `-1` on overflow.
+//  - Stale Paste Expiration: In-flight paste sessions automatically expire after 30 seconds of
+//    inactivity if the remote host fails to stream data, unblocking future Finder paste shortcuts.
+//  - IP Literal Validation: `normalizedIp` validates peer IP addresses with `inet_pton` (`AF_INET`
+//    and `AF_INET6`) before passing host hints across FFI.
+//  - Buffer Capacity Verification: `read_pasteboard_files_in_app` and snapshot FFI buffers strictly
+//    verify non-null pointers and output buffer capacities before copying bytes.
 //
 
 import AppKit
@@ -67,59 +96,86 @@ private let controlStripBundleId = "com.apple.controlstrip"
 private let finderBundleId = "com.apple.finder"
 
 // MARK: - RPC Data Models
+
+/// Deserialized GPU hardware telemetry metrics sampled from the paired Windows 11 workstation.
 struct GpuTelemetryData: Codable {
+    /// Human-readable GPU adapter model name (e.g., `"NVIDIA GeForce RTX 4080"`).
     let gpu_name: String
+    /// Core die temperature in degrees Celsius (`°C`).
     let temperature_c: UInt32
+    /// Real-time board power draw in Watts (`W`).
     let power_usage_watts: Float
+    /// Compute / 3D engine utilization percentage (`0..100%`).
     let gpu_utilization_percent: UInt32
+    /// Dedicated video memory controller utilization percentage (`0..100%`).
     let memory_utilization_percent: UInt32
+    /// Currently allocated dedicated VRAM in megabytes (`MB`).
     let memory_used_mb: UInt64
+    /// Total physical dedicated VRAM capacity in megabytes (`MB`).
     let memory_total_mb: UInt64
+    /// Active graphics core clock frequency in megahertz (`MHz`).
     let core_clock_mhz: UInt32
 }
 
+/// Deserialized fallback response payload from `fetch_rust_gpu_telemetry_json`.
 struct DisplayRpcResponseData: Codable {
+    /// Indicates whether the remote RPC query succeeded.
     let success: Bool
+    /// Diagnostic status message from the remote display controller.
     let message: String
+    /// Whether the remote virtual display stream is currently active.
     let is_active: Bool
+    /// Optional human-readable mode string (e.g., `"2560x1440@120Hz"`).
     let active_mode: String?
+    /// Optional GPU telemetry snapshot attached to the display response.
     let gpu_telemetry: GpuTelemetryData?
 }
 
+/// Deserialized Windows Global System Media Transport Controls (GSMTC) playback state.
 struct MediaPlaybackStateData: Codable {
+    /// Current media track title.
     let title: String
+    /// Current media artist or channel name.
     let artist: String
+    /// Source media application identifier or display name.
     let app_name: String
+    /// `true` when playback is actively running; `false` when paused or stopped.
     let is_playing: Bool
+    /// Current playback elapsed position in seconds (`s`).
     let position_secs: Double
+    /// Total track duration in seconds (`s`).
     let duration_secs: Double
+    /// `true` if an active media session exists on the paired Windows machine.
     let has_session: Bool
 }
 
+/// Aggregated live Touch Bar state snapshot returned by `fetch_rust_touchbar_snapshot_json`.
 struct TouchBarLiveSnapshotData: Codable {
+    /// Optional live GPU hardware telemetry from the Windows peer.
     let gpu_telemetry: GpuTelemetryData?
+    /// Optional live Windows GSMTC media playback state.
     let media_state: MediaPlaybackStateData?
+    /// Whether the macOS Shared Camera stream is currently active.
     let camera_active: Bool
+    /// Whether the Hardware Camera Privacy Killswitch shutter is currently engaged (muted).
     let camera_muted: Bool
-    let kvm_locked: Bool
-    let audio_balance: Float
-    let audio_muted: Bool
-    let display_active: Bool
-    let display_width: UInt32
-    let display_height: UInt32
-    let display_fps: UInt32
-    let display_hdr: Bool
 }
 
 // MARK: - Feature 1: Visual Touch ID Passkey & UAC Animated Sensor Pointer View
 /// Illuminated animated Touch Bar strip pinned to the far-right corner pointing directly
 /// toward the MacBook Pro physical Touch ID sensor (`[ 🛡️ Approve ... ] ───────> 👆 [Touch ID]`).
 final class TouchIdPromptGlowView: NSView {
+    /// Frosted dark-emerald HUD backdrop container.
     private let bgEffect = NSVisualEffectView()
+    /// Sweeping horizontal cyan/green light gradient indicating physical Touch ID direction.
     private let sweepLayer = CAGradientLayer()
+    /// Primary prompt description text shown on the left side of the strip.
     private let label = NSTextField(labelWithString: "")
+    /// Monospaced directional pointer leading to the physical Touch ID key.
     private let arrowLabel = NSTextField(labelWithString: "───────▶  👆 Touch ID")
+    /// Pulsing green beacon ring aligned at the far-right edge beside Touch ID.
     private let pulseRing = CALayer()
+    /// Fixed horizontal layout width in AppKit points (`460 pt`).
     private let stripWidth: CGFloat = 460
 
     override init(frame frameRect: NSRect) {
@@ -136,6 +192,7 @@ final class TouchIdPromptGlowView: NSView {
         return NSSize(width: stripWidth, height: 30)
     }
 
+    /// Configures subviews, gradient layers, AutoLayout constraints, and initial sweep animations.
     private func setup() {
         wantsLayer = true
         layer?.cornerRadius = 9
@@ -205,12 +262,14 @@ final class TouchIdPromptGlowView: NSView {
         startPulseAnimations()
     }
 
+    /// Updates the displayed authentication prompt string and restarts pulse animations.
     func updateLabel(_ text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         label.stringValue = clean.isEmpty ? "🛡️ Approve Windows Hello Login" : "🛡️ \(clean)"
         startPulseAnimations()
     }
 
+    /// Starts continuous left-to-right gradient sweep and beacon scale animations.
     func startPulseAnimations() {
         sweepLayer.removeAllAnimations()
         let sweep = CABasicAnimation(keyPath: "locations")
@@ -234,20 +293,33 @@ final class TouchIdPromptGlowView: NSView {
 }
 
 // MARK: - Liquid Glass Pill View (Crisp, Critically-Damped Tactile Physics)
+
+/// Frosted Liquid Glass Touch Bar button view featuring critically-damped tactile spring settle
+/// (`zeta = 1.0`), haptic feedback, and direct NSTouch/mouse hit-slop tracking.
 class GoopyLiquidGlassPillView: NSView {
+    /// Frosted `.hudWindow` blur layer rendering the tinted glass pill body.
     let visualEffectView = NSVisualEffectView()
+    /// Centered single-line monospaced label rendered atop `visualEffectView`.
     let label = NSTextField(labelWithString: "")
+    /// Semantic tint accent applied to the glass background and active glow border.
     var accentColor: NSColor = .systemGreen {
         didSet { updateRestingStyle() }
     }
+    /// Tap action closure invoked cleanly when touch/mouse ends inside tap slop.
     var onTap: (() -> Void)?
 
+    /// Starting point of the current touch/drag gesture for micro-translation clamping.
     private var initialTouchPoint: CGPoint = .zero
+    /// Active `NSTouch.identity` tracked exclusively until touch end/cancel.
     private var activeTouchIdentity: AnyObject? = nil
+    /// Whether the pill is currently depressed under a touch or mouse click.
     private var isHeld: Bool = false
+    /// Whether the tracked pointer remains inside expanded tap slop bounds.
     private var isTouchInside: Bool = false
+    /// Intrinsic pill width in Touch Bar points (`30 pt` fixed height).
     private let pillWidth: CGFloat
 
+    /// Creates a new Liquid Glass pill view with the specified initial label, accent color, and width.
     init(text: String, accent: NSColor, width: CGFloat = 88) {
         self.pillWidth = width
         self.accentColor = accent
@@ -264,6 +336,15 @@ class GoopyLiquidGlassPillView: NSView {
         return NSSize(width: pillWidth, height: 30)
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil && isHeld {
+            activeTouchIdentity = nil
+            endInteraction(triggerTap: false)
+        }
+    }
+
+    /// Configures frosted glass subviews and AutoLayout label centering.
     func setup(text: String) {
         wantsLayer = true
         layer?.masksToBounds = false
@@ -306,18 +387,21 @@ class GoopyLiquidGlassPillView: NSView {
         updateRestingStyle()
     }
 
+    /// Updates the pill text safely on the main AppKit thread.
     func setText(_ newText: String) {
         DispatchQueue.main.async { [weak self] in
             self?.label.stringValue = newText
         }
     }
 
+    /// Updates the pill accent tint safely on the main AppKit thread.
     func setAccent(_ color: NSColor) {
         DispatchQueue.main.async { [weak self] in
             self?.accentColor = color
         }
     }
 
+    /// Applies the unpressed Liquid Glass surface border, tint, and resting glow parameters.
     func updateRestingStyle() {
         guard !isHeld else { return }
         layer?.shadowColor = accentColor.cgColor
@@ -330,6 +414,7 @@ class GoopyLiquidGlassPillView: NSView {
         visualEffectView.layer?.backgroundColor = accentColor.withAlphaComponent(0.14).cgColor
     }
 
+    /// Builds a center-pivoted 3D transform (`sx`, `sy`, horizontal micro-translation `tx`) around `bounds`.
     private func centeredTransform(sx: CGFloat, sy: CGFloat, tx: CGFloat = 0) -> CATransform3D {
         let cx = bounds.midX
         let cy = bounds.midY
@@ -340,6 +425,7 @@ class GoopyLiquidGlassPillView: NSView {
         return t
     }
 
+    /// Returns `true` if `pt` lies within forgiving Touch Bar finger slop bounds (`dx = -18pt, dy = -20pt`).
     private func isPointWithinTapSlop(_ pt: CGPoint) -> Bool {
         return bounds.insetBy(dx: -18, dy: -20).contains(pt)
     }
@@ -495,30 +581,50 @@ class GoopyLiquidGlassPillView: NSView {
 /// Fully rounded Liquid Glass pill containing a capsule progress bar, glowing circular thumb,
 /// and elapsed/total timestamps with zero-snap-back touch scrubbing.
 final class LiquidGlassMediaScrubPillView: NSView {
+    /// Frosted `.hudWindow` blur container rendering the scrubber pill backdrop.
     private let bgEffect = NSVisualEffectView()
+    /// Formatted `m:ss` current playback or scrub position indicator.
     private let elapsedLabel = NSTextField(labelWithString: "0:00")
+    /// Formatted `m:ss` total duration indicator (`--:--` when no active session).
     private let totalLabel = NSTextField(labelWithString: "0:00")
+    /// Container view hosting Core Animation track, fill, and circular thumb layers.
     private let trackContainer = NSView()
+    /// Capsule background rail layer representing `0%..100%` track length.
     private let trackBg = CALayer()
+    /// Active filled progress capsule tracking `positionSecs / durationSecs`.
     private let trackFill = CALayer()
+    /// Interactive circular scrubber thumb expanding from `11pt` to `14pt` while scrubbing.
     private let thumbLayer = CALayer()
 
+    /// Intrinsic horizontal pill width in Touch Bar points (`176 pt`).
     private let pillWidth: CGFloat
+    /// Capsule progress rail thickness in Touch Bar points (`6 pt`).
     private let trackHeight: CGFloat = 6.0
 
+    /// Active `NSTouch.identity` during a direct Touch Bar drag scrub gesture.
     private var activeTouchIdentity: AnyObject? = nil
+    /// True while the user is actively dragging along the scrubber rail.
     private var isScrubbing: Bool = false
+    /// Hold-off timestamp preventing 1 Hz telemetry polls from snapping the thumb back while Windows seeks.
     private var scrubHoldUntil: Date = .distantPast
+    /// Rate-limiter timestamp spacing live preview seeks at `>= 350 ms`.
     private var lastPreviewSentAt: Date = .distantPast
 
+    /// Displayed playback position in seconds (`>= 0`).
     private var positionSecs: Double = 0.0
+    /// Total track duration in seconds (`>= 0`).
     private var durationSecs: Double = 0.0
+    /// True when the remote Windows GSMTC media session is actively playing.
     private var isPlaying: Bool = false
+    /// True when Windows reports an active media transport session.
     private var hasSession: Bool = false
 
+    /// Throttled live-preview callback invoked during dragging with target seek time in seconds.
     var onPreviewSeek: ((Double) -> Void)?
+    /// Final seek commit callback invoked upon finger lift / mouse release with target seconds.
     var onCommitSeek: ((Double) -> Void)?
 
+    /// Initializes the Liquid Glass media scrubber pill with the given Touch Bar width (`176 pt` default).
     init(width: CGFloat = 176) {
         self.pillWidth = width
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
@@ -538,6 +644,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { return true }
     override var acceptsFirstResponder: Bool { return true }
 
+    /// Formats non-negative finite seconds as `m:ss` (`0:00` on non-finite or negative input).
     private static func formatTime(_ secs: Double) -> String {
         guard secs.isFinite && secs >= 0 else { return "0:00" }
         let total = Int(secs.rounded(.down))
@@ -546,6 +653,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return String(format: "%d:%02d", mins, rem)
     }
 
+    /// Configures monospaced timestamp typography for elapsed and total duration labels.
     private func configureTimeLabel(_ lbl: NSTextField, alignment: NSTextAlignment, alpha: CGFloat) {
         lbl.alignment = alignment
         lbl.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold)
@@ -557,6 +665,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         lbl.maximumNumberOfLines = 1
     }
 
+    /// Initializes frosted glass backdrop, timestamp fields, and track/thumb sublayers.
     private func setup() {
         wantsLayer = true
         layer?.cornerRadius = 9
@@ -612,28 +721,34 @@ final class LiquidGlassMediaScrubPillView: NSView {
         layoutSublayersAndFrames(animated: false)
     }
 
+    /// Updates track playback position, duration, and active session visual state on the main thread.
+    ///
+    /// Respects active scrubbing gestures and the 2.4-second seek-confirmation hold window to prevent
+    /// remote polling jitter from snapping the scrubber thumb backwards.
     func update(position: Double, duration: Double, isPlaying: Bool, hasSession: Bool) {
         self.durationSecs = duration.isFinite ? max(duration, 0.0) : 0.0
         self.isPlaying = isPlaying
         self.hasSession = hasSession
         self.totalLabel.stringValue = hasSession && self.durationSecs > 0.5 ? Self.formatTime(self.durationSecs) : "--:--"
 
+        let safePos = position.isFinite ? position : 0.0
         if !self.isScrubbing {
             let now = Date()
             if now < self.scrubHoldUntil {
                 // Keep showing the user's scrubbed position until Windows confirms the seek
-                if abs(position - self.positionSecs) <= 3.0 {
+                if abs(safePos - self.positionSecs) <= 3.0 {
                     self.scrubHoldUntil = .distantPast
-                    self.positionSecs = min(max(position, 0.0), max(self.durationSecs, 0.0))
+                    self.positionSecs = min(max(safePos, 0.0), max(self.durationSecs, 0.0))
                 }
             } else {
-                self.positionSecs = hasSession ? min(max(position, 0.0), max(self.durationSecs, 0.0)) : 0.0
+                self.positionSecs = hasSession ? min(max(safePos, 0.0), max(self.durationSecs, 0.0)) : 0.0
             }
         }
 
         layoutSublayersAndFrames(animated: false)
     }
 
+    /// Recomputes elapsed/total label bounds, progress fill geometry, and thumb diameter.
     private func layoutSublayersAndFrames(animated: Bool) {
         let w = bounds.width
         let h = bounds.height
@@ -780,7 +895,11 @@ final class LiquidGlassMediaScrubPillView: NSView {
 }
 
 // MARK: - Touch Bar Controller (Singleton within Main App)
+
+/// Singleton coordinator managing the macOS system-modal Touch Bar HUD, persistent `∫` Control
+/// Strip tray item, 1 Hz telemetry/media polling, and dynamic Touch Bar layout switching.
 @objc public class TouchBarHudController: NSObject, NSTouchBarDelegate {
+    /// Shared singleton instance driving in-process and standalone Touch Bar HUD lifecycles.
     public static let shared = TouchBarHudController()
 
     /// Fallback control RPC port used only if Rust has not yet pushed `config::CONTROL_PORT`.
@@ -799,16 +918,21 @@ final class LiquidGlassMediaScrubPillView: NSView {
             stateLock.unlock()
         }
     }
+    /// Mutex synchronizing `peerIp`, `rpcPort`, `_isActive`, `_generation`, `isPollingInFlight`, and cached GPU telemetry.
     private let stateLock = NSLock()
 
+    /// Internal active-HUD flag synchronized under `stateLock`.
     private var _isActive: Bool = false
+    /// Returns `true` when the system-modal Touch Bar HUD is currently active.
     public var isActive: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return _isActive
     }
 
+    /// Validated peer IPv4/IPv6 string synchronized under `stateLock`.
     private var _peerIp: String? = nil
+    /// Normalized remote peer IPv4/IPv6 literal used as an optional RPC telemetry target hint.
     var peerIp: String? {
         get {
             stateLock.lock()
@@ -822,18 +946,18 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Active Touch Bar presentation mode: primary HUD strip (`.main`) or expanded GPU metrics strip (`.gpu`).
     private enum TouchBarPanelMode {
         case main
-        case media
-        case display
-        case audio
         case gpu
     }
 
+    /// Dynamically loaded handle to `/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation`.
     private static let dfrHandle: UnsafeMutableRawPointer? = {
         dlopen("/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation", RTLD_LAZY)
     }()
 
+    /// Enables or disables the native system `X` close box when the system-modal Touch Bar is frontmost.
     private static func setDfrShowsCloseBox(_ shows: Bool) {
         guard let handle = dfrHandle,
               let sym = dlsym(handle, "DFRSystemModalShowsCloseBoxWhenFrontMost") else { return }
@@ -841,6 +965,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         unsafeBitCast(sym, to: Fn.self)(shows)
     }
 
+    /// Sets the visibility presence of the persistent `∫` item in the macOS Control Strip.
     private static func setDfrControlStripPresence(_ identifier: NSTouchBarItem.Identifier, present: Bool) {
         guard let handle = dfrHandle,
               let sym = dlsym(handle, "DFRElementSetControlStripPresenceForIdentifier") else { return }
@@ -848,79 +973,79 @@ final class LiquidGlassMediaScrubPillView: NSView {
         unsafeBitCast(sym, to: Fn.self)(identifier.rawValue as CFString, present)
     }
 
+    /// Persistent Control Strip item identifier for the `∫` restore button.
     private let systemTrayItemId = NSTouchBarItem.Identifier("com.manveersingh.integrator.touchbar.tray")
+    /// Retained reference to the persistent Control Strip `NSCustomTouchBarItem`.
     private var systemTrayItem: NSCustomTouchBarItem? = nil
+    /// KVO observation token tracking `NSTouchBar.isVisible` to detect external dismissal via the `X` close button.
     private var visibilityObservation: NSKeyValueObservation? = nil
+    /// Tracks whether the current modal `NSTouchBar` instance has completed initial presentation.
     private var hasEverBeenVisible: Bool = false
+    /// Current sub-panel mode (`.main` or `.gpu`).
     private var activeMode: TouchBarPanelMode = .main
 
+    /// Monotonically increasing session generation counter used to discard stale async poll callbacks.
     private var _generation: UInt64 = 0
+    /// Guards against overlapping background telemetry RPC polls.
     private var isPollingInFlight: Bool = false
-    private var lastKnownGpuName: String? = nil
+    /// Cached GPU telemetry metrics from the most recent poll cycle.
     private var lastGpuTelemetry: GpuTelemetryData? = nil
+    /// Formatted label for an announced pending remote clipboard file (`📥 Paste <name> (<size>)`).
     private var pendingPasteText: String? = nil
 
+    /// Checks whether the given session generation matches the currently active Touch Bar generation.
     private func isGenerationCurrent(_ gen: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return _isActive && _generation == gen
     }
 
+    /// Active system-modal `NSTouchBar` instance.
     var touchBar: NSTouchBar?
+    /// 1 Hz main-RunLoop timer driving background telemetry and media state polling.
     var pollTimer: Timer?
 
-    // Liquid Glass Pill Views (Telemetry + Quick Actions)
+    /// Compact GPU name + die temperature pill shown in `.main` strip (taps into `.gpu` detail strip).
     var viewGpu: GoopyLiquidGlassPillView?
+    /// GPU core temperature (`°C`) pill in `.gpu` detail strip.
     var viewTemp: GoopyLiquidGlassPillView?
+    /// GPU board power draw (`W`) pill in `.gpu` detail strip.
     var viewPower: GoopyLiquidGlassPillView?
+    /// GPU graphics core clock (`MHz`) pill in `.gpu` detail strip.
     var viewClock: GoopyLiquidGlassPillView?
+    /// GPU dedicated VRAM utilization (`used / total GB`) pill in `.gpu` detail strip.
     var viewVram: GoopyLiquidGlassPillView?
+    /// GPU 3D engine utilization percentage (`%`) pill in `.gpu` detail strip.
     var viewUtil: GoopyLiquidGlassPillView?
+    /// Dynamic Remote Paste announcement & transfer progress pill (`📥 Paste ...`).
     var viewPaste: GoopyLiquidGlassPillView?
 
-    // Feature 1: Visual Touch ID Passkey Prompt
+    /// Far-right animated Touch ID prompt banner (`touchid_prompt`).
     var viewTouchIdPrompt: TouchIdPromptGlowView?
+    /// True while the full-width Touch ID prompt takeover banner is displayed.
     private var touchIdPromptActive: Bool = false
+    /// Display prompt text shown inside `viewTouchIdPrompt`.
     private var touchIdPromptLabel: String = "Approve Windows Hello Login"
+    /// Remembers whether the standard HUD was active prior to Touch ID takeover so dismissal restores cleanly.
     private var hudWasActiveBeforeTouchId: Bool = false
 
-    // Feature 2: Display Refresh Rate & Mode Quick-Slider
-    var viewDisplayTrigger: GoopyLiquidGlassPillView?
-    var displayFpsSliderItem: NSSliderTouchBarItem?
-    var viewDisplayResBtn: GoopyLiquidGlassPillView?
-    var viewDisplayHdrBtn: GoopyLiquidGlassPillView?
-    private var currentDisplayFps: UInt32 = 120
-    private var currentDisplayResIndex: Int = 2 // 0 = 1080p, 1 = 1440p, 2 = Native Retina
-    private var currentDisplayHdr: Bool = false
-    private let displayResPresets: [(label: String, w: UInt32, h: UInt32)] = [
-        ("1080p", 1920, 1080),
-        ("1440p", 2560, 1440),
-        ("Retina", 0, 0)
-    ]
-
-    // Feature 3: Hardware Camera Privacy Killswitch
+    /// Hardware Camera Privacy Killswitch pill (`🟢 FaceTime HD` / `🚫 Cam Muted`).
     var viewCameraPrivacy: GoopyLiquidGlassPillView?
+    /// True while macOS Shared Camera video capture is actively streaming to Windows.
     private var cameraIsActive: Bool = false
+    /// True while the Hardware Camera Privacy Killswitch shutter is engaged.
     private var cameraIsMuted: Bool = false
 
-    // Feature 4: Cross-Platform Audio Mixer & Soundbar Slider
-    var viewAudioTrigger: GoopyLiquidGlassPillView?
-    var audioBalanceSliderItem: NSSliderTouchBarItem?
-    var viewAudioMuteBtn: GoopyLiquidGlassPillView?
-    private var currentAudioBalance: Float = 0.0
-    private var currentAudioMuted: Bool = false
-
-    // Feature 5: KVM Gaming Boundary Lock
-    var viewKvmLock: GoopyLiquidGlassPillView?
-    private var kvmBoundaryLocked: Bool = false
-
-    // Feature 6: Windows Media Controls
-    var viewMediaTrigger: GoopyLiquidGlassPillView?
+    /// Windows media transport Play/Pause pill (`▶️` / `⏸️`).
     var viewMediaPlayPause: GoopyLiquidGlassPillView?
+    /// Active track title & artist ticker pill in `.main` strip.
     var viewMediaTrackLabel: GoopyLiquidGlassPillView?
+    /// Rounded Liquid Glass media scrub bar (`LiquidGlassMediaScrubPillView`).
     var viewMediaScrub: LiquidGlassMediaScrubPillView?
+    /// Most recently polled Windows GSMTC media state cached for optimistic play/pause feedback.
     private var currentMediaState: MediaPlaybackStateData? = nil
 
+    /// Validates an optional raw IP string as a syntactically valid IPv4 or IPv6 literal via `inet_pton`.
     private static func normalizedIp(_ raw: String?) -> String? {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else {
@@ -934,6 +1059,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return nil
     }
 
+    /// One-time probe checking system-modal `NSTouchBar` selector availability plus physical DFR / ControlStrip presence.
     private static let cachedTouchBarSupported: Bool = {
         let presentSelPlacement = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
         let presentSelLegacy = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
@@ -984,6 +1110,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return cachedTouchBarSupported
     }
 
+    /// Formats an arbitrary byte size into a compact Touch Bar display string (`B`, `KB`, `MB`, `GB`).
     private static func formatByteSize(_ totalBytes: UInt64) -> String {
         let bytes = Double(totalBytes)
         let gb = 1024.0 * 1024.0 * 1024.0
@@ -1004,6 +1131,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return "\(totalBytes) B"
     }
 
+    /// Displays and activates the Remote Paste announcement pill on the Touch Bar for an announced file.
     public func showRemotePasteButton(name: String, totalBytes: UInt64) {
         guard Self.isTouchBarSupported() else { return }
 
@@ -1034,15 +1162,19 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Updates the Remote Paste pill with finite, clamped completion percentage (`0..100%`) and rate (`MB/s`).
     public func updatePasteProgress(percent: Float, mbPerSec: Float) {
         guard Self.isTouchBarSupported() else { return }
+        let safePct = percent.isFinite ? min(max(percent, 0.0), 100.0) : 0.0
+        let safeRate = mbPerSec.isFinite ? max(mbPerSec, 0.0) : 0.0
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let view = self.viewPaste else { return }
-            view.setText(String(format: "📥 %.0f%% • %.0f MB/s", percent, mbPerSec))
+            view.setText(String(format: "📥 %.0f%% • %.0f MB/s", safePct, safeRate))
             view.setAccent(NSColor.systemGreen)
         }
     }
 
+    /// Removes and resets the Remote Paste Touch Bar pill after transfer finishes or cancels.
     public func resetPasteButton() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -1059,11 +1191,14 @@ final class LiquidGlassMediaScrubPillView: NSView {
         super.init()
     }
 
+    /// Launches or refreshes the Touch Bar HUD targeting an optional peer IP hint.
     public func launch_touchbar_hud(peerIp: String? = nil) {
         start(peerIp: peerIp)
     }
 
     // MARK: - Control Strip Persistent System Tray Button (∫)
+
+    /// Enables or removes the persistent `∫` Control Strip system tray button on main thread.
     public func setSystemTrayEnabled(_ enabled: Bool) {
         guard Self.isTouchBarSupported() else { return }
         let block = { [weak self] in
@@ -1081,6 +1216,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Registers the persistent `∫` button inside the macOS Control Strip (`DispatchQueue.main` only).
     private func installSystemTrayItemOnMain() {
         guard Self.isTouchBarSupported() else { return }
         Self.setDfrShowsCloseBox(true)
@@ -1108,6 +1244,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         NSLog("🚀 [TouchBarHud] Registered persistent ∫ Control Strip system tray button.")
     }
 
+    /// Unregisters and releases the persistent `∫` button from the macOS Control Strip (`DispatchQueue.main` only).
     private func removeSystemTrayItemOnMain() {
         Self.setDfrControlStripPresence(systemTrayItemId, present: false)
         guard let item = systemTrayItem else { return }
@@ -1121,6 +1258,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         systemTrayItem = nil
     }
 
+    /// Toggles system-modal Touch Bar HUD visibility when the user taps `∫` in Control Strip.
     @objc private func onSystemTrayButtonTapped(_ sender: Any?) {
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
         if self.isActive, let tb = self.touchBar, tb.isVisible {
@@ -1134,6 +1272,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Validates `peerIp` (if provided) and presents or refreshes the system-modal Touch Bar HUD.
     public func start(peerIp: String? = nil) {
         guard Self.isTouchBarSupported() else {
             NSLog("ℹ️ [TouchBarHud] Touch Bar DF/NSTouchBar support not detected on this Mac; skipping HUD launch.")
@@ -1174,6 +1313,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Instantiates the modal `NSTouchBar`, bumps session generation, and starts 1 Hz polling.
     private func activateOnMainThread() {
         guard Self.isTouchBarSupported() else { return }
         guard !self.isActive else { return }
@@ -1188,6 +1328,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         NSLog("🚀 Integrator Touch Bar GPU HUD active.")
     }
 
+    /// Tears down active KVO tokens, timers, and pill view references while keeping `∫` in Control Strip.
     private func cleanupAfterDismissalOnMain(clearSystemBar: Bool) {
         self.stateLock.lock()
         let wasActive = self._isActive
@@ -1225,16 +1366,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         self.viewUtil = nil
         self.viewPaste = nil
         self.viewTouchIdPrompt = nil
-        self.viewDisplayTrigger = nil
-        self.displayFpsSliderItem = nil
-        self.viewDisplayResBtn = nil
-        self.viewDisplayHdrBtn = nil
         self.viewCameraPrivacy = nil
-        self.viewAudioTrigger = nil
-        self.audioBalanceSliderItem = nil
-        self.viewAudioMuteBtn = nil
-        self.viewKvmLock = nil
-        self.viewMediaTrigger = nil
         self.viewMediaPlayPause = nil
         self.viewMediaTrackLabel = nil
         self.viewMediaScrub = nil
@@ -1247,11 +1379,13 @@ final class LiquidGlassMediaScrubPillView: NSView {
         NSLog("🚀 Integrator Touch Bar GPU HUD dismissed (tap ∫ in Control Strip to restore).")
     }
 
+    /// Handles external system dismissal (such as tapping macOS's `X` close box) observed via KVO.
     private func handleExternalDismissalIfNeeded(bar: NSTouchBar) {
         guard self.touchBar === bar, !bar.isVisible, self.isActive else { return }
         self.cleanupAfterDismissalOnMain(clearSystemBar: false)
     }
 
+    /// Programmatically dismisses the system-modal Touch Bar HUD if active.
     public func dismiss() {
         let block: () -> Void = { [weak self] in
             self?.cleanupAfterDismissalOnMain(clearSystemBar: true)
@@ -1264,6 +1398,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Computes the ordered `NSTouchBarItem.Identifier` list for the current `activeMode` (`.main` or `.gpu`).
     private func buildNormalItemIdentifiers() -> [NSTouchBarItem.Identifier] {
         switch activeMode {
         case .main:
@@ -1285,31 +1420,6 @@ final class LiquidGlassMediaScrubPillView: NSView {
             ])
             return ids
 
-        case .media:
-            return [
-                NSTouchBarItem.Identifier("back_to_main"),
-                NSTouchBarItem.Identifier("media_prev"),
-                NSTouchBarItem.Identifier("media_play_pause"),
-                NSTouchBarItem.Identifier("media_next"),
-                NSTouchBarItem.Identifier("media_title"),
-                NSTouchBarItem.Identifier("media_scrub_slider")
-            ]
-
-        case .display:
-            return [
-                NSTouchBarItem.Identifier("back_to_main"),
-                NSTouchBarItem.Identifier("display_fps_slider"),
-                NSTouchBarItem.Identifier("display_res_btn"),
-                NSTouchBarItem.Identifier("display_hdr_btn")
-            ]
-
-        case .audio:
-            return [
-                NSTouchBarItem.Identifier("back_to_main"),
-                NSTouchBarItem.Identifier("audio_balance_slider"),
-                NSTouchBarItem.Identifier("audio_mute_btn")
-            ]
-
         case .gpu:
             return [
                 NSTouchBarItem.Identifier("back_to_main"),
@@ -1322,6 +1432,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Switches between `.main` and `.gpu` strips on the main thread when not overridden by Touch ID.
     private func switchMode(_ newMode: TouchBarPanelMode) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.isActive, !self.touchIdPromptActive else { return }
@@ -1329,9 +1440,6 @@ final class LiquidGlassMediaScrubPillView: NSView {
             self.refreshTouchBarIdentifiersOnMain()
             switch newMode {
             case .main:
-                self.applyDisplayModeUi()
-                self.applyAudioMixerUi()
-                self.applyKvmLockStyle()
                 self.applyCameraPillStyle()
                 self.applyMediaUi(self.currentMediaState)
                 self.stateLock.lock()
@@ -1340,13 +1448,6 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 if let t = cached {
                     self.updateUi(with: t)
                 }
-            case .media:
-                self.applyMediaUi(self.currentMediaState)
-                self.queryTelemetry()
-            case .display:
-                self.applyDisplayModeUi()
-            case .audio:
-                self.applyAudioMixerUi()
             case .gpu:
                 self.stateLock.lock()
                 let cached = self.lastGpuTelemetry
@@ -1359,6 +1460,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Reapplies `defaultItemIdentifiers` on the active `NSTouchBar` prioritizing Touch ID takeover when active.
     private func refreshTouchBarIdentifiersOnMain() {
         guard let tb = self.touchBar else { return }
         if touchIdPromptActive {
@@ -1372,6 +1474,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
     }
 
     // MARK: - Feature 1: Visual Touch ID Passkey Prompt Control
+
+    /// Shows or dismisses the full-width glowing Touch ID directional prompt banner (`touchid_prompt`).
     public func showTouchIdPrompt(label: String, active: Bool) {
         guard Self.isTouchBarSupported() else { return }
         DispatchQueue.main.async { [weak self] in
@@ -1401,6 +1505,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
     }
 
     // MARK: - Feature 3: Camera Privacy State Sync
+
+    /// Synchronizes Camera Privacy pill visibility and muted/live appearance cleanly on main thread.
     public func updateCameraState(active: Bool, muted: Bool) {
         guard Self.isTouchBarSupported() else { return }
         DispatchQueue.main.async { [weak self] in
@@ -1415,6 +1521,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Updates the Camera Privacy Killswitch pill text and semantic color (green live / red muted).
     private func applyCameraPillStyle() {
         guard let v = self.viewCameraPrivacy else { return }
         if cameraIsMuted {
@@ -1426,135 +1533,12 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
-    // MARK: - Feature 5: KVM Boundary Lock State Sync
-    public func updateKvmLockState(locked: Bool) {
-        guard Self.isTouchBarSupported() else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.kvmBoundaryLocked = locked
-            self.applyKvmLockStyle()
-        }
-    }
+    // MARK: - Expanded Windows Media Control Actions
 
-    private func applyKvmLockStyle() {
-        guard let v = self.viewKvmLock else { return }
-        if kvmBoundaryLocked {
-            v.setText("🔒 Locked")
-            v.setAccent(.systemOrange)
-        } else {
-            v.setText("🔓 Lock")
-            v.setAccent(.systemGray)
-        }
-    }
-
-    // MARK: - Feature 2: Display Mode State Sync
-    public func updateDisplayModeState(width: UInt32, height: UInt32, fps: UInt32, hdr: Bool) {
-        guard Self.isTouchBarSupported() else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.currentDisplayFps = fps > 0 ? fps : 120
-            self.currentDisplayHdr = hdr
-            if width == 1920 && height == 1080 {
-                self.currentDisplayResIndex = 0
-            } else if width == 2560 && height == 1440 {
-                self.currentDisplayResIndex = 1
-            } else {
-                self.currentDisplayResIndex = 2
-            }
-            self.applyDisplayModeUi()
-        }
-    }
-
-    private func applyDisplayModeUi() {
-        let hdrTag = currentDisplayHdr ? " HDR" : ""
-        viewDisplayTrigger?.setText("🎚️ \(currentDisplayFps)Hz\(hdrTag)")
-        viewDisplayTrigger?.setAccent(currentDisplayHdr ? .systemYellow : .systemIndigo)
-        displayFpsSliderItem?.slider.doubleValue = Double(currentDisplayFps)
-        displayFpsSliderItem?.label = "\(currentDisplayFps)Hz"
-        let preset = displayResPresets[currentDisplayResIndex]
-        viewDisplayResBtn?.setText("🖥️ \(preset.label)")
-        viewDisplayHdrBtn?.setText(currentDisplayHdr ? "✨ HDR On" : "HDR Off")
-        viewDisplayHdrBtn?.setAccent(currentDisplayHdr ? .systemYellow : .systemGray)
-    }
-
-    private func pushCurrentDisplayModeToRust() {
-        let preset = displayResPresets[currentDisplayResIndex]
-        let fps = currentDisplayFps
-        let hdr = currentDisplayHdr
-        applyDisplayModeUi()
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = set_rust_display_mode(preset.w, preset.h, fps, hdr)
-        }
-    }
-
-    @objc private func onDisplayFpsSliderChanged(_ sender: NSSliderTouchBarItem) {
-        let raw = sender.slider.doubleValue
-        // Snap smoothly to standard 60Hz, 120Hz, 165Hz detents with tactile haptic click
-        let snapped: UInt32
-        if raw < 90.0 {
-            snapped = 60
-        } else if raw < 142.5 {
-            snapped = 120
-        } else {
-            snapped = 165
-        }
-        if snapped != currentDisplayFps {
-            currentDisplayFps = snapped
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
-            pushCurrentDisplayModeToRust()
-        }
-        sender.slider.doubleValue = Double(snapped)
-    }
-
-    // MARK: - Feature 4: Cross-Platform Audio Mixer Control
-    private func applyAudioMixerUi() {
-        let pct = Int(round(currentAudioBalance * 100.0))
-        if currentAudioMuted {
-            viewAudioTrigger?.setText("🔇 Mix")
-            viewAudioTrigger?.setAccent(.systemRed)
-            viewAudioMuteBtn?.setText("🔇 Win Muted")
-            viewAudioMuteBtn?.setAccent(.systemRed)
-        } else {
-            let icon = pct < -15 ? "🍎 Mix" : (pct > 15 ? "🎮 Mix" : "🎛️ Mix")
-            viewAudioTrigger?.setText(icon)
-            viewAudioTrigger?.setAccent(.systemPurple)
-            viewAudioMuteBtn?.setText("🔊 Win Live")
-            viewAudioMuteBtn?.setAccent(.systemGreen)
-        }
-        audioBalanceSliderItem?.slider.doubleValue = Double(currentAudioBalance)
-        if pct < -10 {
-            audioBalanceSliderItem?.label = "Mac +\(-pct)%"
-        } else if pct > 10 {
-            audioBalanceSliderItem?.label = "PC +\(pct)%"
-        } else {
-            audioBalanceSliderItem?.label = "Balanced"
-        }
-    }
-
-    @objc private func onAudioBalanceSliderChanged(_ sender: NSSliderTouchBarItem) {
-        var val = Float(sender.slider.doubleValue)
-        if abs(val) < 0.06 {
-            if abs(currentAudioBalance) >= 0.06 {
-                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
-            }
-            val = 0.0
-            sender.slider.doubleValue = 0.0
-        }
-        currentAudioBalance = val
-        let muted = currentAudioMuted
-        applyAudioMixerUi()
-        DispatchQueue.global(qos: .userInitiated).async {
-            set_rust_audio_mixer(val, muted)
-        }
-    }
-
-    // MARK: - Feature 6: Windows Media Control Actions
+    /// Refreshes Windows GSMTC track title, Play/Pause pill, and Liquid Glass scrub bar on main thread.
     private func applyMediaUi(_ st: MediaPlaybackStateData?) {
         currentMediaState = st
         if let m = st, m.has_session, !m.title.isEmpty {
-            let shortTitle = m.title.count > 12 ? String(m.title.prefix(11)) + "…" : m.title
-            viewMediaTrigger?.setText(m.is_playing ? "🎵 \(shortTitle)" : "⏸️ \(shortTitle)")
-            viewMediaTrigger?.setAccent(m.is_playing ? .systemPink : .systemGray)
             viewMediaPlayPause?.setText(m.is_playing ? "⏸️" : "▶️")
             viewMediaPlayPause?.setAccent(m.is_playing ? .systemGreen : .systemCyan)
             let subtitle = m.artist.isEmpty ? m.title : "\(m.title) — \(m.artist)"
@@ -1567,8 +1551,6 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 hasSession: true
             )
         } else {
-            viewMediaTrigger?.setText("🎵 Media")
-            viewMediaTrigger?.setAccent(.systemGray)
             viewMediaPlayPause?.setText("▶️")
             viewMediaPlayPause?.setAccent(.systemGray)
             viewMediaTrackLabel?.setText("🎵 No Windows Media")
@@ -1577,6 +1559,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Dispatches a non-blocking Windows GSMTC seek command across C FFI and optionally refreshes telemetry.
     private func dispatchWindowsSeek(_ targetSecs: Double, refreshAfter: Bool) {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = send_rust_windows_media_cmd(3, targetSecs)
@@ -1588,6 +1571,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Instantiates and presents the system-modal `NSTouchBar` and installs the `isVisible` KVO watcher.
     @discardableResult
     func setupTouchBar() -> Bool {
         guard Self.isTouchBarSupported() else { return false }
@@ -1650,9 +1634,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return presented
     }
 
+    /// NSTouchBarDelegate factory constructing each active Liquid Glass pill, media scrubber, or Touch ID view.
     public func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         switch identifier.rawValue {
-        // MARK: Back navigation pill for sub-bars (Media / Display / Audio / GPU)
+        // MARK: Back navigation pill for GPU detail sub-bar
         case "back_to_main":
             let item = NSCustomTouchBarItem(identifier: identifier)
             let v = GoopyLiquidGlassPillView(text: "◀", accent: .systemGray, width: 42)
@@ -1661,7 +1646,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
             item.visibilityPriority = .high
             return item
 
-        // MARK: Feature 1 — Visual Touch ID Passkey Prompt (far-right glowing pointer)
+        // MARK: Visual Touch ID Passkey Prompt (far-right glowing pointer)
         case "touchid_prompt":
             let item = NSCustomTouchBarItem(identifier: identifier)
             let v = TouchIdPromptGlowView()
@@ -1671,59 +1656,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
             item.visibilityPriority = .high
             return item
 
-        // MARK: Feature 2 — Display Refresh Rate & Mode Quick-Slider
-        case "display_mode":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let trigger = GoopyLiquidGlassPillView(text: "🎚️ \(currentDisplayFps)Hz", accent: .systemIndigo, width: 70)
-            trigger.onTap = { [weak self] in self?.switchMode(.display) }
-            self.viewDisplayTrigger = trigger
-            item.view = trigger
-            item.visibilityPriority = .high
-            applyDisplayModeUi()
-            return item
-
-        case "display_fps_slider":
-            let sliderItem = NSSliderTouchBarItem(identifier: identifier)
-            sliderItem.label = "\(currentDisplayFps)Hz"
-            sliderItem.slider.minValue = 60.0
-            sliderItem.slider.maxValue = 165.0
-            sliderItem.slider.doubleValue = Double(currentDisplayFps)
-            sliderItem.target = self
-            sliderItem.action = #selector(onDisplayFpsSliderChanged(_:))
-            sliderItem.minimumSliderWidth = 170
-            sliderItem.maximumSliderWidth = 240
-            sliderItem.visibilityPriority = .high
-            self.displayFpsSliderItem = sliderItem
-            return sliderItem
-
-        case "display_res_btn":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let preset = displayResPresets[currentDisplayResIndex]
-            let v = GoopyLiquidGlassPillView(text: "🖥️ \(preset.label)", accent: .systemBlue, width: 88)
-            v.onTap = { [weak self] in
-                guard let self = self else { return }
-                self.currentDisplayResIndex = (self.currentDisplayResIndex + 1) % self.displayResPresets.count
-                self.pushCurrentDisplayModeToRust()
-            }
-            self.viewDisplayResBtn = v
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        case "display_hdr_btn":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: currentDisplayHdr ? "✨ HDR On" : "HDR Off", accent: currentDisplayHdr ? .systemYellow : .systemGray, width: 84)
-            v.onTap = { [weak self] in
-                guard let self = self else { return }
-                self.currentDisplayHdr.toggle()
-                self.pushCurrentDisplayModeToRust()
-            }
-            self.viewDisplayHdrBtn = v
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        // MARK: Feature 3 — Hardware Camera Privacy Killswitch
+        // MARK: Hardware Camera Privacy Killswitch
         case "camera_privacy":
             let item = NSCustomTouchBarItem(identifier: identifier)
             let v = GoopyLiquidGlassPillView(
@@ -1734,7 +1667,11 @@ final class LiquidGlassMediaScrubPillView: NSView {
             v.onTap = { [weak self] in
                 DispatchQueue.global(qos: .userInitiated).async {
                     let muted = toggle_rust_camera_privacy_mute()
-                    self?.updateCameraState(active: self?.cameraIsActive ?? true, muted: muted)
+                    // Read main-thread-owned `cameraIsActive` strictly on DispatchQueue.main to avoid data races.
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.updateCameraState(active: self.cameraIsActive, muted: muted)
+                    }
                 }
             }
             self.viewCameraPrivacy = v
@@ -1742,84 +1679,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
             item.visibilityPriority = .high
             return item
 
-        // MARK: Feature 4 — Cross-Platform Audio Mixer & Soundbar Slider
-        case "audio_mixer":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let trigger = GoopyLiquidGlassPillView(text: "🎛️ Mix", accent: .systemPurple, width: 62)
-            trigger.onTap = { [weak self] in self?.switchMode(.audio) }
-            self.viewAudioTrigger = trigger
-            item.view = trigger
-            item.visibilityPriority = .high
-            applyAudioMixerUi()
-            return item
-
-        case "audio_balance_slider":
-            let sliderItem = NSSliderTouchBarItem(identifier: identifier)
-            sliderItem.label = "Balanced"
-            sliderItem.slider.minValue = -1.0
-            sliderItem.slider.maxValue = 1.0
-            sliderItem.slider.doubleValue = Double(currentAudioBalance)
-            sliderItem.target = self
-            sliderItem.action = #selector(onAudioBalanceSliderChanged(_:))
-            sliderItem.minimumSliderWidth = 210
-            sliderItem.maximumSliderWidth = 290
-            sliderItem.visibilityPriority = .high
-            self.audioBalanceSliderItem = sliderItem
-            applyAudioMixerUi()
-            return sliderItem
-
-        case "audio_mute_btn":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: currentAudioMuted ? "🔇 Win Muted" : "🔊 Win Live", accent: currentAudioMuted ? .systemRed : .systemGreen, width: 108)
-            v.onTap = { [weak self] in
-                guard let self = self else { return }
-                self.currentAudioMuted.toggle()
-                let bal = self.currentAudioBalance
-                let muted = self.currentAudioMuted
-                self.applyAudioMixerUi()
-                DispatchQueue.global(qos: .userInitiated).async {
-                    set_rust_audio_mixer(bal, muted)
-                }
-            }
-            self.viewAudioMuteBtn = v
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        // MARK: Feature 5 — KVM Gaming Boundary Lock Toggle
-        case "kvm_lock":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(
-                text: kvmBoundaryLocked ? "🔒 Locked" : "🔓 Lock",
-                accent: kvmBoundaryLocked ? .systemOrange : .systemGray,
-                width: 76
-            )
-            v.onTap = { [weak self] in
-                guard let self = self else { return }
-                // Optimistic UI feedback while syncing lock state to Rust & peer
-                self.kvmBoundaryLocked.toggle()
-                self.applyKvmLockStyle()
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let locked = toggle_rust_kvm_boundary_lock()
-                    self.updateKvmLockState(locked: locked)
-                }
-            }
-            self.viewKvmLock = v
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        // MARK: Feature 6 — Windows Media Controls
-        case "win_media":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let trigger = GoopyLiquidGlassPillView(text: "🎵 Media", accent: .systemPink, width: 136)
-            trigger.onTap = { [weak self] in self?.switchMode(.media) }
-            self.viewMediaTrigger = trigger
-            item.view = trigger
-            item.visibilityPriority = .high
-            applyMediaUi(currentMediaState)
-            return item
-
+        // MARK: Expanded Windows Media Controls
         case "media_prev":
             let item = NSCustomTouchBarItem(identifier: identifier)
             let v = GoopyLiquidGlassPillView(text: "⏮️", accent: .systemCyan, width: 40)
@@ -1968,6 +1828,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return item
     }
 
+    /// Starts the 1 Hz common-modes telemetry timer and watches for external system dismissal.
     func startPolling() {
         self.pollTimer?.invalidate()
         queryTelemetry()
@@ -1987,6 +1848,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         self.pollTimer = timer
     }
 
+    /// Dispatches an asynchronous C FFI snapshot query guarded by `_generation` and `isPollingInFlight`.
     func queryTelemetry() {
         stateLock.lock()
         guard _isActive, !isPollingInFlight else {
@@ -2023,14 +1885,9 @@ final class LiquidGlassMediaScrubPillView: NSView {
                     if camChanged && !self.touchIdPromptActive {
                         self.refreshTouchBarIdentifiersOnMain()
                     }
-                    self.kvmBoundaryLocked = snap.kvm_locked
-                    self.applyKvmLockStyle()
-                    self.currentAudioBalance = snap.audio_balance
-                    self.currentAudioMuted = snap.audio_muted
-                    self.applyAudioMixerUi()
                 }
             } else if let host = self.peerIp,
-                      let response = self.sendRpcRequest(host: host, port: self.rpcPort, requestJson: "\"GetGpuTelemetry\""),
+                      let response = self.fetchFallbackGpuTelemetry(host: host),
                       response.success,
                       let telemetry = response.gpu_telemetry {
                 guard self.isGenerationCurrent(gen) else { return }
@@ -2041,6 +1898,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Queries the unified Touch Bar live snapshot from Rust across C FFI (`<= 64 KiB` JSON).
     private func fetchTouchBarSnapshot(host: String?) -> TouchBarLiveSnapshotData? {
         let bufCap = 65_536
         var outBuf = [UInt8](repeating: 0, count: bufCap)
@@ -2061,9 +1919,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return try? JSONDecoder().decode(TouchBarLiveSnapshotData.self, from: data)
     }
 
-    private func sendRpcRequest(host: String, port: UInt16, requestJson: String) -> DisplayRpcResponseData? {
-        let _ = port
-        let _ = requestJson
+    /// Queries standalone GPU telemetry from Rust if the aggregated snapshot is unavailable.
+    private func fetchFallbackGpuTelemetry(host: String) -> DisplayRpcResponseData? {
         let bufCap = 65_536
         var outBuf = [UInt8](repeating: 0, count: bufCap)
         let n = host.withCString { cHost -> Int in
@@ -2082,6 +1939,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return decoded
     }
 
+    /// Normalizes and truncates long GPU adapter names (to `<= 14` chars) to fit the compact GPU pill.
     private func compactGpuName(_ raw: String) -> String {
         var name = raw
             .replacingOccurrences(of: "(R)", with: "")
@@ -2115,6 +1973,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return name
     }
 
+    /// Updates all GPU telemetry pills to a neutral offline placeholder state on the main thread.
     func updateOfflineUi(statusText: String = "Peer Offline", expectedGeneration: UInt64? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -2143,9 +2002,9 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
+    /// Updates the compact GPU pill and `.gpu` detail strip metrics with color-coded thermal states.
     func updateUi(with t: GpuTelemetryData, expectedGeneration: UInt64? = nil) {
         self.stateLock.lock()
-        self.lastKnownGpuName = t.gpu_name
         self.lastGpuTelemetry = t
         self.stateLock.unlock()
 
@@ -2158,7 +2017,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
             }
             let hasLiveCounters =
                 t.temperature_c > 0 ||
-                t.power_usage_watts > 0.05 ||
+                (t.power_usage_watts.isFinite && t.power_usage_watts > 0.05) ||
                 t.core_clock_mhz > 0 ||
                 t.gpu_utilization_percent > 0
 
@@ -2199,7 +2058,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
             // 2. Power Draw
             if let v = self.viewPower {
-                if t.power_usage_watts > 0.05 {
+                if t.power_usage_watts.isFinite && t.power_usage_watts > 0.05 {
                     v.setText(String(format: "⚡ %.1fW", t.power_usage_watts))
                     v.setAccent(NSColor(red: 0.95, green: 0.65, blue: 0.1, alpha: 1.0))
                 } else {
@@ -2252,82 +2111,46 @@ final class LiquidGlassMediaScrubPillView: NSView {
             }
         }
     }
-
-    public func updateUiExplicit(temp: UInt32, power: Float, clock: UInt32, vramUsed: UInt64, vramTotal: UInt64, util: UInt32) {
-        stateLock.lock()
-        let gpuName = lastKnownGpuName ?? "Remote GPU"
-        stateLock.unlock()
-
-        let memPercent: UInt32
-        if vramTotal > 0 {
-            let pct = (Double(vramUsed) * 100.0) / Double(vramTotal)
-            memPercent = UInt32(min(100.0, max(0.0, pct)))
-        } else {
-            memPercent = 0
-        }
-
-        let t = GpuTelemetryData(
-            gpu_name: gpuName,
-            temperature_c: temp,
-            power_usage_watts: power.isFinite ? power : 0.0,
-            gpu_utilization_percent: util,
-            memory_utilization_percent: memPercent,
-            memory_used_mb: vramUsed,
-            memory_total_mb: vramTotal,
-            core_clock_mhz: clock
-        )
-        updateUi(with: t)
-    }
 }
 
 // MARK: - C FFI Interface for Main App Integration
+
+/// Configures the TCP control RPC port forwarded from Rust (`config::CONTROL_PORT`).
 @_cdecl("set_touchbar_rpc_port_in_app")
 public func set_touchbar_rpc_port_in_app(port: UInt16) {
     TouchBarHudController.shared.rpcPort = port
 }
 
+/// Initializes or refreshes the system-modal Touch Bar HUD targeting an optional peer IP string.
 @_cdecl("init_touchbar_in_app")
 public func init_touchbar_in_app(peerIpPtr: UnsafePointer<CChar>?) {
     let peerIp = peerIpPtr != nil ? String(cString: peerIpPtr!) : nil
     TouchBarHudController.shared.launch_touchbar_hud(peerIp: peerIp)
 }
 
+/// Dismisses the system-modal Touch Bar HUD while keeping the persistent `∫` Control Strip tray item.
 @_cdecl("dismiss_touchbar_in_app")
 public func dismiss_touchbar_in_app() {
     TouchBarHudController.shared.dismiss()
 }
 
+/// Returns `true` while the system-modal Touch Bar HUD is active.
 @_cdecl("is_touchbar_active_in_app")
 public func is_touchbar_active_in_app() -> Bool {
     return TouchBarHudController.shared.isActive
 }
 
+/// Installs or removes the persistent `∫` Control Strip tray restore item.
 @_cdecl("set_touchbar_tray_enabled_in_app")
 public func set_touchbar_tray_enabled_in_app(enabled: Bool) {
     TouchBarHudController.shared.setSystemTrayEnabled(enabled)
 }
 
-@_cdecl("update_touchbar_telemetry_in_app")
-public func update_touchbar_telemetry_in_app(
-    temp: UInt32,
-    power: Float,
-    clock: UInt32,
-    vramUsed: UInt64,
-    vramTotal: UInt64,
-    util: UInt32
-) {
-    TouchBarHudController.shared.updateUiExplicit(
-        temp: temp,
-        power: power,
-        clock: clock,
-        vramUsed: vramUsed,
-        vramTotal: vramTotal,
-        util: util
-    )
-}
-
+/// Retained GCD signal sources ensuring clean `SIGINT`/`SIGTERM` shutdown in standalone Touch Bar CLI mode.
 private var touchBarCliSignalSources: [DispatchSourceSignal] = []
 
+/// Runs the blocking AppKit Touch Bar HUD event loop for standalone CLI invocation (`core.rs`),
+/// exiting cleanly on `SIGINT` or `SIGTERM` via main-queue GCD signal sources.
 @_cdecl("run_touchbar_cli_loop")
 public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
     guard TouchBarHudController.isTouchBarSupported() else {
@@ -2370,51 +2193,55 @@ public func run_touchbar_cli_loop(peerIpPtr: UnsafePointer<CChar>?) {
 }
 
 // MARK: - On-Demand Remote Paste, Telemetry & TouchBar Controls C FFI Bridge
+
+/// Rust C-ABI entrypoint triggering on-demand zero-RAM remote file paste streaming (`clipboard/service.rs`).
 @_silgen_name("trigger_rust_remote_paste")
 func trigger_rust_remote_paste()
 
+/// Rust C-ABI fallback query returning standalone GPU telemetry JSON (`display/controller.rs`).
 @_silgen_name("fetch_rust_gpu_telemetry_json")
 func fetch_rust_gpu_telemetry_json(_ peerIp: UnsafePointer<CChar>?, _ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int
 
+/// Rust C-ABI query returning the unified Touch Bar snapshot JSON (`core.rs`).
 @_silgen_name("fetch_rust_touchbar_snapshot_json")
 func fetch_rust_touchbar_snapshot_json(_ peerIp: UnsafePointer<CChar>?, _ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int
 
-@_silgen_name("set_rust_display_mode")
-func set_rust_display_mode(_ width: UInt32, _ height: UInt32, _ fps: UInt32, _ hdr: Bool) -> Bool
-
+/// Rust C-ABI toggle switching the Hardware Camera Privacy Killswitch shutter (`core.rs`).
 @_silgen_name("toggle_rust_camera_privacy_mute")
 func toggle_rust_camera_privacy_mute() -> Bool
 
-@_silgen_name("set_rust_audio_mixer")
-func set_rust_audio_mixer(_ balance: Float, _ muted: Bool)
-
-@_silgen_name("toggle_rust_kvm_boundary_lock")
-func toggle_rust_kvm_boundary_lock() -> Bool
-
+/// Rust C-ABI command dispatching Windows GSMTC media control (`0=PlayPause, 1=Next, 2=Prev, 3=Seek`) (`core.rs`).
 @_silgen_name("send_rust_windows_media_cmd")
 func send_rust_windows_media_cmd(_ cmdCode: Int32, _ seekSecs: Double) -> Bool
 
+/// Presents or dismisses the illuminated Visual Touch ID Passkey & UAC prompt on the Touch Bar.
 @_cdecl("notify_touchbar_touchid_prompt_in_app")
 public func notify_touchbar_touchid_prompt_in_app(labelPtr: UnsafePointer<CChar>?, active: Bool) {
     let label = labelPtr != nil ? String(cString: labelPtr!) : "Approve Windows Hello Login"
     TouchBarHudController.shared.showTouchIdPrompt(label: label, active: active)
 }
 
+/// Synchronizes the Hardware Camera Privacy Killswitch pill state on the Touch Bar.
 @_cdecl("notify_touchbar_camera_state_in_app")
 public func notify_touchbar_camera_state_in_app(active: Bool, muted: Bool) {
     TouchBarHudController.shared.updateCameraState(active: active, muted: muted)
 }
 
+/// C-ABI linkage entry point declared by `core.rs` for KVM boundary lock state notifications.
+/// Retained as a no-op because the KVM lock Touch Bar pill was removed from the active strip layout.
 @_cdecl("notify_touchbar_kvm_lock_state_in_app")
 public func notify_touchbar_kvm_lock_state_in_app(locked: Bool) {
-    TouchBarHudController.shared.updateKvmLockState(locked: locked)
+    _ = locked
 }
 
+/// C-ABI linkage entry point declared by `core.rs` for display mode notifications.
+/// Retained as a no-op because the display mode Touch Bar sub-panel was removed from the active strip layout.
 @_cdecl("notify_touchbar_display_mode_in_app")
 public func notify_touchbar_display_mode_in_app(width: UInt32, height: UInt32, fps: UInt32, hdr: Bool) {
-    TouchBarHudController.shared.updateDisplayModeState(width: width, height: height, fps: fps, hdr: hdr)
+    _ = (width, height, fps, hdr)
 }
 
+/// Announces a pending remote clipboard file on the Touch Bar (`📥 Paste <name> (<size>)`).
 @_cdecl("notify_touchbar_remote_file")
 public func notify_touchbar_remote_file(namePtr: UnsafePointer<CChar>?, totalBytes: UInt64) {
     guard let namePtr = namePtr else { return }
@@ -2422,12 +2249,14 @@ public func notify_touchbar_remote_file(namePtr: UnsafePointer<CChar>?, totalByt
     TouchBarHudController.shared.showRemotePasteButton(name: name, totalBytes: totalBytes)
 }
 
+/// Updates the Touch Bar remote paste pill with live transfer percentage and MB/s throughput.
 @_cdecl("update_touchbar_paste_progress")
 public func update_touchbar_paste_progress(percent: Float, mbPerSec: Float) {
     PasteboardShortcutInterceptor.shared.touchPasteActivity()
     TouchBarHudController.shared.updatePasteProgress(percent: percent, mbPerSec: mbPerSec)
 }
 
+/// Resets and hides the Touch Bar remote paste pill after transfer completion or cancellation.
 @_cdecl("reset_touchbar_paste_progress")
 public func reset_touchbar_paste_progress() {
     PasteboardShortcutInterceptor.shared.isPasting = false
@@ -2435,16 +2264,26 @@ public func reset_touchbar_paste_progress() {
 }
 
 // MARK: - Native Finder Cmd+V Shortcut Interceptor
+/// Intercepts `Cmd+V` inside macOS Finder when a remote file announcement is pending,
+/// triggering zero-RAM on-demand file streaming from the paired Windows workstation.
 public class PasteboardShortcutInterceptor: NSObject {
+    /// Singleton interceptor registered on the main `CFRunLoop`.
     public static let shared = PasteboardShortcutInterceptor()
 
+    /// Mutex guarding pending announcement flags and stale paste timestamps.
     private let lock = NSLock()
+    /// True while remote Windows files await paste on the local clipboard.
     private var _hasPendingRemoteFile: Bool = false
+    /// True while a streamed remote paste operation is actively downloading.
     private var _isPasting: Bool = false
+    /// Timestamp of the last paste trigger or progress update (expires after 30 seconds).
     private var _pasteStartedAt: Date? = nil
+    /// Installed Quartz session-level key-down event tap (`CGEventTap`).
     private var eventTap: CFMachPort?
+    /// `CFRunLoopSource` attaching `eventTap` to `CFRunLoopGetMain()`.
     private var runLoopSource: CFRunLoopSource?
 
+    /// Thread-safe toggle tracking whether a remote file announcement is currently pending.
     public var hasPendingRemoteFile: Bool {
         get {
             lock.lock()
@@ -2462,6 +2301,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         }
     }
 
+    /// Thread-safe indicator tracking an active remote paste transfer (auto-expiring after 30s inactivity).
     public var isPasting: Bool {
         get {
             lock.lock()
@@ -2477,6 +2317,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         }
     }
 
+    /// Refreshes the inactivity timeout timestamp while remote paste progress packets arrive.
     func touchPasteActivity() {
         lock.lock()
         if _isPasting {
@@ -2485,6 +2326,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         lock.unlock()
     }
 
+    /// Clears stale in-flight paste state if 30 seconds elapse without progress or reset (`lock` held).
     private func expireStalePastingLocked() {
         if _isPasting, let started = _pasteStartedAt, Date().timeIntervalSince(started) > 30.0 {
             _isPasting = false
@@ -2496,6 +2338,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         super.init()
     }
 
+    /// Installs the Accessibility-gated Finder `Cmd+V` Quartz `CGEventTap` once on main thread.
     public func start() {
         let block = { [weak self] in
             guard let self = self else { return }
@@ -2519,12 +2362,11 @@ public class PasteboardShortcutInterceptor: NSObject {
                     return PasteboardShortcutInterceptor.shared.handleEvent(proxy: proxy, type: type, event: event)
                 },
                 userInfo: nil
-            ) else {
+            ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
                 NSLog("ℹ️ [PasteboardShortcutInterceptor] Could not create CGEventTap; falling back to direct clipboard registration.")
                 return
             }
 
-            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             self.lock.lock()
             self.eventTap = tap
             self.runLoopSource = source
@@ -2543,6 +2385,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         }
     }
 
+    /// Returns `true` when `event` represents `Cmd+V` (without Option or Control modifiers).
     private func isPasteShortcutEvent(_ event: CGEvent) -> Bool {
         let flags = event.flags
         guard flags.contains(.maskCommand),
@@ -2558,6 +2401,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         return event.getIntegerValueField(.keyboardEventKeycode) == 9
     }
 
+    /// Processes `CGEventTap` events, swallowing Finder `Cmd+V` to launch streaming when a remote file is pending.
     func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout {
             lock.lock()
@@ -2595,6 +2439,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         return Unmanaged.passUnretained(event)
     }
 
+    /// Marks paste active, updates the Touch Bar pill with haptic feedback, and invokes `trigger_rust_remote_paste()`.
     func triggerPaste() {
         lock.lock()
         expireStalePastingLocked()
@@ -2619,16 +2464,20 @@ public class PasteboardShortcutInterceptor: NSObject {
 }
 
 // MARK: - C FFI Interface for Shortcut Interceptor & Pasteboard
+
+/// Starts the Finder `Cmd+V` remote paste shortcut interceptor.
 @_cdecl("init_shortcut_interceptor")
 public func init_shortcut_interceptor() {
     PasteboardShortcutInterceptor.shared.start()
 }
 
+/// Updates whether a remote file announcement is pending on the local Mac clipboard.
 @_cdecl("set_has_pending_remote_file")
 public func set_has_pending_remote_file(pending: Bool) {
     PasteboardShortcutInterceptor.shared.hasPendingRemoteFile = pending
 }
 
+/// Executes a closure synchronously on the main AppKit thread for safe `NSPasteboard` access.
 private func onMainPasteboardSync<T>(_ work: () -> T) -> T {
     if Thread.isMainThread || !(NSApp?.isRunning ?? false) {
         return work()
@@ -2636,16 +2485,21 @@ private func onMainPasteboardSync<T>(_ work: () -> T) -> T {
     return DispatchQueue.main.sync(execute: work)
 }
 
+/// Clears all contents from `NSPasteboard.general` on the main AppKit thread.
 @_cdecl("clear_pasteboard_in_app")
 public func clear_pasteboard_in_app() {
-    onMainPasteboardSync {
+    _ = onMainPasteboardSync {
         NSPasteboard.general.clearContents()
     }
 }
 
 /// Reads file URLs from `NSPasteboard.general` into `outBuf` as `\0`-delimited UTF-8 paths.
-/// Returns `0` when no file URLs are present, `-1` when `outBuf` is invalid or `cap` is too small,
-/// or the exact byte count written into `outBuf`.
+///
+/// - Parameters:
+///   - outBuf: Caller-allocated byte buffer receiving `\0`-separated file paths.
+///   - cap: Capacity of `outBuf` in bytes.
+/// - Returns: `0` when no file URLs are present, `-1` when `outBuf` is null or `cap` is insufficient,
+///   or exact byte count copied into `outBuf`.
 @_cdecl("read_pasteboard_files_in_app")
 public func read_pasteboard_files_in_app(_ outBuf: UnsafeMutablePointer<UInt8>?, _ cap: Int) -> Int {
     guard let outBuf = outBuf, cap > 0 else { return -1 }
@@ -2692,6 +2546,9 @@ public func read_pasteboard_files_in_app(_ outBuf: UnsafeMutablePointer<UInt8>?,
 }
 
 /// Writes `\0`-delimited UTF-8 file paths in `pathsPtr[0..<len]` onto `NSPasteboard.general`.
+///
+/// Rejects invalid UTF-8 byte sequences cleanly rather than substituting replacement characters.
+/// - Returns: `true` if one or more valid file URLs were written to `NSPasteboard.general`.
 @_cdecl("write_pasteboard_files_in_app")
 public func write_pasteboard_files_in_app(_ pathsPtr: UnsafePointer<UInt8>?, _ len: Int) -> Bool {
     guard let pathsPtr = pathsPtr, len > 0 else { return false }
@@ -2699,8 +2556,7 @@ public func write_pasteboard_files_in_app(_ pathsPtr: UnsafePointer<UInt8>?, _ l
     var seen = Set<String>()
     var urls: [NSURL] = []
     for slice in buf.split(separator: 0, omittingEmptySubsequences: true) {
-        let path = String(decoding: slice, as: UTF8.self)
-        guard !path.isEmpty else { continue }
+        guard let path = String(bytes: slice, encoding: .utf8), !path.isEmpty else { continue }
         if seen.insert(path).inserted {
             urls.append(URL(fileURLWithPath: path) as NSURL)
         }

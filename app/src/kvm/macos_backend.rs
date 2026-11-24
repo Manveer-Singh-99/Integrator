@@ -93,6 +93,10 @@ static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
 /// Atomic indicator showing whether the macOS `CGEventTap` is currently installed and healthy.
 static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Atomic shutdown latch preventing the background Accessibility retry loop from re-installing
+/// the event tap after `stop()` has been requested.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Mutual exclusion lock guarding event tap initialization and teardown routines.
 static START_TAP_LOCK: Mutex<()> = Mutex::new(());
 
@@ -102,6 +106,7 @@ type KvmEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
 /// C-compatible function pointer for drag-and-drop termination callbacks from Swift.
 type KvmDragEndedCallback = extern "C" fn(bool, *const c_char);
 
+// C-ABI entry points exported by `src/kvm_macos.swift` (`libtouchbar.a`).
 extern "C" {
     fn integrator_kvm_macos_start_tap(
         cb: Option<KvmEventCallback>,
@@ -167,6 +172,7 @@ extern "C" {
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
     let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    STOP_REQUESTED.store(false, Ordering::Release);
     let ok = unsafe {
         integrator_kvm_macos_start_tap(Some(on_cg_event), Some(on_drag_ended))
     };
@@ -177,18 +183,24 @@ pub fn start(service: Arc<KvmService>) {
         tracing::warn!(
             "⚠️ Failed to initialize macOS CGEventTap (grant Accessibility permission to Integrator in System Settings -> Privacy & Security)"
         );
-        // Auto-retry until Accessibility permission is granted so KVM activates without app restart
+        // Auto-retry until Accessibility permission is granted (or stop() is called) so KVM activates without restart.
         std::thread::Builder::new()
             .name("kvm-macos-tap-retry".into())
             .spawn(|| {
                 loop {
                     std::thread::sleep(ACCESSIBILITY_RETRY_INTERVAL);
+                    if STOP_REQUESTED.load(Ordering::Acquire) {
+                        break;
+                    }
                     let active_now = unsafe { integrator_kvm_macos_is_tap_active() };
                     if active_now {
                         TAP_ACTIVE.store(true, Ordering::Release);
                         break;
                     }
                     let _g = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    if STOP_REQUESTED.load(Ordering::Acquire) {
+                        break;
+                    }
                     let activated = unsafe {
                         integrator_kvm_macos_start_tap(Some(on_cg_event), Some(on_drag_ended))
                     };
@@ -206,6 +218,7 @@ pub fn start(service: Arc<KvmService>) {
 /// Disables and removes the macOS `CGEventTap`, restoring standard OS input dispatch.
 pub fn stop() {
     let _guard = START_TAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    STOP_REQUESTED.store(true, Ordering::Release);
     TAP_ACTIVE.store(false, Ordering::Release);
     unsafe {
         integrator_kvm_macos_stop_tap();
@@ -238,10 +251,12 @@ pub fn request_accessibility() -> bool {
     trusted
 }
 
-/// Queries the primary display bounds in Quartz global coordinates.
+/// Queries the union virtual-desktop bounding box across all active macOS displays in Quartz
+/// global coordinates (logical points/DIPs, supporting negative-origin secondary monitors).
 ///
 /// # Returns
-/// A `ScreenRect` representing the dimensions and origin of the main screen.
+/// A `ScreenRect` representing the active display bounds, falling back to safe defaults if
+/// Quartz returns non-finite or sub-minimum dimensions.
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
@@ -251,8 +266,8 @@ pub fn get_primary_screen_rect() -> ScreenRect {
         integrator_kvm_macos_screen_rect(&mut x, &mut y, &mut w, &mut h);
     }
     ScreenRect {
-        x: x as f32,
-        y: y as f32,
+        x: if x.is_finite() { x as f32 } else { 0.0 },
+        y: if y.is_finite() { y as f32 } else { 0.0 },
         width: (w as f32).max(crate::config::MIN_KVM_DISPLAY_WIDTH),
         height: (h as f32).max(crate::config::MIN_KVM_DISPLAY_HEIGHT),
     }
@@ -269,6 +284,9 @@ pub fn set_controlling_mode(
     restore_x: f32,
     restore_y: f32,
 ) {
+    if !park_x.is_finite() || !park_y.is_finite() || !restore_x.is_finite() || !restore_y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_macos_set_controlling(
             controlling,
@@ -284,6 +302,9 @@ pub fn set_controlling_mode(
 ///
 /// Warps the cursor to the entry coordinate `(entry_x, entry_y)` and ensures the cursor is visible.
 pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
+    if !entry_x.is_finite() || !entry_y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_macos_set_controlled(controlled, entry_x as f64, entry_y as f64);
     }
@@ -343,6 +364,9 @@ pub fn extract_file_icon_png_b64(path: &std::path::Path) -> Option<String> {
 ///
 /// If `left_held` is true, posts a `kCGEventLeftMouseDragged` event; otherwise `kCGEventMouseMoved`.
 pub fn inject_mouse_move(x: f32, y: f32, left_held: bool) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_macos_inject_mouse_move(x as f64, y as f64, left_held);
     }
@@ -356,6 +380,9 @@ pub fn inject_mouse_move(x: f32, y: f32, left_held: bool) {
 /// * `x` - Current pointer X position.
 /// * `y` - Current pointer Y position.
 pub fn inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: f32) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     let btn = match button {
         RemoteMouseButton::Left => 0,
         RemoteMouseButton::Right => 1,
@@ -398,6 +425,9 @@ pub fn inject_key(key: LogicalKey, pressed: bool, mods: ModifierMask) {
 
 /// Displays the floating translucent drag ghost HUD at `(x, y)`.
 pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, icon_b64: Option<&str>) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     let Ok(c_title) = CString::new(title) else { return };
     let Ok(c_sub) = CString::new(subtitle) else { return };
     let c_icon = icon_b64.and_then(|s| CString::new(s).ok());
@@ -414,6 +444,9 @@ pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, icon_b64: Op
 
 /// Moves the active drag ghost HUD to new pointer coordinates `(x, y)`.
 pub fn move_drag_ghost(x: f32, y: f32) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_macos_move_drag_ghost(x as f64, y as f64);
     }
@@ -433,17 +466,24 @@ pub fn hide_drag_ghost() {
 /// * `session_id` - Drag session identifier for completion tracking.
 /// * `x` - Initial cursor X position in Quartz coordinates.
 /// * `y` - Initial cursor Y position in Quartz coordinates.
-pub fn begin_native_drop_drag(paths: &[PathBuf], session_id: &str, x: f32, y: f32) {
+///
+/// # Returns
+/// `true` if the drag request was dispatched to Swift AppKit, or `false` if coordinates,
+/// paths, or C-string conversion failed.
+pub fn begin_native_drop_drag(paths: &[PathBuf], session_id: &str, x: f32, y: f32) -> bool {
+    if !x.is_finite() || !y.is_finite() {
+        return false;
+    }
     let str_paths: Vec<String> = paths
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
     if str_paths.is_empty() {
-        return;
+        return false;
     }
-    let Ok(json) = serde_json::to_string(&str_paths) else { return };
-    let Ok(c_paths) = CString::new(json) else { return };
-    let Ok(c_sid) = CString::new(session_id) else { return };
+    let Ok(json) = serde_json::to_string(&str_paths) else { return false };
+    let Ok(c_paths) = CString::new(json) else { return false };
+    let Ok(c_sid) = CString::new(session_id) else { return false };
     unsafe {
         integrator_kvm_macos_begin_native_drag(
             c_paths.as_ptr(),
@@ -452,6 +492,7 @@ pub fn begin_native_drop_drag(paths: &[PathBuf], session_id: &str, x: f32, y: f3
             y as f64,
         );
     }
+    true
 }
 
 /// Callback triggered by Swift when an active AppKit dragging session finishes or is cancelled.
@@ -494,9 +535,16 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
         }
         3 => svc.on_local_mouse_scroll(a as f32, b as f32),
         4 => {
-            let kc = a as u16;
-            if let Some(key) = macos_keycode_to_logical(kc) {
-                svc.on_local_key_event(key, b > 0.5, cg_flags_to_modifiers(extra))
+            // Bounds-check keycode before truncating to u16 so malformed FFI floats cannot alias.
+            if a.is_finite() && a >= 0.0 && a <= u16::MAX as f64 {
+                let kc = a as u16;
+                if let Some(key) = macos_keycode_to_logical(kc) {
+                    svc.on_local_key_event(key, b > 0.5, cg_flags_to_modifiers(extra))
+                } else if svc.is_controlling_peer_fast() {
+                    HookDecision::Swallow
+                } else {
+                    HookDecision::PassThrough
+                }
             } else if svc.is_controlling_peer_fast() {
                 HookDecision::Swallow
             } else {
@@ -504,15 +552,21 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
             }
         }
         5 => {
-            let kc = a as u16;
-            let mods = cg_flags_to_modifiers(extra);
-            if kc == 57 {
-                // CapsLock flagsChanged fires once per lock toggle; emit a tap so peers toggle in sync.
-                let decision = svc.on_local_key_event(LogicalKey::CapsLock, true, mods);
-                let _ = svc.on_local_key_event(LogicalKey::CapsLock, false, mods);
-                decision
-            } else if let Some((key, pressed)) = macos_flags_changed_key(kc, extra, mods) {
-                svc.on_local_key_event(key, pressed, mods)
+            if a.is_finite() && a >= 0.0 && a <= u16::MAX as f64 {
+                let kc = a as u16;
+                let mods = cg_flags_to_modifiers(extra);
+                if kc == 57 {
+                    // CapsLock flagsChanged fires once per lock toggle; emit a tap so peers toggle in sync.
+                    let decision = svc.on_local_key_event(LogicalKey::CapsLock, true, mods);
+                    let _ = svc.on_local_key_event(LogicalKey::CapsLock, false, mods);
+                    decision
+                } else if let Some((key, pressed)) = macos_flags_changed_key(kc, extra, mods) {
+                    svc.on_local_key_event(key, pressed, mods)
+                } else if svc.is_controlling_peer_fast() {
+                    HookDecision::Swallow
+                } else {
+                    HookDecision::PassThrough
+                }
             } else if svc.is_controlling_peer_fast() {
                 HookDecision::Swallow
             } else {
@@ -530,6 +584,12 @@ extern "C" fn on_cg_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64)
 }
 
 /// Converts raw 64-bit CoreGraphics event flags into canonical `ModifierMask`.
+///
+/// Uses standard `CGEventFlags` bit positions:
+/// - `0x0002_0000`: `kCGEventFlagMaskShift`
+/// - `0x0004_0000`: `kCGEventFlagMaskControl`
+/// - `0x0008_0000`: `kCGEventFlagMaskAlternate`
+/// - `0x0010_0000`: `kCGEventFlagMaskCommand`
 fn cg_flags_to_modifiers(raw: u64) -> ModifierMask {
     ModifierMask {
         shift: (raw & 0x0002_0000) != 0,

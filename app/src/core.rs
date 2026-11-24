@@ -10,7 +10,8 @@
 //! - **Virtual Display Engine**: Coordinates `DisplayController` and `DisplayServer` for screen extension and mirroring.
 //! - **Cross-Platform KVM & Gestures**: Integrates `KvmService` for seamless pointer, keyboard, and drag-and-drop routing.
 //! - **Unified Clipboard**: Manages `ClipboardService` for bidirectional synchronization of text, images, and files.
-//! - **Shared Virtual Camera**: Operates `CameraService` forwarding video frames between macOS and Windows 11.
+//! - **Shared Virtual Camera & Mic**: Operates `CameraService` forwarding video frames and microphone
+//!   audio between macOS and Windows 11.
 //! - **Audio Bridging & Spatial Sound**: Controls WASAPI and CoreAudio streaming pipelines.
 //! - **Hardware Telemetry & TrueTone**: Gathers GPU metrics and synchronizes display white points across machines.
 //! - **Cryptographic Trust Store**: Manages SPAKE2+ PIN pairing, Ed25519 authorization, and peer blacklisting.
@@ -21,12 +22,14 @@
 //! ### Upstream Callers:
 //! - `main.rs`: Bootstraps the application via `IntegratorCore::init_global()`, checks for single-instance
 //!   activation via `try_focus_existing_instance()`, and handles CLI subcommands via `run_cli_if_requested()`.
-//! - `ffi.rs`: Delegates external C ABI requests (`integrator_core_invoke`, `integrator_core_tray_action`,
+//! - `ffi.rs`: Delegates external C ABI requests (`integrator_core_init`, `integrator_core_set_ui_callback`,
+//!   `integrator_core_invoke`, `integrator_core_free_string`, `integrator_core_tray_action`,
 //!   `integrator_core_shutdown`) to the global core singleton (`GLOBAL_CORE`).
 //!
 //! ### Downstream Callees:
-//! - Subsystems: `audio`, `autostart`, `benchmark`, `camera`, `clipboard`, `discovery`, `display`,
-//!   `features`, `kvm`, `storage`, `system_info`, `telemetry`, `truetone`, `trust`.
+//! - Subsystems: `audio`, `autostart`, `benchmark`, `ble_discovery`, `bonjour_discovery`, `camera`,
+//!   `clipboard`, `discovery`, `display`, `features`, `kvm`, `media`, `security`, `setup`, `storage`,
+//!   `system_info`, `telemetry`, `truetone`, `trust`.
 //! - Logging Framework: Configures `tracing-subscriber` with stdout, rotating private log files (`~/.integrator.log`),
 //!   and an in-memory UI ring layer (`UiRingLogLayer`).
 //! - OS Firewall: Automates Windows Defender Firewall rules (`ensure_windows_firewall_rules`) on Windows hosts.
@@ -335,22 +338,38 @@ pub extern "C" fn send_rust_windows_media_cmd(cmd_code: i32, seek_secs: f64) -> 
 /// Aggregated live snapshot polled by `touchbar_hud.swift` over a single C-ABI round-trip.
 #[derive(Serialize)]
 struct TouchBarLiveSnapshot {
+    /// Latest Windows GPU telemetry payload from the paired workstation, if reachable.
     gpu_telemetry: Option<telemetry::GpuTelemetry>,
+    /// Latest Windows GSMTC media playback session state, if reachable.
     media_state: Option<crate::media::MediaPlaybackState>,
+    /// `true` when the shared virtual camera capture or stream is active.
     camera_active: bool,
+    /// `true` when the hardware camera privacy shutter killswitch is engaged.
     camera_muted: bool,
+    /// `true` when the KVM Gaming Boundary Lock freezes screen-edge cursor hopping.
     kvm_locked: bool,
+    /// Cross-platform audio mixer balance ratio (`-1.0..=1.0`).
     audio_balance: f32,
+    /// `true` when the dynamic audio sink output is muted.
     audio_muted: bool,
+    /// `true` when extended display streaming is active.
     display_active: bool,
+    /// Preferred extended display width in pixels (`0` if unset).
     display_width: u32,
+    /// Preferred extended display height in pixels (`0` if unset).
     display_height: u32,
+    /// Preferred extended display refresh rate in Hz (defaults to `120`).
     display_fps: u32,
+    /// `true` if HDR mode is requested for the extended display.
     display_hdr: bool,
 }
 
 /// C-ABI entry point polled by `touchbar_hud.swift` to fetch synchronized GPU telemetry,
 /// Windows GSMTC media state, camera privacy state, KVM boundary lock, audio mixer, and display mode.
+///
+/// # Safety
+/// `peer_ip_ptr` must be null or point to a valid NUL-terminated UTF-8 C string; `out_buf` must be
+/// writable for at least `cap` bytes (returns `0` if `out_buf` is null, `cap < 2`, or JSON exceeds `cap - 1`).
 #[no_mangle]
 pub extern "C" fn fetch_rust_touchbar_snapshot_json(
     peer_ip_ptr: *const c_char,
@@ -711,7 +730,9 @@ pub struct IntegratorCore {
 /// Helper visitor extracting message strings and key-value fields from `tracing::Event`.
 #[derive(Default)]
 struct LogVisitor {
+    /// Primary `"message"` field text extracted from the tracing event.
     msg: String,
+    /// Additional structured `key=value` fields formatted in event visit order.
     fields: Vec<String>,
 }
 
@@ -950,7 +971,9 @@ pub fn try_focus_existing_instance() -> bool {
 /// Parses and executes CLI subcommands passed into the process without launching the full GUI.
 ///
 /// Supported subcommands: `paste-remote`, `benchmark <ip>`, `telemetry <ip>`, `touchbar <ip>`,
-/// `display [toggle|stop|status]`, `pin`, `pair <ip> <pin>`, `status`, `camera [toggle|start|stop|status]`.
+/// `display [toggle|stop|status]`, `pin`, `pair <ip> <pin>`, `status`, `camera [toggle|start|stop|status]`,
+/// `setup [status|json]`, `discovery [status|auth-via-ble|auth-via-bonjour]`, `touchid [status|verify]`,
+/// and `passkey [status|list|test|make-hex|assert-hex]`.
 pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
     if args.len() <= 1 {
         return None;
@@ -1429,7 +1452,8 @@ pub fn run_cli_if_requested(args: &[String]) -> Option<Result<()>> {
                         let assertion = assert_resp.passkey_assertion.ok_or_else(|| {
                             anyhow::anyhow!("Mac peer returned success without assertion signature")
                         })?;
-                        println!("==> Success! Passkey assertion signed via Touch ID: {}…", &assertion.signature_der_hex[..20]);
+                        let sig_preview: String = assertion.signature_der_hex.chars().take(20).collect();
+                        println!("==> Success! Passkey assertion signed via Touch ID: {}…", sig_preview);
                         Ok(())
                     })
                 }
@@ -2155,16 +2179,17 @@ impl IntegratorCore {
             sz_exe_file: [u16; 260],
         }
         const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-        const INVALID_HANDLE_VALUE: isize = -1;
+        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = (-1isize) as *mut std::ffi::c_void;
         extern "system" {
-            fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
-            fn Process32FirstW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
-            fn Process32NextW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
-            fn CloseHandle(h_object: isize) -> i32;
+            fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> *mut std::ffi::c_void;
+            fn Process32FirstW(h_snapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+            fn Process32NextW(h_snapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
+            fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
         }
 
+        // SAFETY: `CreateToolhelp32Snapshot` takes value flags and returns a valid handle or `INVALID_HANDLE_VALUE`.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snap == 0 || snap == INVALID_HANDLE_VALUE {
+        if snap.is_null() || snap == INVALID_HANDLE_VALUE {
             return None;
         }
         let mut entry = ProcessEntry32W {
@@ -2180,6 +2205,7 @@ impl IntegratorCore {
             sz_exe_file: [0u16; 260],
         };
         let mut found: Option<&'static str> = None;
+        // SAFETY: `snap` is a valid Toolhelp snapshot handle and `entry.dw_size` is initialized.
         if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
             loop {
                 let nul_pos = entry.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(entry.sz_exe_file.len());
@@ -2190,11 +2216,13 @@ impl IntegratorCore {
                 } else if name == "credentialuibroker.exe" {
                     found = Some("Approve Windows Hello Login");
                 }
+                // SAFETY: `snap` and `entry` remain valid for enumeration until `CloseHandle`.
                 if unsafe { Process32NextW(snap, &mut entry) } == 0 {
                     break;
                 }
             }
         }
+        // SAFETY: `snap` is valid and non-null, closed exactly once.
         unsafe {
             CloseHandle(snap);
         }
@@ -2264,12 +2292,7 @@ impl IntegratorCore {
                 let als = if truetone_enabled {
                     truetone::read_ambient_light()
                 } else {
-                    truetone::AmbientLightData {
-                        lux: 0.0,
-                        cct_kelvin: config::D65_CCT_KELVIN,
-                        supported: false,
-                        updated_at_secs: 0,
-                    }
+                    unsupported_ambient_light()
                 };
                 let trust_snap = trust::get_trust_snapshot();
                 let setup_snap = crate::setup::collect_setup_health_snapshot(
@@ -2295,12 +2318,7 @@ impl IntegratorCore {
                 auto_mount,
                 false,
                 ("auto".to_string(), "auto".to_string()),
-                truetone::AmbientLightData {
-                    lux: 0.0,
-                    cct_kelvin: config::D65_CCT_KELVIN,
-                    supported: false,
-                    updated_at_secs: 0,
-                },
+                unsupported_ambient_light(),
                 (
                     trust::TrustConfigFile {
                         auto_trust_direct_cable: false,
@@ -2476,6 +2494,31 @@ impl IntegratorCore {
         }
     }
 
+    /// Disables KVM (`input_kvm`) and clears pending clipboard/drag state when Extended Screen
+    /// is about to start, preventing Moonlight/Sunshine cursor capture conflicts.
+    async fn disable_kvm_for_display_start(&self, reason: &str) {
+        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
+            let _ = self.features.set_flag_checked("input_kvm", false);
+            self.kvm.force_release_all(true);
+            if !self.features.is_enabled("clipboard") && !self.features.is_enabled("dragdrop") {
+                self.clipboard.clear_pending_state().await;
+            }
+            tracing::info!("🖥️ {}: automatically disabled KVM and released input hooks.", reason);
+        }
+    }
+
+    /// Stops any active Mac->PC or PC->Mac virtual display / Moonlight stream if running.
+    async fn stop_active_display_streams(&self) -> bool {
+        if self.display_ctrl.is_active().await || self.display_ctrl.get_active_mode().await.is_some()
+        {
+            let _ = self.display_ctrl.stop_mac_to_pc().await;
+            let _ = self.display_ctrl.stop_pc_to_mac().await;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Primary JSON-RPC dispatcher processing incoming method calls from native GUI frontends.
     ///
     /// # Arguments
@@ -2507,12 +2550,7 @@ impl IntegratorCore {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
                     }
                     if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
-                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
-                            self.features.set_flag("input_kvm", false);
-                            self.features.set_flag("input", false);
-                            self.kvm.force_release_all(true);
-                            tracing::info!("🖥️ Screen extension starting: automatically disabled KVM to prevent cursor capture conflicts.");
-                        }
+                        self.disable_kvm_for_display_start("Screen extension starting").await;
                     }
                     let msg = if cfg!(target_os = "macos") {
                         self.display_ctrl.toggle_mac_to_pc().await
@@ -2527,12 +2565,7 @@ impl IntegratorCore {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
                     }
                     if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
-                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
-                            self.features.set_flag("input_kvm", false);
-                            self.features.set_flag("input", false);
-                            self.kvm.force_release_all(true);
-                            tracing::info!("🖥️ Screen extension (Mac -> PC) starting: automatically disabled KVM to prevent cursor capture conflicts.");
-                        }
+                        self.disable_kvm_for_display_start("Screen extension (Mac -> PC) starting").await;
                     }
                     let msg = self
                         .display_ctrl
@@ -2546,12 +2579,7 @@ impl IntegratorCore {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
                     }
                     if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
-                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
-                            self.features.set_flag("input_kvm", false);
-                            self.features.set_flag("input", false);
-                            self.kvm.force_release_all(true);
-                            tracing::info!("🖥️ Screen extension (PC -> Mac) starting: automatically disabled KVM to prevent cursor capture conflicts.");
-                        }
+                        self.disable_kvm_for_display_start("Screen extension (PC -> Mac) starting").await;
                     }
                     let msg = self
                         .display_ctrl
@@ -2573,11 +2601,56 @@ impl IntegratorCore {
                     Ok(serde_json::json!(true))
                 }
                 "quit_app" => {
-                    self.kvm.force_release_all(true);
+                    self.shutdown();
                     std::process::exit(0);
                 }
+                "shutdown_subsystem" => {
+                    #[derive(Deserialize)]
+                    struct ShutdownStepArgs {
+                        step: String,
+                    }
+                    let args: ShutdownStepArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let step = args.step.trim().to_ascii_lowercase();
+                    match step.as_str() {
+                        "audio" => {
+                            let _ = tokio::task::spawn_blocking(audio::AudioManager::shutdown_sync).await;
+                        }
+                        "camera" => {
+                            self.camera.stop().await;
+                            let cam = Arc::clone(&self.camera);
+                            let _ = tokio::task::spawn_blocking(move || cam.shutdown_sync()).await;
+                        }
+                        "display" => {
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(900),
+                                self.stop_active_display_streams(),
+                            )
+                            .await;
+                            let _ = tokio::task::spawn_blocking(truetone::reset_hardware_gamma_ramp).await;
+                        }
+                        "storage" => {
+                            self.clipboard.clear_pending_state().await;
+                            let _ = tokio::task::spawn_blocking(storage::StorageManager::unmount).await;
+                        }
+                        "kvm" => {
+                            #[cfg(target_os = "macos")]
+                            if system_info::has_touch_bar_hardware() {
+                                unsafe {
+                                    dismiss_touchbar_in_app();
+                                    set_touchbar_tray_enabled_in_app(false);
+                                }
+                            }
+                            self.kvm.shutdown();
+                        }
+                        other => {
+                            return Err(format!("Unknown shutdown subsystem step: {}", other));
+                        }
+                    }
+                    Ok(serde_json::json!(format!("Stopped {}", step)))
+                }
                 "set_gpu_preferences" => {
-                    #[allow(dead_code)]
+                    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
                     #[derive(Deserialize)]
                     struct GpuArgs {
                         #[serde(alias = "encodeGpu")]
@@ -2679,28 +2752,13 @@ impl IntegratorCore {
                 }
                 "get_ambient_light" => {
                     let data = if !self.features.is_enabled("truetone") {
-                        truetone::AmbientLightData {
-                            lux: 0.0,
-                            cct_kelvin: config::D65_CCT_KELVIN,
-                            supported: false,
-                            updated_at_secs: 0,
-                        }
+                        unsupported_ambient_light()
                     } else {
                         let als = tokio::task::spawn_blocking(truetone::read_ambient_light)
                             .await
-                            .unwrap_or(truetone::AmbientLightData {
-                                lux: 0.0,
-                                cct_kelvin: config::D65_CCT_KELVIN,
-                                supported: false,
-                                updated_at_secs: 0,
-                            });
+                            .unwrap_or_else(|_| unsupported_ambient_light());
                         if !als.supported || !als.lux.is_finite() || als.lux < 0.0 {
-                            truetone::AmbientLightData {
-                                lux: 0.0,
-                                cct_kelvin: config::D65_CCT_KELVIN,
-                                supported: false,
-                                updated_at_secs: 0,
-                            }
+                            unsupported_ambient_light()
                         } else {
                             als
                         }
@@ -2737,11 +2795,16 @@ impl IntegratorCore {
                             config::MAX_GAMMA_COMP_FACTOR
                         ));
                     }
+                    truetone::set_user_gamma_comp(args.comp_factor);
                     if cfg!(target_os = "windows") {
                         let cct = args.cct;
                         let comp = args.comp_factor;
                         tokio::task::spawn_blocking(move || {
-                            truetone::apply_hardware_gamma_ramp(cct, comp)
+                            let res = truetone::apply_hardware_gamma_ramp(cct, comp);
+                            if res.is_ok() {
+                                truetone::record_synced_ambient(0.0, cct);
+                            }
+                            res
                         })
                         .await
                         .map_err(|e| format!("TrueTone task panicked: {}", e))?
@@ -2758,12 +2821,7 @@ impl IntegratorCore {
                             .ok_or_else(|| "No peer connected to sync True Tone calibration".to_string())?;
                         let als = tokio::task::spawn_blocking(truetone::read_ambient_light)
                             .await
-                            .unwrap_or(truetone::AmbientLightData {
-                                lux: 0.0,
-                                cct_kelvin: config::D65_CCT_KELVIN,
-                                supported: false,
-                                updated_at_secs: 0,
-                            });
+                            .unwrap_or_else(|_| unsupported_ambient_light());
                         let lux = if als.supported && als.lux.is_finite() && als.lux >= 0.0 {
                             als.lux
                         } else {
@@ -2859,17 +2917,18 @@ impl IntegratorCore {
                     }
                     let args: FlagArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
                     let feat = args.feature.trim();
-                    let flags = self.features.set_flag_checked(feat, args.enabled)?;
+                    let _ = self.features.set_flag_checked(feat, args.enabled)?;
                     if feat == "camera" {
                         self.camera.sync_with_feature_flag(args.enabled).await;
                     } else if args.enabled {
-                        if matches!(feat, "input_kvm" | "input") {
-                            if self.display_ctrl.is_active().await
-                                || self.display_ctrl.get_active_mode().await.is_some()
-                            {
-                                let _ = self.display_ctrl.stop_mac_to_pc().await;
-                                let _ = self.display_ctrl.stop_pc_to_mac().await;
-                                tracing::info!("⌨️🖱️ KVM enabled: automatically stopped active screen extension.");
+                        if feat == "display" {
+                            // Mutual exclusion: enabling Extended Display must atomically disable KVM and release hooks.
+                            self.disable_kvm_for_display_start("Extended Display enabled").await;
+                        } else if matches!(feat, "input_kvm" | "input") {
+                            // Mutual exclusion: enabling Universal Input KVM must atomically disable Display and stop streams.
+                            let _ = self.features.set_flag_checked("display", false);
+                            if self.stop_active_display_streams().await {
+                                tracing::info!("⌨️🖱️ KVM enabled: automatically disabled Extended Display and stopped active streams.");
                             }
                         } else if feat == "touchbar" {
                             #[cfg(target_os = "macos")]
@@ -2883,12 +2942,7 @@ impl IntegratorCore {
                     } else {
                         match feat {
                             "display" => {
-                                if self.display_ctrl.is_active().await
-                                    || self.display_ctrl.get_active_mode().await.is_some()
-                                {
-                                    let _ = self.display_ctrl.stop_mac_to_pc().await;
-                                    let _ = self.display_ctrl.stop_pc_to_mac().await;
-                                }
+                                let _ = self.stop_active_display_streams().await;
                             }
                             "storage" => {
                                 let _ = tokio::task::spawn_blocking(storage::StorageManager::unmount).await;
@@ -2918,7 +2972,8 @@ impl IntegratorCore {
                             _ => {}
                         }
                     }
-                    Ok(serde_json::to_value(flags).map_err(|e| e.to_string())?)
+                    let refreshed_flags = self.features.get_flags();
+                    Ok(serde_json::to_value(refreshed_flags).map_err(|e| e.to_string())?)
                 }
                 "toggle_camera" => {
                     let msg = self.camera.toggle().await?;
@@ -2931,6 +2986,176 @@ impl IntegratorCore {
                 "stop_camera" => {
                     self.camera.stop().await;
                     Ok(serde_json::json!("Shared Camera stopped"))
+                }
+                "list_cameras" => {
+                    let cams = if cfg!(target_os = "macos") {
+                        tokio::task::spawn_blocking(crate::camera::list_available_cameras)
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::ListCameras)
+                            .await
+                            .ok()
+                            .and_then(|r| if r.success { r.available_cameras } else { None })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(serde_json::to_value(cams).map_err(|e| e.to_string())?)
+                }
+                "select_camera" => {
+                    #[derive(Deserialize)]
+                    struct SelectCameraArgs {
+                        #[serde(alias = "deviceId")]
+                        device_id: String,
+                    }
+                    let args: SelectCameraArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let clean_id = args.device_id.trim().to_string();
+                    if clean_id.is_empty()
+                        || clean_id.len() > 256
+                        || clean_id.chars().any(|c| c.is_control())
+                    {
+                        return Err("Invalid camera device ID".into());
+                    }
+                    if cfg!(target_os = "macos") {
+                        let id_for_call = clean_id.clone();
+                        let ok = tokio::task::spawn_blocking(move || {
+                            crate::camera::select_camera_device(&id_for_call)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if ok {
+                            Ok(serde_json::json!(format!("Selected camera '{}'", clean_id)))
+                        } else {
+                            Err(format!("Failed to select camera '{}'", clean_id))
+                        }
+                    } else {
+                        let peer_ip = self
+                            .discovery
+                            .get_peer_ip()
+                            .await
+                            .ok_or_else(|| "No connected Mac peer to select camera".to_string())?;
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::SelectCamera {
+                                device_id: clean_id,
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if resp.success {
+                            Ok(serde_json::json!(resp.message))
+                        } else {
+                            Err(resp.message)
+                        }
+                    }
+                }
+                "list_mics" => {
+                    let mics = if cfg!(target_os = "macos") {
+                        let cam = Arc::clone(&self.camera);
+                        tokio::task::spawn_blocking(move || cam.list_mics())
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::ListMics)
+                            .await
+                            .ok()
+                            .and_then(|r| if r.success { r.available_mics } else { None })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(serde_json::to_value(mics).map_err(|e| e.to_string())?)
+                }
+                "select_mic" => {
+                    #[derive(Deserialize)]
+                    struct SelectMicArgs {
+                        #[serde(alias = "deviceId")]
+                        device_id: String,
+                    }
+                    let args: SelectMicArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let clean_id = args.device_id.trim().to_string();
+                    if clean_id.is_empty()
+                        || clean_id.len() > 256
+                        || clean_id.chars().any(|c| c.is_control())
+                    {
+                        return Err("Invalid microphone device ID".into());
+                    }
+                    if cfg!(target_os = "macos") {
+                        let cam = Arc::clone(&self.camera);
+                        let msg = tokio::task::spawn_blocking(move || cam.select_mic(&clean_id))
+                            .await
+                            .map_err(|e| e.to_string())??;
+                        Ok(serde_json::json!(msg))
+                    } else {
+                        let peer_ip = self
+                            .discovery
+                            .get_peer_ip()
+                            .await
+                            .ok_or_else(|| "No connected Mac peer to select microphone".to_string())?;
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::SelectMic {
+                                device_id: clean_id,
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if resp.success {
+                            Ok(serde_json::json!(resp.message))
+                        } else {
+                            Err(resp.message)
+                        }
+                    }
+                }
+                "set_mic_settings" => {
+                    #[derive(Deserialize)]
+                    struct MicSettingsArgs {
+                        enabled: bool,
+                        muted: bool,
+                        #[serde(default = "default_mic_gain")]
+                        gain: f32,
+                    }
+                    fn default_mic_gain() -> f32 {
+                        1.0
+                    }
+                    let args: MicSettingsArgs =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    if !args.gain.is_finite() {
+                        return Err("Invalid microphone gain (must be finite)".into());
+                    }
+                    let clamped_gain = args.gain.clamp(0.0, 2.0);
+                    let cam = Arc::clone(&self.camera);
+                    let status = tokio::task::spawn_blocking(move || {
+                        cam.set_mic_settings(args.enabled, args.muted, clamped_gain)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    // Best-effort peer sync so both Mac and PC reflect unified microphone state
+                    if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            DisplayController::send_remote_rpc(
+                                &peer_ip,
+                                &DisplayRpcRequest::SetMicSettings {
+                                    enabled: args.enabled,
+                                    muted: args.muted,
+                                    gain: clamped_gain,
+                                },
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(serde_json::to_value(status).map_err(|e| e.to_string())?)
+                }
+                "request_mic_permission" => {
+                    let cam = Arc::clone(&self.camera);
+                    let granted = tokio::task::spawn_blocking(move || cam.request_mic_permission())
+                        .await
+                        .map_err(|e| e.to_string())??;
+                    Ok(serde_json::json!(granted))
                 }
                 "get_kvm_status" => {
                     Ok(serde_json::to_value(self.kvm.get_status_snapshot()).map_err(|e| e.to_string())?)
@@ -3350,7 +3575,7 @@ impl IntegratorCore {
                     }
                     let args: MakeRemoteArgs =
                         serde_json::from_value(params_val).map_err(|e| e.to_string())?;
-                    let target_ip = match args.peer_ip {
+                    let target_ip = match args.peer_ip.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
                         Some(ip) => ip,
                         None => {
                             let peer = self
@@ -3380,7 +3605,7 @@ impl IntegratorCore {
                     }
                     let args: AssertRemoteArgs =
                         serde_json::from_value(params_val).map_err(|e| e.to_string())?;
-                    let target_ip = match args.peer_ip {
+                    let target_ip = match args.peer_ip.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
                         Some(ip) => ip,
                         None => {
                             let peer = self
@@ -3423,7 +3648,7 @@ impl IntegratorCore {
                         .map_err(|e| e.to_string())?;
                     Ok(serde_json::json!(msg))
                 }
-                "toggle_camera_privacy" => {
+                "toggle_camera_privacy" | "toggle_camera_privacy_mute" => {
                     let muted = self.camera.toggle_privacy_muted();
                     Ok(serde_json::json!({ "privacy_muted": muted }))
                 }
@@ -3630,7 +3855,7 @@ impl IntegratorCore {
         });
     }
 
-    /// Shuts down all active services, releasing system hooks and closing sockets.
+    /// Shuts down all active services, releasing system hooks, audio pipelines, and closing sockets.
     pub fn shutdown(&self) {
         #[cfg(target_os = "macos")]
         if system_info::has_touch_bar_hardware() {
@@ -3639,6 +3864,7 @@ impl IntegratorCore {
                 set_touchbar_tray_enabled_in_app(false);
             }
         }
+        crate::audio::AudioManager::shutdown_sync();
         self.camera.shutdown_sync();
         self.kvm.shutdown();
         register_ui_callback(None);
@@ -3648,7 +3874,7 @@ impl IntegratorCore {
     ///
     /// # Supported Actions:
     /// - `"paste_remote"`: Initiates remote clipboard paste operation.
-    /// - `"toggle_display"`: Starts or stops screen extension streaming.
+    /// - `"toggle_display"`: Starts or stops screen extension streaming (releasing KVM if starting display).
     /// - `"toggle_touchbar"`: Shows or hides the macOS Touch Bar HUD strip.
     /// - `"open_cache"`: Reveals application data folder in file manager.
     /// - `"quit"`: Releases input locks and emits application exit event.
@@ -3669,7 +3895,19 @@ impl IntegratorCore {
                     return;
                 }
                 let ctrl = self.display_ctrl.clone();
+                let features = Arc::clone(&self.features);
+                let kvm = Arc::clone(&self.kvm);
+                let cb = self.clipboard.clone();
                 self.rt.spawn(async move {
+                    if !ctrl.is_active().await && ctrl.get_active_mode().await.is_none() {
+                        if features.is_enabled("input_kvm") || features.is_enabled("input") {
+                            let _ = features.set_flag_checked("input_kvm", false);
+                            kvm.force_release_all(true);
+                            if !features.is_enabled("clipboard") && !features.is_enabled("dragdrop") {
+                                cb.clear_pending_state().await;
+                            }
+                        }
+                    }
                     let res = if cfg!(target_os = "macos") {
                         ctrl.toggle_mac_to_pc().await
                     } else {
@@ -3722,6 +3960,16 @@ impl IntegratorCore {
     }
 }
 
+/// Returns a neutral unsupported `AmbientLightData` snapshot used when True Tone is disabled or unavailable.
+fn unsupported_ambient_light() -> truetone::AmbientLightData {
+    truetone::AmbientLightData {
+        lux: 0.0,
+        cct_kelvin: config::D65_CCT_KELVIN,
+        supported: false,
+        updated_at_secs: 0,
+    }
+}
+
 /// Formats an error string into a standard JSON error envelope `{"ok": false, "error": ...}`.
 fn wrap_err(msg: String) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
@@ -3730,6 +3978,9 @@ fn wrap_err(msg: String) -> String {
 /// Converts a raw C-string pointer (`*const c_char`) into an owned Rust `String`.
 ///
 /// Returns an empty string if `ptr` is null, or lossy UTF-8 if invalid sequences are encountered.
+///
+/// # Safety
+/// `ptr` must be null or point to a valid NUL-terminated C string for the duration of this call.
 pub fn c_str_to_rust(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();

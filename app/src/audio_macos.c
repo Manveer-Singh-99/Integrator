@@ -3,51 +3,116 @@
  * Integrator Dynamic Audio Routing: macOS Native CoreAudio Output & C11 SPSC
  * ============================================================================
  *
- * Pure C11 implementation (AUD-1G7-04, AUD-1G7-09, AUD-1G7-10):
+ * 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+ * ----------------------------------------------------------------------------
+ * Implements macOS real-time system speaker playout for Integrator's Dynamic
+ * Audio Routing pipeline (`audio` feature) using Apple's `DefaultOutput`
+ * AudioUnit backed by a lock-free Single-Producer Single-Consumer (SPSC) ring
+ * buffer written purely in C11.
+ *
+ * Key Guarantees (AUD-1G7-04, AUD-1G7-09, AUD-1G7-10):
  * - Zero Swift runtime, zero resilient metadata accessors, zero `_swift_once`,
  *   zero dynamic exclusivity checks, zero heap allocations, and zero mutexes
  *   on the real-time CoreAudio `AURenderCallback` thread.
  * - True C11 acquire/release hardware memory ordering (`memory_order_acquire`
- *   / `memory_order_release`, compiling to ARM64 `ldar` / `stlr`).
+ *   / `memory_order_release`, compiling to ARM64 `ldar`/`ldapr` & `stlr`).
  * - Monotonic 64-bit byte cursors eliminating 32-bit wraparound edge cases.
  * - Strict 4-byte stereo 16-bit PCM frame alignment enforced on every write
  *   and render pull, plus `mDataByteSize` bounds validation on `AudioBuffer`.
  * - Consumer-owned flush epoch (`g_flush_req_epoch`) so active flushes never
  *   mutate the consumer's `g_read_idx` from the producer/control thread.
+ *
+ * 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
+ * ----------------------------------------------------------------------------
+ * - Upstream Callers (`app/src/audio/mod.rs`):
+ *   * `integrator_mac_audio_prewarm` / `start` / `stop` / `is_active`
+ *   * `integrator_mac_audio_write_pcm` (called by `JitterBuffer` playout thread)
+ *   * `integrator_mac_audio_flush` / `underruns` / `set_local_duck`
+ *   * Test/Diagnostic helpers (`buffered_bytes`, `test_render_pull`, `test_reset`)
+ * - Downstream Callees:
+ *   * `AudioToolbox` & `CoreAudio`: `kAudioUnitSubType_DefaultOutput`,
+ *     `AudioObjectGetPropertyData` / `AudioObjectSetPropertyData`.
+ * - Cross-Platform Flow (Windows 11 <-> macOS):
+ *   1. Windows WASAPI loopback (`win_capture.cpp`) captures system audio and
+ *      streams canonical 48 kHz stereo S16LE (`240` samples / `960 B` per 5ms)
+ *      over authenticated UDP `IUA2` (`PORT 58284`).
+ *   2. Rust `audio/mod.rs` decrypts/reorders frames in `JitterBuffer` and calls
+ *      `integrator_mac_audio_write_pcm` into the static 64 KiB SPSC ring buffer.
+ *   3. macOS CoreAudio RT callback (`core_audio_render_callback`) pulls aligned
+ *      PCM bytes lock-free directly into the default output hardware device.
+ *
+ * 3. THREADING & CONCURRENCY MODEL
+ * ----------------------------------------------------------------------------
+ * - Control/Lifecycle Thread (`g_lifecycle_lock` pthread mutex): Serializes
+ *   `start`, `stop`, `flush`, `set_local_duck`, and `test_reset`.
+ * - Single Producer Thread (`integrator_mac_audio_write_pcm`): Exclusively owns
+ *   updates to `g_write_idx`.
+ * - Single Real-Time Consumer Thread (`core_audio_render_callback`): Lock-free;
+ *   exclusively owns updates to `g_read_idx` and `g_consumer_flush_epoch` while
+ *   the AudioUnit is running. `AudioOutputUnitStop` acts as a synchronous
+ *   barrier guaranteeing no RT callbacks run after `stop()` proceeds.
+ *
+ * 4. SECURITY & SAFETY INVARIANTS
+ * ----------------------------------------------------------------------------
+ * - AudioBuffer Bounds Clamping: `core_audio_render_callback` clamps pulled byte
+ *   counts strictly to CoreAudio's `mDataByteSize` and 4-byte stereo alignment.
+ * - Floating-Point Normalization: `integrator_mac_audio_set_local_duck` rejects
+ *   `NaN`/`Inf` balances and device volume readings, always keeping system volume
+ *   bounded within `[0.0, 1.0]`.
+ * ============================================================================
  */
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-/* 65,536 bytes = 16,384 stereo 16-bit frames (~341.3 ms @ 48 kHz). Power of 2. */
+/** Ring buffer capacity in bytes: 65,536 B = 16,384 stereo 16-bit frames (~341.3 ms @ 48 kHz). Power of 2. */
 #define SPSC_CAPACITY_BYTES 65536u
+/** Bitmask for O(1) modular wraparound indexing into `g_spsc_buffer`. */
 #define SPSC_CAPACITY_MASK  (SPSC_CAPACITY_BYTES - 1u)
+/** Canonical frame stride in bytes: 2 channels * 16 bits/sample = 4 bytes per stereo frame. */
 #define STEREO_16_FRAME_BYTES 4u
 
-/* Static zero-initialized SPSC ring buffer and atomics (process lifetime). */
+/** Static zero-initialized SPSC PCM ring buffer (process lifetime, avoids RT heap allocation). */
 static uint8_t g_spsc_buffer[SPSC_CAPACITY_BYTES];
+/** Monotonic byte cursor written exclusively by the producer (`write_pcm`) or stopped reset. */
 static _Atomic uint64_t g_write_idx = 0;
+/** Monotonic byte cursor written exclusively by the RT consumer (or stopped reset/flush). */
 static _Atomic uint64_t g_read_idx = 0;
+/** Cumulative count of RT render callbacks that experienced partial or full ring-buffer underrun. */
 static _Atomic uint64_t g_underrun_count = 0;
+/** Control-plane flush epoch incremented on active `flush()`; consumed lock-free by RT callback. */
 static _Atomic uint64_t g_flush_req_epoch = 0;
-static uint64_t g_consumer_flush_epoch = 0; /* Accessed solely by RT consumer (or under lock when stopped) */
+/** Last flush epoch acknowledged by the RT consumer (owned strictly by consumer or under `g_lifecycle_lock` when stopped). */
+static uint64_t g_consumer_flush_epoch = 0;
+/** Non-zero while `g_audio_unit` is initialized and running. */
 static _Atomic int32_t g_active = 0;
 
+/** Active CoreAudio `DefaultOutput` AudioUnit instance (`NULL` when stopped). */
 static AudioComponentInstance g_audio_unit = NULL;
+/** Mutex serializing non-RT AudioUnit lifecycle transitions and macOS volume ducking. */
 static pthread_mutex_t g_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+/** Whether `g_saved_sys_vol` holds a captured pre-ducking macOS default output volume baseline. */
 static bool g_has_saved_sys_vol = false;
+/** Saved macOS default output scalar volume `[0.0, 1.0]` restored when balance returns `<= 0.05`. */
 static Float32 g_saved_sys_vol = 0.75f;
 
-/*
+/**
  * Core SPSC consumer pull routine.
+ *
  * Must only be called by the single consumer (CoreAudio RT thread, or unit tests
- * while AudioUnit is stopped). Enforces 4-byte stereo frame alignment and strict
- * acquire/release barriers.
+ * while the AudioUnit is stopped). Enforces 4-byte stereo frame alignment, processes
+ * live flush epochs without mutating `g_read_idx` off-thread, zero-pads underrun tails,
+ * and emits hardware acquire/release barriers around buffer reads.
+ *
+ * @param dest             Destination PCM output buffer.
+ * @param requested_bytes  Desired byte count to fill in `dest`.
+ * @return Number of real PCM bytes copied from the ring buffer (remainder up to `requested_bytes` zeroed).
  */
 static uint32_t spsc_consumer_pull(uint8_t *dest, uint32_t requested_bytes) {
     /* Enforce 4-byte stereo frame alignment */
@@ -101,9 +166,13 @@ static uint32_t spsc_consumer_pull(uint8_t *dest, uint32_t requested_bytes) {
     return to_copy;
 }
 
-/*
+/**
  * Real-time CoreAudio render callback (`AURenderCallback`).
+ *
  * Pure C, zero locks, zero allocations, zero Swift/ObjC runtime calls.
+ * Clamps pulled byte count strictly to CoreAudio's `mDataByteSize` and stereo 4-byte framing,
+ * delegating sample consumption to `spsc_consumer_pull()`. Any secondary buffers in non-interleaved
+ * lists are defensively zeroed.
  */
 static OSStatus core_audio_render_callback(
     void *inRefCon,
@@ -156,7 +225,11 @@ static OSStatus core_audio_render_callback(
  * C FFI EXPORTS (Callable by Rust)
  * ============================================================================ */
 
-/* Pre-warms static storage; returns 0 on success (exact i32 ABI parity with Rust). */
+/**
+ * Pre-warms static ring-buffer and atomic storage prior to CoreAudio startup.
+ *
+ * @return Always returns `0` (matches Rust `extern "C" fn() -> i32` ABI contract).
+ */
 int32_t integrator_mac_audio_prewarm(void) {
     (void)atomic_load_explicit(&g_active, memory_order_acquire);
     (void)atomic_load_explicit(&g_write_idx, memory_order_acquire);
@@ -164,7 +237,14 @@ int32_t integrator_mac_audio_prewarm(void) {
     return 0;
 }
 
-/* Starts the native macOS CoreAudio DefaultOutput AudioUnit. Returns 0 on success, -1 on failure. */
+/**
+ * Starts the native macOS CoreAudio DefaultOutput AudioUnit at canonical 48 kHz stereo S16LE.
+ *
+ * Idempotent if already running; otherwise instantiates, configures stream format + render
+ * callback, initializes, quiesces residual SPSC samples, and starts RT playback.
+ *
+ * @return `0` on success, `-1` if AudioUnit discovery/initialization/start fails.
+ */
 int32_t integrator_mac_audio_start(void) {
     pthread_mutex_lock(&g_lifecycle_lock);
 
@@ -264,7 +344,9 @@ int32_t integrator_mac_audio_start(void) {
     return 0;
 }
 
-/* Stops and disposes the CoreAudio AudioUnit synchronously, then resets the quiescent SPSC buffer. */
+/**
+ * Stops and disposes the CoreAudio AudioUnit synchronously, then resets the quiescent SPSC buffer.
+ */
 void integrator_mac_audio_stop(void) {
     pthread_mutex_lock(&g_lifecycle_lock);
 
@@ -288,14 +370,24 @@ void integrator_mac_audio_stop(void) {
     pthread_mutex_unlock(&g_lifecycle_lock);
 }
 
-/* Returns 1 if CoreAudio playback is active, 0 otherwise. */
+/**
+ * Queries whether the native macOS CoreAudio AudioUnit is currently active.
+ *
+ * @return `1` if active, `0` otherwise.
+ */
 int32_t integrator_mac_audio_is_active(void) {
     return atomic_load_explicit(&g_active, memory_order_acquire);
 }
 
-/*
+/**
  * Pushes 48 kHz 16-bit stereo PCM bytes into the lock-free SPSC ring buffer.
- * Enforces 4-byte stereo frame alignment and strict acquire/release barriers.
+ *
+ * Enforces 4-byte stereo frame alignment and strict acquire/release barriers. Must be
+ * called by a single producer thread (`PLAYOUT_STATE_LOCK`-serialized playout worker).
+ *
+ * @param data  Pointer to interleaved 16-bit signed stereo PCM frames (`NULL` -> `0`).
+ * @param len   Byte count of `data` (rounded down to multiple of `4` bytes).
+ * @return Exact number of PCM bytes enqueued into the SPSC ring buffer.
  */
 uint32_t integrator_mac_audio_write_pcm(const uint8_t *data, uint32_t len) {
     if (data == NULL || len < STEREO_16_FRAME_BYTES) {
@@ -335,13 +427,16 @@ uint32_t integrator_mac_audio_write_pcm(const uint8_t *data, uint32_t len) {
     return to_write;
 }
 
-/* Returns cumulative render-callback underrun events. */
+/**
+ * Returns cumulative render-callback underrun events recorded since process start or test reset.
+ */
 uint64_t integrator_mac_audio_underruns(void) {
     return atomic_load_explicit(&g_underrun_count, memory_order_relaxed);
 }
 
-/*
- * Flushes the SPSC ring buffer without violating SPSC single-consumer ownership (AUD-1G7-04):
+/**
+ * Flushes the SPSC ring buffer without violating SPSC single-consumer ownership (AUD-1G7-04).
+ *
  * - When AudioUnit is active: signals consumer-owned `g_flush_req_epoch` so the RT callback
  *   discards queued frames on its very next pull.
  * - When AudioUnit is stopped: advances `g_read_idx` to `g_write_idx` safely under lifecycle lock.
@@ -358,15 +453,17 @@ void integrator_mac_audio_flush(void) {
     pthread_mutex_unlock(&g_lifecycle_lock);
 }
 
-/*
- * Adjusts CoreAudio output gain / gentle macOS local volume ducking for the TouchBar
- * Cross-Platform Audio Mixer slider (`balance` in [-1.0, +1.0]).
- * - When `balance <= 0.0`: restores any previously saved macOS default output volume baseline.
- * - When `balance > 0.0`: gently ducks local macOS system volume relative to saved baseline
- *   while scaling up the dedicated Windows soundbar AudioUnit output gain so PC games/Discord
- *   cut through cleanly without permanently altering the user's Mac volume.
+/**
+ * Adjusts macOS local system volume ducking relative to a saved baseline (`balance` in `[-1.0, +1.0]`).
+ *
+ * - Non-finite (`NaN`/`Inf`) inputs normalize safely to `0.0` (restoring any saved baseline).
+ * - When `balance <= 0.05`: restores any previously saved macOS default output volume baseline.
+ * - When `balance > 0.05`: smoothly ducks local macOS system volume down to `25%` of baseline at `+1.0`.
+ *
+ * @param balance  Cross-platform mixer balance factor (`-1.0` = Mac focus, `+1.0` = PC focus).
  */
 void integrator_mac_audio_set_local_duck(float balance) {
+    if (!isfinite(balance)) balance = 0.0f;
     if (balance < -1.0f) balance = -1.0f;
     if (balance > 1.0f) balance = 1.0f;
 
@@ -393,7 +490,12 @@ void integrator_mac_audio_set_local_duck(float balance) {
                     if (!g_has_saved_sys_vol) {
                         Float32 cur = 0.75f;
                         UInt32 sz = sizeof(cur);
-                        if (AudioObjectGetPropertyData(dev, &vol_addr, 0, NULL, &sz, &cur) == noErr) {
+                        if (AudioObjectGetPropertyData(dev, &vol_addr, 0, NULL, &sz, &cur) == noErr
+                            && sz == sizeof(cur)
+                            && isfinite(cur))
+                        {
+                            if (cur < 0.0f) cur = 0.0f;
+                            if (cur > 1.0f) cur = 1.0f;
                             g_saved_sys_vol = cur;
                             g_has_saved_sys_vol = true;
                         }
@@ -402,6 +504,7 @@ void integrator_mac_audio_set_local_duck(float balance) {
                         /* Duck local Mac audio smoothly down to 25% of baseline at +1.0 */
                         Float32 mac_scale = 1.0f - (balance * 0.75f);
                         Float32 target = g_saved_sys_vol * mac_scale;
+                        if (!isfinite(target)) target = g_saved_sys_vol;
                         if (target < 0.0f) target = 0.0f;
                         if (target > 1.0f) target = 1.0f;
                         (void)AudioObjectSetPropertyData(dev, &vol_addr, 0, NULL, sizeof(target), &target);
@@ -421,16 +524,19 @@ void integrator_mac_audio_set_local_duck(float balance) {
  * Native SPSC Test & Diagnostics Helpers (Used by macOS `cargo test`)
  * ============================================================================ */
 
+/** Returns the number of unread PCM bytes currently queued inside the SPSC ring buffer. */
 uint32_t integrator_mac_audio_buffered_bytes(void) {
     uint64_t w = atomic_load_explicit(&g_write_idx, memory_order_acquire);
     uint64_t r = atomic_load_explicit(&g_read_idx, memory_order_acquire);
     return (w >= r) ? (uint32_t)(w - r) : 0u;
 }
 
+/** Unit-test entry point invoking `spsc_consumer_pull()` directly while AudioUnit is stopped. */
 uint32_t integrator_mac_audio_test_render_pull(uint8_t *out, uint32_t requested_bytes) {
     return spsc_consumer_pull(out, requested_bytes);
 }
 
+/** Unit-test helper stopping CoreAudio and zero-resetting all SPSC cursors, epochs, and buffers. */
 void integrator_mac_audio_test_reset(void) {
     integrator_mac_audio_stop();
     pthread_mutex_lock(&g_lifecycle_lock);

@@ -10,30 +10,44 @@
 //      monitoring, and status bar menu (`NSStatusItem`) control.
 //
 // 2. Architectural Linkages & Native Core Bridge:
-//    - Dynamic Library Linkage: Direct C-ABI dynamic invocation against `integrator_core.dylib` via
-//      `@_silgen_name` bindings:
-//        * `integrator_core_invoke(method, paramsJson) -> *mut c_char`: Synchronous JSON-RPC request/response.
-//        * `integrator_core_free_string(ptr)`: Releases heap-allocated UTF-8 C-string buffers from Rust.
-//        * `integrator_core_tray_action(action)`: Fires one-way asynchronous tray notifications into Rust.
-//        * `integrator_core_shutdown()`: Performs graceful teardown of Tokio runtimes, daemon tasks, and network listeners.
-//        * `integrator_core_set_ui_callback(cb)`: Registers the reverse event trampoline (`RustUiCallback`).
+//    - Upstream Callers:
+//        * Invoked at process launch by the Rust executable entry point (`app/src/main.rs` / `app/src/core.rs`)
+//          via the exported `@_cdecl("integrator_macos_run_app")` C-ABI symbol.
+//        * Receives asynchronous reverse notifications from Rust core subsystems via `swiftUiEventTrampoline`.
+//    - Downstream Callees & Dynamic Library Linkage:
+//        * Direct C-ABI dynamic invocation against `integrator_core.dylib` via `@_silgen_name` bindings:
+//            - `integrator_core_invoke(method, paramsJson) -> *mut c_char`: Synchronous JSON-RPC request/response.
+//            - `integrator_core_free_string(ptr)`: Releases heap-allocated UTF-8 C-string buffers from Rust.
+//            - `integrator_core_tray_action(action)`: Fires one-way asynchronous tray notifications into Rust.
+//            - `integrator_core_shutdown()`: Performs graceful teardown of Tokio runtimes, daemon tasks, and network listeners.
+//            - `integrator_core_set_ui_callback(cb)`: Registers the reverse event trampoline (`RustUiCallback`).
+//        * Native macOS Frameworks: AppKit (`NSApplication`, `NSWindow`, `NSStatusItem`, `NSAlert`, `NSOpenPanel`),
+//          SwiftUI (`View`, `ObservableObject`, `@MainActor`), CoreText (`CTLine` optical glyph centering),
+//          and QuartzCore (`CAKeyframeAnimation`, `CATransform3D`).
+//    - Cross-Platform / Cross-Device Flow (Mac <-> Windows 11):
+//        * Synchronizes feature flags (enforcing mutual exclusion between Extended Screen and Universal Input KVM),
+//          2D desk monitor layout topology, SPAKE2 pairing PINs, True Tone ambient lux/CCT calibration, Touch Bar HUD
+//          telemetry, spatial UDP audio routing, and Mac -> PC shared camera & microphone capture settings over
+//          authenticated TransportV2 TCP/UDP channels to the Windows 11 peer workstation.
 //    - JSON-RPC Dispatch Pipeline:
 //        * High-level requests from UI interactions or the 2.0s polling timer are packaged into JSON strings.
 //        * Dispatched onto background GCD queues (`DispatchQueue.global(qos: .userInitiated)`) to ensure the
 //          macOS Main Thread (and AppKit UI rendering loop) is never blocked by synchronous Rust RPC calls.
 //        * The raw JSON string returned by Rust is parsed into strongly-typed Codable structures (`BridgeStatusModel`,
-//          `SpeedTestResultModel`, `GpuTelemetryModel`, etc.) and published to `@MainActor` state variables.
+//          `SpeedTestResultModel`, `GpuTelemetryModel`, `MicDeviceModel`, etc.) and published to `@MainActor` state variables.
 //    - Asynchronous Event Trampoline (`swiftUiEventTrampoline`):
 //        * Registered with Rust core at startup (`integrator_core_set_ui_callback`).
 //        * Core pushes notifications for window control (`show_window`, `hide_window`), toast banners (`toast`),
 //          and lifecycle termination (`quit`).
 //        * High-frequency telemetry events (`log_entry`) are dropped at the C-trampoline boundary to prevent
-//          main thread saturation; log rings are polled deterministically via snapshot snapshots.
+//          main thread saturation; log rings are polled deterministically via periodic status snapshots.
 //
 // 3. Card Architecture & Subsystems:
-//    - Card 1: Extended Screen & GPU Acceleration (DirectX/NVENC/Moonlight vs Apple Silicon VideoToolbox).
+//    - Card 1: Extended Screen & GPU Acceleration (DirectX/NVENC/Moonlight vs Apple Silicon VideoToolbox,
+//      guarded by mutual-exclusion confirmation against Universal Input KVM).
 //    - Card 2: Universal Input KVM & Desk Layout (Interactive 2D spatial monitor arrangement, edge hop delays,
-//      modifier translation Cmd<->Ctrl, corner guard dead zones, macOS Accessibility hook status).
+//      modifier translation Cmd<->Ctrl, corner guard dead zones, macOS Accessibility hook status,
+//      guarded by mutual-exclusion confirmation against Extended Screen).
 //    - Card 3: Cross-Screen Drag & Drop (Zero-RAM file streaming, ghost thumbnail badge, QoS clamping, drop directory).
 //    - Card 4: Universal Clipboard (ChaCha20 encrypted sync, SHA-256 integrity, atomic staging cache).
 //    - Card 5: Peer Discovery & v1.0 Trust (mDNS / UDP beacon discovery, SPAKE2 6-digit PIN pairing, manual IP routing,
@@ -43,8 +57,10 @@
 //    - Card 8: True Tone & Chromatic Sync (Ambient light sensor / CCT synchronization, manual chromaticity calibration).
 //    - Card 9: Touch Bar Hardware HUD (Touch Bar telemetry strip, quick-action controls for supported MacBooks).
 //    - Card 10: Dynamic Audio Routing (ChaCha20-Poly1305 encrypted spatial UDP sink, test chime invocation).
-//    - Card 10B: Mac -> PC Shared Camera (AVFoundation 720p30 capture streaming over TCP :58287 to Windows Virtual Camera).
-//    - Card 11: System & Autostart (macOS SMAppService login item autostart, Liquid Glass shader intensity slider).
+//    - Card 10B: Mac -> PC Shared Camera & Mic (AVFoundation 720p30 video capture, hardware privacy shutter killswitch,
+//      and shared microphone source selection, mute control, and input gain streaming over TCP :58287 to Windows).
+//    - Card 11: System & Autostart (macOS SMAppService login item autostart, Liquid Glass shader intensity slider,
+//      and Touch ID remote biometric gate).
 //    - Card 12: Live Telemetry & Security Logs (Monospaced tailing log console with ANSI/log-level visual highlighting).
 //
 // 4. Liquid Glass Shader & Visual Styling:
@@ -140,7 +156,7 @@ private struct RpcEnvelope<T: Decodable>: Decodable {
 }
 
 /// Primary display geometry and scaling factor of the local macOS workstation.
-struct PrimaryDisplayInfo: Codable, Hashable {
+struct PrimaryDisplayInfo: Codable, Hashable, Sendable {
     /// Native horizontal resolution in pixels.
     var width: UInt32 = 0
     /// Native vertical resolution in pixels.
@@ -152,7 +168,7 @@ struct PrimaryDisplayInfo: Codable, Hashable {
 }
 
 /// Metadata describing an individual GPU detected on the local or peer machine.
-struct GpuDeviceInfo: Codable, Identifiable, Hashable {
+struct GpuDeviceInfo: Codable, Identifiable, Hashable, Sendable {
     /// Stable identifier constructed from the GPU index and name.
     var id: String { "\(index)-\(name)" }
     /// Zero-based adapter index assigned by Metal or DirectX.
@@ -168,7 +184,7 @@ struct GpuDeviceInfo: Codable, Identifiable, Hashable {
 }
 
 /// Geometric attributes of a display monitor.
-struct DisplayGeometryModel: Codable, Hashable {
+struct DisplayGeometryModel: Codable, Hashable, Sendable {
     /// Width in physical pixels.
     var width: UInt32
     /// Height in physical pixels.
@@ -178,7 +194,7 @@ struct DisplayGeometryModel: Codable, Hashable {
 }
 
 /// Network interface descriptor capturing IP address, link speed, and interface type.
-struct LocalInterfaceModel: Codable, Identifiable, Hashable {
+struct LocalInterfaceModel: Codable, Identifiable, Hashable, Sendable {
     /// Composite identifier based on interface name and IP.
     var id: String { "\(name)-\(ip)" }
     /// System interface device name (e.g., "en0", "bridge0").
@@ -202,7 +218,7 @@ struct LocalInterfaceModel: Codable, Identifiable, Hashable {
 }
 
 /// Unpaired peer device discovered over the local network or direct cable.
-struct PendingPeerModel: Codable, Identifiable, Hashable {
+struct PendingPeerModel: Codable, Identifiable, Hashable, Sendable {
     /// Stable device identifier.
     var id: String { device_id }
     /// Cryptographic device identifier string.
@@ -220,7 +236,7 @@ struct PendingPeerModel: Codable, Identifiable, Hashable {
 }
 
 /// Record of an authenticated and trusted peer workstation.
-struct TrustedPeerModel: Codable, Identifiable, Hashable {
+struct TrustedPeerModel: Codable, Identifiable, Hashable, Sendable {
     /// Stable device identifier.
     var id: String { device_id }
     /// Cryptographic device identifier string.
@@ -240,7 +256,7 @@ struct TrustedPeerModel: Codable, Identifiable, Hashable {
 }
 
 /// Discovered peer device actively broadcasting mDNS/UDP beacons.
-struct DiscoveredPeerModel: Codable, Identifiable, Hashable {
+struct DiscoveredPeerModel: Codable, Identifiable, Hashable, Sendable {
     /// Composite identifier combining device ID and IP address.
     var id: String { "\(device_id)-\(ip)" }
     /// Cryptographic device identifier string.
@@ -282,7 +298,7 @@ struct DiscoveredPeerModel: Codable, Identifiable, Hashable {
 }
 
 /// Complete snapshot of the cryptographic pairing and trust database.
-struct TrustSnapshotModel: Codable, Hashable {
+struct TrustSnapshotModel: Codable, Hashable, Sendable {
     /// Current 6-digit SPAKE2 pairing PIN code generated by the local machine.
     var pairing_pin: String
     /// Policy flag: automatically trust peers on direct point-to-point cables.
@@ -298,7 +314,7 @@ struct TrustSnapshotModel: Codable, Hashable {
 }
 
 /// Current mount status of the peer's shared network storage volume.
-struct StorageStatusModel: Codable, Hashable {
+struct StorageStatusModel: Codable, Hashable, Sendable {
     /// True if the SMB volume is currently mounted in macOS `/Volumes`.
     var is_mounted: Bool
     /// Local filesystem path where the volume is mounted.
@@ -363,7 +379,7 @@ private enum UiDefaults {
 }
 
 /// Status of the low-latency authenticated UDP spatial audio stream.
-struct AudioRoutingStatusModel: Codable, Hashable {
+struct AudioRoutingStatusModel: Codable, Hashable, Sendable {
     /// Human-readable description of active audio topology (e.g., "Mac -> PC Stereo").
     var topology: String
     /// End-to-end measured audio routing latency in milliseconds.
@@ -382,8 +398,8 @@ struct AudioRoutingStatusModel: Codable, Hashable {
     var sink_muted: Bool?
 }
 
-/// Telemetry and state of the Mac -> PC shared virtual camera pipeline.
-struct CameraStatusModel: Codable, Hashable {
+/// Telemetry and state of the Mac -> PC shared virtual camera and microphone pipeline.
+struct CameraStatusModel: Codable, Hashable, Sendable {
     /// True if camera capture platform subsystem is supported.
     var supported: Bool
     /// True if a video capture device (built-in, external USB, or Continuity Camera) is currently detected.
@@ -412,10 +428,30 @@ struct CameraStatusModel: Codable, Hashable {
     var device_name: String?
     /// True if the hardware camera privacy shutter killswitch is currently engaged.
     var privacy_muted: Bool?
+    /// True if Mac -> PC shared microphone forwarding is enabled.
+    var mic_enabled: Bool?
+    /// True if the shared microphone audio feed is currently muted.
+    var mic_muted: Bool?
+    /// Friendly name of the currently selected macOS microphone capture device.
+    var mic_device_name: String?
+    /// True if macOS TCC microphone capture permission (`AVMediaType.audio`) is granted.
+    var mic_permission_granted: Bool?
+    /// Linear microphone input gain multiplier (0.0 to 2.0, where 1.0 represents 100% unity gain).
+    var mic_gain: Float?
+}
+
+/// Descriptor for a physical or virtual microphone audio input device discovered via AVFoundation.
+struct MicDeviceModel: Codable, Hashable, Identifiable, Sendable {
+    /// Stable CoreAudio / AVFoundation unique device identifier (`AVCaptureDevice.uniqueID`).
+    var id: String
+    /// Human-readable microphone name (e.g., "MacBook Pro Microphone", "USB Condenser Mic").
+    var name: String
+    /// True if this device is currently the operating system's default audio input source.
+    var is_default: Bool?
 }
 
 /// Boolean feature flags controlling active subsystem daemons in Rust core.
-struct FeatureFlagsModel: Codable, Hashable {
+struct FeatureFlagsModel: Codable, Hashable, Sendable {
     /// Extended display streaming subsystem flag.
     var display: Bool
     /// Universal input KVM capture and injection flag.
@@ -441,7 +477,7 @@ struct FeatureFlagsModel: Codable, Hashable {
 }
 
 /// User-configured desk layout configuration for multi-monitor cursor transitions.
-struct KvmLayoutConfigModel: Codable, Hashable {
+struct KvmLayoutConfigModel: Codable, Hashable, Sendable {
     /// Screen edge where peer monitor is placed: "left", "right", "top", or "bottom".
     var peer_edge: String
     /// Fractional alignment offset along the shared boundary (-0.5 to +0.5).
@@ -465,7 +501,7 @@ struct KvmLayoutConfigModel: Codable, Hashable {
 }
 
 /// Live operational state of the universal input KVM subsystem.
-struct KvmStatusSnapshotModel: Codable, Hashable {
+struct KvmStatusSnapshotModel: Codable, Hashable, Sendable {
     /// Overall KVM subsystem enable flag.
     var enabled: Bool
     /// Cross-screen drag and drop active state.
@@ -491,7 +527,7 @@ struct KvmStatusSnapshotModel: Codable, Hashable {
 }
 
 /// Single log entry emitted by the Rust core tracing subscriber.
-struct LogEntryModel: Codable, Identifiable, Hashable {
+struct LogEntryModel: Codable, Identifiable, Hashable, Sendable {
     /// Unique identifier constructed from timestamp, log level, and message content.
     var id: String { "\(ts_ms)-\(level)-\(message)" }
     /// Milliseconds since Unix epoch when log was recorded.
@@ -503,7 +539,7 @@ struct LogEntryModel: Codable, Identifiable, Hashable {
 }
 
 /// Operating system permission audit status item returned inside `SetupHealthSnapshotModel`.
-struct PermissionStatusModel: Codable, Identifiable, Hashable {
+struct PermissionStatusModel: Codable, Identifiable, Hashable, Sendable {
     /// Canonical permission identifier (e.g., "accessibility", "input_monitoring", "screen_recording").
     var id: String
     /// Human-readable permission title.
@@ -523,7 +559,7 @@ struct PermissionStatusModel: Codable, Identifiable, Hashable {
 }
 
 /// Companion streaming tool or driver dependency status item returned inside `SetupHealthSnapshotModel`.
-struct DependencyStatusModel: Codable, Identifiable, Hashable {
+struct DependencyStatusModel: Codable, Identifiable, Hashable, Sendable {
     /// Canonical dependency identifier ("sunshine", "moonlight", "usb_ncm", "vdd", "vcam").
     var id: String
     /// Human-readable dependency name.
@@ -549,7 +585,7 @@ struct DependencyStatusModel: Codable, Identifiable, Hashable {
 }
 
 /// Complete cross-platform OS permissions and companion dependencies health snapshot.
-struct SetupHealthSnapshotModel: Codable, Hashable {
+struct SetupHealthSnapshotModel: Codable, Hashable, Sendable {
     /// Operating system identifier ("macos", "windows").
     var os: String
     /// True if process is running with elevated privileges.
@@ -577,7 +613,7 @@ private struct RenderedLogEntry: Identifiable {
 }
 
 /// Results from an active TCP/UDP link throughput benchmark.
-struct SpeedTestResultModel: Codable, Hashable {
+struct SpeedTestResultModel: Codable, Hashable, Sendable {
     /// Peak measured throughput in gigabits per second.
     var max_gbps: Double
     /// Upload bandwidth in gigabits per second.
@@ -595,7 +631,7 @@ struct SpeedTestResultModel: Codable, Hashable {
 }
 
 /// Hardware telemetry metrics polled from a discrete or integrated GPU.
-struct GpuTelemetryModel: Codable, Hashable {
+struct GpuTelemetryModel: Codable, Hashable, Sendable {
     /// Name of the monitored GPU adapter.
     var gpu_name: String
     /// Die temperature in degrees Celsius.
@@ -617,7 +653,7 @@ struct GpuTelemetryModel: Codable, Hashable {
 }
 
 /// Aggregate system state model returned by `get_bridge_status` RPC.
-struct BridgeStatusModel: Codable {
+struct BridgeStatusModel: Codable, Sendable {
     /// Cryptographic identifier of the local workstation.
     var device_id: String
     /// Network hostname of the local workstation.
@@ -748,7 +784,7 @@ struct BridgeStatusModel: Codable {
 // MARK: - ViewModel
 
 /// High-level navigation categories for filtering cards on the dashboard.
-enum NavSection: String, CaseIterable, Identifiable {
+enum NavSection: String, CaseIterable, Identifiable, Sendable {
     /// Displays all thirteen subsystem cards in a scrollable responsive grid.
     case all = "All Modules"
     /// Filters to Extended Display, GPU Acceleration, True Tone, and Touch Bar controls.
@@ -776,13 +812,23 @@ enum NavSection: String, CaseIterable, Identifiable {
 }
 
 /// Ephemeral toast notification banner presented at the bottom of the dashboard.
-struct ToastBanner: Identifiable {
+struct ToastBanner: Identifiable, Sendable {
     /// Unique identifier for SwiftUI transition tracking.
     let id = UUID()
     /// Notification style kind: "success", "error", or "info".
     let kind: String
     /// Text message displayed within the notification pill.
     let message: String
+}
+
+/// Brings Integrator to the foreground across macOS 12–15 without triggering macOS 14+ deprecation warnings.
+@MainActor
+private func activateIntegratorApp() {
+    if #available(macOS 14.0, *) {
+        NSApp.activate()
+    } else {
+        NSApp.activate(ignoringOtherApps: true)
+    }
 }
 
 /// Central application ViewModel orchestrating JSON-RPC communication with `integrator_core.dylib`,
@@ -804,14 +850,14 @@ final class IntegratorViewModel: ObservableObject {
     @Published var toast: ToastBanner? = nil
     /// True while an asynchronous speed benchmark run is executing.
     @Published var isRunningSpeedTest = false
-    /// General busy state indicator for long-running operations.
-    @Published var isBusy = false
     /// True while an extended display start or stop transition is in progress.
     @Published var isDisplayToggling = false
     /// Controls presentation of the Setup, Drivers & Permissions Assistant sheet.
     @Published var showSetupSheet: Bool = false
     /// Guard flag ensuring the automatic launch setup prompt is evaluated at most once per app launch.
     private var didEvaluateLaunchSetupPrompt: Bool = false
+    /// Reentrancy guard preventing overlapping KVM <-> Extended Screen mutual-exclusion NSAlert popups.
+    private var isMutualExclusionAlertOpen: Bool = false
 
     // MARK: - Local Interactive Form States
 
@@ -837,6 +883,22 @@ final class IntegratorViewModel: ObservableObject {
     @Published var trueToneCct: Double = UiDefaults.defaultTrueToneCct
     /// True Tone chromatic compensation factor slider value.
     @Published var trueToneComp: Double = 1.0
+    /// Discovered macOS microphone input sources available for Mac -> PC shared microphone streaming.
+    @Published var availableMics: [MicDeviceModel] = []
+    /// Identifier of the currently selected macOS microphone source.
+    @Published var selectedMicId: String = ""
+    /// Shared microphone input gain multiplier (0.0 to 2.0, corresponding to 0% to 200%).
+    @Published var micGain: Double = 1.0
+    /// Dirty flag preventing background status polls from overwriting the mic gain slider while uncommitted.
+    var micGainDirty: Bool = false
+    /// True while the user is actively dragging the mic gain slider thumb.
+    private var isEditingMicGain: Bool = false
+    /// Debounce timer work item for applying mic gain changes after track clicks or keyboard steps.
+    private var micGainDebounceWorkItem: DispatchWorkItem? = nil
+    /// Monotonic generation counter ensuring stale in-flight gain RPC completions do not clear newer dirty edits.
+    private var micGainRequestGeneration: UInt64 = 0
+    /// Guard flag ensuring `refreshMics()` is triggered automatically once on initial bridge status load.
+    private var didInitialMicRefresh: Bool = false
 
     // MARK: - Editable KVM Layout Draft
 
@@ -844,8 +906,6 @@ final class IntegratorViewModel: ObservableObject {
     private var kvmLayoutDirty = false
     /// Guard flag preventing local dirty flags from setting during remote updates.
     private var isApplyingRemoteLayout = false
-    /// Timestamp of the last synchronized server layout.
-    private var lastServerLayoutUpdatedMs: UInt64 = 0
 
     /// Live editable KVM layout configuration draft.
     @Published var kvmLayout = KvmLayoutConfigModel(
@@ -923,10 +983,12 @@ final class IntegratorViewModel: ObservableObject {
     func showToast(_ kind: String, _ msg: String) {
         toast = ToastBanner(kind: kind, message: msg)
         let capturedId = toast?.id
-        // Auto-dismiss the toast banner after the configured toast delay
+        // Auto-dismiss the toast banner after the configured toast delay on @MainActor
         DispatchQueue.main.asyncAfter(deadline: .now() + UiDefaults.toastDismissDelaySec) { [weak self] in
-            if self?.toast?.id == capturedId {
-                self?.toast = nil
+            Task { @MainActor in
+                if self?.toast?.id == capturedId {
+                    self?.toast = nil
+                }
             }
         }
     }
@@ -1045,11 +1107,10 @@ final class IntegratorViewModel: ObservableObject {
                         self.showSetupSheet = true
                     }
                 }
-                // Preserve local draft of KVM layout if user is currently editing sliders
-                if !self.kvmLayoutDirty {
+                // Preserve local draft of KVM layout if user is currently editing sliders or if an older in-flight poll arrives
+                if !self.kvmLayoutDirty && model.kvm.layout.updated_at_ms >= self.kvmLayout.updated_at_ms {
                     self.isApplyingRemoteLayout = true
                     self.kvmLayout = model.kvm.layout
-                    self.lastServerLayoutUpdatedMs = model.kvm.layout.updated_at_ms
                     self.kvmLayoutDirty = false
                     self.isApplyingRemoteLayout = false
                 }
@@ -1063,6 +1124,19 @@ final class IntegratorViewModel: ObservableObject {
                     self.preferredShareInput = model.preferred_peer_share ?? ""
                 }
                 self.localSharedFolder = model.local_shared_folder ?? ""
+                // Synchronize shared microphone gain and selected device when not actively dragging gain slider
+                if !self.micGainDirty && !self.isEditingMicGain, let remoteGain = model.camera_status?.mic_gain {
+                    self.micGain = min(max(Double(remoteGain), 0.0), 2.0)
+                }
+                if !self.didInitialMicRefresh {
+                    self.didInitialMicRefresh = true
+                    self.refreshMics(showErrorToast: false)
+                } else if let remoteMicName = model.camera_status?.mic_device_name,
+                          !remoteMicName.isEmpty,
+                          let matchedMic = self.availableMics.first(where: { $0.id == remoteMicName || $0.name == remoteMicName })
+                {
+                    self.selectedMicId = matchedMic.id
+                }
                 // Clear paired PIN inputs for successfully authenticated peers
                 for peer in model.discovered_peers where peer.trusted {
                     self.pairPinInputs.removeValue(forKey: peer.ip)
@@ -1088,7 +1162,7 @@ final class IntegratorViewModel: ObservableObject {
         refreshAfter: Bool = true,
         suppressDataToast: Bool = false,
         successToast: String? = nil,
-        onCompleted: ((Bool) -> Void)? = nil
+        onCompleted: (@MainActor @Sendable (Bool) -> Void)? = nil
     ) {
         let jsonStr: String
         if let data = try? JSONSerialization.data(withJSONObject: params),
@@ -1123,16 +1197,304 @@ final class IntegratorViewModel: ObservableObject {
         runAction("set_feature_flag", params: ["feature": feature, "enabled": enabled])
     }
 
+    /// Requests a feature flag toggle while enforcing mutual exclusion between Extended Screen (`"display"`)
+    /// and Universal Input KVM (`"input_kvm"`).
+    ///
+    /// Why mutual exclusion is required:
+    /// Extended Screen streams the desktop over Moonlight/Sunshine, which captures mouse and keyboard
+    /// input directly inside the stream window. Running Universal Input KVM's low-level `CGEventTap` input
+    /// hooks and screen-edge cursor hopping simultaneously causes cursor capture conflicts, stuck modifier
+    /// keys, and phantom screen hops.
+    ///
+    /// - Parameters:
+    ///   - requested: The feature flag identifier (`"display"` or `"input_kvm"`).
+    ///   - enabled: Desired boolean activation state.
+    func requestFeatureToggleWithMutualExclusion(_ requested: String, enabled: Bool) {
+        // Turning a feature OFF never conflicts with another active feature
+        guard enabled else {
+            toggleFeature(requested, enabled: false)
+            return
+        }
+
+        let displayCurrentlyOn = (status?.feature_flags.display == true) || (status?.display_active == true)
+        let kvmCurrentlyOn = (status?.feature_flags.input_kvm == true)
+
+        if requested == "display" && kvmCurrentlyOn {
+            // Force SwiftUI NSSwitch binding to revert to current state until user confirms
+            objectWillChange.send()
+            let confirmed = presentKvmDisplayConflictAlert(switchingToDisplay: true)
+            if confirmed {
+                toggleFeature("display", enabled: true)
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.objectWillChange.send()
+                }
+            }
+            return
+        }
+
+        if requested == "input_kvm" && displayCurrentlyOn {
+            // Force SwiftUI NSSwitch binding to revert to current state until user confirms
+            objectWillChange.send()
+            let confirmed = presentKvmDisplayConflictAlert(switchingToDisplay: false)
+            if confirmed {
+                toggleFeature("input_kvm", enabled: true)
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.objectWillChange.send()
+                }
+            }
+            return
+        }
+
+        toggleFeature(requested, enabled: true)
+    }
+
+    /// Initiates or stops a Mac -> PC or PC -> Mac Extended Screen session, intercepting with a
+    /// mutual-exclusion confirmation alert if Universal Input KVM (`input_kvm`) is currently enabled.
+    ///
+    /// - Parameters:
+    ///   - rpcMethod: Core RPC endpoint (`"toggle_mac_to_pc"` or `"toggle_pc_to_mac"`).
+    ///   - isCurrentlyActive: True if the user is stopping an already-active display stream.
+    func requestDisplayStreamToggle(_ rpcMethod: String, isCurrentlyActive: Bool) {
+        // Stopping an active stream never conflicts with KVM
+        if !isCurrentlyActive && (status?.feature_flags.input_kvm == true) {
+            let confirmed = presentKvmDisplayConflictAlert(switchingToDisplay: true)
+            guard confirmed else { return }
+            // Enable `"display"` first so Rust core atomically disables `"input_kvm"` and releases hooks,
+            // then immediately trigger the requested display stream direction.
+            isDisplayToggling = true
+            runAction("set_feature_flag", params: ["feature": "display", "enabled": true], refreshAfter: false) { [weak self] ok in
+                guard let self = self else { return }
+                guard ok else {
+                    self.isDisplayToggling = false
+                    self.refresh()
+                    return
+                }
+                self.runAction(rpcMethod) { [weak self] _ in
+                    self?.isDisplayToggling = false
+                }
+            }
+            return
+        }
+
+        isDisplayToggling = true
+        runAction(rpcMethod) { [weak self] _ in
+            self?.isDisplayToggling = false
+        }
+    }
+
+    /// Presents a native modal `NSAlert` (`alertStyle = .warning`) explaining why Extended Screen
+    /// and Universal Input KVM cannot run at the same time and offering a clean atomic switch.
+    ///
+    /// - Parameter switchingToDisplay: True when user requested Extended Screen while KVM is active;
+    ///   false when user requested Universal Input KVM while Extended Screen is active.
+    /// - Returns: True if the user clicked the primary `"Switch to ..."` button; false on `"Cancel"`.
+    func presentKvmDisplayConflictAlert(switchingToDisplay: Bool) -> Bool {
+        guard !isMutualExclusionAlertOpen else { return false }
+        isMutualExclusionAlertOpen = true
+        defer { isMutualExclusionAlertOpen = false }
+
+        activateIntegratorApp()
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Extended Screen & Universal Input KVM Cannot Run Together"
+        let actionPrompt = switchingToDisplay
+            ? "Would you like to disable Universal Input KVM and switch to Extended Screen?"
+            : "Would you like to stop Extended Screen and switch to Universal Input KVM?"
+        alert.informativeText =
+            "Extended Screen streams your desktop over Moonlight/Sunshine, which captures mouse and keyboard input directly. " +
+            "Running Universal Input KVM's low-level input hooks and screen-edge hopping at the same time causes cursor capture conflicts, " +
+            "stuck modifier keys, or phantom screen hops.\n\n" +
+            actionPrompt
+
+        let primaryTitle = switchingToDisplay
+            ? "Switch to Extended Screen"
+            : "Switch to Universal Input KVM"
+        alert.addButton(withTitle: primaryTitle)
+        let cancelBtn = alert.addButton(withTitle: "Cancel")
+        cancelBtn.keyEquivalent = "\u{1b}"
+
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    // MARK: - Shared Camera & Microphone Controls
+
+    /// Queries the Rust core (`"list_mics"`) for all available macOS microphone input devices
+    /// and reconciles the active `selectedMicId` selection.
+    ///
+    /// - Parameter showErrorToast: When true, displays an error toast banner if enumeration fails.
+    func refreshMics(showErrorToast: Bool = true) {
+        invoke("list_mics", params: "{}", as: [MicDeviceModel].self) { [weak self] res in
+            guard let self = self else { return }
+            switch res {
+            case .success(let mics):
+                self.availableMics = mics
+                if let currentName = self.status?.camera_status?.mic_device_name,
+                   !currentName.isEmpty,
+                   let match = mics.first(where: { $0.id == currentName || $0.name == currentName })
+                {
+                    self.selectedMicId = match.id
+                } else if self.selectedMicId.isEmpty || !mics.contains(where: { $0.id == self.selectedMicId }) {
+                    if let defaultMic = mics.first(where: { $0.is_default == true }) ?? mics.first {
+                        self.selectedMicId = defaultMic.id
+                    } else {
+                        self.selectedMicId = ""
+                    }
+                }
+            case .failure(let err):
+                if showErrorToast {
+                    self.showToast("error", err.message)
+                }
+            }
+        }
+    }
+
+    /// Requests macOS TCC microphone capture permission (`AVCaptureDevice.requestAccess(for: .audio)`)
+    /// via `"request_mic_permission"` and refreshes both bridge status and enumerated microphones.
+    func requestMicPermission() {
+        invoke("request_mic_permission", params: "{}", as: Bool.self) { [weak self] res in
+            guard let self = self else { return }
+            switch res {
+            case .success(let granted):
+                if granted {
+                    self.showToast("success", "Microphone permission granted")
+                } else {
+                    self.showToast("error", "Microphone access denied — enable Integrator in System Settings > Privacy & Security > Microphone")
+                }
+            case .failure(let err):
+                self.showToast("error", err.message)
+            }
+            self.refresh()
+            self.refreshMics(showErrorToast: false)
+        }
+    }
+
+    /// Selects a specific macOS microphone source by device identifier via the `"select_mic"` RPC.
+    ///
+    /// - Parameter id: CoreAudio / AVFoundation unique identifier of the target microphone.
+    func selectMic(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        selectedMicId = trimmed
+        runAction("select_mic", params: ["deviceId": trimmed])
+    }
+
+    /// Updates Mac -> PC shared microphone streaming state, mute state, and linear gain multiplier
+    /// via the `"set_mic_settings"` RPC endpoint.
+    ///
+    /// - Parameters:
+    ///   - enabled: True to enable shared microphone streaming alongside the virtual camera.
+    ///   - muted: True to silence outgoing microphone audio packets.
+    ///   - gain: Linear input gain multiplier in the range `0.0...2.0` (`0%` to `200%`).
+    func updateMicSettings(enabled: Bool, muted: Bool, gain: Double) {
+        let clampedGain = min(max(gain, 0.0), 2.0)
+        micGain = clampedGain
+        micGainRequestGeneration &+= 1
+        let capturedGen = micGainRequestGeneration
+        runAction(
+            "set_mic_settings",
+            params: [
+                "enabled": enabled,
+                "muted": muted,
+                "gain": Float(clampedGain)
+            ],
+            suppressDataToast: true
+        ) { [weak self] ok in
+            guard let self = self else { return }
+            if ok && !self.isEditingMicGain && self.micGainRequestGeneration == capturedGen {
+                self.micGainDirty = false
+            }
+        }
+    }
+
+    /// Schedules a debounced `"set_mic_settings"` synchronization when the user adjusts the mic gain
+    /// slider via track clicks, scroll wheel, or keyboard steps.
+    ///
+    /// - Parameters:
+    ///   - newGain: New linear input gain multiplier (`0.0...2.0`).
+    ///   - enabled: Current microphone share enabled state.
+    ///   - muted: Current microphone mute state.
+    func handleMicGainChanged(_ newGain: Double, enabled: Bool, muted: Bool) {
+        let clamped = min(max(newGain, 0.0), 2.0)
+        micGainDirty = true
+        micGain = clamped
+        micGainDebounceWorkItem?.cancel()
+        // If user is not actively dragging, dispatch after a short debounce so track clicks apply reliably
+        guard !isEditingMicGain else { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self = self, !self.isEditingMicGain else { return }
+                let latestEnabled = self.status?.camera_status?.mic_enabled ?? enabled
+                let latestMuted = self.status?.camera_status?.mic_muted ?? muted
+                self.updateMicSettings(enabled: latestEnabled, muted: latestMuted, gain: self.micGain)
+            }
+        }
+        micGainDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+    }
+
+    /// Tracks active slider drag state and commits the final mic gain value immediately on release.
+    ///
+    /// - Parameters:
+    ///   - editing: True when drag starts; false when drag ends.
+    ///   - enabled: Current microphone share enabled state.
+    ///   - muted: Current microphone mute state.
+    func handleMicGainEditingChanged(_ editing: Bool, enabled: Bool, muted: Bool) {
+        isEditingMicGain = editing
+        if editing {
+            micGainDirty = true
+            micGainDebounceWorkItem?.cancel()
+        } else {
+            micGainDebounceWorkItem?.cancel()
+            updateMicSettings(enabled: enabled, muted: muted, gain: micGain)
+        }
+    }
+
+    /// Toggles the hardware camera privacy shutter killswitch in the Rust core.
+    ///
+    /// Invokes `"toggle_camera_privacy"` (with automatic fallback to `"toggle_camera_privacy_mute"`
+    /// if the alternate RPC alias is registered), applies immediate UI state feedback, and refreshes status.
+    func toggleCameraPrivacyMute() {
+        invokeRaw("toggle_camera_privacy", params: "{}") { [weak self] ok, dataJson, errMsg in
+            guard let self = self else { return }
+            if ok {
+                if let bytes = dataJson,
+                   let obj = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                   let muted = obj["privacy_muted"] as? Bool
+                {
+                    self.status?.camera_status?.privacy_muted = muted
+                    self.showToast(
+                        "info",
+                        muted
+                            ? "Camera privacy shutter closed — transmitting black privacy frame"
+                            : "Camera privacy shutter opened — live video resumed"
+                    )
+                }
+                self.refresh()
+            } else if let err = errMsg, err.localizedCaseInsensitiveContains("Unknown") {
+                self.runAction("toggle_camera_privacy_mute", suppressDataToast: true)
+            } else {
+                self.showToast("error", errMsg ?? "Failed to toggle camera privacy shutter")
+                self.refresh()
+            }
+        }
+    }
+
     /// Synchronizes the locally drafted KVM desk layout configuration with the Rust core.
     func syncKvmLayout() {
         isApplyingRemoteLayout = true
         kvmLayout.updated_at_ms = UInt64(Date().timeIntervalSince1970 * 1000)
-        kvmLayoutDirty = false
         isApplyingRemoteLayout = false
         guard let encoded = try? JSONEncoder().encode(kvmLayout),
               let dict = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         else { return }
-        runAction("set_kvm_layout", params: ["layout": dict])
+        runAction("set_kvm_layout", params: ["layout": dict]) { [weak self] ok in
+            if ok {
+                self?.kvmLayoutDirty = false
+            }
+        }
     }
 
     /// Updates the active peer edge transition direction while preserving unsaved draft sliders.
@@ -1228,11 +1590,11 @@ final class IntegratorViewModel: ObservableObject {
     ///   - params: JSON parameter string.
     ///   - type: Expected decodable result type.
     ///   - completion: Completion handler invoked on `@MainActor`.
-    private func invoke<T: Decodable>(
+    private func invoke<T: Decodable & Sendable>(
         _ method: String,
         params: String,
         as type: T.Type,
-        completion: @escaping @MainActor (Result<T, RpcErrorMessage>) -> Void
+        completion: @escaping @MainActor @Sendable (Result<T, RpcErrorMessage>) -> Void
     ) {
         // Offload synchronous C FFI invocation to a background thread to prevent UI freezing
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1257,20 +1619,22 @@ final class IntegratorViewModel: ObservableObject {
                 if env.ok, let d = env.data {
                     Task { @MainActor in completion(.success(d)) }
                 } else {
-                    Task { @MainActor in completion(.failure(RpcErrorMessage(env.error ?? "Command failed"))) }
+                    let errMsg = env.error ?? "Command failed"
+                    Task { @MainActor in completion(.failure(RpcErrorMessage(errMsg))) }
                 }
             } catch {
-                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(error.localizedDescription)"))) }
+                let errDesc = error.localizedDescription
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(errDesc)"))) }
             }
         }
     }
 
     /// Dispatches an RPC request where the data payload may be optional or null.
-    private func invokeOptional<T: Decodable>(
+    private func invokeOptional<T: Decodable & Sendable>(
         _ method: String,
         params: String,
         as type: T.Type,
-        completion: @escaping @MainActor (Result<T?, RpcErrorMessage>) -> Void
+        completion: @escaping @MainActor @Sendable (Result<T?, RpcErrorMessage>) -> Void
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
             let rawPtr = method.withCString { mPtr in
@@ -1291,12 +1655,15 @@ final class IntegratorViewModel: ObservableObject {
             do {
                 let env = try JSONDecoder().decode(RpcEnvelope<T>.self, from: data)
                 if env.ok {
-                    Task { @MainActor in completion(.success(env.data)) }
+                    let d = env.data
+                    Task { @MainActor in completion(.success(d)) }
                 } else {
-                    Task { @MainActor in completion(.failure(RpcErrorMessage(env.error ?? "Command failed"))) }
+                    let errMsg = env.error ?? "Command failed"
+                    Task { @MainActor in completion(.failure(RpcErrorMessage(errMsg))) }
                 }
             } catch {
-                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(error.localizedDescription)"))) }
+                let errDesc = error.localizedDescription
+                Task { @MainActor in completion(.failure(RpcErrorMessage("Decode error: \(errDesc)"))) }
             }
         }
     }
@@ -1305,7 +1672,7 @@ final class IntegratorViewModel: ObservableObject {
     private func invokeRaw(
         _ method: String,
         params: String,
-        completion: @escaping @MainActor (Bool, Data?, String?) -> Void
+        completion: @escaping @MainActor @Sendable (Bool, Data?, String?) -> Void
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
             let rawPtr = method.withCString { mPtr in
@@ -1331,13 +1698,14 @@ final class IntegratorViewModel: ObservableObject {
             if let d = obj["data"] {
                 dataBytes = try? JSONSerialization.data(withJSONObject: d, options: [.fragmentsAllowed])
             }
-            Task { @MainActor in completion(ok, dataBytes, err) }
+            let finalBytes = dataBytes
+            Task { @MainActor in completion(ok, finalBytes, err) }
         }
     }
 }
 
 /// Strongly typed error wrapper for native RPC failure messages.
-struct RpcErrorMessage: Error, LocalizedError {
+struct RpcErrorMessage: Error, LocalizedError, Sendable {
     /// Human-readable error description returned by the Rust core.
     let message: String
     /// Initializes with an error string.
@@ -1359,6 +1727,7 @@ private struct LiquidGlassCardModifier: ViewModifier {
     /// User-configured shader intensity slider (0.10 to 1.00).
     @AppStorage("liquidGlassIntensity") private var intensity: Double = 0.85
 
+    /// Applies the liquid glass material, specular border, and corner clipping to the target card content.
     func body(content: Content) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
@@ -1404,6 +1773,7 @@ private struct LiquidGlassSidebarModifier: ViewModifier {
     /// User-configured shader intensity slider.
     @AppStorage("liquidGlassIntensity") private var intensity: Double = 0.85
 
+    /// Applies the liquid glass material, specular border, and corner clipping to the target card content.
     func body(content: Content) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
@@ -1449,6 +1819,7 @@ private struct StatusPill: View {
     /// Accent color for indicator dot and semi-transparent badge background.
     let color: Color
 
+    /// Renders the capsule-shaped status pill with its leading indicator dot and status text.
     var body: some View {
         HStack(spacing: 6) {
             Circle()
@@ -1482,6 +1853,7 @@ private struct CardHeader: View {
     /// True if the toggle switch should be disabled.
     var toggleDisabled: Bool = false
 
+    /// Renders the horizontal card header bar containing the icon badge, title, status pill, and toggle switch.
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
@@ -1525,11 +1897,12 @@ struct MainDashboardView: View {
     /// Convenience accessor for active subsystem feature flags with fallback defaults.
     private var flags: FeatureFlagsModel {
         s?.feature_flags ?? FeatureFlagsModel(
-            display: true, input_kvm: true, clipboard: true, dragdrop: true,
+            display: false, input_kvm: true, clipboard: true, dragdrop: false,
             truetone: true, touchbar: true, storage: true, audio: true
         )
     }
 
+    /// Renders the primary two-column dashboard layout, navigation sidebar, top toolbar, and toast overlay.
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             // Full-window behind-window blur backdrop
@@ -1606,8 +1979,10 @@ struct MainDashboardView: View {
             SetupAssistantSheetView(vm: vm)
         }
         .onAppear {
-            // Begin periodic polling when view hierarchy attaches
-            vm.startPolling()
+            // Begin periodic polling when view hierarchy attaches unless launched hidden in the menu bar tray
+            if gMacAppDelegate?.startHidden != true || gMacAppDelegate?.mainWindow?.isVisible == true {
+                vm.startPolling()
+            }
         }
     }
 
@@ -1810,7 +2185,7 @@ struct MainDashboardView: View {
                 pillColor: s?.display_active == true ? .green : .secondary,
                 toggleBinding: Binding(
                     get: { flags.display },
-                    set: { vm.toggleFeature("display", enabled: $0) }
+                    set: { vm.requestFeatureToggleWithMutualExclusion("display", enabled: $0) }
                 )
             )
 
@@ -1884,10 +2259,7 @@ struct MainDashboardView: View {
                 HStack(spacing: 8) {
                     if isMacToPcActive {
                         Button {
-                            vm.isDisplayToggling = true
-                            vm.runAction("toggle_mac_to_pc") { _ in
-                                vm.isDisplayToggling = false
-                            }
+                            vm.requestDisplayStreamToggle("toggle_mac_to_pc", isCurrentlyActive: true)
                         } label: {
                             Text("Stop Extending").frame(maxWidth: .infinity)
                         }
@@ -1895,23 +2267,17 @@ struct MainDashboardView: View {
                         .disabled(!flags.display || vm.isDisplayToggling)
                     } else {
                         Button {
-                            vm.isDisplayToggling = true
-                            vm.runAction("toggle_mac_to_pc") { _ in
-                                vm.isDisplayToggling = false
-                            }
+                            vm.requestDisplayStreamToggle("toggle_mac_to_pc", isCurrentlyActive: false)
                         } label: {
                             Text("Extend Mac -> PC").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!flags.display || vm.isDisplayToggling)
+                        .disabled((!flags.display && !flags.input_kvm) || vm.isDisplayToggling)
                     }
 
                     if isPcToMacActive {
                         Button {
-                            vm.isDisplayToggling = true
-                            vm.runAction("toggle_pc_to_mac") { _ in
-                                vm.isDisplayToggling = false
-                            }
+                            vm.requestDisplayStreamToggle("toggle_pc_to_mac", isCurrentlyActive: true)
                         } label: {
                             Text("Stop Extending").frame(maxWidth: .infinity)
                         }
@@ -1919,25 +2285,27 @@ struct MainDashboardView: View {
                         .disabled(!flags.display || vm.isDisplayToggling)
                     } else {
                         Button {
-                            vm.isDisplayToggling = true
-                            vm.runAction("toggle_pc_to_mac") { _ in
-                                vm.isDisplayToggling = false
-                            }
+                            vm.requestDisplayStreamToggle("toggle_pc_to_mac", isCurrentlyActive: false)
                         } label: {
                             Text("Extend PC -> Mac").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
-                        .disabled(!flags.display || vm.isDisplayToggling)
+                        .disabled((!flags.display && !flags.input_kvm) || vm.isDisplayToggling)
                     }
                 }
                 HStack(spacing: 8) {
                     Button("Apply GPU") {
-                        vm.encodeGpuDirty = false
-                        vm.decodeGpuDirty = false
+                        let enc = vm.selectedEncodeGpu
+                        let dec = vm.selectedDecodeGpu
                         vm.runAction("set_gpu_preferences", params: [
-                            "encodeGpu": vm.selectedEncodeGpu,
-                            "decodeGpu": vm.selectedDecodeGpu
-                        ])
+                            "encodeGpu": enc,
+                            "decodeGpu": dec
+                        ]) { ok in
+                            if ok {
+                                vm.encodeGpuDirty = false
+                                vm.decodeGpuDirty = false
+                            }
+                        }
                     }
                     .buttonStyle(.bordered)
                     .disabled(!(s?.gpu_controls_supported ?? false))
@@ -1983,7 +2351,7 @@ struct MainDashboardView: View {
                 pillColor: roleColor,
                 toggleBinding: Binding(
                     get: { flags.input_kvm },
-                    set: { vm.toggleFeature("input_kvm", enabled: $0) }
+                    set: { vm.requestFeatureToggleWithMutualExclusion("input_kvm", enabled: $0) }
                 )
             )
 
@@ -2548,8 +2916,11 @@ struct MainDashboardView: View {
                 .textFieldStyle(.roundedBorder)
                 Button("Set Share") {
                     let trimmed = vm.preferredShareInput.trimmingCharacters(in: .whitespaces)
-                    vm.preferredShareDirty = false
-                    vm.runAction("set_preferred_peer_share", params: ["share": trimmed.isEmpty ? NSNull() : trimmed])
+                    vm.runAction("set_preferred_peer_share", params: ["share": trimmed.isEmpty ? NSNull() : trimmed]) { ok in
+                        if ok {
+                            vm.preferredShareDirty = false
+                        }
+                    }
                 }
                 .buttonStyle(.bordered)
             }
@@ -2591,13 +2962,25 @@ struct MainDashboardView: View {
 
     /// Card 8: Ambient light sensor readings (Lux / CCT) and chromatic calibration controls.
     private var trueToneCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // When True Tone is disabled, display "Paused". When enabled, display "Auto • <lux> lux • <CCT>K"
+        // if ambient sensor hardware is supported, or "Active • <CCT>K" otherwise (never "Manual" while active).
+        let trueTonePillText: String = {
+            guard flags.truetone else { return "Paused" }
+            if s?.ambient_supported == true {
+                return String(
+                    format: "Auto • %.0f lux • %dK",
+                    s?.ambient_lux ?? 0,
+                    s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct)
+                )
+            }
+            return "Active • \(Int(vm.trueToneCct))K"
+        }()
+
+        return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "sun.max",
                 title: "True Tone & Chromatic Sync",
-                pillText: s?.ambient_supported == true
-                    ? (flags.truetone ? String(format: "Auto • %.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct)) : "Paused")
-                    : "Manual",
+                pillText: trueTonePillText,
                 pillColor: flags.truetone ? .yellow : .secondary,
                 toggleBinding: Binding(
                     get: { flags.truetone },
@@ -2699,13 +3082,17 @@ struct MainDashboardView: View {
         .modifier(LiquidGlassCardModifier())
     }
 
-    // MARK: - Card 10B: Mac -> PC Shared Camera
+    // MARK: - Card 10B: Mac -> PC Shared Camera & Mic
 
-    /// Card 10B: Mac AVFoundation camera capture and encrypted TCP transmission to Windows virtual camera.
+    /// Card 10B: Mac AVFoundation camera & microphone capture, hardware privacy shutter killswitch,
+    /// microphone device selection, input gain control, and encrypted TCP transmission to Windows.
     private var cameraCard: some View {
         let camEnabled = flags.camera ?? false
         let cam = s?.camera_status
         let camActive = cam?.active == true
+        let privacyMuted = cam?.privacy_muted == true
+        let micEnabled = cam?.mic_enabled ?? false
+        let micMuted = cam?.mic_muted ?? false
         let camWidth = (cam?.width ?? 0) > 0 ? (cam?.width ?? UiDefaults.defaultCameraWidth) : UiDefaults.defaultCameraWidth
         let camHeight = (cam?.height ?? 0) > 0 ? (cam?.height ?? UiDefaults.defaultCameraHeight) : UiDefaults.defaultCameraHeight
         let camFps = (cam?.fps ?? 0) > 0 ? (cam?.fps ?? UiDefaults.defaultCameraFps) : UiDefaults.defaultCameraFps
@@ -2722,7 +3109,7 @@ struct MainDashboardView: View {
         return VStack(alignment: .leading, spacing: 12) {
             CardHeader(
                 icon: "video.fill",
-                title: "Mac → PC Shared Camera",
+                title: "Mac → PC Shared Camera & Mic",
                 pillText: cam?.state ?? (camEnabled ? "Standby" : "Disabled"),
                 pillColor: camActive ? .green : (camEnabled ? .cyan : .secondary),
                 toggleBinding: Binding(
@@ -2744,17 +3131,148 @@ struct MainDashboardView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             } else {
-                Text("Streams your Mac camera (\(camHeight)p\(camFps)) into Windows '\(camDeviceName)' (TCP :\(camPort)).")
+                Text("Streams your Mac camera (\(camHeight)p\(camFps)) & microphone into Windows '\(camDeviceName)' (TCP :\(camPort)).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            HStack {
+            HStack(spacing: 8) {
                 Button(camActive ? "Stop Camera Stream" : "Start Camera Stream") {
                     vm.runAction("toggle_camera")
                 }
                 .buttonStyle(.borderedProminent)
+
+                Button {
+                    vm.toggleCameraPrivacyMute()
+                } label: {
+                    Label(
+                        privacyMuted ? "Shutter Closed" : "Privacy Shutter",
+                        systemImage: privacyMuted ? "video.slash.fill" : "video.fill"
+                    )
+                    .foregroundStyle(privacyMuted ? .red : .primary)
+                }
+                .buttonStyle(.bordered)
+                .tint(privacyMuted ? .red : .secondary)
+                .help(privacyMuted
+                    ? "Disengage hardware camera privacy shutter to resume live video frames"
+                    : "Engage hardware camera privacy shutter (transmits studio-black privacy frame)")
+
                 Spacer()
+            }
+
+            Divider().opacity(0.35)
+
+            // Shared Microphone Subsection
+            VStack(alignment: .leading, spacing: 8) {
+                if cam?.mic_permission_granted == false {
+                    HStack(spacing: 8) {
+                        Label("macOS Microphone permission is required to stream Mac audio input to Windows.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Grant Mic Access") {
+                            vm.requestMicPermission()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                HStack(spacing: 10) {
+                    Toggle("Share Mac Microphone", isOn: Binding(
+                        get: { micEnabled },
+                        set: { newEnabled in
+                            vm.updateMicSettings(enabled: newEnabled, muted: micMuted, gain: vm.micGain)
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .font(.subheadline.weight(.medium))
+
+                    Spacer()
+
+                    Button {
+                        vm.updateMicSettings(enabled: micEnabled, muted: !micMuted, gain: vm.micGain)
+                    } label: {
+                        Label(
+                            micMuted ? "Mic Muted" : "Mic Live",
+                            systemImage: micMuted ? "mic.slash.fill" : "mic.fill"
+                        )
+                        .foregroundStyle(micMuted ? .red : .green)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(micMuted ? .red : .green)
+                    .controlSize(.small)
+                    .disabled(!micEnabled)
+                }
+
+                HStack(spacing: 8) {
+                    Text("Mic Source")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 68, alignment: .leading)
+
+                    Picker("", selection: Binding(
+                        get: {
+                            if !vm.selectedMicId.isEmpty && vm.availableMics.contains(where: { $0.id == vm.selectedMicId }) {
+                                return vm.selectedMicId
+                            }
+                            return vm.availableMics.first?.id ?? ""
+                        },
+                        set: { newId in
+                            if !newId.isEmpty && newId != vm.selectedMicId {
+                                vm.selectMic(newId)
+                            }
+                        }
+                    )) {
+                        if vm.availableMics.isEmpty {
+                            Text((cam?.mic_device_name?.isEmpty == false) ? (cam?.mic_device_name ?? "System Default Microphone") : "System Default Microphone")
+                                .tag("")
+                        } else {
+                            ForEach(vm.availableMics) { mic in
+                                Text(mic.is_default == true ? "\(mic.name) (Default)" : mic.name)
+                                    .tag(mic.id)
+                            }
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+
+                    Button {
+                        vm.refreshMics(showErrorToast: true)
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Refresh available macOS microphone input devices")
+                }
+
+                HStack(spacing: 8) {
+                    Text("Mic Gain")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 68, alignment: .leading)
+
+                    Slider(
+                        value: Binding(
+                            get: { vm.micGain },
+                            set: { newGain in
+                                vm.handleMicGainChanged(newGain, enabled: micEnabled, muted: micMuted)
+                            }
+                        ),
+                        in: 0.0...2.0,
+                        step: 0.05,
+                        onEditingChanged: { isEditing in
+                            vm.handleMicGainEditingChanged(isEditing, enabled: micEnabled, muted: micMuted)
+                        }
+                    )
+
+                    Text("\(Int(round(vm.micGain * 100)))%")
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 44, alignment: .trailing)
+                }
             }
         }
         .modifier(LiquidGlassCardModifier())
@@ -2822,6 +3340,7 @@ struct MainDashboardView: View {
                     vm.runAction("verify_touchid")
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(!(flags.touchid ?? true))
             }
         }
         .modifier(LiquidGlassCardModifier())
@@ -2884,6 +3403,7 @@ private struct SetupAssistantSheetView: View {
         vm.status?.setup_status
     }
 
+    /// Renders the modal setup assistant sheet with OS permission audit rows and companion tool installers.
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             // Sheet Header
@@ -3205,6 +3725,7 @@ private struct VisualEffectBackdrop: NSViewRepresentable {
     /// Blending mode: behind window or within window.
     let blendingMode: NSVisualEffectView.BlendingMode
 
+    /// Instantiates and configures the underlying AppKit `NSVisualEffectView`.
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.material = material
@@ -3213,6 +3734,7 @@ private struct VisualEffectBackdrop: NSViewRepresentable {
         return view
     }
 
+    /// Synchronizes updated material and blending parameters with the existing `NSVisualEffectView`.
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
         nsView.material = material
         nsView.blendingMode = blendingMode
@@ -3221,44 +3743,65 @@ private struct VisualEffectBackdrop: NSViewRepresentable {
 
 // MARK: - Graceful Shutdown Progress View (macOS)
 
+/// Lifecycle state of an individual subsystem teardown step during graceful application exit.
 private enum ShutdownStepState: Equatable {
+    /// Step is queued and awaiting teardown of prior subsystems.
     case pending
+    /// Subsystem is actively executing its synchronous FFI/runtime shutdown routine.
     case stopping
+    /// Subsystem has completed teardown and released all OS resources.
     case stopped
 }
 
+/// Model representing a single subsystem row inside the floating graceful shutdown window.
 private struct ShutdownStepItem: Identifiable {
+    /// Canonical subsystem identifier passed to `"shutdown_subsystem"` (`"audio"`, `"camera"`, `"display"`, `"storage"`, `"kvm"`).
     let id: String
+    /// Human-readable subsystem title displayed in the shutdown checklist.
     let title: String
+    /// Detailed status description shown while the subsystem is actively stopping.
     let detail: String
+    /// Current lifecycle state of this teardown step.
     var state: ShutdownStepState = .pending
 }
 
+/// Reactive view model driving the live subsystem teardown checklist during graceful application termination.
 @MainActor
 private final class ShutdownProgressViewModel: ObservableObject {
+    /// Primary headline text displayed at the top of the shutdown window.
     @Published var headerTitle: String = "Shutting Down Integrator…"
+    /// Subtitle text explaining the current shutdown phase.
     @Published var headerSubtitle: String = "Stopping all background processes and services"
+    /// True once every subsystem and the Rust Tokio runtime have cleanly stopped.
     @Published var allComplete: Bool = false
+    /// Ordered list of subsystem teardown steps executed sequentially on exit.
     @Published var steps: [ShutdownStepItem] = [
         ShutdownStepItem(id: "audio", title: "Dynamic Audio Routing", detail: "Stopping CoreAudio & UDP sink"),
-        ShutdownStepItem(id: "camera", title: "Shared Camera", detail: "Stopping AVFoundation capture & streams"),
+        ShutdownStepItem(id: "camera", title: "Shared Camera & Mic", detail: "Stopping AVFoundation capture & streams"),
         ShutdownStepItem(id: "display", title: "Extended Display & GPU", detail: "Stopping Moonlight, virtual display & gamma"),
         ShutdownStepItem(id: "storage", title: "Clipboard & Shared Storage", detail: "Clearing cache & unmounting remote shares"),
         ShutdownStepItem(id: "kvm", title: "KVM Hooks & Core Services", detail: "Releasing input taps & closing network sockets"),
     ]
 
+    /// Transitions the specified subsystem row into the `.stopping` spinner state.
+    ///
+    /// - Parameter id: Canonical subsystem identifier.
     func markStopping(_ id: String) {
         if let idx = steps.firstIndex(where: { $0.id == id }) {
             steps[idx].state = .stopping
         }
     }
 
+    /// Transitions the specified subsystem row into the `.stopped` completed checkmark state.
+    ///
+    /// - Parameter id: Canonical subsystem identifier.
     func markStopped(_ id: String) {
         if let idx = steps.firstIndex(where: { $0.id == id }) {
             steps[idx].state = .stopped
         }
     }
 
+    /// Marks all subsystem steps complete and updates the header before final `NSApp.terminate`.
     func markAllDone() {
         for idx in steps.indices {
             steps[idx].state = .stopped
@@ -3269,9 +3812,12 @@ private final class ShutdownProgressViewModel: ObservableObject {
     }
 }
 
+/// SwiftUI view rendered inside the floating HUD window during graceful application teardown.
 private struct ShutdownProgressView: View {
+    /// Observed view model tracking step-by-step teardown progress.
     @ObservedObject var model: ShutdownProgressViewModel
 
+    /// Renders the HUD backdrop, progress header, and per-subsystem checklist rows.
     var body: some View {
         ZStack {
             VisualEffectBackdrop(material: .hudWindow, blendingMode: .behindWindow)
@@ -3353,27 +3899,34 @@ private struct ShutdownProgressView: View {
 /// strictly around the exact optical center of the integral glyph (`∫`) between
 /// vertical (0°) when inactive and horizontal (-90°) when the menu opens.
 private final class RotatingIntegralIconView: NSView {
+    /// Backing image view rendering the template integral glyph (`∫`).
     private let imageView: NSImageView
+    /// True when the icon is currently rotated to the horizontal (-90°) open-menu orientation.
     private(set) var isHorizontal: Bool = false
+    /// Current target rotation angle in radians (`0.0` vertical, `-pi/2` horizontal).
     private var currentAngle: CGFloat = 0.0
 
+    /// Initializes the rotating icon view with the given status bar button frame.
     override init(frame frameRect: NSRect) {
         self.imageView = NSImageView(frame: NSRect(origin: .zero, size: frameRect.size))
         super.init(frame: frameRect)
         setup()
     }
 
+    /// Initializes the rotating icon view from an AppKit storyboard or nib coder.
     required init?(coder: NSCoder) {
         self.imageView = NSImageView(frame: .zero)
         super.init(coder: coder)
         setup()
     }
 
+    /// Returns `nil` so mouse events pass directly through to the parent `NSStatusBarButton`.
     override func hitTest(_ point: NSPoint) -> NSView? {
         // Transparent to mouse clicks so the parent NSStatusBarButton receives clicks directly
         return nil
     }
 
+    /// Configures CoreAnimation layer-backing and embeds the centered integral glyph subview.
     private func setup() {
         wantsLayer = true
         layer?.masksToBounds = false
@@ -3389,6 +3942,7 @@ private final class RotatingIntegralIconView: NSView {
         addSubview(imageView)
     }
 
+    /// Synchronizes subview geometry on layout passes and reapplies the center-pivoted transform.
     override func layout() {
         super.layout()
         // Keep imageView aligned to full bounds and re-center the rotation transform
@@ -3412,10 +3966,17 @@ private final class RotatingIntegralIconView: NSView {
         return t
     }
 
+    /// Evaluates a smooth cubic ease-in-out curve for normalized progress `t` in `0.0...1.0`.
     private static func easeInOutCubic(_ t: CGFloat) -> CGFloat {
         return t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
     }
 
+    /// Rotates the integral glyph between vertical (`0°`) and horizontal (`-90°`) using a 32-step
+    /// center-pinned `CAKeyframeAnimation` that eliminates translational drift during rotation.
+    ///
+    /// - Parameters:
+    ///   - horizontal: True to rotate to `-90°` (menu open); false to restore `0°` (menu closed).
+    ///   - animated: True to animate smoothly over 220ms; false to snap immediately.
     func setRotated(_ horizontal: Bool, animated: Bool = true) {
         guard isHorizontal != horizontal else { return }
         isHorizontal = horizontal
@@ -3504,6 +4065,7 @@ private final class RotatingIntegralIconView: NSView {
 /// dashboard window presentation, and graceful lifecycle termination.
 @MainActor
 private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+    /// `UserDefaults` key storing the user's preference to skip the quit confirmation dialog.
     private static let skipQuitConfirmationKey = "com.manveersingh.integrator.skipQuitConfirmation"
 
     /// macOS status bar item in the menu bar.
@@ -3568,8 +4130,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         if isShuttingDown {
             return false
         }
-        sender.orderOut(nil)
-        IntegratorViewModel.shared.setPollingPaused(true)
+        hideDashboard()
         return false
     }
 
@@ -3647,10 +4208,12 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
     // MARK: - NSMenuDelegate (Menu Bar Icon Animation)
 
+    /// Rotates the menu bar integral glyph (`∫`) to horizontal (`-90°`) when the status menu opens.
     func menuWillOpen(_ menu: NSMenu) {
         statusIconView?.setRotated(true, animated: true)
     }
 
+    /// Restores the menu bar integral glyph (`∫`) to vertical (`0°`) when the status menu closes.
     func menuDidClose(_ menu: NSMenu) {
         statusIconView?.setRotated(false, animated: true)
     }
@@ -3667,6 +4230,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         win.titleVisibility = .hidden
         win.isOpaque = false
         win.backgroundColor = .clear
+        // Exclude dashboard window from screen recording / screen sharing to protect SPAKE2 PINs and Ed25519 keys
         win.sharingType = .none
         win.center()
         win.delegate = self
@@ -3677,20 +4241,40 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     func showDashboard() {
         NSApp.setActivationPolicy(.regular)
         mainWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateIntegratorApp()
         IntegratorViewModel.shared.setPollingPaused(false)
     }
 
-    /// Orders out dashboard window and pauses polling to conserve CPU/power.
+    /// Orders out dashboard window, switches to Accessory policy to avoid an orphaned Dock icon,
+    /// and pauses background polling to conserve CPU/power.
     func hideDashboard() {
         mainWindow?.orderOut(nil)
+        NSApp.setActivationPolicy(.accessory)
         IntegratorViewModel.shared.setPollingPaused(true)
     }
 
+    /// Menu bar action: reveals and focuses the main dashboard window.
     @objc private func onShowDashboard() { showDashboard() }
+    /// Menu bar action: triggers remote clipboard item paste via the Rust core tray handler.
     @objc private func onPasteRemote() { "paste_remote".withCString { rustCoreTrayAction($0) } }
-    @objc private func onToggleDisplay() { "toggle_display".withCString { rustCoreTrayAction($0) } }
+    /// Menu bar action: toggles Extended Screen streaming, enforcing KVM mutual-exclusion confirmation if KVM is active.
+    @objc private func onToggleDisplay() {
+        let vm = IntegratorViewModel.shared
+        let displayActive = vm.status?.display_active == true
+        if !displayActive && (vm.status?.feature_flags.input_kvm == true) {
+            guard vm.presentKvmDisplayConflictAlert(switchingToDisplay: true) else { return }
+            vm.runAction("set_feature_flag", params: ["feature": "display", "enabled": true], refreshAfter: false) { ok in
+                if ok {
+                    "toggle_display".withCString { rustCoreTrayAction($0) }
+                }
+            }
+            return
+        }
+        "toggle_display".withCString { rustCoreTrayAction($0) }
+    }
+    /// Menu bar action: shows or hides the MacBook Touch Bar hardware HUD strip.
     @objc private func onToggleTouchBar() { "toggle_touchbar".withCString { rustCoreTrayAction($0) } }
+    /// Menu bar action: opens the local encrypted clipboard staging cache folder in Finder.
     @objc private func onOpenCache() { "open_cache".withCString { rustCoreTrayAction($0) } }
 
     /// Menu bar, App menu, and Cmd+Q entry point.
@@ -3711,7 +4295,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         isQuitPromptOpen = true
         defer { isQuitPromptOpen = false }
 
-        NSApp.activate(ignoringOtherApps: true)
+        activateIntegratorApp()
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -3762,13 +4346,14 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         win.center()
         shutdownWindow = win
 
-        NSApp.activate(ignoringOtherApps: true)
+        activateIntegratorApp()
         win.makeKeyAndOrderFront(nil)
 
         let orderedSteps = ["audio", "camera", "display", "storage", "kvm"]
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             for step in orderedSteps {
-                DispatchQueue.main.sync {
+                // Use non-blocking main-actor dispatch to avoid deadlocking if the main thread is awaiting FFI
+                DispatchQueue.main.async {
                     model.markStopping(step)
                 }
                 let payload = "{\"step\":\"\(step)\"}"
@@ -3781,7 +4366,7 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
                 }
                 // Brief visual beat so each process teardown transition is legible
                 Thread.sleep(forTimeInterval: 0.14)
-                DispatchQueue.main.sync {
+                DispatchQueue.main.async {
                     model.markStopped(step)
                 }
             }
@@ -3806,13 +4391,14 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     }
 }
 
-/// Global reference to delegate instance.
+/// Global `@MainActor`-isolated reference to the application delegate instance.
+@MainActor
 private var gMacAppDelegate: MacAppDelegate? = nil
 
 /// C-convention reverse event callback registered with `integrator_core.dylib`.
 ///
 /// Dispatches asynchronous UI notifications (show/hide window, toasts, quit commands)
-/// from the background Tokio runtime onto macOS `DispatchQueue.main`.
+/// from the background Tokio runtime onto macOS `@MainActor`.
 private let swiftUiEventTrampoline: RustUiCallback = { evPtr, payloadPtr in
     let eventName = evPtr.map { String(cString: $0) } ?? ""
     // Drop high-frequency log push notifications; logs are polled on schedule
@@ -3820,7 +4406,7 @@ private let swiftUiEventTrampoline: RustUiCallback = { evPtr, payloadPtr in
         return
     }
     let payloadStr = payloadPtr.map { String(cString: $0) } ?? "{}"
-    DispatchQueue.main.async {
+    Task { @MainActor in
         switch eventName {
         case "show_window":
             gMacAppDelegate?.showDashboard()

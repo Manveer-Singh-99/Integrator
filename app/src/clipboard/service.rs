@@ -4,13 +4,13 @@
 //! The `ClipboardService` provides secure, full-duplex, mutually authenticated clipboard
 //! synchronization across macOS and Windows 10/11 workstations.
 //!
-//! Operating over `TransportSessionV2` (`ServiceId::ClipboardSync` on TCP port `CLIPBOARD_PORT = 58285`),
+//! Operating over `TransportSessionV2` (`ServiceId::ClipboardTransfer` on TCP port `CLIPBOARD_PORT = 58283`),
 //! the service synchronizes UTF-8 plain text, uncompressed RGBA bitmaps, and entire directory
 //! trees with zero memory-buffering overhead.
 //!
 //! ### Core Subsystem Responsibilities:
 //! 1. **Lightweight Change Polling**: Continuously polls `os_seq::get_clipboard_sequence()` every
-//!    250ms. Expensive OS clipboard reads and SHA-256 hashing occur only when the native sequence
+//!    120ms. Expensive OS clipboard reads and SHA-256 hashing occur only when the native sequence
 //!    number increments.
 //! 2. **Multi-Format Ingestion & Negotiation**:
 //!    - Text strings up to 10 MiB are hashed and synchronized instantly upon copy.
@@ -43,7 +43,7 @@
 //!                                           ▼
 //!              ┌─────────────────────────────────────────────────────────┐
 //!              │                    ClipboardService                     │
-//!              │  - Sequence Watcher Loop (250ms interval)               │
+//!              │  - Sequence Watcher Loop (120ms interval)               │
 //!              │  - Format Negotiator (Text, Image, LazyAnnouncement)   │
 //!              │  - Staging Pipeline & Atomic Cache Promotion            │
 //!              └───────┬─────────────────┬───────────────────┬───────────┘
@@ -53,17 +53,17 @@
 //!                      ▼                 ▼                   ▼
 //!       ┌───────────────────────────────┐     ┌──────────────────────────────┐
 //!       │      TransportSessionV2       │     │     touchbar_hud.swift       │
-//!       │  (ServiceId::ClipboardSync)   │     │  - Live Transfer Progress %  │
+//!       │ (ServiceId::ClipboardTransfer)│     │  - Live Transfer Progress %  │
 //!       │   ChaCha20-Poly1305 over TCP  │     │  - MB/s Streaming Velocity   │
 //!       └──────────────┬────────────────┘     └──────────────────────────────┘
-//!                      │ Port 58285
+//!                      │ Port 58283
 //!                      ▼
 //!             Remote Peer Workstation
 //! ```
 //!
 //! ### Upstream Callers:
 //! - `src/core.rs`: Instantiates `ClipboardService::new`, assigns `CLIPBOARD_INSTANCE`, spawns the
-//!   sequence watcher task, and calls `shutdown()`.
+//!   sequence watcher task, and handles `clear_pending_state` / `clear_peer_remote_state_bounded[_async]`.
 //! - Native Keyboard Shortcut Interceptors: Invoke `trigger_rust_remote_paste()` when the user
 //!   presses `Cmd+V` / `Ctrl+V` while a remote lazy file transfer is pending.
 //! - KVM Engine (`src/kvm/service.rs`): Reuses `ClipboardService` staging and streaming helpers
@@ -71,11 +71,11 @@
 //!
 //! ### Downstream Callees:
 //! - `super::protocol`: Wire message formats and frame markers.
-//! - `super::os_seq`: OS sequence counter queries.
+//! - `super::os_seq`: OS sequence counter queries and fail-closed privacy inspection.
 //! - `super::file_helper::FileClipboardHelper`: Native OS file clipboard access (`NSPasteboard` / `CF_HDROP`).
 //! - `arboard::Clipboard`: Cross-platform plain text and bitmap read/write operations.
 //! - `crate::trust`: Mutually authenticated transport session establishment.
-//! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58285.
+//! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58283.
 //!
 //! ## 3. Threading & Concurrency Model
 //! - **Tokio Multi-Thread Runtime**: Manages TCP connection acceptance, handshake timeouts,
@@ -126,11 +126,16 @@ use crate::security::transport::{ServiceId, TransportSessionV2};
 use crate::trust;
 use tokio::io::AsyncWriteExt;
 
+/// Maximum number of concurrent unauthenticated TCP clipboard connections accepted before handshake (`16`).
 const MAX_PRE_AUTH_CLIP_CONNS: usize = 16;
+/// Maximum number of concurrent authenticated clipboard/drag transfer sessions (`8`).
 const MAX_POST_AUTH_CLIP_CONNS: usize = 8;
+/// Timeout applied to the `TransportSessionV2` mutual authentication handshake (`10 s`).
 const CLIP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const STREAM_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB high-throughput AEAD chunk
+/// High-throughput AEAD stream chunk payload size in bytes (`256 KiB`).
+const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+/// Per-frame network I/O timeout guarding stalled reads/writes during streaming (`15 s`).
 const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum age before orphaned staging directories are swept on startup or announcement (1 hour).
@@ -156,20 +161,30 @@ const MAX_VERIFIED_CACHE_ENTRIES: usize = 8;
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Installs the macOS `CGEventTap` `Cmd+V` shortcut interceptor for pending remote file pastes.
     pub fn init_shortcut_interceptor();
+    /// Updates the macOS Touch Bar HUD to advertise an announced remote file (`name`, `total_bytes`).
     fn notify_touchbar_remote_file(name: *const std::os::raw::c_char, total_bytes: u64);
+    /// Updates the macOS Touch Bar HUD progress bar (`percent` in `0.0..=100.0`, `mb_per_sec`).
     fn update_touchbar_paste_progress(percent: f32, mb_per_sec: f32);
+    /// Resets and clears the macOS Touch Bar HUD paste progress state.
     fn reset_touchbar_paste_progress();
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 extern "C" {
+    /// Notifies native OS shortcut hooks (`CGEventTap` / `WH_KEYBOARD_LL`) whether a remote lazy
+    /// file announcement is pending so `Cmd+V` / `Ctrl+V` can intercept and stream on demand.
     pub fn set_has_pending_remote_file(pending: bool);
 }
 
+/// Global singleton reference to the initialized `ClipboardService`, used by C FFI callbacks.
 pub static CLIPBOARD_INSTANCE: std::sync::OnceLock<ClipboardService> = std::sync::OnceLock::new();
+/// Global Tokio runtime handle captured at initialization for spawning async tasks from C FFI.
 pub static TOKIO_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
 
+/// C-ABI entry point invoked by native shortcut interceptors (`Cmd+V` / `Ctrl+V` / TouchBar)
+/// to trigger on-demand streaming and pasting of the pending remote file announcement.
 #[no_mangle]
 pub extern "C" fn trigger_rust_remote_paste() {
     if let (Some(service), Some(handle)) = (CLIPBOARD_INSTANCE.get(), TOKIO_HANDLE.get()) {
@@ -184,16 +199,19 @@ pub extern "C" fn trigger_rust_remote_paste() {
     }
 }
 
+/// Encodes an arbitrary byte slice into lowercase hexadecimal ASCII characters.
 fn to_hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Computes the SHA-256 hex digest of a UTF-8 plain text clipboard payload.
 fn compute_text_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     to_hex_string(&hasher.finalize())
 }
 
+/// Computes a dimension-bound SHA-256 hex digest over `(width || height || byte_len || rgba)`.
 fn compute_image_hash(width: usize, height: usize, rgba: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(&(width as u64).to_le_bytes());
@@ -203,16 +221,19 @@ fn compute_image_hash(width: usize, height: usize, rgba: &[u8]) -> String {
     to_hex_string(&hasher.finalize())
 }
 
+/// Validates RGBA bitmap dimensions and buffer byte length via `protocol::validate_image_bounds`.
 fn validate_image_bounds(width: usize, height: usize, rgba_len: usize) -> bool {
     super::protocol::validate_image_bounds(width, height, rgba_len).is_some()
 }
 
+/// Validates that `session_id` is a non-empty ASCII hex string of at most 128 characters.
 fn is_valid_hex_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= 128
         && session_id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Formats an IPv4/IPv6/hostname target and TCP port into a valid socket address string.
 fn format_socket_target(ip: &str, port: u16) -> String {
     let trimmed = ip.trim();
     if let Ok(parsed) = trimmed.parse::<IpAddr>() {
@@ -225,6 +246,8 @@ fn format_socket_target(ip: &str, port: u16) -> String {
     }
 }
 
+/// Creates `dir` with private permissions (`0o700` on Unix) if absent, or verifies an existing
+/// path is a real non-symlink directory.
 fn create_private_dir_no_symlink(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(meta) => {
@@ -290,6 +313,8 @@ fn ensure_dir_no_symlinks(base: &Path, target_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Opens `path` read-only after verifying via `symlink_metadata` that it is a regular non-symlink
+/// file, additionally passing `O_NOFOLLOW` on Unix to close any open-time symlink TOCTOU gap.
 fn open_source_file_no_follow(path: &Path) -> Result<File> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("Failed to stat source path {:?}", path))?;
@@ -310,6 +335,8 @@ fn open_source_file_no_follow(path: &Path) -> Result<File> {
         .with_context(|| format!("Failed to open source file {:?}", path))
 }
 
+/// Atomically moves a verified non-symlink staged entry from `src` to `dst`, falling back to
+/// recursive copy-and-remove only if `rename` fails across filesystem boundaries.
 fn move_staged_entry(src: &Path, dst: &Path) -> Result<()> {
     let src_meta = std::fs::symlink_metadata(src)
         .with_context(|| format!("Staged entry missing: {:?}", src))?;
@@ -333,6 +360,7 @@ fn move_staged_entry(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Disambiguates colliding top-level basenames in multi-root selections (`file (2).ext`, ...).
 fn resolve_unique_root_name(
     used: &mut std::collections::HashSet<String>,
     base_name: &str,
@@ -361,6 +389,7 @@ fn resolve_unique_root_name(
     fallback
 }
 
+/// Removes orphaned non-symlink staging directories/files matching `prefixes` older than `max_age`.
 fn sweep_staging_dir_entries(parent: &Path, prefixes: &[&str], max_age: Duration) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -390,6 +419,7 @@ fn sweep_staging_dir_entries(parent: &Path, prefixes: &[&str], max_age: Duration
     }
 }
 
+/// Sweeps expired temporary clipboard and drag-and-drop staging directories older than 1 hour.
 fn cleanup_orphaned_staging_dirs(cache_dir: &Path) {
     sweep_staging_dir_entries(
         cache_dir,
@@ -469,6 +499,8 @@ fn validate_single_path_component(comp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Extracts and validates the first safe path segment from a legacy announcement `root_name`,
+/// falling back to `"clipboard_item"` if no valid segment exists.
 fn safe_root_entry_name(raw: &str) -> String {
     let candidate = raw
         .split(['/', '\\'])
@@ -594,22 +626,35 @@ fn resolve_non_colliding_dest(target_dir: &Path, safe_name: &str) -> PathBuf {
     ))
 }
 
+/// Indexed local file/directory selection prepared for lazy announcement or cross-screen drag streaming.
 #[derive(Clone, Debug)]
 pub struct LocalPendingCopy {
+    /// Random hex session identifier matching `LazyAnnouncement::session_id` or drag session ID.
     pub session_id: String,
+    /// Display summary string (e.g. `"report.pdf"` or `"report.pdf (+2 items)"`).
     pub root_name: String,
+    /// Total count of regular files across all roots (`1..=MAX_TRANSFER_FILES`).
     pub total_files: usize,
+    /// Cumulative payload size in bytes across all indexed regular files (`<= MAX_TOTAL_TRANSFER_BYTES`).
     pub total_bytes: u64,
+    /// Ordered relative directory paths (POSIX `/` separators) to create via `FRAME_DIR`.
     pub directories: Vec<String>,
+    /// Ordered `(relative_path, source_abs_path)` pairs to stream via `FRAME_FILE`.
     pub files: Vec<(String, PathBuf)>,
+    /// Disambiguated top-level root names matching `LazyAnnouncement::roots`.
     pub top_entries: Vec<String>,
 }
 
+/// Verified disk cache entry retained in an LRU queue after passing per-file and manifest SHA-256 checks.
 #[derive(Clone, Debug)]
 struct VerifiedCacheEntry {
+    /// Session identifier of the cached transfer.
     session_id: String,
+    /// Cumulative SHA-256 manifest digest verified at `FRAME_END`.
     manifest_hash: [u8; 32],
+    /// Private directory under `clipboard_cache` holding the verified root items.
     session_dir: PathBuf,
+    /// Top-level root entry names contained inside `session_dir`.
     roots: Vec<String>,
 }
 
@@ -618,7 +663,9 @@ struct VerifiedCacheEntry {
 /// and vice-versa (SEC-1F-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPurpose {
+    /// Standard Universal Clipboard copy/paste or inline/streamed image transfer.
     Clipboard,
+    /// Cross-screen KVM drag-and-drop file transfer.
     DragDrop,
 }
 
@@ -626,13 +673,16 @@ pub enum TransferPurpose {
 /// throughout long-running file and image streaming transfers (SEC-1F-02).
 #[derive(Clone)]
 pub struct TransferCancellation {
+    /// Subsystem scope (`Clipboard` vs `DragDrop`) determining which feature flag applies.
     purpose: TransferPurpose,
+    /// Optional reference to the live `FeatureManager` polled at chunk/frame boundaries.
     features: Option<Arc<crate::features::FeatureManager>>,
+    /// Optional explicit atomic abort flag for caller/test-driven cancellation.
     manual_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-#[allow(dead_code)]
 impl TransferCancellation {
+    /// Creates a new cancellation token bound to `purpose` and optional `FeatureManager`.
     pub fn new(
         purpose: TransferPurpose,
         features: Option<Arc<crate::features::FeatureManager>>,
@@ -644,6 +694,8 @@ impl TransferCancellation {
         }
     }
 
+    /// Creates a cancellation token with an explicit manual `AtomicBool` abort signal (used in tests).
+    #[cfg(test)]
     pub fn with_manual(
         purpose: TransferPurpose,
         features: Option<Arc<crate::features::FeatureManager>>,
@@ -656,22 +708,25 @@ impl TransferCancellation {
         }
     }
 
+    /// Creates a `TransferPurpose::Clipboard` cancellation token (used in tests).
+    #[cfg(test)]
     pub fn clipboard(features: Option<Arc<crate::features::FeatureManager>>) -> Self {
         Self::new(TransferPurpose::Clipboard, features)
     }
 
+    /// Creates a `TransferPurpose::DragDrop` cancellation token (used in tests).
+    #[cfg(test)]
     pub fn dragdrop(features: Option<Arc<crate::features::FeatureManager>>) -> Self {
         Self::new(TransferPurpose::DragDrop, features)
     }
 
-    pub fn none(purpose: TransferPurpose) -> Self {
-        Self::new(purpose, None)
-    }
-
+    /// Returns the `TransferPurpose` assigned to this cancellation token (used in tests).
+    #[cfg(test)]
     pub fn purpose(&self) -> TransferPurpose {
         self.purpose
     }
 
+    /// Evaluates whether the transfer has been cancelled via manual abort or feature disablement.
     pub fn is_cancelled(&self) -> bool {
         if let Some(manual) = &self.manual_cancel {
             if manual.load(std::sync::atomic::Ordering::Relaxed) {
@@ -687,6 +742,7 @@ impl TransferCancellation {
         }
     }
 
+    /// Fails with a descriptive cancellation error if `is_cancelled()` is true.
     pub fn check_cancelled(&self) -> Result<()> {
         if self.is_cancelled() {
             anyhow::bail!(
@@ -701,29 +757,49 @@ impl TransferCancellation {
     }
 }
 
+/// Full-duplex, mutually authenticated Universal Clipboard & file streaming service.
 #[derive(Clone)]
 pub struct ClipboardService {
+    /// Peer discovery manager used to resolve active paired peer IP addresses.
     discovery: DiscoveryManager,
+    /// SHA-256 hex digest of the most recently synced/applied clipboard content for loop deduplication.
     last_hash: Arc<RwLock<String>>,
+    /// Most recently observed OS clipboard modification sequence number (`-1` if unavailable).
     last_seq: Arc<RwLock<i64>>,
+    /// Native OS file clipboard (`NSPasteboard` / `CF_HDROP`) and cache pruning driver.
     file_helper: Arc<FileClipboardHelper>,
+    /// Currently staged local multi-file selection awaiting on-demand remote `RequestStream`.
     pending_local: Arc<RwLock<Option<LocalPendingCopy>>>,
+    /// Most recent remote `LazyAnnouncement` awaiting local paste (`Cmd+V` / `Ctrl+V`).
     pending_remote: Arc<RwLock<Option<LazyAnnouncement>>>,
+    /// Active outbound cross-screen drag sessions indexed by `session_id` (bounded to 16).
     pending_drag_sessions: Arc<RwLock<HashMap<String, LocalPendingCopy>>>,
+    /// FIFO eviction queue tracking registration order for `pending_drag_sessions`.
     pending_drag_order: Arc<RwLock<VecDeque<String>>>,
+    /// Bounded LRU cache of up to `MAX_VERIFIED_CACHE_ENTRIES` (8) verified file transfers on disk.
     verified_cache: Arc<RwLock<VecDeque<VerifiedCacheEntry>>>,
+    /// IP address of the peer that sent the active `pending_remote` lazy announcement.
     last_remote_ip: Arc<RwLock<Option<IpAddr>>>,
+    /// Re-entrancy guard preventing concurrent `paste_remote` invocations.
     is_pasting: Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime `FeatureManager` handle gating `clipboard` and `dragdrop` operations.
     features: Arc<OnceLock<Arc<crate::features::FeatureManager>>>,
+    /// Per-peer `(LazyAnnouncement, source_ip, trust_generation)` map supporting scoped revocation.
     pending_remote_by_peer:
         Arc<std::sync::RwLock<HashMap<String, (LazyAnnouncement, IpAddr, u64)>>>,
+    /// Per-peer set of registered drag `session_id`s supporting scoped revocation on unpair/block.
     drag_sessions_by_peer: Arc<std::sync::RwLock<HashMap<String, HashSet<String>>>>,
+    /// Mapping from drag `session_id` to the peer trust generation under which it was registered.
     drag_session_generations: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// Per-peer clipboard revocation generation watermark preventing stale re-population.
     revoked_clipboard_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// Async RwLock serializing OS clipboard commit writes (read) against peer revocation (write).
     clipboard_commit_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ClipboardService {
+    /// Initializes `ClipboardService`, sweeps orphaned staging directories, records the initial OS
+    /// clipboard sequence counter, and registers the global `CLIPBOARD_INSTANCE` / `TOKIO_HANDLE`.
     pub fn new(discovery: DiscoveryManager) -> Result<Self> {
         let file_helper = Arc::new(FileClipboardHelper::new()?);
         cleanup_orphaned_staging_dirs(file_helper.get_cache_dir());
@@ -756,10 +832,12 @@ impl ClipboardService {
         Ok(service)
     }
 
+    /// Binds the shared `FeatureManager` used to gate clipboard sync and cancel active transfers.
     pub fn set_feature_manager(&self, fm: Arc<crate::features::FeatureManager>) {
         let _ = self.features.set(fm);
     }
 
+    /// Returns `true` if the `"clipboard"` feature flag (and its `"input_kvm"` prerequisite) is enabled.
     fn is_clipboard_enabled(&self) -> bool {
         self.features
             .get()
@@ -767,6 +845,7 @@ impl ClipboardService {
             .unwrap_or(false)
     }
 
+    /// Returns `true` if the `"dragdrop"` feature flag is enabled.
     fn is_dragdrop_enabled(&self) -> bool {
         self.features
             .get()
@@ -774,10 +853,12 @@ impl ClipboardService {
             .unwrap_or(false)
     }
 
+    /// Constructs a `TransferCancellation` token scoped to `purpose` (`Clipboard` or `DragDrop`).
     pub(crate) fn cancellation_for(&self, purpose: TransferPurpose) -> TransferCancellation {
         TransferCancellation::new(purpose, self.features.get().cloned())
     }
 
+    /// Clears the pending local and remote clipboard state along with TouchBar/hotkey indicators.
     pub async fn clear_pending_state(&self) {
         {
             let mut lock = self.pending_remote.write().await;
@@ -878,6 +959,16 @@ impl ClipboardService {
             if let Some(ref cur) = *r {
                 if cur.session_id == ann.session_id {
                     *r = None;
+                    let mut ip_lock = self.last_remote_ip.write().await;
+                    *ip_lock = None;
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    unsafe {
+                        set_has_pending_remote_file(false);
+                    }
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        reset_touchbar_paste_progress();
+                    }
                 }
             }
         }
@@ -1269,44 +1360,7 @@ impl ClipboardService {
         remotes.insert(clean_id, (ann, ip, generation));
     }
 
-    /// Synchronously purges all remote clipboard staging, pending drag sessions, and cached verified metadata
-    /// upon peer revocation or emergency teardown.
-    pub fn clear_remote_state(&self) {
-        self.pending_remote_by_peer
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.drag_sessions_by_peer
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.drag_session_generations
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        if let Ok(mut r) = self.pending_remote.try_write() {
-            *r = None;
-        }
-        if let Ok(mut ip) = self.last_remote_ip.try_write() {
-            *ip = None;
-        }
-        if let Ok(mut d) = self.pending_drag_sessions.try_write() {
-            d.clear();
-        }
-        if let Ok(mut o) = self.pending_drag_order.try_write() {
-            o.clear();
-        }
-        if let Ok(mut c) = self.verified_cache.try_write() {
-            c.clear();
-        }
-        self.is_pasting
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        unsafe {
-            set_has_pending_remote_file(false);
-        }
-    }
-
+    /// Checks via `spawn_blocking` whether `ip` belongs to a paired peer in `KeystoreV2`.
     async fn has_paired_peer(ip: IpAddr) -> bool {
         tokio::task::spawn_blocking(move || crate::trust::has_paired_peer_at_ip(ip))
             .await
@@ -1328,6 +1382,8 @@ impl ClipboardService {
         None
     }
 
+    /// Binds TCP listener on `0.0.0.0:CLIPBOARD_PORT`, launches the 120 ms sequence watcher task,
+    /// and installs the native macOS `Cmd+V` shortcut interceptor.
     pub async fn start(&self) -> Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CLIPBOARD_PORT)).await?;
         info!(
@@ -1386,6 +1442,7 @@ impl ClipboardService {
         Ok(())
     }
 
+    /// Validates image bounds and SHA-256 integrity before writing an incoming RGBA bitmap to the OS clipboard.
     async fn apply_remote_image(
         &self,
         peer_addr: SocketAddr,
@@ -1616,6 +1673,16 @@ impl ClipboardService {
                     return Ok(());
                 }
 
+                // Check peer authorization before mutating any local clipboard state or spawning tasks.
+                let peer_dev_id = session.peer_device_id_hex().to_string();
+                if self.is_peer_revoked(&peer_dev_id) {
+                    warn!(
+                        "Ignoring clipboard announcement from revoked peer {}",
+                        peer_dev_id
+                    );
+                    return Ok(());
+                }
+
                 if !msg.hash.is_empty() && msg.hash.len() <= 128 {
                     let mut lock = self.last_hash.write().await;
                     *lock = msg.hash.clone();
@@ -1633,14 +1700,6 @@ impl ClipboardService {
                     ann.total_files,
                     ann.total_bytes as f64 / (1024.0 * 1024.0)
                 );
-                let peer_dev_id = session.peer_device_id_hex().to_string();
-                if self.is_peer_revoked(&peer_dev_id) {
-                    warn!(
-                        "Ignoring clipboard announcement from revoked peer {}",
-                        peer_dev_id
-                    );
-                    return Ok(());
-                }
                 {
                     let mut remotes = self
                         .pending_remote_by_peer
@@ -2154,6 +2213,7 @@ impl ClipboardService {
         }
     }
 
+    /// Clears pending remote file UI/shortcut state when local clipboard content supersedes it.
     async fn clear_remote_pending_ui_state(&self) {
         {
             let mut remote_lock = self.pending_remote.write().await;
@@ -2510,6 +2570,8 @@ end run"#;
         }
     }
 
+    /// Recursively copies non-symlink files and directories from `src` to `dst` using `O_NOFOLLOW`
+    /// and `create_new(true)` when cross-device `rename` cannot be used.
     pub(crate) fn copy_entry_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let meta = std::fs::symlink_metadata(src)?;
         if meta.file_type().is_symlink() {
@@ -2613,6 +2675,7 @@ end run"#;
         Ok(promoted)
     }
 
+    /// Resolves the peer IP to connect to for streaming, verifying `source_ip` is a paired peer first.
     async fn resolve_stream_peer_ip(&self, source_ip: Option<IpAddr>) -> Result<String> {
         if let Some(ip) = source_ip {
             if Self::has_paired_peer(ip).await {
@@ -2625,6 +2688,7 @@ end run"#;
         anyhow::bail!("No trusted peer connected for clipboard stream")
     }
 
+    /// Connects to `peer_ip:CLIPBOARD_PORT` over `TransportSessionV2` and sends `RequestStream`.
     async fn connect_and_request_stream(
         peer_ip: &str,
         session_id: &str,
@@ -2632,6 +2696,8 @@ end run"#;
         Self::connect_and_request_stream_kind(peer_ip, session_id, false).await
     }
 
+    /// Connects to `peer_ip:CLIPBOARD_PORT` over `TransportSessionV2` and sends `RequestStream` or
+    /// `RequestDragStream` depending on `is_drag`.
     async fn connect_and_request_stream_kind(
         peer_ip: &str,
         session_id: &str,
@@ -2766,6 +2832,8 @@ end run"#;
         })
     }
 
+    /// Registers a local cross-screen drag session, evicting the oldest entry if the
+    /// `MAX_CONCURRENT_DRAG_SESSIONS` (16) cap is reached.
     pub async fn register_drag_session(&self, copy: LocalPendingCopy) {
         let mut map = self.pending_drag_sessions.write().await;
         let mut order = self.pending_drag_order.write().await;
@@ -2780,9 +2848,12 @@ end run"#;
         map.insert(copy.session_id.clone(), copy);
     }
 
+    /// Removes a completed or cancelled cross-screen drag session from both the map and FIFO order queue.
     pub async fn remove_drag_session(&self, session_id: &str) {
         let mut map = self.pending_drag_sessions.write().await;
+        let mut order = self.pending_drag_order.write().await;
         map.remove(session_id);
+        order.retain(|sid| sid != session_id);
     }
 
     /// Streams an offered cross-screen drag session into an isolated `drag_staging/<session_id>` folder,
@@ -3113,6 +3184,7 @@ end run"#;
         Ok((transferred_bytes, start_time, manifest_sha256))
     }
 
+    /// Remaps only an exact matching leading root path component from `orig_root` to `new_root`.
     pub(crate) fn remap_rel_root(rel_path: &str, root_remap: Option<(&str, &str)>) -> String {
         let Some((orig_root, new_root)) = root_remap else {
             return rel_path.to_string();
@@ -3135,6 +3207,7 @@ end run"#;
         }
     }
 
+    /// Extracts, validates, and deduplicates top-level root names from a `LazyAnnouncement`.
     fn effective_roots(ann: &LazyAnnouncement) -> Result<Vec<String>> {
         if ann.roots.is_empty() {
             let single = safe_root_entry_name(&ann.root_name);
@@ -3160,6 +3233,8 @@ end run"#;
         Ok(out)
     }
 
+    /// Inserts a verified transfer into the bounded LRU disk cache (`MAX_VERIFIED_CACHE_ENTRIES = 8`),
+    /// evicting and deleting the oldest directory when full.
     async fn record_verified_cache(&self, entry: VerifiedCacheEntry) {
         let mut cache = self.verified_cache.write().await;
         if let Some(pos) = cache.iter().position(|e| {
@@ -3181,6 +3256,7 @@ end run"#;
         cache.push_back(entry);
     }
 
+    /// Looks up a previously verified cache entry matching `session_id`.
     async fn lookup_verified_cache(&self, session_id: &str) -> Option<VerifiedCacheEntry> {
         let cache = self.verified_cache.read().await;
         cache
@@ -3190,6 +3266,9 @@ end run"#;
             .cloned()
     }
 
+    /// Background pre-stager for announcements `<= MAX_AUTO_STAGE_BYTES` (128 MiB): streams into an
+    /// isolated staging directory, verifies per-file/manifest SHA-256 hashes, atomically promotes
+    /// into `clipboard_cache`, and registers the staged paths on the OS clipboard under `clipboard_commit_lock`.
     async fn stream_to_cache_from(
         &self,
         ann: LazyAnnouncement,
@@ -3278,19 +3357,34 @@ end run"#;
         }
         ensure_dir_no_symlinks(&cache_dir, &session_cache_dir)?;
 
-        // Pre-promotion cancellation check
-        cancellation.check_cancelled()?;
+        // Pre-promotion cancellation check — clean up both stage_dir and session_cache_dir on abort.
+        if let Err(e) = cancellation.check_cancelled() {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            let _ = std::fs::remove_dir_all(&session_cache_dir);
+            #[cfg(target_os = "macos")]
+            unsafe {
+                reset_touchbar_paste_progress();
+            }
+            return Err(e);
+        }
 
         let stage_c = stage_dir.clone();
         let dest_c = session_cache_dir.clone();
         let roots_c = roots.clone();
 
         // Offload filesystem promotion transaction from Tokio async worker (REL-1F-02)
-        let promotion_res = tokio::task::spawn_blocking(move || {
+        let promotion_res = match tokio::task::spawn_blocking(move || {
             ClipboardService::promote_staged_entries_transactional(&stage_c, &dest_c, &roots_c)
         })
         .await
-        .context("Promotion blocking task panicked")?;
+        {
+            Ok(res) => res,
+            Err(join_err) => {
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                let _ = std::fs::remove_dir_all(&session_cache_dir);
+                return Err(anyhow::anyhow!("Promotion blocking task panicked: {}", join_err));
+            }
+        };
 
         let cached_roots: Vec<PathBuf> = match promotion_res {
             Ok(r) => r,
@@ -3319,12 +3413,22 @@ end run"#;
         // Only replace the native OS clipboard AFTER all staged items pass SHA-256 verification.
         let helper = Arc::clone(&self.file_helper);
         let roots_for_cb = cached_roots.clone();
-        let new_seq = tokio::task::spawn_blocking(move || -> Result<i64> {
+        let cb_write_res = tokio::task::spawn_blocking(move || -> Result<i64> {
             helper.write_copied_files(&roots_for_cb)?;
             Ok(os_seq::get_clipboard_sequence())
         })
-        .await
-        .context("Clipboard writer task panicked")??;
+        .await;
+        let new_seq = match cb_write_res {
+            Ok(Ok(seq)) => seq,
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_dir_all(&session_cache_dir);
+                return Err(e);
+            }
+            Err(join_err) => {
+                let _ = std::fs::remove_dir_all(&session_cache_dir);
+                return Err(anyhow::anyhow!("Clipboard writer task panicked: {}", join_err));
+            }
+        };
         if new_seq >= 0 {
             let mut seq_lock = self.last_seq.write().await;
             *seq_lock = new_seq;
@@ -3567,7 +3671,10 @@ end run"#;
             );
         }
 
-        cancellation.check_cancelled()?;
+        if let Err(e) = cancellation.check_cancelled() {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
 
         let stage_c = stage_dir.clone();
         let target_c = target_dir.clone();
@@ -3575,10 +3682,16 @@ end run"#;
 
         // Offload destination folder promotion from Tokio worker (REL-1F-02)
         let commit_res: Vec<PathBuf> =
-            tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
+            match tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
                 let mut committed = Vec::with_capacity(roots_c.len());
                 for root in &roots_c {
-                    let staged_item = ensure_safe_contained_path(&stage_c, root)?;
+                    let staged_item = match ensure_safe_contained_path(&stage_c, root) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&stage_c);
+                            return Err(e);
+                        }
+                    };
                     if !staged_item.exists() {
                         let _ = std::fs::remove_dir_all(&stage_c);
                         anyhow::bail!(
@@ -3597,7 +3710,20 @@ end run"#;
                 Ok(committed)
             })
             .await
-            .context("Paste destination commit task panicked")??;
+            {
+                Ok(Ok(paths)) => paths,
+                Ok(Err(e)) => {
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                    return Err(e);
+                }
+                Err(join_err) => {
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                    return Err(anyhow::anyhow!(
+                        "Paste destination commit task panicked: {}",
+                        join_err
+                    ));
+                }
+            };
         let committed_paths: Vec<PathBuf> = commit_res;
 
         // Also register the committed destination paths on the native OS file clipboard (`CF_HDROP` / `NSPasteboard`)

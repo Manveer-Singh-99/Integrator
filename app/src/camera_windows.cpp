@@ -19,24 +19,43 @@
  * 5. Providing high-performance lock-free ingestion (`integrator_win_vcam_push_nv12`)
  *    from the Rust network receiver loop into the shared memory ping-pong slots.
  *
- * 2. END-TO-END CROSS-OS FRAME FLOW
+ * 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
  * ----------------------------------------------------------------------------
- * 1. Capture (Mac):
- *    Mac camera (built-in FaceTime HD, external USB, or Continuity Camera) captured at 720p30 NV12 by AVFoundation (`camera_macos.swift`).
- * 2. Wire Streaming:
- *    Transported over encrypted `TransportSessionV2` (port 58287, ChaCha20-Poly1305)
- *    to the Windows receiver in `camera/mod.rs`.
- * 3. Lock-Free Ingestion (This File):
- *    `integrator_win_vcam_push_nv12` copies incoming 1,382,400-byte NV12 payloads
- *    into the inactive shared memory slot, issues a hardware `MemoryBarrier()`,
- *    updates presentation timestamps (100-nanosecond units for Media Foundation),
- *    toggles `active_slot`, increments `seq` via `InterlockedIncrement64`, and pulses
- *    `Global\IntegratorVCamEvt_v1`.
- * 4. Standalone Virtual Camera Output (Windows 11 FrameServer):
- *    `integrator_vcam.dll` (running inside FrameServer / client process) wakes,
- *    reads the active slot, packs samples via `IMF2DBuffer2::Lock2DSize`, and feeds
- *    standard Windows applications (Teams, Zoom, Discord, OBS, Edge) without
- *    requiring physical camera wrappers or third-party drivers.
+ * - Upstream Callers:
+ *   - `app/src/camera/mod.rs`: Rust shared-camera runtime invokes the C ABI
+ *     exports (`integrator_win_vcam_start`, `integrator_win_vcam_push_nv12`,
+ *     `integrator_win_vcam_stop`, `integrator_win_vcam_is_active`,
+ *     `integrator_win_prompt_camera_consent_scoped`, and
+ *     `integrator_win_cancel_camera_consent_prompt`).
+ * - Downstream Callees:
+ *   - Windows 11 Media Foundation Virtual Camera API (`mfsensorgroup.dll`:
+ *     `MFCreateVirtualCamera`, `IMFVirtualCamera`; `mfplat.dll`: `MFStartup`,
+ *     `MFShutdown`).
+ *   - Win32 Security & Registry APIs (`advapi32.dll`: `SetNamedSecurityInfoW`,
+ *     `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `RegCreateKeyExW`).
+ *   - Win32 Kernel Shared Memory & Synchronization (`kernel32.dll`:
+ *     `CreateFileMappingW`, `MapViewOfFile`, `CreateEventW`, `SetEvent`).
+ *   - Win32 Common Controls & User32 Modal Dialogs (`comctl32.dll`:
+ *     `TaskDialogIndirect`; `user32.dll`: `MessageBoxTimeoutW`).
+ * - Cross-Platform / Cross-Device Flow:
+ *   1. Capture (Mac):
+ *      Mac camera (built-in FaceTime HD, external USB, or Continuity Camera)
+ *      captured at 720p30 NV12 by AVFoundation (`camera_macos.swift`).
+ *   2. Wire Streaming:
+ *      Transported over encrypted `TransportSessionV2` (port 58287, ChaCha20-Poly1305)
+ *      to the Windows receiver in `camera/mod.rs`.
+ *   3. Lock-Free Ingestion (This File):
+ *      `integrator_win_vcam_push_nv12` copies incoming 1,382,400-byte NV12 payloads
+ *      into the inactive shared memory slot, issues a hardware `MemoryBarrier()`,
+ *      updates presentation timestamps (100-nanosecond units for Media Foundation),
+ *      toggles `active_slot`, increments `seq` via `InterlockedIncrement64`, and pulses
+ *      `Global\IntegratorVCamEvt_v1`.
+ *   4. Standalone Virtual Camera Output (Windows 11 FrameServer):
+ *      `integrator_vcam.dll` (`vcam_windows.cpp`, running inside FrameServer / client
+ *      process) wakes, reads the active slot, packs samples via
+ *      `IMF2DBuffer2::Lock2DSize`, and feeds standard Windows applications
+ *      (Teams, Zoom, Discord, OBS, Edge) without requiring physical camera
+ *      wrappers or third-party drivers.
  *
  * 3. STANDALONE VIRTUAL CAMERA CONTRACT & DRIVERLESS OPERATION
  * ----------------------------------------------------------------------------
@@ -87,6 +106,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <climits>
 #include <string>
 #include <mutex>
 #include <atomic>
@@ -156,6 +176,10 @@ constexpr wchar_t kFriendlyName[] = L"Integrator Mac Camera";
 
 /// Resolves the active virtual camera friendly name, allowing an `INTEGRATOR_CAMERA_NAME`
 /// environment variable override while falling back safely to [`kFriendlyName`].
+///
+/// - Parameters:
+///   - outBuf: Destination wide-character buffer receiving the null-terminated camera name.
+///   - capChars: Capacity of `outBuf` in wide characters (`wchar_t` count, must be > 0).
 void ResolveFriendlyCameraName(wchar_t* outBuf, DWORD capChars) {
     if (!outBuf || capChars == 0) return;
     DWORD len = GetEnvironmentVariableW(L"INTEGRATOR_CAMERA_NAME", outBuf, capChars);
@@ -187,6 +211,9 @@ HANDLE g_hEvent = nullptr;
 
 /// Active Windows 11 Media Foundation virtual camera COM interface pointer.
 IMFVirtualCamera* g_virtualCamera = nullptr;
+
+/// Dynamically loaded `mfsensorgroup.dll` module handle retained while the virtual camera is active.
+HMODULE g_hMfSensorGroup = nullptr;
 
 /// Flag indicating whether Media Foundation runtime has been initialized via `MFStartup`.
 bool g_mfStarted = false;
@@ -250,6 +277,10 @@ bool GrantServiceReadExecuteAcl(const wchar_t* path) {
 ///   - errCap: Capacity of error buffer in bytes.
 /// - Returns: `true` on successful installation and registration; otherwise `false`.
 bool InstallAndRegisterVCamDll(wchar_t* installedPathOut, DWORD capChars, char* errBuf, int32_t errCap) {
+    if (!installedPathOut || capChars == 0) {
+        WriteErr(errBuf, errCap, "Invalid output path buffer");
+        return false;
+    }
     wchar_t exeDir[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, exeDir, MAX_PATH) == 0) {
         WriteErr(errBuf, errCap, "GetModuleFileNameW failed");
@@ -367,6 +398,8 @@ bool EnsureSharedObjects(char* errBuf, int32_t errCap) {
         g_shm = static_cast<SharedVCamMemory*>(
             MapViewOfFile(g_hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedVCamMemory)));
         if (!g_shm) {
+            CloseHandle(g_hMap);
+            g_hMap = nullptr;
             WriteErr(errBuf, errCap, "MapViewOfFile failed");
             return false;
         }
@@ -385,14 +418,33 @@ bool EnsureSharedObjects(char* errBuf, int32_t errCap) {
     }
 
     if (!g_hEvent) {
-        // Event DACL: SYNCHRONIZE access (0x00100000) for LOCAL SERVICE, AppContainers, and Interactive Users
+        // Event DACL: SYNCHRONIZE access (0x00100000) for LOCAL SERVICE, AppContainers, and Interactive Users.
+        // Fail closed if security descriptor creation fails so we never fall back to an unhardened NULL DACL.
         PSECURITY_DESCRIPTOR pEvtSd = nullptr;
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;LS)(A;;0x00100000;;;AC)(A;;0x00100000;;;IU)S:(ML;;NW;;;LW)",
-            SDDL_REVISION_1, &pEvtSd, nullptr);
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;LS)(A;;0x00100000;;;AC)(A;;0x00100000;;;IU)S:(ML;;NW;;;LW)",
+                SDDL_REVISION_1, &pEvtSd, nullptr)) {
+            UnmapViewOfFile(g_shm);
+            g_shm = nullptr;
+            CloseHandle(g_hMap);
+            g_hMap = nullptr;
+            WriteErr(errBuf, errCap, "Failed to create synchronization event DACL");
+            return false;
+        }
         SECURITY_ATTRIBUTES evtSa{ sizeof(evtSa), pEvtSd, FALSE };
         g_hEvent = CreateEventW(&evtSa, FALSE, FALSE, L"Global\\IntegratorVCamEvt_v1");
-        if (pEvtSd) LocalFree(pEvtSd);
+        LocalFree(pEvtSd);
+        if (!g_hEvent) {
+            DWORD err = GetLastError();
+            UnmapViewOfFile(g_shm);
+            g_shm = nullptr;
+            CloseHandle(g_hMap);
+            g_hMap = nullptr;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "CreateEventW failed (err=%lu)", static_cast<unsigned long>(err));
+            WriteErr(errBuf, errCap, msg);
+            return false;
+        }
     }
     return g_shm && g_hEvent;
 }
@@ -406,11 +458,13 @@ extern "C" {
 /// - Parameters:
 ///   - err_buf: Output buffer for error description on failure.
 ///   - err_cap: Size of error buffer in bytes.
-/// - Returns: `0` on success, negative error code on failure.
+/// - Returns: `0` on success, negative error code on failure (`-1` DLL install/reg failure,
+///   `-2` shared memory/event failure, `-3` Media Foundation/VirtualCamera creation failure,
+///   `-4` `IMFVirtualCamera::Start` failure).
 int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_virtualCamera) {
-        if (g_shm) g_shm->publisher_alive = 1;
+        if (g_shm) InterlockedExchange(&g_shm->publisher_alive, 1);
         return 0;
     }
 
@@ -424,12 +478,19 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (!g_mfStarted) {
-        if (SUCCEEDED(MFStartup(MF_VERSION))) {
+        HRESULT hrMf = MFStartup(MF_VERSION);
+        if (SUCCEEDED(hrMf)) {
             g_mfStarted = true;
+        } else {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "MFStartup failed (hr=0x%08lX)", static_cast<unsigned long>(hrMf));
+            WriteErr(err_buf, err_cap, msg);
+            return -3;
         }
     }
 
-    // Dynamically resolve Windows 11 MFCreateVirtualCamera entry point
+    // Dynamically resolve Windows 11 MFCreateVirtualCamera entry point in mfsensorgroup.dll.
+    // Retain module handle in g_hMfSensorGroup for the lifetime of the active virtual camera.
     using PFN_MFCreateVirtualCamera = HRESULT(STDAPICALLTYPE*)(
         MFVirtualCameraType,
         MFVirtualCameraLifetime,
@@ -440,12 +501,18 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
         ULONG,
         IMFVirtualCamera**
     );
-    HMODULE hMfSensorGroup = LoadLibraryW(L"mfsensorgroup.dll");
-    auto pfnCreateVCam = hMfSensorGroup
+    if (!g_hMfSensorGroup) {
+        g_hMfSensorGroup = LoadLibraryW(L"mfsensorgroup.dll");
+    }
+    auto pfnCreateVCam = g_hMfSensorGroup
         ? reinterpret_cast<PFN_MFCreateVirtualCamera>(
-              GetProcAddress(hMfSensorGroup, "MFCreateVirtualCamera"))
+              GetProcAddress(g_hMfSensorGroup, "MFCreateVirtualCamera"))
         : nullptr;
     if (!pfnCreateVCam) {
+        if (g_hMfSensorGroup) {
+            FreeLibrary(g_hMfSensorGroup);
+            g_hMfSensorGroup = nullptr;
+        }
         WriteErr(err_buf, err_cap, "Windows 11 mfsensorgroup.dll (MFCreateVirtualCamera) unavailable");
         return -3;
     }
@@ -453,7 +520,8 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
     wchar_t friendlyName[128] = {};
     ResolveFriendlyCameraName(friendlyName, 128);
 
-    // Register standalone software camera source (zero physical camera source wrapper attributes)
+    // Register standalone software camera source (zero physical camera source wrapper attributes;
+    // MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES is strictly omitted).
     HRESULT hr = pfnCreateVCam(
         MFVirtualCameraType_SoftwareCameraSource,
         MFVirtualCameraLifetime_Session,
@@ -491,7 +559,7 @@ int32_t integrator_win_vcam_start(char* err_buf, int32_t err_cap) {
         return -4;
     }
 
-    g_shm->publisher_alive = 1;
+    InterlockedExchange(&g_shm->publisher_alive, 1);
     SetEvent(g_hEvent);
     return 0;
 }
@@ -516,9 +584,14 @@ void integrator_win_vcam_push_nv12(const uint8_t* data, uint32_t len, uint64_t t
     MemoryBarrier();
 
     // Convert microsecond timestamp to Media Foundation 100-nanosecond units (1 us = 10 x 100ns)
-    shm->timestamp_100ns = static_cast<LONG64>(timestamp_us) * 10;
-    shm->active_slot = nextSlot;
-    shm->publisher_alive = 1;
+    // with saturating overflow protection against signed 64-bit wrap.
+    constexpr uint64_t kMaxTimestampUs = static_cast<uint64_t>(LLONG_MAX / 10);
+    LONG64 ts100ns = (timestamp_us <= kMaxTimestampUs)
+        ? static_cast<LONG64>(timestamp_us * 10ULL)
+        : LLONG_MAX;
+    InterlockedExchange64(&shm->timestamp_100ns, ts100ns);
+    InterlockedExchange(&shm->active_slot, nextSlot);
+    InterlockedExchange(&shm->publisher_alive, 1);
 
     // Atomic increment of sequence number signals consumer of fresh frame arrival
     InterlockedIncrement64(&shm->seq);
@@ -529,13 +602,22 @@ void integrator_win_vcam_push_nv12(const uint8_t* data, uint32_t len, uint64_t t
 void integrator_win_vcam_stop() {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_shm) {
-        g_shm->publisher_alive = 0;
+        InterlockedExchange(&g_shm->publisher_alive, 0);
+        MemoryBarrier();
     }
     if (g_virtualCamera) {
         g_virtualCamera->Shutdown();
         g_virtualCamera->Remove();
         g_virtualCamera->Release();
         g_virtualCamera = nullptr;
+    }
+    if (g_mfStarted) {
+        MFShutdown();
+        g_mfStarted = false;
+    }
+    if (g_hMfSensorGroup) {
+        FreeLibrary(g_hMfSensorGroup);
+        g_hMfSensorGroup = nullptr;
     }
     if (g_hEvent) {
         CloseHandle(g_hEvent);
@@ -559,25 +641,39 @@ int32_t integrator_win_vcam_is_active() {
 
 namespace {
 
-// Typed camera consent decision constants
+/// Typed camera reception consent decision constants returned across the Rust FFI boundary.
 enum IntegratorConsentChoice : int32_t {
+    /// Reject stream request and permanently block the peer device from future requests.
     INTEGRATOR_CONSENT_DENY_AND_BLOCK = -1,
+    /// Reject stream request (or fail closed on timeout, cancellation, or Session 0 headless mode).
     INTEGRATOR_CONSENT_DENY           =  0,
+    /// Authorize a single continuous video stream lease only.
     INTEGRATOR_CONSENT_ALLOW_ONCE     =  1,
+    /// Authorize camera streaming for the duration of the active transport session.
     INTEGRATOR_CONSENT_ACTIVE_SESSION =  2,
+    /// Persist permanent camera streaming authorization for this paired peer device.
     INTEGRATOR_CONSENT_ALWAYS_ALLOW   =  3,
 };
 
-// Thread-safe state for prompt cancellation and tracking
+/// Mutex protecting concurrent access to `g_winActivePromptHwnd` during prompt display and cancellation.
 static std::mutex g_winPromptLock;
+
+/// Window handle of the currently displayed Win32 TaskDialog consent prompt, or `nullptr` if none.
 static HWND g_winActivePromptHwnd = nullptr;
+
+/// Atomic flag set when `integrator_win_cancel_camera_consent_prompt` is invoked by the Rust core.
 static std::atomic<bool> g_winPromptCancelled{false};
 
+/// Callback context passed via `lpCallbackData` into `WinPromptCallbackProc`.
 struct WinPromptContext {
+    /// Maximum dialog display duration in milliseconds before automatic fail-closed dismissal.
     DWORD timeout_ms;
+    /// Flag set to `true` if `TDN_TIMER` elapsed past `timeout_ms`.
     bool timed_out;
 };
 
+/// Win32 `TaskDialogIndirect` notification callback handling window handle registration,
+/// bounded timer countdown, and immediate asynchronous cancellation.
 static HRESULT CALLBACK WinPromptCallbackProc(
     HWND hwnd,
     UINT uNotification,
@@ -593,6 +689,7 @@ static HRESULT CALLBACK WinPromptCallbackProc(
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
     } else if (uNotification == TDN_TIMER) {
+        // wParam carries elapsed milliseconds since dialog creation (~200ms tick resolution)
         DWORD elapsed_ms = static_cast<DWORD>(wParam);
         if (ctx && elapsed_ms >= ctx->timeout_ms) {
             ctx->timed_out = true;
@@ -667,8 +764,10 @@ extern "C" int32_t integrator_win_prompt_camera_consent_scoped(const char* peer_
         { BTN_DENY_BLOCK,    L"Deny & Block\nPermanently block this device from requesting camera access" },
     };
 
+    // Clamp timeout_sec to [1, 300] seconds to prevent 32-bit DWORD multiplication overflow.
+    uint32_t clamped_sec = (timeout_sec == 0) ? 30u : (timeout_sec > 300u ? 300u : timeout_sec);
     WinPromptContext ctx;
-    ctx.timeout_ms = (timeout_sec > 0 ? timeout_sec : 30) * 1000;
+    ctx.timeout_ms = static_cast<DWORD>(clamped_sec * 1000u);
     ctx.timed_out = false;
 
     g_winPromptCancelled.store(false, std::memory_order_release);
@@ -701,7 +800,16 @@ extern "C" int32_t integrator_win_prompt_camera_consent_scoped(const char* peer_
         FreeLibrary(hComCtl);
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_winPromptLock);
+        g_winActivePromptHwnd = nullptr;
+    }
+
     if (FAILED(hr)) {
+        // Check cancellation before displaying fallback MessageBoxTimeoutW so a cancelled prompt never appears.
+        if (g_winPromptCancelled.load(std::memory_order_acquire)) {
+            return INTEGRATOR_CONSENT_DENY;
+        }
         // Fallback for minimal/headless environments using MessageBoxTimeoutW
         typedef int (WINAPI *PFN_MessageBoxTimeoutW)(HWND, LPCWSTR, LPCWSTR, UINT, WORD, DWORD);
         HMODULE hUser32 = GetModuleHandleW(L"user32.dll");

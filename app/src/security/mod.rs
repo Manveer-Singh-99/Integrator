@@ -7,10 +7,11 @@
 //! deterministic device and key identifier derivation, human-readable Short Authentication String (SAS)
 //! generation, hex encoding/decoding, and high-resolution Unix timestamps.
 //!
-//! The module re-exports the five core cryptographic domain modules:
+//! The module re-exports the six core cryptographic domain modules:
 //! - [`spake2_rfc9382`]: Verbatim RFC 9382 Password-Authenticated Key Exchange over Edwards25519.
 //! - [`keystore`]: OS-native hardware- and credential-backed Master Keystore (`trusted_peers_v2.json`).
 //! - [`pairing`]: 4-message mutual SPAKE2 + Ed25519 handshake protocol (`IPR2`) and anti-DoS engine.
+//! - [`passkey`]: FIDO2 / CTAP2 WebAuthn resident passkey authenticator backed by macOS Touch ID.
 //! - [`transport`]: Mutually authenticated, forward-secret, replay-protected TCP record layer (`ITR2`).
 //! - [`audio_udp`]: Authenticated ChaCha20-Poly1305 UDP datagram audio protocol (`IUA2`) with sliding anti-replay.
 //!
@@ -127,7 +128,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// # Returns
 /// 32-byte SHA-256 digest array.
-#[allow(dead_code)]
 pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
@@ -230,7 +230,7 @@ pub fn format_sas_6(bytes: &[u8; 4]) -> String {
 /// # Returns
 /// Lowercase hexadecimal String.
 pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for b in bytes {
         use std::fmt::Write;
         let _ = write!(&mut out, "{:02x}", b);
@@ -263,7 +263,8 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 
 /// Decodes a hexadecimal string into an exact fixed-size byte array `[u8; N]`.
 ///
-/// Rejects input if the decoded byte length does not match `N` exactly.
+/// Rejects input immediately in `O(1)` before allocation if the hex string length does not
+/// equal `2 * N` bytes, preventing transient heap allocations on oversized untrusted inputs.
 ///
 /// # Type Parameters
 /// * `N` - Desired array length in bytes.
@@ -274,6 +275,9 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 /// # Returns
 /// `Some([u8; N])` on exact length and valid hex; `None` otherwise.
 pub fn hex_decode_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N.saturating_mul(2) {
+        return None;
+    }
     let vec = hex_decode(hex)?;
     if vec.len() != N {
         return None;
@@ -863,9 +867,12 @@ mod tests {
         std::fs::write(&secret_target, b"do not delete").unwrap();
 
         // 4. Create a symlink named like a temp file pointing to important_secret.txt
-        let symlink_tmp = dir.join(".trusted_peers_v2.json.tmp.symlink");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&secret_target, &symlink_tmp).unwrap();
+        let symlink_tmp = {
+            let p = dir.join(".trusted_peers_v2.json.tmp.symlink");
+            std::os::unix::fs::symlink(&secret_target, &p).unwrap();
+            p
+        };
 
         // Run stale temp files cleanup
         clean_stale_temp_files(&dir);

@@ -27,8 +27,8 @@
 //!
 //! ## 2. Cross-Subsystem Architectural Coexistence
 //!
-//! ### Display Streaming vs. Camera Streaming
-//! The display streaming subsystem operates concurrently alongside the **Shared Camera Subsystem**
+//! ### Display Streaming vs. Camera & Microphone Streaming
+//! The display streaming subsystem operates concurrently alongside the **Shared Camera & Microphone Subsystem**
 //! (`camera/mod.rs`, `camera_macos.swift`, `camera_windows.cpp`, `vcam_windows.cpp`):
 //! - **Display Pipeline**: Operates over Sunshine/Moonlight streaming ports (TCP/UDP 47989, 48989, 47998-48010)
 //!   and Display Control RPC (TCP 58281). Utilizes hardware-accelerated H.264/HEVC compression to deliver
@@ -37,11 +37,25 @@
 //!   Transfers uncompressed 720p30 NV12 bi-planar video frames directly into Windows 11 Media Foundation
 //!   FrameServer (`integrator_vcam.dll`), bypassing video compression artifacts to provide instant,
 //!   low-overhead camera input to Windows conferencing apps without third-party drivers or physical camera
-//!   source wrapper attributes.
+//!   source wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
+//! - **Shared Microphone Control**: Coordinates macOS AVFoundation audio input discovery, source selection,
+//!   permission verification, mute state, and linear gain (`0.0..=2.0`) over Display Control RPC.
 //!
 //! Both pipelines run concurrently without port conflicts, thread contention, or encoder resource starvation.
 //!
 //! ## 3. Architectural Linkages & Cross-Platform Flow
+//!
+//! ### Upstream Callers
+//! - [`crate::core::IntegratorCore`]: Initializes [`DisplayController`] and [`DisplayServer`] on daemon boot
+//!   and dispatches UI/CLI display, camera, microphone, True Tone, audio, and storage commands.
+//!
+//! ### Downstream Callees
+//! - [`mac_display::MacDisplayManager`]: CoreGraphics `CGVirtualDisplay` FFI (`virtual_display.m`),
+//!   `sunshine.conf` configuration, and `Moonlight.app` / `Sunshine.app` process lifecycle on macOS.
+//! - [`win_display::WinDisplayManager`]: Windows Virtual Display Driver (VDD) PnP management, DirectX
+//!   `UserGpuPreferences` routing, and `Moonlight.exe` / `SunshineService` orchestration on Windows 11.
+//! - [`crate::camera::CameraService`], [`crate::audio::AudioManager`], [`crate::truetone`],
+//!   [`crate::storage::StorageManager`], [`crate::trust`]: Invoked by [`DisplayController::handle_rpc`].
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────────────┐
@@ -98,10 +112,15 @@ pub mod controller;
 /// TCP RPC listener and connection demultiplexer for display control commands.
 pub mod server;
 
+/// Re-exported central display session controller and RPC dispatcher.
 pub use controller::DisplayController;
+/// Re-exported TCP listener and `TransportSessionV2` / `IPR2` protocol demultiplexer.
 pub use server::DisplayServer;
+/// Re-exported Display Control RPC request enum.
 pub use protocol::DisplayRpcRequest;
+/// Re-exported Windows native display and VDD manager.
 #[allow(unused_imports)]
 pub use win_display::WinDisplayManager;
+/// Re-exported macOS native virtual display and Sunshine/Moonlight manager.
 #[allow(unused_imports)]
 pub use mac_display::MacDisplayManager;

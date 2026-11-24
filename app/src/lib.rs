@@ -27,22 +27,26 @@
 //! - `audio`: Low-latency audio capture and playback via CoreAudio (macOS) and WASAPI (Windows).
 //! - `autostart`: OS login item / registry persistence via LaunchAgents (macOS) and Registry Run keys (Windows).
 //! - `benchmark`: Network throughput, RTT, and hardware encode/decode benchmarking suite.
-//! - `bridge`: Active connection RTT monitoring and physical link medium detection (Thunderbolt vs. Wi-Fi).
-//! - `camera`: Virtual webcam pipeline leveraging CoreMediaIO DAL (macOS) and Media Foundation FrameServer (Windows).
+//! - `ble_discovery`: Bluetooth Low Energy (BLE) magic-packet proximity discovery over CoreBluetooth / WinRT.
+//! - `bonjour_discovery`: Standard Bonjour / mDNS (`_integrator._tcp.local.`) zero-configuration discovery.
+//! - `bridge`: Active connection RTT probing (`LinkMonitor`) consumed by `discovery`.
+//! - `camera`: Virtual webcam pipeline leveraging AVFoundation (macOS) and Media Foundation FrameServer (Windows 11).
 //! - `clipboard`: OS pasteboard synchronization using `NSPasteboard` (macOS) and Win32 Clipboard API (Windows).
 //! - `config`: Well-known protocol port constants and network configuration defaults.
 //! - `core`: Global singleton runtime orchestrating lifecycle, state machines, IPC dispatch, and subsystem coordination.
-//! - `discovery`: UDP multicast beacon broadcasting and listener daemon for zero-conf peer discovery.
+//! - `discovery`: Multi-transport peer discovery (UDP beacons, Bonjour/mDNS, BLE) and dynamic route ranking.
 //! - `display`: Screen capture (ScreenCaptureKit/Desktop Duplication) and display stream encoding/decoding.
 //! - `features`: Dynamic capability negotiation and feature flag toggles between peers.
 //! - `ffi`: C-compatible Foreign Function Interface bridge for native GUI frontends.
 //! - `kvm`: Low-level input hooking (CGEventTap / SendInput) and synthetic remote input injection.
-//! - `security`: Mutual authentication (SPAKE2+), wire encryption (ChaCha20-Poly1305), and replay-protected UDP datagrams.
-//! - `storage`: Persistent local JSON configuration, trusted peer keystores, and device identity storage.
-//! - `system_info`: Physical network interface topology, MTU probing, route classification, and battery/power metrics.
-//! - `telemetry`: End-to-end metrics collection, packet loss calculation, RTT tracking, and IPC streaming.
-//! - `truetone`: Ambient light sensing and display color temperature synchronization between paired machines.
-//! - `trust`: Cryptographic trust store managing Ed25519 peer public keys and authorization states.
+//! - `media`: Windows GSMTC media session telemetry and remote playback transport controls.
+//! - `security`: Mutual authentication (SPAKE2+), X25519 key exchange, ChaCha20-Poly1305, and replay protection.
+//! - `setup`: Cross-platform OS permissions audit, launch prompting, and guided companion dependency installer.
+//! - `storage`: Cross-platform SMB shared storage mounting and local shared folder configuration.
+//! - `system_info`: Physical network interface topology, MTU probing, route classification, and hardware/power metrics.
+//! - `telemetry`: Real-time health monitoring, GPU telemetry collection, and diagnostics reporting.
+//! - `truetone`: Ambient light sensing and display white point synchronization between paired machines.
+//! - `trust`: Persistent cryptographic peer identity trust management, Touch ID assertions, and authorization state.
 //!
 //! ### Cross-Platform / Cross-Device Flow:
 //! Data originates on a host machine (e.g. macOS capturing screen frames via ScreenCaptureKit or audio via CoreAudio),

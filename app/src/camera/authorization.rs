@@ -1,19 +1,59 @@
-//! Integrator Camera Authorization & Consent Management Subsystem
+//! # Integrator Camera Authorization & Consent Management Subsystem
 //!
-//! Enforces user-controlled, cryptographically bound camera access permissions
-//! across macOS physical capture and Windows virtual camera publication.
-//!
-//! ========================================================================================
-//! 1. MODULE SCOPE & SECURITY ARCHITECTURE
-//! ========================================================================================
+//! ## 1. Module Purpose & Scope
+//! Enforces user-controlled, cryptographically bound camera access permissions across macOS physical
+//! capture and Windows 11 virtual camera publication (`camera` feature).
 //! - Enforces independent Sender-side (macOS) and Receiver-side (Windows) authorization barriers.
-//! - Implements a formal `CameraConsentState` state machine with explicit transitions.
+//! - Implements a formal [`CameraConsentState`] state machine with explicit lifetime transitions
+//!   (`NoConsent`, `PromptPending`, `DeniedTemporary`, `DeniedPersistent`, `Granted*`, `Revoking`).
 //! - Bridges asynchronous Display RPC control connections and camera video streaming TCP sockets
-//!   via short-lived, single-use, cryptographically random `AuthorizationLease` tokens.
-//! - Enforces exponential denial cooldowns (5m -> 30m -> 24h) preventing modal prompt fatigue.
-//! - Isolates runtime ephemeral states (`Instant`-bound) from HMAC-authenticated persistent records.
-//! - Integrates with `KeystoreV2` and `ACTIVE_SESSION_REGISTRY` to invalidate permissions on
-//!   unpairing, blocking, or trust generation advance.
+//!   via short-lived, single-use, cryptographically random [`AuthorizationLease`] tokens.
+//! - Enforces exponential denial cooldowns (`5m -> 30m -> 24h`) preventing modal prompt fatigue.
+//! - Isolates runtime ephemeral states (`Instant`-bound) from persistent keystore records.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - [`crate::camera::CameraService`]: Calls consent evaluation, prompt initiation, grant/denial
+//!     recording, lease creation/redemption, and revocation lifecycle hooks during RPC setup and
+//!     per-frame stream validation.
+//!   - [`crate::display::controller::DisplayController`]: Queries non-mutating consent status via
+//!     `CheckCameraConsent` RPC and triggers camera startup authorization flows.
+//!   - [`crate::trust`]: Triggers `on_peer_unpaired`, `on_trust_generation_advanced`, and
+//!     `on_session_disconnected` callbacks when trust relationships or transport sessions change.
+//! - **Downstream Callees**:
+//!   - [`crate::security::csprng_array`]: Generates 256-bit cryptographically random bearer lease tokens.
+//!   - [`crate::security::transport::is_peer_revoked`]: Fails closed whenever peer trust is revoked.
+//!   - `KeystoreV2` (via [`crate::camera::CameraService`]): Persists `AlwaysAllow` and `Blocked`
+//!     decisions with trust generation binding across daemon restarts.
+//! - **Cross-Platform / Cross-Device Flow**:
+//!   1. Peer issues `DisplayRpcRequest::StartCamera` over authenticated `TransportSessionV2` (`:58281`).
+//!   2. Responder verifies consent and mints a single-use 32-byte [`AuthorizationLease`] returned in
+//!      `DisplayRpcResponse::camera_lease_token_hex` (macOS sender mints `OutboundSender`, Windows
+//!      receiver mints `InboundReceiver`).
+//!   3. Stream initiator connects to `TCP :58287` (`ServiceId::CameraStream`) and transmits the
+//!      token inside an `ICAM` frame flagged with `FLAG_AUTH_LEASE_REDEMPTION`.
+//!   4. Receiver/sender redeems the single-use lease once before forwarding uncompressed NV12 frames.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Interior Synchronization**: All consent maps, persistent store, lease registry, session epoch
+//!   table, and pending prompt counters are guarded by independent `std::sync::Mutex` instances, with
+//!   a lock-free `AtomicU64` monotonic request-ID generator.
+//! - **Lock Acquisition Order**: When multiple locks are held simultaneously (e.g., `try_begin_prompt`,
+//!   `evaluate_consent_internal`, `record_denial`), acquisition strictly follows:
+//!   `active_prompt_count` -> (`sender_consents` / `receiver_consents`) -> `persistent_consents`.
+//!   Locks are never held across `.await` points or UI modal prompts, and all mutexes recover cleanly
+//!   from poisoning (`unwrap_or_else(|e| e.into_inner())`).
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Fail-Closed Revocation**: `is_peer_revoked` and mismatched `trust_generation` / `session_epoch`
+//!   checks unconditionally deny access and invalidate stale grants.
+//! - **Anti-Replay Single-Use Leases**: Every 32-byte lease token is marked `redeemed = true` atomically
+//!   under the `leases` lock on first use and purged on expiration, unpairing, or revocation.
+//! - **Zero Token Exposure**: `fmt::Debug` on [`AuthorizationLease`] unconditionally redacts
+//!   `lease_token` (`"<REDACTED>"`), preventing secret leakage into logs or crash dumps.
+//! - **Prompt Exhaustion & Cooldown Resistance**: Concurrent prompts are coalesced per peer, capped
+//!   globally at [`MAX_GLOBAL_PENDING_PROMPTS`] (`8`), and rate-limited via non-resettable exponential
+//!   denial cooldowns (`denial_duration_for_attempt`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,39 +116,53 @@ pub enum CameraConsentState {
     NoConsent,
     /// Modal authorization prompt is currently presented or queued on the local host UI.
     PromptPending {
+        /// Monotonic identifier of the pending authorization prompt request.
         request_id: u64,
+        /// Monotonic timestamp when this prompt was initiated (used for [`PROMPT_TIMEOUT`] expiry).
         prompt_started: Instant,
     },
     /// Request was denied; temporarily blocks further prompts to prevent harassment.
     DeniedTemporary {
+        /// Monotonic deadline until which new consent prompts are suppressed.
         expires_at: Instant,
+        /// Consecutive temporary denial count driving the exponential backoff schedule.
         consecutive_denials: u32,
     },
     /// Request was persistently blocked by explicit user choice. Survives daemon restarts.
     DeniedPersistent,
     /// Authorized for a single continuous stream identified by `stream_id`.
     GrantedEphemeral {
+        /// Active transport session epoch under which this grant was issued.
         session_epoch: u64,
+        /// Peer trust generation bound to this authorization.
         generation: u64,
+        /// Unique identifier of the single stream permitted (`0` matches any initial stream close).
         stream_id: u64,
     },
     /// Authorized for a fixed duration.
     GrantedTimed {
+        /// Active transport session epoch under which this grant was issued.
         session_epoch: u64,
+        /// Peer trust generation bound to this authorization.
         generation: u64,
+        /// Monotonic expiration deadline for this timed grant.
         expires_at: Instant,
     },
     /// Authorized for the active transport session epoch. Invalidated on disconnect.
     GrantedSession {
+        /// Active transport session epoch under which this grant was issued.
         session_epoch: u64,
+        /// Peer trust generation bound to this authorization.
         generation: u64,
     },
     /// Persistently authorized across restarts. Revalidated against keystore trust generation on boot.
     GrantedRemembered {
+        /// Peer trust generation at which `AlwaysAllow` consent was recorded.
         generation: u64,
     },
     /// Consent is actively being revoked; in-flight teardown underway.
     Revoking {
+        /// Peer trust generation being revoked or transitioned.
         generation: u64,
     },
 }
@@ -117,7 +171,10 @@ pub enum CameraConsentState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentCameraConsent {
     /// Persistently allowed while paired at `generation`.
-    AlwaysAllow { generation: u64 },
+    AlwaysAllow {
+        /// Keystore trust generation at which persistent consent was granted.
+        generation: u64,
+    },
     /// Persistently blocked until manually unblocked.
     Blocked,
 }
@@ -125,10 +182,15 @@ pub enum PersistentCameraConsent {
 /// Wire-compatible status of camera consent returned to querying peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CameraConsentStatusWire {
+    /// Responder currently lacks active consent and will prompt the local user on stream request.
     RequiresPrompt,
+    /// Responder currently holds valid active consent for the querying peer and generation.
     Granted,
+    /// Responder is temporarily denying consent (active backoff cooldown or revocation in progress).
     Denied,
+    /// Querying peer is persistently blocked or trust-revoked on the responder.
     Blocked,
+    /// Camera subsystem is disabled by local policy or feature toggle.
     Disabled,
 }
 
@@ -140,7 +202,12 @@ pub enum ConsentEvaluation {
     /// No valid consent exists; an interactive user prompt is required.
     RequiresPrompt,
     /// Access is currently blocked under a temporary denial cooldown.
-    DeniedTemporary { remaining: Duration, consecutive_denials: u32 },
+    DeniedTemporary {
+        /// Remaining duration before the cooldown expires.
+        remaining: Duration,
+        /// Total consecutive temporary denials recorded in the current series.
+        consecutive_denials: u32,
+    },
     /// Access is persistently blocked by user choice.
     DeniedPersistent,
     /// Consent is currently in the process of being revoked.
@@ -189,12 +256,29 @@ impl std::fmt::Debug for AuthorizationLease {
 /// Errors occurring during authorization lease validation and redemption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseError {
+    /// Lease token was never issued, already purged, or evicted during revocation.
     UnknownLease,
+    /// Lease token was already consumed by an earlier stream connection (replay rejected).
     AlreadyRedeemed,
+    /// Lease monotonic expiration deadline has passed.
     Expired,
-    PeerMismatch { expected: String, actual: String },
-    GenerationMismatch { expected: u64, actual: u64 },
+    /// Presenting peer identity does not match the peer bound to the minted lease.
+    PeerMismatch {
+        /// Normalized device ID hex bound at lease creation.
+        expected: String,
+        /// Normalized device ID hex presented by the stream connection.
+        actual: String,
+    },
+    /// Peer's current trust generation does not match the generation bound at lease creation.
+    GenerationMismatch {
+        /// Trust generation captured when the lease was issued.
+        expected: u64,
+        /// Trust generation observed during redemption.
+        actual: u64,
+    },
+    /// Lease operation direction (`OutboundSender` vs `InboundReceiver`) does not match endpoint role.
     DirectionMismatch,
+    /// Peer trust has been revoked; lease redemption failed closed.
     PeerRevoked,
 }
 
@@ -221,7 +305,9 @@ impl std::error::Error for LeaseError {}
 /// In-memory record tracking consent state and modification timestamp.
 #[derive(Debug, Clone)]
 pub struct CameraConsentRecord {
+    /// Current state in the [`CameraConsentState`] authorization state machine.
     pub state: CameraConsentState,
+    /// Monotonic instant when [`Self::state`] was most recently updated.
     pub last_updated: Instant,
 }
 
@@ -303,6 +389,9 @@ impl CameraConsentManager {
         self.evaluate_consent_internal(&self.receiver_consents, peer_device_id_hex, current_generation)
     }
 
+    /// Evaluates consent state in `store` for `peer_device_id_hex` against `current_generation`,
+    /// failing closed on revocation, expiration, or session/generation mismatch and transitioning
+    /// expired prompts or cooldowns cleanly.
     fn evaluate_consent_internal(
         &self,
         store: &Mutex<HashMap<String, CameraConsentRecord>>,
@@ -443,6 +532,7 @@ impl CameraConsentManager {
         };
         let mut map = store.lock().unwrap_or_else(|e| e.into_inner());
 
+        let mut was_already_pending = false;
         if let Some(record) = map.get(&clean_id) {
             match &record.state {
                 CameraConsentState::PromptPending { prompt_started, request_id } => {
@@ -450,6 +540,9 @@ impl CameraConsentManager {
                         // Coalesce duplicate requests: return existing active prompt request_id
                         return Ok(*request_id);
                     }
+                    // Previous prompt timed out in map without evaluate_consent_internal running yet;
+                    // replacing it retains the existing active_prompt_count slot without double-counting.
+                    was_already_pending = true;
                 }
                 CameraConsentState::DeniedTemporary { expires_at, consecutive_denials } => {
                     if Instant::now() < *expires_at {
@@ -477,7 +570,9 @@ impl CameraConsentManager {
                 last_updated: Instant::now(),
             },
         );
-        *count_guard += 1;
+        if !was_already_pending {
+            *count_guard += 1;
+        }
         Ok(request_id)
     }
 
@@ -625,17 +720,31 @@ impl CameraConsentManager {
     /// Manually unblocks `peer_device_id_hex`, clearing persistent blocks and temporary denials.
     pub fn unblock_peer(&self, peer_device_id_hex: &str) {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
+        let mut pending_cleared = 0usize;
+        {
+            let mut sender = self.sender_consents.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(
+                sender.remove(&clean_id).map(|r| r.state),
+                Some(CameraConsentState::PromptPending { .. })
+            ) {
+                pending_cleared += 1;
+            }
+        }
+        {
+            let mut receiver = self.receiver_consents.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(
+                receiver.remove(&clean_id).map(|r| r.state),
+                Some(CameraConsentState::PromptPending { .. })
+            ) {
+                pending_cleared += 1;
+            }
+        }
         {
             let mut persistent = self.persistent_consents.lock().unwrap_or_else(|e| e.into_inner());
             persistent.remove(&clean_id);
         }
-        {
-            let mut sender = self.sender_consents.lock().unwrap_or_else(|e| e.into_inner());
-            sender.remove(&clean_id);
-        }
-        {
-            let mut receiver = self.receiver_consents.lock().unwrap_or_else(|e| e.into_inner());
-            receiver.remove(&clean_id);
+        for _ in 0..pending_cleared {
+            self.decrement_prompt_count();
         }
     }
 
@@ -658,11 +767,12 @@ impl CameraConsentManager {
             leases.retain(|_, l| !l.peer_device_id.eq_ignore_ascii_case(&clean_id));
         }
 
-        let mut was_pending = false;
+        // Track both directions separately so simultaneous pending prompts decrement accurately.
+        let mut pending_cleared = 0usize;
         {
             let mut sender = self.sender_consents.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(sender.get(&clean_id).map(|r| &r.state), Some(CameraConsentState::PromptPending { .. })) {
-                was_pending = true;
+                pending_cleared += 1;
             }
             sender.insert(
                 clean_id.clone(),
@@ -675,7 +785,7 @@ impl CameraConsentManager {
         {
             let mut receiver = self.receiver_consents.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(receiver.get(&clean_id).map(|r| &r.state), Some(CameraConsentState::PromptPending { .. })) {
-                was_pending = true;
+                pending_cleared += 1;
             }
             receiver.insert(
                 clean_id,
@@ -686,7 +796,7 @@ impl CameraConsentManager {
             );
         }
 
-        if was_pending {
+        for _ in 0..pending_cleared {
             self.decrement_prompt_count();
         }
     }
@@ -879,6 +989,7 @@ impl CameraConsentManager {
         }
     }
 
+    /// Invalidates all ephemeral, session-bound, and timed grants for `clean_id` on session disconnect.
     fn invalidate_session_scoped_consents(&self, clean_id: &str, _new_epoch: u64) {
         let now = Instant::now();
         let invalidate_entry = |record: &mut CameraConsentRecord| {
@@ -938,6 +1049,7 @@ impl CameraConsentManager {
         }
     }
 
+    /// Decrements the bounded global pending prompt counter saturating at zero.
     fn decrement_prompt_count(&self) {
         if let Ok(mut count) = self.active_prompt_count.lock() {
             if *count > 0 {
@@ -1333,5 +1445,33 @@ mod tests {
             }
             other => panic!("Expected DeniedTemporary, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_authorization_prompt_count_does_not_leak_on_unblock_or_dual_revoke() {
+        let mgr = CameraConsentManager::new();
+        let peer = "peer_prompt_count_leak";
+
+        // Start prompts in both directions for the same peer.
+        let _ = mgr
+            .try_begin_prompt(LeaseDirection::OutboundSender, peer)
+            .expect("sender prompt");
+        let _ = mgr
+            .try_begin_prompt(LeaseDirection::InboundReceiver, peer)
+            .expect("receiver prompt");
+        assert_eq!(*mgr.active_prompt_count.lock().unwrap(), 2);
+
+        // Revoking consent clears both pending prompts accurately back to zero.
+        mgr.revoke_consent(peer, 1);
+        assert_eq!(*mgr.active_prompt_count.lock().unwrap(), 0);
+        mgr.finish_revocation(peer);
+
+        // Re-open prompt and verify unblock_peer also releases the prompt slot cleanly.
+        let _ = mgr
+            .try_begin_prompt(LeaseDirection::OutboundSender, peer)
+            .expect("sender prompt 2");
+        assert_eq!(*mgr.active_prompt_count.lock().unwrap(), 1);
+        mgr.unblock_peer(peer);
+        assert_eq!(*mgr.active_prompt_count.lock().unwrap(), 0);
     }
 }

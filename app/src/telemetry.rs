@@ -292,9 +292,10 @@ fn run_nvidia_smi_with_timeout() -> Option<String> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(_) => {
-                // Process wait error: kill child and exit
+                // Process wait error: kill child, join stdout reader thread, and exit
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
         }
@@ -339,10 +340,15 @@ fn query_nvidia_smi() -> Option<GpuTelemetry> {
         .collect();
 
     if parsed_list.is_empty() {
+        // Cache negative result so empty/unparseable output does not re-spawn nvidia-smi within TTL
+        if let Ok(mut guard) = cache.lock() {
+            *guard = (Instant::now(), None);
+        }
         return None;
     }
 
-    // Prefer GPU configured in Sunshine, otherwise pick the one with highest VRAM
+    // Prefer GPU configured in Sunshine, matching bidirectionally to tolerate WDDM adapter prefixes/suffixes;
+    // otherwise fall back to the discrete/highest-VRAM GPU.
     let selected = if let Some(pref) = preferred_adapter {
         let pref_lower = pref.to_ascii_lowercase();
         parsed_list

@@ -108,6 +108,7 @@ pub mod service;
 #[cfg(target_os = "windows")]
 pub mod windows_backend;
 
-#[allow(unused_imports)]
-pub use protocol::{KvmLayoutConfig, ScreenEdge};
+/// Re-exported desk layout configuration contract for `core.rs` RPC handlers.
+pub use protocol::KvmLayoutConfig;
+/// Re-exported KVM service coordinator and point-in-time status snapshot DTO.
 pub use service::{KvmService, KvmStatusSnapshot};

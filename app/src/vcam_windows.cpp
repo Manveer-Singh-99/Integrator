@@ -19,24 +19,38 @@
  * - `IKsControl`: Handles kernel-streaming camera control property queries.
  * - `IClassFactory`: Standard COM class factory for `CLSID_IntegratorVCamActivate`.
  *
- * 2. END-TO-END CROSS-OS CAMERA PIPELINE
+ * 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
  * ----------------------------------------------------------------------------
- * 1. Capture (macOS AVFoundation):
- *    FaceTime HD camera captured at 1280x720, 30 fps, NV12 bi-planar (`camera_macos.swift`).
- * 2. Network Transport:
- *    Streamed across mutually authenticated `TransportSessionV2` (port 58287, ChaCha20-Poly1305)
- *    to the Windows Integrator host process.
- * 3. Shared Memory Ingestion:
- *    The Windows host process writes frames into `Global\IntegratorVCamShm_v1` and pulses
- *    `Global\IntegratorVCamEvt_v1` via lock-free slot swapping (`camera_windows.cpp`).
- * 4. Sample Generation & Delivery (This File):
- *    - `IntegratorMediaStream::RequestSample` is invoked by the Media Foundation pipeline.
- *    - Waits up to 33 ms on `Global\IntegratorVCamEvt_v1` for 30 fps frame pacing.
- *    - Allocates an `IMFSample` via `IMFVideoSampleAllocator`.
- *    - Locks the sample buffer via `IMF2DBuffer2::Lock2DSize` to determine hardware pitch.
- *    - Copies the active NV12 frame row-by-row respecting pitch alignment.
- *    - If publisher is inactive or sequence is 0, renders a dark neutral standby frame (Y=22, UV=128).
- *    - Dispatches `MEMediaSample` into the media event queue.
+ * - Upstream Callers:
+ *   - Windows Camera Frame Server service (`svchost.exe -k CameraService`, running as
+ *     `NT AUTHORITY\LOCAL SERVICE`) and DirectShow / Media Foundation client applications
+ *     (Teams, Zoom, Discord, OBS, browsers) that activate `CLSID_IntegratorVCamActivate`
+ *     after `camera_windows.cpp` registers the virtual camera via `MFCreateVirtualCamera`.
+ * - Downstream Callees:
+ *   - Windows Media Foundation Core (`mfplat.dll`, `mf.dll`: `MFCreateEventQueue`,
+ *     `MFCreateMediaType`, `MFCreateAttributes`, `MFCreateStreamDescriptor`,
+ *     `MFCreatePresentationDescriptor`, `MFCreateVideoSampleAllocatorEx`, `MFGetSystemTime`).
+ *   - Win32 Shared Memory & Synchronization (`kernel32.dll`: `OpenFileMappingW`,
+ *     `MapViewOfFile` read-only on `Global\IntegratorVCamShm_v1`, `OpenEventW`,
+ *     `WaitForSingleObject` on `Global\IntegratorVCamEvt_v1`).
+ * - Cross-Platform / Cross-Device Flow:
+ *   1. Capture (macOS AVFoundation):
+ *      Mac camera (built-in FaceTime HD, Studio Display, external USB, or Continuity Camera)
+ *      captured at 1280x720, 30 fps, NV12 bi-planar (`camera_macos.swift`).
+ *   2. Network Transport:
+ *      Streamed across mutually authenticated `TransportSessionV2` (port 58287, ChaCha20-Poly1305)
+ *      to the Windows Integrator host process (`app/src/camera/mod.rs`).
+ *   3. Shared Memory Ingestion:
+ *      The Windows host process writes frames into `Global\IntegratorVCamShm_v1` and pulses
+ *      `Global\IntegratorVCamEvt_v1` via lock-free slot swapping (`camera_windows.cpp`).
+ *   4. Sample Generation & Delivery (This File):
+ *      - `IntegratorMediaStream::RequestSample` is invoked by the Media Foundation pipeline.
+ *      - Waits up to 33 ms on `Global\IntegratorVCamEvt_v1` for 30 fps frame pacing.
+ *      - Allocates an `IMFSample` via `IMFVideoSampleAllocator`.
+ *      - Locks the sample buffer via `IMF2DBuffer2::Lock2DSize` to determine hardware pitch.
+ *      - Copies the active NV12 frame row-by-row respecting pitch alignment.
+ *      - If publisher is inactive or sequence is 0, renders a dark neutral standby frame (Y=22, UV=128).
+ *      - Dispatches `MEMediaSample` into the media event queue.
  *
  * 3. DIRECT SOFTWARE SOURCE CONTRACT (ZERO THIRD-PARTY DRIVERS)
  * ----------------------------------------------------------------------------
@@ -63,9 +77,23 @@
  * 5. THREADING & CONCURRENCY MODEL
  * ----------------------------------------------------------------------------
  * - Threading Model: COM Free-Threaded / "Both" (`COINIT_MULTITHREADED`).
- * - Critical Sections: `CRITICAL_SECTION m_cs` protects internal state per COM object.
- * - Non-Blocking Frame Polling: Shared memory reads use memory barriers and sequence checks;
- *   no mutex is shared between the host publisher and the FrameServer consumer.
+ * - Critical Sections: `CRITICAL_SECTION m_cs` protects internal state per COM object
+ *   (`IntegratorMediaStream`, `IntegratorMediaSource`, and `IntegratorVCamActivate`).
+ * - Non-Blocking Frame Polling: Shared memory reads use memory barriers and seqlock
+ *   sequence verification (`seq1 == seq2`); no mutex is shared between the host
+ *   publisher and the FrameServer consumer.
+ *
+ * 6. SECURITY & SAFETY INVARIANTS
+ * ----------------------------------------------------------------------------
+ * - Least-Privilege Read-Only Consumer: `Global\IntegratorVCamShm_v1` is opened strictly
+ *   with `FILE_MAP_READ` and `Global\IntegratorVCamEvt_v1` with `SYNCHRONIZE`, matching
+ *   the hardened DACL applied by `camera_windows.cpp`.
+ * - Bounds & Overflow Verification: All shared memory geometry parameters (`width`, `height`,
+ *   `frame_bytes`, `active_slot`) are treated as untrusted across process boundaries and
+ *   validated with 64-bit arithmetic before copying into locked 2D buffers.
+ * - Exception-Free COM ABI Boundary: All C++ object allocations inside COM methods use
+ *   `new (std::nothrow)` and return `E_OUTOFMEMORY` on allocation failure so C++ exceptions
+ *   never cross the COM ABI into `svchost.exe` (FrameServer).
  * ============================================================================
  */
 
@@ -87,18 +115,13 @@
 #include <propvarutil.h>
 #include <cstdint>
 #include <cstring>
+#include <new>
 
 // {8E4A6D21-7C4B-4F31-9B18-3A62F4B7E912}
+// Unique COM Class Identifier (CLSID) registered under HKLM\SOFTWARE\Classes\CLSID
+// for the Integrator Windows 11 Media Foundation Virtual Camera activator.
 DEFINE_GUID(CLSID_IntegratorVCamActivate,
     0x8e4a6d21, 0x7c4b, 0x4f31, 0x9b, 0x18, 0x3a, 0x62, 0xf4, 0xb7, 0xe9, 0x12);
-
-// {B4894D81-62B7-4EEC-8740-80658C4A9D3E}
-DEFINE_GUID(PROFILE_Legacy,
-    0xb4894d81, 0x62b7, 0x4eec, 0x87, 0x40, 0x80, 0x65, 0x8c, 0x4a, 0x9d, 0x3e);
-
-// {566E6113-8C35-48E7-B89F-D23FDC1219DC}
-DEFINE_GUID(PROFILE_HighFrameRate,
-    0x566e6113, 0x8c35, 0x48e7, 0xb8, 0x9f, 0xd2, 0x3f, 0xdc, 0x12, 0x19, 0xdc);
 
 /// Determines whether diagnostic VCAM trace logging is enabled.
 ///
@@ -244,8 +267,16 @@ void FillStandbyNV12(
     uint32_t width = kWidth,
     uint32_t height = kHeight
 ) {
-    uint32_t ySize = width * height;
-    uint32_t totalBytes = ySize + (ySize / 2);
+    if (!dst || width == 0 || height == 0 || (width & 1u) != 0 || (height & 1u) != 0 || stride < width) {
+        return;
+    }
+    uint64_t ySize64 = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    uint64_t totalBytes64 = ySize64 + (ySize64 / 2ULL);
+    if (totalBytes64 > kFrameBytes) {
+        return;
+    }
+    uint32_t ySize = static_cast<uint32_t>(ySize64);
+    uint32_t totalBytes = static_cast<uint32_t>(totalBytes64);
     // Fast path: contiguous buffer without stride padding
     if (stride == width && bufLen >= totalBytes) {
         std::memset(dst, kStandbyLumaY, ySize);
@@ -254,17 +285,18 @@ void FillStandbyNV12(
     }
     // Stride-aware Y plane fill
     for (uint32_t r = 0; r < height; ++r) {
-        if ((static_cast<size_t>(r) + 1) * stride <= bufLen) {
-            std::memset(dst + static_cast<size_t>(r) * stride, kStandbyLumaY, width);
+        size_t rowOffset = static_cast<size_t>(r) * static_cast<size_t>(stride);
+        if (rowOffset + width <= bufLen) {
+            std::memset(dst + rowOffset, kStandbyLumaY, width);
         }
     }
     // Stride-aware UV plane fill
-    uint8_t* uvBase = dst + static_cast<size_t>(height) * stride;
+    uint8_t* uvBase = dst + static_cast<size_t>(height) * static_cast<size_t>(stride);
     uint32_t uvRows = height / 2;
     for (uint32_t r = 0; r < uvRows; ++r) {
-        size_t offset = static_cast<size_t>(height + r) * stride;
+        size_t offset = static_cast<size_t>(height + r) * static_cast<size_t>(stride);
         if (offset + width <= bufLen) {
-            std::memset(uvBase + static_cast<size_t>(r) * stride, kStandbyChromaUV, width);
+            std::memset(uvBase + static_cast<size_t>(r) * static_cast<size_t>(stride), kStandbyChromaUV, width);
         }
     }
 }
@@ -288,8 +320,16 @@ void CopyNV12ToOutput(
     uint32_t width = kWidth,
     uint32_t height = kHeight
 ) {
-    const uint32_t yBytes = width * height;
-    const uint32_t frameBytes = yBytes + (yBytes / 2);
+    if (!dst || !src || width == 0 || height == 0 || (width & 1u) != 0 || (height & 1u) != 0 || dstStride < width) {
+        return;
+    }
+    const uint64_t yBytes64 = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    const uint64_t frameBytes64 = yBytes64 + (yBytes64 / 2ULL);
+    if (frameBytes64 > kFrameBytes) {
+        return;
+    }
+    const uint32_t yBytes = static_cast<uint32_t>(yBytes64);
+    const uint32_t frameBytes = static_cast<uint32_t>(frameBytes64);
     // Fast path: destination pitch matches source width
     if (dstStride == width && dstLen >= frameBytes) {
         std::memcpy(dst, src, frameBytes);
@@ -297,17 +337,18 @@ void CopyNV12ToOutput(
     }
     // Row-by-row copy for Plane 0 (Y / Luma)
     for (uint32_t r = 0; r < height; ++r) {
-        if (static_cast<size_t>(r) * dstStride + width <= dstLen) {
-            std::memcpy(dst + static_cast<size_t>(r) * dstStride, src + static_cast<size_t>(r) * width, width);
+        size_t dstOffset = static_cast<size_t>(r) * static_cast<size_t>(dstStride);
+        if (dstOffset + width <= dstLen) {
+            std::memcpy(dst + dstOffset, src + static_cast<size_t>(r) * width, width);
         }
     }
     // Row-by-row copy for Plane 1 (CbCr / Chroma)
     const uint8_t* uvSrc = src + yBytes;
-    uint8_t* uvDst = dst + static_cast<size_t>(height) * dstStride;
+    uint8_t* uvDst = dst + static_cast<size_t>(height) * static_cast<size_t>(dstStride);
     for (uint32_t r = 0; r < height / 2; ++r) {
-        size_t outEnd = static_cast<size_t>(height + r) * dstStride + width;
+        size_t outEnd = static_cast<size_t>(height + r) * static_cast<size_t>(dstStride) + width;
         if (outEnd <= dstLen) {
-            std::memcpy(uvDst + static_cast<size_t>(r) * dstStride, uvSrc + static_cast<size_t>(r) * width, width);
+            std::memcpy(uvDst + static_cast<size_t>(r) * static_cast<size_t>(dstStride), uvSrc + static_cast<size_t>(r) * width, width);
         }
     }
 }
@@ -344,8 +385,6 @@ public:
     /// - Returns: `S_OK` on success, or standard COM `HRESULT` failure.
     HRESULT Initialize(IMFMediaSource* parent, DWORD streamId) {
         CriticalLockGuard lock(m_cs);
-        m_parent = parent;
-        if (m_parent) m_parent->AddRef();
         m_streamId = streamId;
 
         HRESULT hr = MFCreateEventQueue(&m_eventQueue);
@@ -390,6 +429,10 @@ public:
             m_streamDesc->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
             m_currentType = mediaType;
             m_currentType->AddRef();
+            // Retain parent reference only after all fallible initialization steps succeed
+            // so a failed Initialize() never leaves an unbreakable circular COM reference.
+            m_parent = parent;
+            if (m_parent) m_parent->AddRef();
         }
         mediaType->Release();
         return hr;
@@ -514,23 +557,34 @@ public:
             LONG pitch = 0;
             DWORD lockedLen = 0;
             bool locked2D = false;
+            bool locked1D = false;
 
-            // Attempt 2D buffer locking to retrieve stride pitch
+            // Attempt 2D buffer locking to retrieve hardware row stride (pitch).
+            // Release buf2d immediately if Lock2DSize fails so we never leak the COM reference.
             if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&buf2d))) && buf2d) {
                 hr = buf2d->Lock2DSize(MF2DBuffer_LockFlags_Write, &dstPtr, &pitch, &bufStart, &lockedLen);
-                if (SUCCEEDED(hr)) locked2D = true;
+                if (SUCCEEDED(hr)) {
+                    locked2D = true;
+                } else {
+                    buf2d->Release();
+                    buf2d = nullptr;
+                }
             }
             if (!locked2D) {
                 DWORD maxLen = 0, curLen = 0;
                 hr = buffer->Lock(&dstPtr, &maxLen, &curLen);
-                lockedLen = maxLen;
-                pitch = static_cast<LONG>(kWidth);
+                if (SUCCEEDED(hr)) {
+                    locked1D = true;
+                    lockedLen = maxLen;
+                    pitch = static_cast<LONG>(kWidth);
+                }
             }
 
             uint32_t outputFrameBytes = kFrameBytes;
-            if (SUCCEEDED(hr) && dstPtr && pitch >= static_cast<LONG>(kWidth)) {
+            if ((locked2D || locked1D) && dstPtr && pitch >= static_cast<LONG>(kWidth)) {
+                uint32_t uPitch = static_cast<uint32_t>(pitch);
                 bool copiedLive = false;
-                // Verify publisher heartbeat and sequence freshness
+                // Verify publisher heartbeat and sequence freshness via lock-free seqlock check
                 if (m_shm && m_shm->magic == kShmMagic && m_shm->version == kShmVersion &&
                     m_shm->publisher_alive != 0 && m_shm->seq > 0) {
                     LONG64 seq1 = m_shm->seq;
@@ -555,8 +609,8 @@ public:
                         }
                     }
 
-                    if (pitch >= static_cast<LONG>(activeW)) {
-                        CopyNV12ToOutput(dstPtr, static_cast<uint32_t>(pitch), lockedLen, m_shm->slots[slot], activeW, activeH);
+                    if (uPitch >= activeW) {
+                        CopyNV12ToOutput(dstPtr, uPitch, lockedLen, m_shm->slots[slot], activeW, activeH);
                         MemoryBarrier();
                         LONG64 seq2 = m_shm->seq;
                         if (seq1 == seq2) {
@@ -565,20 +619,29 @@ public:
                         }
                     }
                 }
-                // Fallback to clean standby frame if stream is idling or host is disconnected
+                // Fallback to clean standby frame if stream is idling, host is disconnected, or seqlock raced
                 if (!copiedLive) {
-                    FillStandbyNV12(dstPtr, static_cast<uint32_t>(pitch), lockedLen, kWidth, kHeight);
+                    FillStandbyNV12(dstPtr, uPitch, lockedLen, kWidth, kHeight);
                 }
             }
 
             if (locked2D && buf2d) {
                 buf2d->Unlock2D();
                 buf2d->Release();
-            } else {
+            } else if (locked1D) {
                 buffer->Unlock();
                 buffer->SetCurrentLength(outputFrameBytes);
             }
             buffer->Release();
+
+            if (!locked2D && !locked1D) {
+                sample->Release();
+                return FAILED(hr) ? hr : E_FAIL;
+            }
+        } else {
+            if (buffer) buffer->Release();
+            sample->Release();
+            return FAILED(hr) ? hr : E_FAIL;
         }
 
         // Set sample timestamps and target frame duration in 100ns units
@@ -619,37 +682,217 @@ public:
         return S_OK;
     }
 
-    // IMFAttributes forwarding
-    STDMETHODIMP GetItem(REFGUID k, PROPVARIANT* v) override { return m_attributes ? m_attributes->GetItem(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetItemType(REFGUID k, MF_ATTRIBUTE_TYPE* t) override { return m_attributes ? m_attributes->GetItemType(k, t) : MF_E_SHUTDOWN; }
-    STDMETHODIMP CompareItem(REFGUID k, REFPROPVARIANT v, BOOL* r) override { return m_attributes ? m_attributes->CompareItem(k, v, r) : MF_E_SHUTDOWN; }
-    STDMETHODIMP Compare(IMFAttributes* t, MF_ATTRIBUTES_MATCH_TYPE m, BOOL* r) override { return m_attributes ? m_attributes->Compare(t, m, r) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetUINT32(REFGUID k, UINT32* v) override { return m_attributes ? m_attributes->GetUINT32(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetUINT64(REFGUID k, UINT64* v) override { return m_attributes ? m_attributes->GetUINT64(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetDouble(REFGUID k, double* v) override { return m_attributes ? m_attributes->GetDouble(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetGUID(REFGUID k, GUID* v) override { return m_attributes ? m_attributes->GetGUID(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetStringLength(REFGUID k, UINT32* l) override { return m_attributes ? m_attributes->GetStringLength(k, l) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetString(REFGUID k, LPWSTR s, UINT32 b, UINT32* l) override { return m_attributes ? m_attributes->GetString(k, s, b, l) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetAllocatedString(REFGUID k, LPWSTR* s, UINT32* l) override { return m_attributes ? m_attributes->GetAllocatedString(k, s, l) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetBlobSize(REFGUID k, UINT32* s) override { return m_attributes ? m_attributes->GetBlobSize(k, s) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetBlob(REFGUID k, UINT8* b, UINT32 bs, UINT32* s) override { return m_attributes ? m_attributes->GetBlob(k, b, bs, s) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetAllocatedBlob(REFGUID k, UINT8** b, UINT32* s) override { return m_attributes ? m_attributes->GetAllocatedBlob(k, b, s) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetUnknown(REFGUID k, REFIID r, LPVOID* p) override { return m_attributes ? m_attributes->GetUnknown(k, r, p) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetItem(REFGUID k, REFPROPVARIANT v) override { return m_attributes ? m_attributes->SetItem(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP DeleteItem(REFGUID k) override { return m_attributes ? m_attributes->DeleteItem(k) : MF_E_SHUTDOWN; }
-    STDMETHODIMP DeleteAllItems() override { return m_attributes ? m_attributes->DeleteAllItems() : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetUINT32(REFGUID k, UINT32 v) override { return m_attributes ? m_attributes->SetUINT32(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetUINT64(REFGUID k, UINT64 v) override { return m_attributes ? m_attributes->SetUINT64(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetDouble(REFGUID k, double v) override { return m_attributes ? m_attributes->SetDouble(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetGUID(REFGUID k, REFGUID v) override { return m_attributes ? m_attributes->SetGUID(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetString(REFGUID k, LPCWSTR v) override { return m_attributes ? m_attributes->SetString(k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetBlob(REFGUID k, const UINT8* b, UINT32 s) override { return m_attributes ? m_attributes->SetBlob(k, b, s) : MF_E_SHUTDOWN; }
-    STDMETHODIMP SetUnknown(REFGUID k, IUnknown* u) override { return m_attributes ? m_attributes->SetUnknown(k, u) : MF_E_SHUTDOWN; }
-    STDMETHODIMP LockStore() override { return m_attributes ? m_attributes->LockStore() : MF_E_SHUTDOWN; }
-    STDMETHODIMP UnlockStore() override { return m_attributes ? m_attributes->UnlockStore() : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetCount(UINT32* c) override { return m_attributes ? m_attributes->GetCount(c) : MF_E_SHUTDOWN; }
-    STDMETHODIMP GetItemByIndex(UINT32 i, GUID* k, PROPVARIANT* v) override { return m_attributes ? m_attributes->GetItemByIndex(i, k, v) : MF_E_SHUTDOWN; }
-    STDMETHODIMP CopyAllItems(IMFAttributes* d) override { return m_attributes ? m_attributes->CopyAllItems(d) : MF_E_SHUTDOWN; }
+    // IMFAttributes forwarding (synchronized via m_cs to prevent Shutdown() UAF races)
+    STDMETHODIMP GetItem(REFGUID k, PROPVARIANT* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetItem(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetItemType(REFGUID k, MF_ATTRIBUTE_TYPE* t) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetItemType(k, t);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP CompareItem(REFGUID k, REFPROPVARIANT v, BOOL* r) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->CompareItem(k, v, r);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP Compare(IMFAttributes* t, MF_ATTRIBUTES_MATCH_TYPE m, BOOL* r) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->Compare(t, m, r);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetUINT32(REFGUID k, UINT32* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetUINT32(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetUINT64(REFGUID k, UINT64* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetUINT64(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetDouble(REFGUID k, double* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetDouble(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetGUID(REFGUID k, GUID* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetGUID(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetStringLength(REFGUID k, UINT32* l) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetStringLength(k, l);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetString(REFGUID k, LPWSTR s, UINT32 b, UINT32* l) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetString(k, s, b, l);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetAllocatedString(REFGUID k, LPWSTR* s, UINT32* l) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetAllocatedString(k, s, l);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetBlobSize(REFGUID k, UINT32* s) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetBlobSize(k, s);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetBlob(REFGUID k, UINT8* b, UINT32 bs, UINT32* s) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetBlob(k, b, bs, s);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetAllocatedBlob(REFGUID k, UINT8** b, UINT32* s) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetAllocatedBlob(k, b, s);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetUnknown(REFGUID k, REFIID r, LPVOID* p) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetUnknown(k, r, p);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetItem(REFGUID k, REFPROPVARIANT v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetItem(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP DeleteItem(REFGUID k) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->DeleteItem(k);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP DeleteAllItems() override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->DeleteAllItems();
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetUINT32(REFGUID k, UINT32 v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetUINT32(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetUINT64(REFGUID k, UINT64 v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetUINT64(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetDouble(REFGUID k, double v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetDouble(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetGUID(REFGUID k, REFGUID v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetGUID(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetString(REFGUID k, LPCWSTR v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetString(k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetBlob(REFGUID k, const UINT8* b, UINT32 s) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetBlob(k, b, s);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP SetUnknown(REFGUID k, IUnknown* u) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->SetUnknown(k, u);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP LockStore() override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->LockStore();
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP UnlockStore() override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->UnlockStore();
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetCount(UINT32* c) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetCount(c);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP GetItemByIndex(UINT32 i, GUID* k, PROPVARIANT* v) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->GetItemByIndex(i, k, v);
+        a->Release();
+        return hr;
+    }
+    STDMETHODIMP CopyAllItems(IMFAttributes* d) override {
+        IMFAttributes* a = AcquireAttributes();
+        if (!a) return MF_E_SHUTDOWN;
+        HRESULT hr = a->CopyAllItems(d);
+        a->Release();
+        return hr;
+    }
 
     // IKsControl (Kernel streaming property handling)
     STDMETHODIMP KsProperty(PKSPROPERTY, ULONG, LPVOID, ULONG, ULONG* pBytesReturned) override {
@@ -695,7 +938,7 @@ public:
         return S_OK;
     }
 
-    IMFAttributes* AttributesPtr() const { return m_attributes; }
+    /// Returns the Media Foundation stream identifier index (`0` for primary video stream).
     DWORD StreamId() const { return m_streamId; }
 
     /// Shuts down stream, releases event queue, and unmaps shared memory.
@@ -713,7 +956,16 @@ public:
     }
 
 private:
-    /// Maps shared video memory and sync event read-only.
+    /// Acquires an `AddRef`'d pointer to `m_attributes` under `m_cs`, or returns `nullptr` if shut down.
+    IMFAttributes* AcquireAttributes() {
+        CriticalLockGuard lock(m_cs);
+        if (m_isShutdown || !m_attributes) return nullptr;
+        m_attributes->AddRef();
+        return m_attributes;
+    }
+
+    /// Maps shared video memory (`Global\IntegratorVCamShm_v1`) and synchronization event
+    /// (`Global\IntegratorVCamEvt_v1`) read-only on first sample request.
     void EnsureSharedMapping() {
         if (!m_shm) {
             m_shmMap = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\IntegratorVCamShm_v1");
@@ -739,6 +991,7 @@ private:
         if (m_frameEvt) { CloseHandle(m_frameEvt); m_frameEvt = nullptr; }
     }
 
+    /// Allocates and initializes sample pool (8 buffers) and transitions stream to `MF_STREAM_STATE_RUNNING`.
     HRESULT StartInternal(bool sendEvent) {
         if (!m_allocator) {
             HRESULT hr = MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&m_allocator));
@@ -755,6 +1008,7 @@ private:
         return S_OK;
     }
 
+    /// Uninitializes sample allocator pool and transitions stream to `MF_STREAM_STATE_STOPPED`.
     HRESULT StopInternal(bool sendEvent) {
         m_streamState = MF_STREAM_STATE_STOPPED;
         if (m_allocator) {
@@ -766,25 +1020,40 @@ private:
         return S_OK;
     }
 
+    /// Atomic COM reference counter.
     volatile LONG m_ref;
+    /// Per-stream critical section serializing state transitions and sample allocation.
     CRITICAL_SECTION m_cs{};
+    /// Flag set once `Shutdown()` has been executed.
     bool m_isShutdown = false;
+    /// Media Foundation stream index (`0`).
     DWORD m_streamId = 0;
+    /// Current stream execution state (`STOPPED`, `PAUSED`, or `RUNNING`).
     MF_STREAM_STATE m_streamState = MF_STREAM_STATE_STOPPED;
+    /// Owning `IMFMediaSource` reference (released during `Shutdown()`).
     IMFMediaSource* m_parent = nullptr;
+    /// Media Foundation asynchronous event queue for stream events and `MEMediaSample`.
     IMFMediaEventQueue* m_eventQueue = nullptr;
+    /// Stream-level attributes store (`MF_DEVICESTREAM_*`).
     IMFAttributes* m_attributes = nullptr;
+    /// Media Foundation stream descriptor exposing supported 720p30 NV12 media types.
     IMFStreamDescriptor* m_streamDesc = nullptr;
+    /// Active negotiated video `IMFMediaType`.
     IMFMediaType* m_currentType = nullptr;
+    /// Sample allocator pool managing output video buffers.
     IMFVideoSampleAllocator* m_allocator = nullptr;
 
+    /// Win32 file-mapping handle for `Global\IntegratorVCamShm_v1`.
     HANDLE m_shmMap = nullptr;
+    /// Read-only mapped pointer to `SharedVCamMemory`.
     const SharedVCamMemory* m_shm = nullptr;
+    /// Win32 synchronization event handle for `Global\IntegratorVCamEvt_v1`.
     HANDLE m_frameEvt = nullptr;
+    /// Last observed shared-memory frame sequence number.
     LONG64 m_lastSeq = 0;
 };
 
-/// Media Foundation capture source representing the "Integrator MacBook Camera".
+/// Media Foundation capture source representing the "Integrator Mac Camera".
 ///
 /// Implements `IMFMediaSourceEx` for capture control, `IMFGetService`, `IKsControl`,
 /// and `IMFSampleAllocatorControl` for allocator sharing with FrameServer.
@@ -794,11 +1063,13 @@ class IntegratorMediaSource final :
     public IKsControl,
     public IMFSampleAllocatorControl {
 public:
+    /// Constructs a new media source and initializes its synchronization lock.
     IntegratorMediaSource() : m_ref(1) {
         ModuleAddRef();
         InitializeCriticalSection(&m_cs);
     }
 
+    /// Ensures source is shut down and releases synchronization primitives.
     ~IntegratorMediaSource() {
         Shutdown();
         DeleteCriticalSection(&m_cs);
@@ -806,6 +1077,9 @@ public:
     }
 
     /// Initializes event queue, presentation descriptors, and child media stream.
+    ///
+    /// On any initialization error after `m_stream` creation, invokes `Shutdown()` so
+    /// circular COM references (`m_source <-> m_stream`) are broken before returning.
     HRESULT Initialize(IMFAttributes* activateAttrs) {
         LogTrace("IntegratorMediaSource::Initialize start");
         CriticalLockGuard lock(m_cs);
@@ -813,25 +1087,39 @@ public:
         if (FAILED(hr)) return hr;
 
         hr = MFCreateAttributes(&m_attributes, 16);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            Shutdown();
+            return hr;
+        }
         if (activateAttrs) {
             activateAttrs->CopyAllItems(m_attributes);
         }
 
-        m_stream = new IntegratorMediaStream();
+        m_stream = new (std::nothrow) IntegratorMediaStream();
+        if (!m_stream) {
+            Shutdown();
+            return E_OUTOFMEMORY;
+        }
         hr = m_stream->Initialize(this, 0);
         if (FAILED(hr)) {
             LogTrace("m_stream->Initialize failed");
+            Shutdown();
             return hr;
         }
 
         IMFStreamDescriptor* sd = nullptr;
         hr = m_stream->GetStreamDescriptor(&sd);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            Shutdown();
+            return hr;
+        }
 
         hr = MFCreatePresentationDescriptor(1, &sd, &m_presDesc);
         sd->Release();
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            Shutdown();
+            return hr;
+        }
 
         m_presDesc->SelectStream(0);
         m_state = State::Stopped;
@@ -859,7 +1147,8 @@ public:
         } else if (riid == IID_IMFSampleAllocatorControl) {
             *ppv = static_cast<IMFSampleAllocatorControl*>(this);
         } else if (riid == IID_IMFAttributes) {
-            if (m_attributes) {
+            CriticalLockGuard lock(m_cs);
+            if (m_state != State::Shutdown && m_attributes) {
                 return m_attributes->QueryInterface(riid, ppv);
             }
             return E_NOINTERFACE;
@@ -1055,30 +1344,46 @@ public:
     }
 
 private:
+    /// Internal lifecycle states of the Media Foundation video source.
     enum class State { Invalid, Stopped, Started, Shutdown };
+    /// Atomic COM reference counter.
     volatile LONG m_ref;
+    /// Per-source critical section serializing state changes and event queue operations.
     CRITICAL_SECTION m_cs{};
+    /// Current lifecycle state of the media source.
     State m_state = State::Invalid;
+    /// Tracks whether stream 0 has been previously selected (`MENewStream` vs `MEUpdatedStream`).
     bool m_wasSelected = false;
+    /// Media Foundation asynchronous event queue for source events (`MESourceStarted`, `MESourceStopped`).
     IMFMediaEventQueue* m_eventQueue = nullptr;
+    /// Presentation descriptor describing the single 720p30 NV12 capture stream.
     IMFPresentationDescriptor* m_presDesc = nullptr;
+    /// Source-level Media Foundation attributes store.
     IMFAttributes* m_attributes = nullptr;
+    /// Child video stream instance (`StreamId == 0`).
     IntegratorMediaStream* m_stream = nullptr;
 };
 
 /// COM activation object implementing `IMFActivate` to defer `IntegratorMediaSource` creation until needed.
 class IntegratorVCamActivate final : public IMFActivate {
 public:
+    /// Constructs a new `IMFActivate` object and initializes its attribute store and lock.
     IntegratorVCamActivate() : m_ref(1) {
         ModuleAddRef();
+        InitializeCriticalSection(&m_cs);
         MFCreateAttributes(&m_attrs, 16);
         if (m_attrs) {
             m_attrs->SetGUID(MFT_TRANSFORM_CLSID_Attribute, CLSID_IntegratorVCamActivate);
         }
     }
+    /// Releases the activated source (if any), attribute store, and critical section.
     ~IntegratorVCamActivate() {
-        if (m_source) { m_source->Release(); m_source = nullptr; }
-        if (m_attrs) { m_attrs->Release(); m_attrs = nullptr; }
+        {
+            CriticalLockGuard lock(m_cs);
+            if (m_source) { m_source->Release(); m_source = nullptr; }
+            if (m_attrs) { m_attrs->Release(); m_attrs = nullptr; }
+        }
+        DeleteCriticalSection(&m_cs);
         ModuleRelease();
     }
 
@@ -1100,12 +1405,18 @@ public:
     }
 
     // IMFActivate
+    /// Lazily instantiates and initializes `IntegratorMediaSource` under `m_cs` lock
+    /// and queries the requested interface (`IMFMediaSource` / `IMFMediaSourceEx`).
     STDMETHODIMP ActivateObject(REFIID riid, void** ppv) override {
         LogTrace("ActivateObject called");
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
+        CriticalLockGuard lock(m_cs);
         if (!m_source) {
-            m_source = new IntegratorMediaSource();
+            m_source = new (std::nothrow) IntegratorMediaSource();
+            if (!m_source) {
+                return E_OUTOFMEMORY;
+            }
             HRESULT hr = m_source->Initialize(m_attrs);
             if (FAILED(hr)) {
                 LogTrace("ActivateObject Initialize failed");
@@ -1116,7 +1427,9 @@ public:
         }
         return m_source->QueryInterface(riid, ppv);
     }
+    /// Shuts down and releases the cached `IntegratorMediaSource` instance under `m_cs` lock.
     STDMETHODIMP ShutdownObject() override {
+        CriticalLockGuard lock(m_cs);
         if (m_source) {
             m_source->Shutdown();
             m_source->Release();
@@ -1124,7 +1437,9 @@ public:
         }
         return S_OK;
     }
+    /// Detaches and releases the cached `IntegratorMediaSource` reference without shutting it down.
     STDMETHODIMP DetachObject() override {
+        CriticalLockGuard lock(m_cs);
         if (m_source) {
             m_source->Release();
             m_source = nullptr;
@@ -1165,8 +1480,13 @@ public:
     STDMETHODIMP CopyAllItems(IMFAttributes* d) override { return m_attrs ? m_attrs->CopyAllItems(d) : MF_E_SHUTDOWN; }
 
 private:
+    /// Atomic COM reference counter.
     volatile LONG m_ref;
+    /// Critical section serializing `ActivateObject`, `ShutdownObject`, and `DetachObject`.
+    CRITICAL_SECTION m_cs{};
+    /// Media Foundation activation attributes store.
     IMFAttributes* m_attrs = nullptr;
+    /// Cached `IntegratorMediaSource` instance created by `ActivateObject`.
     IntegratorMediaSource* m_source = nullptr;
 };
 
@@ -1199,7 +1519,8 @@ public:
         *ppvObject = nullptr;
         if (riid == IID_IMFMediaSource || riid == IID_IMFMediaSourceEx) {
             LogTrace("CreateInstance activating MediaSource directly");
-            IntegratorMediaSource* src = new IntegratorMediaSource();
+            IntegratorMediaSource* src = new (std::nothrow) IntegratorMediaSource();
+            if (!src) return E_OUTOFMEMORY;
             HRESULT hr = src->Initialize(nullptr);
             if (FAILED(hr)) {
                 src->Release();
@@ -1209,7 +1530,8 @@ public:
             src->Release();
             return hr;
         }
-        IntegratorVCamActivate* act = new IntegratorVCamActivate();
+        IntegratorVCamActivate* act = new (std::nothrow) IntegratorVCamActivate();
+        if (!act) return E_OUTOFMEMORY;
         HRESULT hr = act->QueryInterface(riid, ppvObject);
         act->Release();
         return hr;
@@ -1220,6 +1542,7 @@ public:
         return S_OK;
     }
 private:
+    /// Atomic COM reference counter.
     volatile LONG m_ref;
 };
 
@@ -1229,7 +1552,7 @@ private:
 // STANDARD COM DLL EXPORTS
 // ============================================================================
 
-/// DLL entry point managing Media Foundation startup and shutdown per process attach/detach.
+/// DLL entry point disabling per-thread notifications on process attach.
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
@@ -1240,9 +1563,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     return TRUE;
 }
 
-/// Standard COM export returning whether the DLL has active references.
+/// Standard COM export returning whether the DLL has active object or lock references.
 STDAPI DllCanUnloadNow() {
-    return g_moduleRefCount == 0 ? S_OK : S_FALSE;
+    return InterlockedCompareExchange(&g_moduleRefCount, 0, 0) == 0 ? S_OK : S_FALSE;
 }
 
 /// Standard COM export instantiating the class factory for `CLSID_IntegratorVCamActivate`.
@@ -1252,7 +1575,8 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     *ppv = nullptr;
     if (rclsid == CLSID_IntegratorVCamActivate) {
         LogTrace("DllGetClassObject CLSID matched");
-        IntegratorClassFactory* cf = new IntegratorClassFactory();
+        IntegratorClassFactory* cf = new (std::nothrow) IntegratorClassFactory();
+        if (!cf) return E_OUTOFMEMORY;
         HRESULT hr = cf->QueryInterface(riid, ppv);
         cf->Release();
         return hr;

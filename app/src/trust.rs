@@ -41,10 +41,35 @@
 //!   All locks are acquired, read/updated, and dropped synchronously before invoking network I/O,
 //!   ensuring all async futures implement `Send` and remain fully Tokio-compatible.
 //!
-//! ## 2.3 Subsystem Linkages
+//! ## 2.3 Cross-Platform / Cross-Device Flow (macOS ↔ Windows 11)
+//! - **Discovery Phase (UDP Port `58280`)**: Both macOS and Windows 11 periodically broadcast
+//!   Ed25519-signed `DiscoveryBeacon` v2 packets (`sign_discovery_beacon_v2_full`). The receiving
+//!   counterpart verifies the signature, $\pm 60\text{s}$ timestamp freshness, `device_id` derivation,
+//!   and blocklist state via `verify_discovery_beacon_v2_full`, then records the untrusted UI hint via
+//!   `observe_discovered_peer`.
+//! - **Pairing Phase (TCP Port `58281`, `IPR2`)**: When the user enters the 6-digit PIN displayed on
+//!   the peer workstation, `pair_with_remote_peer_v2` (client) and `handle_incoming_pairing_stream_v2`
+//!   (server) execute the 4-message RFC 9382 SPAKE2 + Ed25519 identity pinning handshake and persist
+//!   the shared 32-byte root key $K_{\text{root}}$ in `KeystoreV2`.
+//! - **Operational Transport Phase (`ITR2`)**: All cross-device services connect via
+//!   `connect_transport_to_ip` / `connect_transport_to_hinted_ip` and accept via
+//!   `accept_transport_from_stream`, binding each TCP stream to a dedicated `ServiceId`.
+//! - **Biometric Passkey / Touch ID Flow (Windows 11 → macOS)**: Windows 11 generates a 32-byte
+//!   CSPRNG challenge nonce (`generate_random_token_hex(32)`) and requests Touch ID verification over
+//!   `TransportSessionV2`. The macOS host invokes `evaluate_local_touchid_and_sign` (calling into native
+//!   `LocalAuthentication.framework` via FFI), signs the domain-separated challenge transcript with its
+//!   Ed25519 identity key, and returns a `TouchIdSignedAssertion` that Windows 11 verifies via
+//!   `verify_touchid_assertion` within a $\pm 120\text{s}$ freshness window.
+//! - **Two-Phase Revocation Flow (`SEC-1D-06`, `SEC-1D-07`, `VULN-04`)**: When a user unpairs or blocks
+//!   a peer (`untrust_or_block_device` / `unpair_device`), Phase A synchronously updates `KeystoreV2`
+//!   on disk and increments the peer's revocation generation under the keystore lock, and Phase B
+//!   asynchronously tears down all active KVM, Display, Camera, Audio, and Clipboard sessions outside
+//!   the keystore lock.
+//!
+//! ## 2.4 Subsystem Linkages
 //! ```text
 //!       +-----------------------+
-//!       |      Discovery        | (Port 58280 UDP - Untrusted hints)
+//!       |      Discovery        | (Port 58280 UDP / Bonjour / BLE - Untrusted hints)
 //!       +-----------+-----------+
 //!                   | observe_discovered_peer()
 //!                   v
@@ -53,7 +78,7 @@
 //!       | (Trust Orchestrator)  |       | (~/.integrator/security)|
 //!       +-----+-----------+-----+       +-------------------------+
 //!             |           |
-//!  pair_v2()  |           | connect_transport()
+//!  pair_v2()  |           | connect_transport_to_ip()
 //!             v           v
 //!       +-----------+   +-------------------+
 //!       | PairingV2 |   | TransportSessionV2|
@@ -62,17 +87,22 @@
 //! ```
 //!
 //! # 3. Callers & Callees
-//! - **Callers**:
-//!   - `crate::discovery`: Periodically broadcasts signed v2 beacons and feeds observed advertisements into `observe_discovered_peer`.
-//!   - `crate::rpc::server`: Invokes `handle_incoming_pairing_stream_v2` and `accept_transport_from_stream` on TCP port 58281.
-//!   - `crate::clipboard::sync`: Calls `connect_transport_to_ip` on TCP port 58283 for encrypted clipboard data.
-//!   - `crate::benchmark::runner`: Calls `connect_transport_to_ip` on TCP port 58285 for link benchmarking.
-//!   - UI Handlers / IPC: Calls `open_or_get_pairing_pin`, `regenerate_pin`, `untrust_or_block_device`, `get_trust_snapshot`.
-//! - **Callees**:
-//!   - `crate::security::keystore::KeystoreV2`: Device identity key, peer trust store, root keys.
-//!   - `crate::security::pairing::PairingCoordinatorV2`: SPAKE2 protocol execution and PIN window tracking.
-//!   - `crate::security::transport::TransportSessionV2`: Authenticated, encrypted record layer.
-//!   - `crate::system_info`: Hostname, OS platform, and direct cable route detection.
+//! - **Upstream Callers**:
+//!   - `crate::discovery`: Broadcasts signed v2 beacons (`sign_discovery_beacon_v2_full`), verifies incoming beacons (`verify_discovery_beacon_v2_full`), feeds advertisements into `observe_discovered_peer`, and probes roamed peers via `connect_transport_to_hinted_ip`.
+//!   - `crate::display::server` & `crate::display::controller`: Invokes `handle_incoming_pairing_stream_v2`, `accept_transport_from_stream`, `connect_transport_to_ip`, `open_or_get_pairing_pin`, and `evaluate_local_touchid_and_sign` on TCP port `58281`.
+//!   - `crate::clipboard::service`: Calls `connect_transport_to_ip`, `accept_transport_from_stream`, `has_paired_peer_at_ip`, `generate_random_token_hex`, and `constant_time_eq` on TCP port `58283`.
+//!   - `crate::benchmark`: Calls `connect_transport_to_ip` and `accept_transport_from_stream` on TCP port `58285`.
+//!   - `crate::kvm::service`: Calls `connect_transport_to_ip` and `accept_transport_from_stream` on TCP port `58286`.
+//!   - `crate::camera`: Calls `connect_transport_to_hinted_ip` and `accept_transport_from_stream` on TCP port `58287`.
+//!   - `crate::audio`: Calls `lookup_verified_peer_for_ip`, `lookup_verified_peer_by_id_at_ip`, and `local_device_id_hex` for `IUA2` UDP audio session negotiation on port `58284`.
+//!   - `crate::storage`: Calls `has_paired_peer_at_ip` before mounting or querying remote SMB shares.
+//!   - `crate::core` & `crate::security::passkey`: Calls `get_trust_snapshot`, `regenerate_pin`, `untrust_or_block_device`, `unpair_device`, `pair_with_remote_peer_v2`, and Touch ID assertion helpers.
+//! - **Downstream Callees**:
+//!   - `crate::security::keystore::KeystoreV2`: Persistent Ed25519 device identity key, pinned peer trust store, and root keys $K_{\text{root}}$.
+//!   - `crate::security::pairing::PairingCoordinatorV2`: RFC 9382 SPAKE2 protocol execution, PIN window lifecycle, and per-IP anti-DoS rate limiting.
+//!   - `crate::security::transport::TransportSessionV2`: Authenticated, replay-protected ChaCha20-Poly1305 record layer.
+//!   - `crate::system_info`: Hostname, OS platform, subnet validation, and direct Thunderbolt/USB4 cable route detection.
+//!   - Native macOS FFI (`integrator_mac_touchid_available`, `integrator_mac_touchid_authenticate`): Objective-C/Swift `LocalAuthentication` bridge for Secure Enclave biometric verification.
 //! ============================================================================
 
 use crate::security::{
@@ -223,15 +253,13 @@ fn runtime_state() -> &'static RuntimeTrustState {
     })
 }
 
-/// Fills a buffer with cryptographically secure random bytes from the OS CSPRNG.
-#[allow(dead_code)]
-pub fn csprng_fill(buf: &mut [u8]) {
-    security::csprng_fill(buf);
-}
-
-/// Generates a cryptographically secure random hex-encoded token of `byte_len` bytes.
+/// Generates a cryptographically secure random lowercase hex-encoded token of `byte_len` bytes
+/// (producing `2 * byte_len` hex characters).
+///
+/// The intermediate raw random byte buffer is wrapped in [`zeroize::Zeroizing`] so raw entropy
+/// does not linger on the heap after hex encoding.
 pub fn generate_random_token_hex(byte_len: usize) -> String {
-    let mut bytes = vec![0u8; byte_len];
+    let mut bytes = zeroize::Zeroizing::new(vec![0u8; byte_len]);
     security::csprng_fill(&mut bytes);
     security::hex_encode(&bytes)
 }
@@ -313,7 +341,7 @@ pub fn regenerate_pin() -> String {
 
 /// Discovery boundary: records an untrusted discovery advertisement in the bounded in-memory UI cache.
 /// NEVER creates or mutates trusted peer credentials; returns `true` ONLY if `device_id` is already
-/// cryptographically paired and pinned in `KeystoreV2`.
+/// cryptographically paired and pinned in `KeystoreV2` and neither the device nor source IP is blocked.
 pub fn observe_discovered_peer(
     device_id: &str,
     hostname: &str,
@@ -321,10 +349,24 @@ pub fn observe_discovered_peer(
     via_direct_cable: bool,
 ) -> bool {
     let clean_id = device_id.trim().to_ascii_lowercase();
-    let clean_ip = ip.trim();
-    if clean_id.is_empty() || clean_ip.is_empty() || clean_id.len() > 64 {
+    let raw_ip = ip.trim();
+    if clean_id.is_empty() || raw_ip.is_empty() || clean_id.len() > 64 {
         return false;
     }
+    // Parse and canonicalize the IP address; reject malformed, unspecified (0.0.0.0 / ::),
+    // multicast, or IPv4 broadcast addresses so they can never pollute `last_ip` or hint maps.
+    let Ok(parsed_ip) = raw_ip.parse::<IpAddr>() else {
+        return false;
+    };
+    if parsed_ip.is_unspecified()
+        || parsed_ip.is_multicast()
+        || parsed_ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+    {
+        return false;
+    }
+    let canon_ip = parsed_ip.to_string();
+    let clean_ip = canon_ip.as_str();
+
     // Never record one of our own local interface IPs as a remote peer's IP (e.g. Windows ICS NAT reflection)
     if system_info::list_local_ipv4_interfaces()
         .iter()
@@ -346,8 +388,15 @@ pub fn observe_discovered_peer(
 
     let (is_blocked, is_paired, effective_ip) = {
         let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        let blocked = ks.is_device_or_ip_blocked(&clean_id, clean_ip);
+        let device_blocked = ks.is_device_or_ip_blocked(&clean_id, "");
+        let blocked = device_blocked || ks.is_device_or_ip_blocked(&clean_id, clean_ip);
         if blocked {
+            // If only the incoming source IP is blocked while `clean_id` is an actively paired,
+            // non-blocked peer in `KeystoreV2`, drop the spoofed/blocked-IP advertisement
+            // immediately so it cannot overwrite the legitimate peer's UI record.
+            if !device_blocked && ks.get_peer(&clean_id).is_some() {
+                return false;
+            }
             (true, false, clean_ip.to_string())
         } else if let Some(existing) = ks.get_peer(&clean_id) {
             let prev_ip = existing.last_ip.clone();
@@ -379,10 +428,18 @@ pub fn observe_discovered_peer(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(clean_ip) {
-            hints.clear();
+            // Evict a single existing entry rather than wiping the entire hint table (anti-DoS).
+            if let Some(first_ip) = hints.keys().next().cloned() {
+                hints.remove(&first_ip);
+            }
         }
         hints.insert(clean_ip.to_string(), clean_id.clone());
         if effective_ip != clean_ip {
+            if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(&effective_ip) {
+                if let Some(first_ip) = hints.keys().next().cloned() {
+                    hints.remove(&first_ip);
+                }
+            }
             hints.insert(effective_ip.clone(), clean_id.clone());
         }
     }
@@ -454,7 +511,8 @@ pub async fn untrust_or_block_device(device_id: &str, block: bool) -> Result<(),
     Ok(())
 }
 
-/// Synchronous wrapper for `untrust_or_block_device` used in non-async contexts or sync tests.
+/// Synchronous test helper for `untrust_or_block_device` used in unit tests.
+#[cfg(test)]
 pub fn untrust_or_block_device_sync(device_id: &str, block: bool) -> Result<(), crate::security::keystore::KeystoreError> {
     let clean_id = device_id.trim().to_ascii_lowercase();
     let rt = runtime_state();
@@ -494,12 +552,21 @@ pub fn untrust_or_block_device_sync(device_id: &str, block: bool) -> Result<(), 
 pub async fn unpair_device(device_id_hex: &str) -> Result<bool, crate::security::keystore::KeystoreError> {
     let clean_id = device_id_hex.trim().to_ascii_lowercase();
     let rt = runtime_state();
+    let known_ip = {
+        let mut pending = rt.pending_peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = pending.get_mut(&clean_id) {
+            p.trusted = false;
+            Some(p.ip.clone())
+        } else {
+            None
+        }
+    };
     {
         let mut hints = rt
             .ip_to_device_hint
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        hints.retain(|_, id| id != &clean_id);
+        hints.retain(|ip, id| id != &clean_id && known_ip.as_deref() != Some(ip.as_str()));
     }
 
     // Phase A: Persist trust removal to disk and invalidate active transport sessions under keystore lock
@@ -515,31 +582,6 @@ pub async fn unpair_device(device_id_hex: &str) -> Result<bool, crate::security:
             warn!("Subsystem teardown failed during unpair for {}: {}", clean_id, e);
             return Err(crate::security::keystore::KeystoreError::IoFailure(e));
         }
-    }
-
-    Ok(removed)
-}
-
-/// Synchronous wrapper for `unpair_device` used in non-async contexts or sync tests.
-#[allow(dead_code)]
-pub fn unpair_device_sync(device_id_hex: &str) -> Result<bool, crate::security::keystore::KeystoreError> {
-    let clean_id = device_id_hex.trim().to_ascii_lowercase();
-    let rt = runtime_state();
-    {
-        let mut hints = rt
-            .ip_to_device_hint
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        hints.retain(|_, id| id != &clean_id);
-    }
-
-    let (removed, unpair_gen) = {
-        let mut ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        ks.unpair_peer_ext(&clean_id)?
-    };
-
-    if let Some(core) = crate::core::GLOBAL_CORE.get() {
-        core.terminate_peer_connections(&clean_id, unpair_gen);
     }
 
     Ok(removed)
@@ -920,6 +962,11 @@ pub async fn connect_transport_to_ip(
             .ip_to_device_hint
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(&canon_ip) {
+            if let Some(first_ip) = hints.keys().next().cloned() {
+                hints.remove(&first_ip);
+            }
+        }
         hints.insert(canon_ip, creds.device_id_hex.clone());
     }
 
@@ -975,12 +1022,17 @@ pub async fn connect_transport_to_hinted_ip(
 
     // Handshake cryptographically proved possession of `creds`'s Ed25519 identity key & root_key
     // at `canon_ip`; bind `canon_ip -> device_id_hex` for all subsequent services (KVM, Clipboard, etc.).
-    {
+    if !ip_addr.is_loopback() {
         let rt = runtime_state();
         let mut hints = rt
             .ip_to_device_hint
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(&canon_ip) {
+            if let Some(first_ip) = hints.keys().next().cloned() {
+                hints.remove(&first_ip);
+            }
+        }
         hints.insert(canon_ip, creds.device_id_hex.clone());
     }
 
@@ -1049,7 +1101,9 @@ pub async fn accept_transport_from_stream(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if hints.len() >= MAX_DISCOVERED_PENDING_PEERS && !hints.contains_key(&ip_str) {
-                hints.clear();
+                if let Some(first_ip) = hints.keys().next().cloned() {
+                    hints.remove(&first_ip);
+                }
             }
             hints.insert(ip_str, dev_id);
         }
@@ -1064,7 +1118,15 @@ pub async fn accept_transport_from_stream(
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Queries macOS `LocalAuthentication.framework` (`LAContext.canEvaluatePolicy`) to determine
+    /// whether physical Touch ID Secure Enclave hardware is present and enrolled on this Mac.
     fn integrator_mac_touchid_available() -> bool;
+
+    /// Synchronously prompts the macOS Touch ID biometric sheet (`LAPolicyDeviceOwnerAuthenticationWithBiometrics`)
+    /// with the localized UTF-8 `reason_ptr` string.
+    ///
+    /// Returns `1` on verified fingerprint match, or `0` on failure/cancellation (writing a
+    /// null-terminated UTF-8 diagnostic into `out_error_buf` up to `out_error_cap` bytes).
     fn integrator_mac_touchid_authenticate(
         reason_ptr: *const std::os::raw::c_char,
         out_error_buf: *mut std::os::raw::c_char,
@@ -1076,6 +1138,7 @@ extern "C" {
 pub fn is_local_touchid_available() -> bool {
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: `integrator_mac_touchid_available` takes no arguments and safely queries `LAContext`.
         unsafe { integrator_mac_touchid_available() }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1085,6 +1148,10 @@ pub fn is_local_touchid_available() -> bool {
 }
 
 /// Constructs the domain-separated binary transcript signed for a Touch ID biometric assertion.
+///
+/// Wire layout:
+/// `TOUCHID_ASSERTION_DOMAIN_SEP` || `LP(challenge_nonce_hex)` || `LP(requester_device_id)` ||
+/// `LP(signer_device_id)` || `LP(signer_hostname)` || `timestamp_ms (u64 BE)`.
 fn build_touchid_assertion_signing_payload(
     challenge_nonce_hex: &str,
     requester_device_id: &str,
@@ -1103,6 +1170,7 @@ fn build_touchid_assertion_signing_payload(
 }
 
 /// Signs a verified Touch ID biometric challenge using the local installation's Ed25519 identity key.
+#[cfg(any(target_os = "macos", test))]
 pub fn sign_touchid_assertion(
     challenge_nonce_hex: &str,
     requester_device_id: &str,
@@ -1144,6 +1212,9 @@ pub fn sign_touchid_assertion(
 
 /// Prompts the local macOS Touch ID Secure Enclave sensor and returns a signed [`TouchIdSignedAssertion`]
 /// on biometric fingerprint match.
+///
+/// Pre-validates `challenge_nonce_hex` (64 hex chars) and `requester_device_id` (32 hex chars)
+/// before invoking the OS biometric modal so malformed requests fail fast without prompting the user.
 pub fn evaluate_local_touchid_and_sign(
     challenge_nonce_hex: &str,
     requester_device_id: &str,
@@ -1151,6 +1222,17 @@ pub fn evaluate_local_touchid_and_sign(
 ) -> Result<TouchIdSignedAssertion, String> {
     #[cfg(target_os = "macos")]
     {
+        let clean_nonce = challenge_nonce_hex.trim().to_ascii_lowercase();
+        let clean_req_id = requester_device_id.trim().to_ascii_lowercase();
+        if clean_nonce.len() != TOUCHID_CHALLENGE_NONCE_HEX_LEN
+            || !clean_nonce.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err("Invalid 32-byte Touch ID challenge nonce".into());
+        }
+        if clean_req_id.len() != 32 || !clean_req_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid requester device_id for Touch ID challenge".into());
+        }
+
         let clean_host: String = requester_hostname
             .trim()
             .chars()
@@ -1165,6 +1247,8 @@ pub fn evaluate_local_touchid_and_sign(
         let c_reason = std::ffi::CString::new(reason)
             .map_err(|_| "Invalid Touch ID prompt reason".to_string())?;
         let mut err_buf = vec![0 as std::os::raw::c_char; TOUCHID_MAC_ERROR_BUF_CAP];
+        // SAFETY: `c_reason` is a valid null-terminated CString and `err_buf` has capacity
+        // `TOUCHID_MAC_ERROR_BUF_CAP`. We explicitly enforce a trailing NUL byte before reading.
         let rc = unsafe {
             integrator_mac_touchid_authenticate(
                 c_reason.as_ptr(),
@@ -1173,8 +1257,10 @@ pub fn evaluate_local_touchid_and_sign(
             )
         };
         if rc == 1 {
-            sign_touchid_assertion(challenge_nonce_hex, requester_device_id)
+            sign_touchid_assertion(&clean_nonce, &clean_req_id)
         } else {
+            err_buf[TOUCHID_MAC_ERROR_BUF_CAP - 1] = 0;
+            // SAFETY: `err_buf` is guaranteed to contain at least one NUL terminator within bounds.
             let err_str = unsafe { std::ffi::CStr::from_ptr(err_buf.as_ptr()) }
                 .to_string_lossy()
                 .trim()
@@ -1218,7 +1304,10 @@ pub fn verify_touchid_assertion(
 
     let clean_signer = assertion.signer_device_id.trim().to_ascii_lowercase();
     let exp_signer = expected_signer_device_id.trim().to_ascii_lowercase();
-    if clean_signer.len() != 32 || (!exp_signer.is_empty() && clean_signer != exp_signer) {
+    if clean_signer.len() != 32
+        || (!exp_signer.is_empty()
+            && !constant_time_eq(clean_signer.as_bytes(), exp_signer.as_bytes()))
+    {
         return Err("Touch ID assertion signer_device_id mismatch".into());
     }
 
@@ -1244,7 +1333,10 @@ pub fn verify_touchid_assertion(
     // Enforce pinned public key check in KeystoreV2 (or local self identity when tested locally on Mac)
     {
         let ks = global_keystore().lock().unwrap_or_else(|e| e.into_inner());
-        if clean_signer == ks.local_device_id_hex() {
+        if ks.is_device_or_ip_blocked(&clean_signer, "") {
+            return Err("Touch ID assertion signer is blocked in KeystoreV2".into());
+        }
+        if constant_time_eq(clean_signer.as_bytes(), ks.local_device_id_hex().as_bytes()) {
             if !constant_time_eq(&ks.local_ed25519_pubkey(), &pk_bytes) {
                 return Err("Local Ed25519 public key mismatch in Touch ID assertion".into());
             }
@@ -1385,18 +1477,33 @@ pub fn verify_discovery_beacon_v2(
 }
 
 /// Canonical metadata fields bound into `DiscoveryBeacon` v2 Ed25519 signatures.
+///
+/// Every field is serialized using unambiguous big-endian length-prefixed framing in
+/// [`build_beacon_v2_full_signing_payload`] so an on-path adversary cannot tamper with
+/// advertised display capabilities, SMB share names, Sunshine ports, or GPU lists.
 #[derive(Debug, Clone)]
 pub struct DiscoveryBeaconSignedMeta<'a> {
+    /// Discovery beacon wire protocol version (must equal `2`).
     pub protocol_version: u16,
+    /// Hostname advertised by the sending workstation (1..=128 Unicode scalar values).
     pub sender_name: &'a str,
+    /// Operating system identifier string (e.g. `"macOS"` or `"Windows 11"`, max 64 chars).
     pub os: &'a str,
+    /// Hardware model description string (e.g. `"MacBook Pro"` or `"Custom Workstation"`, max 128 chars).
     pub hardware_model: &'a str,
+    /// Primary display horizontal resolution in physical pixels.
     pub display_width: u32,
+    /// Primary display vertical resolution in physical pixels.
     pub display_height: u32,
+    /// Primary display refresh rate in frames per second (Hz).
     pub display_fps: u32,
+    /// Optional SMB network share name advertised by the host (max 128 chars).
     pub share_name: Option<&'a str>,
+    /// Optional Sunshine display streaming host name advertised by the host (max 128 chars).
     pub sunshine_name: Option<&'a str>,
+    /// TCP port on which the peer's Sunshine service listens (e.g. `47989`, or `0` if inactive).
     pub sunshine_port: u16,
+    /// Slice of detected GPU adapter display names (max 8 entries, up to 128 chars each).
     pub gpus: &'a [String],
 }
 

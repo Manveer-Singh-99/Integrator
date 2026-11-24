@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
-# Builds a Universal (arm64 Apple Silicon + x86_64 Intel, macOS 12.0+) Integrator.app bundle.
-# Default output: app/target/bundle/Integrator.app (pass --install to also install into INSTALL_DIR).
+# ==============================================================================
+# Integrator Universal macOS Application Bundle Builder (`build-universal-app.sh`)
+# ==============================================================================
+#
+# 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+#    Compiles Universal macOS release binaries (`aarch64-apple-darwin` +
+#    `x86_64-apple-darwin`) for `integrator` and the fallback clipboard helper
+#    `macos_clip_files`, bundles optional native resources (`IntegratorAudioDriver`,
+#    installer scripts, application icon), generates `Info.plist` with all required
+#    macOS TCC usage descriptions (Camera, Microphone, Bluetooth, Local Network),
+#    and code-signs the bundle with Integrator's persistent development signing
+#    identity so Accessibility / Input Monitoring TCC approvals persist across builds.
+#
+# 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
+#    - Upstream Callers: Release packaging / developer `--install` workflows.
+#    - Downstream Callees: `cargo build`, `lipo`, `macos/audio-driver/build-audio-driver.sh`,
+#      `openssl`, `security`, `codesign`, `ditto`.
+#
+# 3. THREADING & EXECUTION MODEL
+#    Single-threaded sequential shell build pipeline (`set -euo pipefail`).
+#
+# 4. SECURITY & SAFETY INVARIANTS
+#    - Validates bundle identifier, deployment target, and version strings before
+#      interpolating into `Info.plist`.
+#    - Declares explicit TCC usage descriptions (`NSCameraUsageDescription`,
+#      `NSMicrophoneUsageDescription`, `NSBluetoothAlwaysUsageDescription`,
+#      `NSLocalNetworkUsageDescription`) so macOS never aborts on TCC requests.
+#    - Uses persistent certificate keychain (`~/.integrator_codesign`) rather than
+#      ad-hoc signatures so TCC Designated Requirement remains stable across rebuilds.
 #
 # Configurable environment variables:
 #   MACOSX_DEPLOYMENT_TARGET  Minimum supported macOS version        (default: 12.0)
 #   INSTALL_DIR               Destination directory for --install    (default: /Applications)
 #   APP_BUNDLE_ID             CFBundleIdentifier written to plist    (default: com.manveersingh.integrator)
+# ==============================================================================
 
 set -euo pipefail
 
@@ -20,9 +48,29 @@ APP_VERSION="${APP_VERSION:-1.0.0}"
 OUT_BUNDLE="$APP_DIR/target/bundle/Integrator.app"
 INSTALL_TO_APPS=0
 
-if [ "${1:-}" = "--install" ]; then
-    INSTALL_TO_APPS=1
-fi
+for arg in "$@"; do
+    case "$arg" in
+        --install)
+            INSTALL_TO_APPS=1
+            ;;
+        *)
+            echo "Unknown option: $arg (expected: [--install])" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Reject characters that could corrupt XML Info.plist or shell templates.
+for pair in "APP_BUNDLE_ID:$APP_BUNDLE_ID" "DEPLOY_TARGET:$DEPLOY_TARGET" "APP_VERSION:$APP_VERSION"; do
+    key="${pair%%:*}"
+    val="${pair#*:}"
+    case "$val" in
+        ''|*'<'*|*'>'*|*'&'*|*'"'*|*"'"*)
+            echo "Invalid XML-unsafe value for ${key}: '${val}'" >&2
+            exit 1
+            ;;
+    esac
+done
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     if ! rustup target list --installed | grep -qx "$target"; then
@@ -30,6 +78,12 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
         rustup target add "$target"
     fi
 done
+
+# Ensure the universal CoreAudio HAL driver plugin is freshly compiled before bundling.
+if [ -x "$REPO_ROOT/macos/audio-driver/build-audio-driver.sh" ]; then
+    echo "Building universal CoreAudio HAL audio driver..."
+    bash "$REPO_ROOT/macos/audio-driver/build-audio-driver.sh"
+fi
 
 echo "Building arm64 release (MACOSX_DEPLOYMENT_TARGET=$DEPLOY_TARGET)..."
 MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET" cargo build \
@@ -107,7 +161,9 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 	<key>CFBundleIconFile</key>
 	<string>icon.icns</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Integrator captures your Mac camera when Shared Camera (Mac to Windows 11) is turned on.</string>
+	<string>Integrator captures your Mac camera when Shared Camera &amp; Mic (Mac to Windows 11) is turned on.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Integrator captures your Mac microphone when Shared Camera &amp; Mic (Mac to Windows 11) is turned on.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Integrator uses Bluetooth Low Energy (BLE) magic packets to discover nearby paired Mac and Windows workstations even when Wi-Fi broadcasts are restricted.</string>
 	<key>NSLocalNetworkUsageDescription</key>
@@ -121,10 +177,12 @@ EOF
 # Ensure persistent developer code signing identity exists so TCC permissions (Accessibility, Input Monitoring) NEVER reset across builds
 KEYCHAIN_PATH="$HOME/.integrator_codesign/integrator.keychain-db"
 CERT_PATH="$HOME/.integrator_codesign/cert.pem"
+SIGNING_PASS="${INTEGRATOR_KEYCHAIN_PASS:-integrator}"
 
 if [ ! -f "$KEYCHAIN_PATH" ] || [ ! -f "$CERT_PATH" ]; then
     echo "Creating persistent Integrator developer code-signing identity (so Accessibility permissions never reset)..."
     mkdir -p "$HOME/.integrator_codesign"
+    chmod 700 "$HOME/.integrator_codesign"
     CNF_PATH="$HOME/.integrator_codesign/cert.cnf"
     KEY_PATH="$HOME/.integrator_codesign/key.pem"
     P12_PATH="$HOME/.integrator_codesign/cert.p12"
@@ -141,19 +199,22 @@ keyUsage = digitalSignature
 extendedKeyUsage = 1.3.6.1.5.5.7.3.3
 CNF_EOF
     openssl req -x509 -new -nodes -keyout "$KEY_PATH" -out "$CERT_PATH" -days 3650 -config "$CNF_PATH" -extensions v3_ca
-    openssl pkcs12 -export -out "$P12_PATH" -inkey "$KEY_PATH" -in "$CERT_PATH" -passout pass:integrator -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+    chmod 600 "$KEY_PATH"
+    openssl pkcs12 -export -out "$P12_PATH" -inkey "$KEY_PATH" -in "$CERT_PATH" -passout "pass:${SIGNING_PASS}" -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+    chmod 600 "$P12_PATH"
     security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-    security create-keychain -p "integrator" "$KEYCHAIN_PATH"
-    security unlock-keychain -p "integrator" "$KEYCHAIN_PATH"
+    security create-keychain -p "$SIGNING_PASS" "$KEYCHAIN_PATH"
+    security unlock-keychain -p "$SIGNING_PASS" "$KEYCHAIN_PATH"
     security set-keychain-settings "$KEYCHAIN_PATH"
-    security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "integrator" -T /usr/bin/codesign
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "integrator" "$KEYCHAIN_PATH"
+    security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$SIGNING_PASS" -T /usr/bin/codesign
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$SIGNING_PASS" "$KEYCHAIN_PATH"
     security add-trusted-cert -d -r trustRoot -p codeSign "$CERT_PATH" 2>/dev/null || true
 fi
 
-security unlock-keychain -p "integrator" "$KEYCHAIN_PATH" 2>/dev/null || true
+security unlock-keychain -p "$SIGNING_PASS" "$KEYCHAIN_PATH" 2>/dev/null || true
 echo "Signing bundle with persistent Integrator identity (prevents TCC permission resets)..."
 codesign --force --deep --keychain "$KEYCHAIN_PATH" --sign "Integrator Development Code Signing" "$OUT_BUNDLE"
+codesign --verify --deep --strict "$OUT_BUNDLE"
 echo "Built Universal app bundle: $OUT_BUNDLE"
 file "$OUT_BUNDLE/Contents/MacOS/integrator"
 

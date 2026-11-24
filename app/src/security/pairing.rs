@@ -13,7 +13,21 @@
 //! In addition to the protocol state machine, this module contains the host-side [`PairingCoordinatorV2`], which
 //! enforces strict anti-DoS protections to prevent unauthorized PIN rotation, brute-force enumeration, or resource exhaustion.
 //!
-//! ## 2. Protocol State Machine (4-Message Staged Mutual Confirmation)
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - `app/src/trust.rs`: Invokes [`PairingCoordinatorV2`], [`run_client_pairing_with_shared_keystore`], [`handle_server_pairing_with_shared_locks`], [`generate_unbiased_6digit_pin`], and [`is_valid_6digit_pin`] to orchestrate host PIN generation and client/server pairing workflows.
+//!   - `app/src/display/controller.rs`: Peeks the 4-byte wire header on port 58281 against [`PAIRING_WIRE_MAGIC`] (`"IPR2"`) to route unauthenticated pairing connections to [`handle_server_pairing_with_shared_locks`] using `already_read_magic: Some(*b"IPR2")`.
+//! - **Downstream Callees**:
+//!   - `app/src/security/spake2_rfc9382.rs`: [`Spake2State`], [`compute_password_salt`], and [`Spake2Role`] for RFC 9382 Edwards25519 PAKE key exchange and transcript authentication.
+//!   - `app/src/security/keystore.rs`: [`KeystoreV2`] for verifying peer identity-key pinning, generating Ed25519 transcript signatures, and atomically committing newly paired peers to OS-protected storage (`trusted_peers_v2.json`).
+//!   - `app/src/core.rs` & `app/src/clipboard/mod.rs`: Clears prior clipboard revocation state (`clear_peer_revocation`), resets camera session consent (`revoke_peer_consent`), and terminates half-open connections on rollback (`terminate_peer_connections_async`).
+//!   - `tokio::io::{AsyncReadExt, AsyncWriteExt}` & `tokio::time::timeout`: Bounded asynchronous network frame I/O with strict 10-second per-operation timeouts.
+//! - **Cross-Platform / Cross-Device Flow (Mac ↔ Windows 11)**:
+//!   - Executes identically whether macOS acts as Initiator (Client A) and Windows 11 acts as Responder (Server B), or vice versa.
+//!   - Wire frames use an 8-byte header (`[magic: "IPR2"][ver: 0x02][msg_type: u8][payload_len: u16 BE]`) wrapping UTF-8 JSON payloads capped at [`MAX_PAIRING_FRAME_BYTES`] (4,096 bytes).
+//!   - Propagates link topology metadata (`via_direct_cable` for Thunderbolt/USB4/direct Ethernet vs standard LAN) and sanitized device/platform labels into [`KeystoreV2`] on both machines.
+//!
+//! ### Protocol State Machine (4-Message Staged Mutual Confirmation)
 //! ```text
 //!    Initiator (Client A)                                 Responder (Server B)
 //!    ====================                                 ====================
@@ -257,26 +271,54 @@ pub struct PairErrorWireMsg {
 /// Error scenarios occurring during pairing handshake execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
+    /// Peer presented an unsupported protocol version number (expected [`PAIRING_PROTOCOL_VERSION`] = `2`).
     UnsupportedVersion(u16),
+    /// Wire frame header did not start with the 4-byte [`PAIRING_WIRE_MAGIC`] (`"IPR2"`).
     InvalidFrameMagic([u8; 4]),
+    /// Wire frame header specified an unknown or out-of-sequence [`PairingMsgType`] discriminator byte.
     InvalidMessageType(u8),
+    /// Serialized frame payload length was `0` or exceeded [`MAX_PAIRING_FRAME_BYTES`] (4,096 bytes).
     OversizedFrame(usize),
+    /// JSON payload deserialization or fixed-length hex field decoding failed.
     MalformedMessage(String),
+    /// Host pairing window is currently closed (`pairing_window_open == false` or no active PIN).
     PairingWindowClosed,
+    /// Active host pairing PIN exceeded its [`PIN_TTL_SECS`] (600-second) validity window.
     PinExpired,
+    /// User-supplied or configured PIN is not exactly 6 ASCII decimal digits (`0`..=`9`).
     InvalidPinFormat,
-    IpRateLimited { retry_after_secs: u64 },
+    /// Source IP address is temporarily locked out due to excessive failed attempts or `PairInit` floods.
+    IpRateLimited {
+        /// Remaining lockout duration in seconds before the remote IP may retry.
+        retry_after_secs: u64,
+    },
+    /// Server already has [`MAX_CONCURRENT_PAIRING_SESSIONS`] (4) active in-flight sessions from other IPs.
     TooManyConcurrentSessions,
+    /// Referenced 16-byte `pairing_session_id` does not exist or exceeded [`INFLIGHT_SESSION_TTL_SECS`] (15s).
     SessionNotFoundOrExpired,
+    /// `PairClientConfirm` arrived from a different source IP than the `PairInit` that created the session.
     SessionIpMismatch,
+    /// Peer's claimed 16-byte `device_id` does not match `SHA256("integrator-device-id-v2" || ed25519_pk)[0..16]`.
     SpoofedDeviceId,
+    /// Peer's Ed25519 public key conflicts with an existing pinned record for the same device ID or hostname.
     IdentityKeyPinnedConflict(String),
+    /// Underlying RFC 9382 SPAKE2 mathematical or confirmation MAC verification error.
     Spake2Failure(Spake2Error),
+    /// Peer's Ed25519 signature (`sig_A` or `sig_B`) over the pairing transcript digest failed verification.
     SignatureVerificationFailed,
+    /// Server's final completion acknowledgment tag (`F_ack`) or derived `key_id` failed constant-time verification.
     AckMacVerificationFailed,
+    /// Underlying OS keystore verification or persistence failure.
     KeystoreFailure(KeystoreError),
+    /// Asynchronous socket read, write, flush, or 10-second I/O timeout error.
     IoFailure(String),
-    RemotePeerRejected { code: u8, message: String },
+    /// Counterpart machine aborted the handshake with an explicit [`PairErrorWireMsg`] frame.
+    RemotePeerRejected {
+        /// Numeric wire error category code (`1`..=`99`).
+        code: u8,
+        /// Sanitized error description from the remote peer.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for PairingError {
@@ -346,7 +388,10 @@ impl PairingError {
         let (code, retry) = match self {
             PairingError::UnsupportedVersion(_) => (1, 0),
             PairingError::PairingWindowClosed | PairingError::PinExpired => (2, 0),
-            PairingError::IpRateLimited { retry_after_secs } => (3, *retry_after_secs as u32),
+            PairingError::IpRateLimited { retry_after_secs } => {
+                // Clamp to u32::MAX to prevent silent integer truncation on wire serialization.
+                (3, (*retry_after_secs).min(u32::MAX as u64) as u32)
+            }
             PairingError::TooManyConcurrentSessions => (4, 5),
             PairingError::SpoofedDeviceId | PairingError::IdentityKeyPinnedConflict(_) => (5, 0),
             PairingError::Spake2Failure(_)
@@ -365,54 +410,80 @@ impl PairingError {
 /// Rate-limiting record tracking authentication failures and init attempts for a single IP address.
 #[derive(Debug, Clone)]
 struct IpRateLimitRecord {
+    /// Count of authentication or protocol failures recorded within the active 60-second failure window.
     failures: u32,
+    /// Count of `PairInit` messages received within the active 60-second init window.
     init_attempts: u32,
+    /// Unix timestamp (seconds) when the current 60-second failure counting window started.
     window_started_at: u64,
+    /// Unix timestamp (seconds) when the current 60-second `PairInit` rate window started.
     init_window_started_at: u64,
+    /// Unix timestamp (seconds) until which this IP is locked out (`0` or `<= now_secs` if unlocked).
     locked_until: u64,
+    /// Number of consecutive lockouts triggered by this IP, used to compute exponential backoff ($60\text{s} \cdot 2^{\min(k, 4)}$).
     consecutive_lockouts: u32,
+    /// Unix timestamp (seconds) when this record was last accessed, used for LRU eviction when the table is full.
     last_touched: u64,
 }
 
 /// In-flight handshake state retained by Server B between `PairInit` and `PairClientConfirm`.
 struct InFlightServerSession {
+    /// 16-byte random CSPRNG session identifier uniquely binding `PairServerShare` to `PairClientConfirm`.
     pairing_session_id: [u8; 16],
+    /// Network IP address of Initiator (Client A) that sent `PairInit`; enforced on `PairClientConfirm`.
     source_ip: IpAddr,
+    /// Unix timestamp (seconds) when this in-flight session was created (expires after [`INFLIGHT_SESSION_TTL_SECS`] = 15s).
     created_at_secs: u64,
+    /// Verified 16-byte canonical device ID of Client A.
     client_device_id: [u8; 16],
+    /// Verified 32-byte compressed Ed25519 public key of Client A.
     client_ed25519_pk: [u8; 32],
+    /// Sanitized friendly display name of Client A (clamped to [`MAX_NAME_LEN`] = 64 chars).
     client_device_name: String,
+    /// Sanitized operating system platform identifier of Client A (clamped to [`MAX_PLATFORM_LEN`] = 16 chars).
     client_platform: String,
+    /// Ephemeral Responder B RFC 9382 SPAKE2 state machine awaiting Client A's public share $pA$.
     spake2_state: Spake2State,
+    /// 32-byte SHA-256 digest of the `PairInitMsg` and `PairServerShareMsg` wire fields bound as HKDF AAD.
     aad_hash: [u8; 32],
 }
 
 /// Host-side pairing coordinator managing the active PIN, in-flight handshakes, and anti-DoS rate limiting.
 pub struct PairingCoordinatorV2 {
+    /// Currently active 6-digit numeric pairing PIN wrapped in [`Zeroizing`] memory, or `None` if closed.
     active_pin: Option<Zeroizing<String>>,
+    /// Unix timestamp (seconds) when `active_pin` was generated (valid for [`PIN_TTL_SECS`] = 600s).
     pin_created_at_secs: u64,
+    /// Whether the host pairing window is currently open to accept incoming `PairInit` requests.
     pairing_window_open: bool,
+    /// Sanitized friendly display name of this host machine advertised in `PairServerShareMsg`.
     local_device_name: String,
+    /// Sanitized platform label of this host machine (e.g. `"macOS"` or `"Windows"`) advertised in `PairServerShareMsg`.
     local_platform: String,
+    /// Map of active in-flight sessions keyed by 16-byte `pairing_session_id` (capped at [`MAX_CONCURRENT_PAIRING_SESSIONS`] = 4).
     inflight_sessions: HashMap<[u8; 16], InFlightServerSession>,
+    /// Per-IP rate-limiting and exponential lockout state table (capped at [`MAX_IP_RATE_LIMIT_ENTRIES`] = 1,024).
     ip_rate_limits: HashMap<IpAddr, IpRateLimitRecord>,
 }
 
 impl PairingCoordinatorV2 {
-    /// Constructs a fresh coordinator with specified local device name and platform.
+    /// Constructs a fresh coordinator with sanitized local device name and platform labels.
     pub fn new(local_device_name: String, local_platform: String) -> Self {
         Self {
             active_pin: None,
             pin_created_at_secs: 0,
             pairing_window_open: false,
-            local_device_name,
-            local_platform,
+            local_device_name: sanitize_label(&local_device_name, MAX_NAME_LEN),
+            local_platform: sanitize_label(&local_platform, MAX_PLATFORM_LEN),
             inflight_sessions: HashMap::new(),
             ip_rate_limits: HashMap::new(),
         }
     }
 
     /// Generates an unbiased 6-digit numeric PIN (`100000`..=`999999`) and opens the 10-minute pairing window.
+    ///
+    /// Preserves existing `ip_rate_limits` across PIN regenerations so an already-locked-out attacker IP
+    /// cannot bypass its exponential backoff window when the local user refreshes the PIN.
     pub fn open_pairing_window(&mut self, now_secs: u64) -> String {
         let pin = generate_unbiased_6digit_pin();
         self.active_pin = Some(Zeroizing::new(pin.clone()));
@@ -578,8 +649,9 @@ impl PairingCoordinatorV2 {
         self.ip_rate_limits.remove(&ip);
     }
 
-    /// Prunes in-flight handshake sessions exceeding `INFLIGHT_SESSION_TTL_SECS` (15s).
-    fn prune_expired_sessions(&mut self, now_secs: u64) {
+    /// Prunes in-flight handshake sessions exceeding `INFLIGHT_SESSION_TTL_SECS` (15s),
+    /// penalizing each expired session's source IP and returning the list of pruned IPs.
+    fn prune_expired_sessions(&mut self, now_secs: u64) -> Vec<IpAddr> {
         let mut expired_ips = Vec::new();
         self.inflight_sessions.retain(|_, s| {
             if now_secs.saturating_sub(s.created_at_secs) > INFLIGHT_SESSION_TTL_SECS {
@@ -589,9 +661,10 @@ impl PairingCoordinatorV2 {
                 true
             }
         });
-        for ip in expired_ips {
+        for &ip in &expired_ips {
             self.record_ip_failure(ip, now_secs);
         }
+        expired_ips
     }
 
     /// Step 1 (Server B): Processes incoming `PairInitMsg` and responds with `PairServerShareMsg`.
@@ -602,8 +675,8 @@ impl PairingCoordinatorV2 {
         init_msg: &PairInitMsg,
         now_secs: u64,
     ) -> Result<PairServerShareMsg, PairingError> {
+        let _ = self.prune_expired_sessions(now_secs);
         self.check_ip_rate_limit(source_ip, now_secs)?;
-        self.prune_expired_sessions(now_secs);
 
         if init_msg.version != PAIRING_PROTOCOL_VERSION {
             return Err(PairingError::UnsupportedVersion(init_msg.version));
@@ -671,7 +744,7 @@ impl PairingCoordinatorV2 {
         let server_device_id = keystore.local_device_id();
         let server_ed25519_pk = keystore.local_ed25519_pubkey();
 
-        let salt_pw = compute_password_salt(&client_device_id, &server_device_id);
+        let salt_pw = Zeroizing::new(compute_password_salt(&client_device_id, &server_device_id));
         let id_a = build_spake2_identity_a(&client_device_id, &client_ed25519_pk, &client_nonce);
         let id_b = build_spake2_identity_b(
             &server_device_id,
@@ -681,7 +754,7 @@ impl PairingCoordinatorV2 {
         );
 
         let (spake2_state, spake2_share_b) =
-            Spake2State::start_b(pin.as_bytes(), &salt_pw, &id_a, &id_b)
+            Spake2State::start_b(pin.as_bytes(), &*salt_pw, &id_a, &id_b)
                 .map_err(PairingError::Spake2Failure)?;
 
         let share_msg = PairServerShareMsg {
@@ -725,7 +798,7 @@ impl PairingCoordinatorV2 {
         now_secs: u64,
     ) -> Result<(PairServerCompleteMsg, VerifiedPeerCredentials, String), PairingError> {
         self.check_ip_rate_limit(source_ip, now_secs)?;
-        self.prune_expired_sessions(now_secs);
+        let expired_ips = self.prune_expired_sessions(now_secs);
 
         if !self.pairing_window_open || self.active_pin.is_none() {
             return Err(PairingError::PairingWindowClosed);
@@ -737,12 +810,18 @@ impl PairingCoordinatorV2 {
 
         let session_id: [u8; 16] = hex_decode_array(&confirm_msg.pairing_session_id_hex)
             .ok_or_else(|| {
+                if !expired_ips.contains(&source_ip) {
+                    self.record_ip_failure(source_ip, now_secs);
+                }
                 PairingError::MalformedMessage("invalid pairing_session_id_hex".into())
             })?;
 
         match self.inflight_sessions.get(&session_id) {
             None => {
-                self.record_ip_failure(source_ip, now_secs);
+                // Avoid double-penalizing source_ip if prune_expired_sessions already recorded the expiration failure above.
+                if !expired_ips.contains(&source_ip) {
+                    self.record_ip_failure(source_ip, now_secs);
+                }
                 return Err(PairingError::SessionNotFoundOrExpired);
             }
             Some(s) if s.source_ip != source_ip => {
@@ -854,21 +933,33 @@ impl PairingCoordinatorV2 {
 
 /// Client-side (Initiator A) state machine managing an active pairing handshake.
 pub struct ClientPairingHandshakeV2 {
+    /// 6-digit numeric pairing PIN entered by the user, wrapped in [`Zeroizing`] memory.
     pin: Zeroizing<String>,
+    /// Sent [`PairInitMsg`] retained for computing the header AAD digest in Step 2.
     init_msg: PairInitMsg,
+    /// 16-byte canonical device identifier of this client machine.
     client_device_id: [u8; 16],
+    /// 32-byte compressed Ed25519 identity public key of this client machine.
     client_ed25519_pk: [u8; 32],
+    /// 32-byte CSPRNG random nonce generated for this handshake session.
     client_nonce: [u8; 32],
 }
 
 /// Intermediate client state awaiting final `PairServerCompleteMsg`.
 pub struct ClientAwaitingServerComplete {
+    /// 16-byte session identifier assigned by Server B in `PairServerShareMsg`.
     pairing_session_id: [u8; 16],
+    /// Verified 16-byte canonical device identifier of Server B.
     server_device_id: [u8; 16],
+    /// Verified 32-byte compressed Ed25519 identity public key of Server B.
     server_ed25519_pk: [u8; 32],
+    /// Sanitized friendly display name of Server B (clamped to [`MAX_NAME_LEN`] = 64 chars).
     server_device_name: String,
+    /// Sanitized operating system platform identifier of Server B (clamped to [`MAX_PLATFORM_LEN`] = 16 chars).
     server_platform: String,
+    /// Client A's 64-byte Ed25519 signature over `tt_sha256 || F_A`, bound into Server B's signature and `K_root` derivation.
     sig_a: [u8; 64],
+    /// Completed RFC 9382 SPAKE2 transcript output containing $K_e$, $F_B$, and `tt_sha256`.
     transcript_out: crate::security::spake2_rfc9382::Spake2TranscriptOutput,
 }
 
@@ -953,7 +1044,8 @@ impl ClientPairingHandshakeV2 {
                 other => PairingError::KeystoreFailure(other),
             })?;
 
-        let salt_pw = compute_password_salt(&self.client_device_id, &server_device_id);
+        let salt_pw =
+            Zeroizing::new(compute_password_salt(&self.client_device_id, &server_device_id));
         let id_a = build_spake2_identity_a(
             &self.client_device_id,
             &self.client_ed25519_pk,
@@ -967,7 +1059,7 @@ impl ClientPairingHandshakeV2 {
         );
 
         let (spake2_state, spake2_share_a) =
-            Spake2State::start_a(self.pin.as_bytes(), &salt_pw, &id_a, &id_b)
+            Spake2State::start_a(self.pin.as_bytes(), &*salt_pw, &id_a, &id_b)
                 .map_err(PairingError::Spake2Failure)?;
 
         let aad_hash = compute_pairing_header_aad(&self.init_msg, share_msg);
@@ -1608,14 +1700,14 @@ where
 // Transcript & Helper Functions
 // ============================================================================
 
-/// Assembles the Client A identity byte string for SPAKE2 transcript:
-/// `"integrator-pair-v2-A" || u16_be(ver) || client_device_id || client_ed25519_pk || client_nonce`.
+/// Assembles the 102-byte Client A identity byte string for the SPAKE2 transcript:
+/// `20B("integrator-pair-v2-A") || 2B(u16_be(ver)) || 16B(client_device_id) || 32B(client_ed25519_pk) || 32B(client_nonce)`.
 fn build_spake2_identity_a(
     client_device_id: &[u8; 16],
     client_ed25519_pk: &[u8; 32],
     client_nonce: &[u8; 32],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(22 + 2 + 16 + 32 + 32);
+    let mut out = Vec::with_capacity(20 + 2 + 16 + 32 + 32);
     out.extend_from_slice(b"integrator-pair-v2-A");
     out.extend_from_slice(&PAIRING_PROTOCOL_VERSION.to_be_bytes());
     out.extend_from_slice(client_device_id);
@@ -1624,15 +1716,15 @@ fn build_spake2_identity_a(
     out
 }
 
-/// Assembles the Server B identity byte string for SPAKE2 transcript:
-/// `"integrator-pair-v2-B" || u16_be(ver) || server_device_id || server_ed25519_pk || server_nonce || session_id`.
+/// Assembles the 118-byte Server B identity byte string for the SPAKE2 transcript:
+/// `20B("integrator-pair-v2-B") || 2B(u16_be(ver)) || 16B(server_device_id) || 32B(server_ed25519_pk) || 32B(server_nonce) || 16B(session_id)`.
 fn build_spake2_identity_b(
     server_device_id: &[u8; 16],
     server_ed25519_pk: &[u8; 32],
     server_nonce: &[u8; 32],
     pairing_session_id: &[u8; 16],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(22 + 2 + 16 + 32 + 32 + 16);
+    let mut out = Vec::with_capacity(20 + 2 + 16 + 32 + 32 + 16);
     out.extend_from_slice(b"integrator-pair-v2-B");
     out.extend_from_slice(&PAIRING_PROTOCOL_VERSION.to_be_bytes());
     out.extend_from_slice(server_device_id);
@@ -1662,24 +1754,24 @@ fn compute_pairing_header_aad(init_msg: &PairInitMsg, share_msg: &PairServerShar
     out
 }
 
-/// Assembles the payload signed by Client A:
-/// `"integrator-pair-sig-A-v2" || tt_sha256 || confirm_mac_a`.
+/// Assembles the 88-byte payload signed by Client A:
+/// `24B("integrator-pair-sig-A-v2") || 32B(tt_sha256) || 32B(confirm_mac_a)`.
 fn build_client_signature_payload(tt_sha256: &[u8; 32], confirm_mac_a: &[u8; 32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(26 + 32 + 32);
+    let mut buf = Vec::with_capacity(24 + 32 + 32);
     buf.extend_from_slice(b"integrator-pair-sig-A-v2");
     buf.extend_from_slice(tt_sha256);
     buf.extend_from_slice(confirm_mac_a);
     buf
 }
 
-/// Assembles the payload signed by Server B:
-/// `"integrator-pair-sig-B-v2" || tt_sha256 || confirm_mac_b || sig_a`.
+/// Assembles the 152-byte payload signed by Server B:
+/// `24B("integrator-pair-sig-B-v2") || 32B(tt_sha256) || 32B(confirm_mac_b) || 64B(sig_a)`.
 fn build_server_signature_payload(
     tt_sha256: &[u8; 32],
     confirm_mac_b: &[u8; 32],
     sig_a: &[u8; 64],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(26 + 32 + 32 + 64);
+    let mut buf = Vec::with_capacity(24 + 32 + 32 + 64);
     buf.extend_from_slice(b"integrator-pair-sig-B-v2");
     buf.extend_from_slice(tt_sha256);
     buf.extend_from_slice(confirm_mac_b);

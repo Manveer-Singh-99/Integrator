@@ -260,15 +260,12 @@ pub struct KvmStatusSnapshot {
 }
 
 /// State machine variants governing workstation input authority.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum KvmRole {
     /// Local machine inputs control the local desktop.
     Idle,
     /// Local machine is currently swallowing local inputs and streaming them to the peer.
     ControllingPeer {
-        /// Target peer IP address receiving input commands.
-        peer_ip: String,
         /// Active drag session identifier if a cross-screen drag is in flight.
         active_drag_session: Option<String>,
         /// Cursor X coordinate to restore when control returns to the local screen.
@@ -278,18 +275,14 @@ enum KvmRole {
     },
     /// Local machine is currently being remote-controlled by the peer workstation.
     ControlledByPeer {
-        /// Controlling peer IP address.
-        peer_ip: String,
         /// Edge where the remote cursor entered the local screen.
         entry_edge: ScreenEdge,
-        /// Current simulated cursor X position.
+        /// Current simulated cursor X position in local virtual-desktop coordinates.
         cur_x: f32,
-        /// Current simulated cursor Y position.
+        /// Current simulated cursor Y position in local virtual-desktop coordinates.
         cur_y: f32,
         /// Active drag session identifier if receiving files.
         active_drag_session: Option<String>,
-        /// User-visible preview title for the active drag operation.
-        active_drag_label: Option<String>,
         /// Indicates if a native OS dragging session (`NSDraggingSession` or OLE) has been initiated.
         native_drag_started: bool,
     },
@@ -302,49 +295,87 @@ enum KvmOutboundCmd {
     Wire(KvmWireMessage),
     /// Request to initiate a cross-screen drag session with a set of local file paths.
     EnterWithDragPaths {
+        /// Peer screen edge across which the dragged pointer is entering.
         entry_edge: ScreenEdge,
+        /// Normalized perpendicular position `[0.02, 0.98]` along `entry_edge`.
         norm_pos: f32,
+        /// True when the local primary mouse button is held down at the edge crossing.
         left_button_held: bool,
+        /// Local filesystem paths extracted from the OS drag pasteboard / `IDataObject`.
         paths: Vec<PathBuf>,
     },
 }
 
 /// Central coordinator service managing KVM state, networking, hooks, and drag sessions.
 pub struct KvmService {
+    /// Peer discovery manager used to resolve trusted peer IPs, OS types, and display bounds.
     discovery: DiscoveryManager,
+    /// Clipboard service used to register, stream, and clean up cross-screen drag payloads.
     clipboard: ClipboardService,
+    /// Runtime feature-gate registry (`input_kvm`, `dragdrop`).
     features: Arc<FeatureManager>,
 
+    /// Validated desk topology and behavioral layout preferences (`kvm_layout.json`).
     layout: RwLock<KvmLayoutConfig>,
+    /// Mutual-exclusion state machine guard (`Idle` | `ControllingPeer` | `ControlledByPeer`).
     role: Mutex<KvmRole>,
+    /// Lock-free mirror of `matches!(role, KvmRole::ControllingPeer { .. })` for hot hook callbacks.
     controlling_peer_fast: AtomicBool,
+    /// Cached bounding rectangle of the local workstation's virtual desktop (in DIPs / points).
     local_rect: RwLock<ScreenRect>,
+    /// Cached bounding rectangle of the paired peer workstation's virtual desktop.
     peer_rect: RwLock<ScreenRect>,
+    /// Lowercase hex device ID of the currently connected KVM peer, used for revocation teardown.
     connected_peer_device_id: RwLock<Option<String>>,
+    /// IP address string of the currently connected KVM peer transport session.
     connected_peer_ip: RwLock<Option<String>>,
+    /// Operating system string advertised by the connected peer (`"macos"` or `"windows"`).
     peer_os: RwLock<Option<String>>,
+    /// True when the peer runs a different OS than the local machine (enables Cmd <-> Ctrl swap).
     peer_diff_os: AtomicBool,
+    /// Tracks whether the controlling peer's primary mouse button is currently held down.
     remote_left_down: AtomicBool,
+    /// User-visible title of an active cross-screen drag operation for status telemetry.
     pending_drag_drop_label: RwLock<Option<String>>,
+    /// Active edge-dwell timer `(edge, started_at)` while waiting for `hop_delay_ms` to elapse.
     edge_dwell: Mutex<Option<(ScreenEdge, Instant)>>,
+    /// Timestamp of the last completed edge crossing to enforce `EDGE_TRANSITION_COOLDOWN`.
     last_edge_transition: Mutex<Instant>,
+    /// Set of synthetic remote keys currently pressed on the local OS (drained on release).
     held_remote_keys: Mutex<HashSet<LogicalKey>>,
+    /// Set of synthetic remote mouse buttons currently pressed on the local OS.
     held_remote_buttons: Mutex<HashSet<RemoteMouseButton>>,
+    /// Map of local physical keys pressed while `ControllingPeer` to their translated remote key.
     sent_remote_keys: Mutex<HashMap<LogicalKey, (LogicalKey, ModifierMask)>>,
+    /// Bounded MPSC sender to the active `run_writer_loop` task, or `None` when disconnected.
     outbound_tx: RwLock<Option<mpsc::Sender<KvmOutboundCmd>>>,
+    /// Monotonic counter issuing unique IDs for each attached transport session.
     next_session_id: AtomicU64,
+    /// Identifier of the currently attached transport session (`0` when disconnected).
     active_session_id: AtomicU64,
+    /// Guard ensuring at most one outbound KVM TCP dial runs concurrently.
     connect_in_flight: AtomicBool,
+    /// Latch set during `shutdown()` to terminate background accept/connector/cleanup tasks.
     shutting_down: AtomicBool,
+    /// Abort handles for long-lived listener and connector background tasks.
     active_tasks: Mutex<Vec<AbortHandle>>,
+    /// Abort handles `(reader, writer)` for the active transport session tasks.
     session_abort: Mutex<Option<(AbortHandle, AbortHandle)>>,
+    /// Abort handle for an in-flight incoming drag payload staging task.
     staging_task: Mutex<Option<AbortHandle>>,
+    /// Map of active `session_id -> temp_stage_dir` pending cleanup after drop or cancellation.
     drag_stage_dirs: Mutex<HashMap<String, PathBuf>>,
+    /// Unix epoch millisecond timestamp when `ControlledByPeer` last began (grace window for takeover).
     last_controlled_entry_ms: AtomicU64,
+    /// Lock-free Gaming Boundary Lock flag freezing all cursor edge-hopping when `true`.
     boundary_locked: AtomicBool,
+    /// Serializes `set_boundary_locked` / `toggle_boundary_locked` updates, wire sync, and HUD updates.
+    boundary_lock_mutex: Mutex<()>,
 }
 
 impl KvmService {
+    /// Constructs a new `KvmService` instance, loads persisted layout preferences, and queries
+    /// the local platform's initial virtual-desktop bounds.
     pub fn new(
         discovery: DiscoveryManager,
         clipboard: ClipboardService,
@@ -392,15 +423,20 @@ impl KvmService {
             drag_stage_dirs: Mutex::new(HashMap::new()),
             last_controlled_entry_ms: AtomicU64::new(0),
             boundary_locked: AtomicBool::new(false),
+            boundary_lock_mutex: Mutex::new(()),
         });
         svc.refresh_local_rect();
         svc
     }
 
+    /// Lock-free fast-path query returning `true` when the local workstation is swallowing
+    /// hardware inputs to control the remote peer.
     pub fn is_controlling_peer_fast(&self) -> bool {
         self.controlling_peer_fast.load(Ordering::Acquire)
     }
 
+    /// Atomically transitions `role_guard` to `next_role`, keeps `controlling_peer_fast` in sync,
+    /// and emits UI notification banners when entering or exiting `ControlledByPeer`.
     fn set_role_locked(&self, role_guard: &mut KvmRole, next_role: KvmRole) -> KvmRole {
         let is_controlling = matches!(next_role, KvmRole::ControllingPeer { .. });
         let is_controlled = matches!(next_role, KvmRole::ControlledByPeer { .. });
@@ -422,6 +458,7 @@ impl KvmService {
         prev
     }
 
+    /// Aborts the active transport reader and writer Tokio tasks, if any.
     fn abort_active_session_tasks(&self) {
         if let Some((r_abort, w_abort)) = self
             .session_abort
@@ -434,11 +471,21 @@ impl KvmService {
         }
     }
 
+    /// Tears down the current transport session, clears peer metadata, releases held inputs,
+    /// and re-synchronizes the native edge probe window.
     fn teardown_active_session(&self) {
         self.active_session_id.store(0, Ordering::Release);
         self.abort_active_session_tasks();
         *self
+            .connected_peer_device_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
             .connected_peer_ip
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .peer_os
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
         *self
@@ -449,6 +496,8 @@ impl KvmService {
         self.sync_platform_probe();
     }
 
+    /// Gracefully shuts down the KVM service: notifies any peer to release inputs, aborts all
+    /// background tasks, purges staged drag directories, and uninstalls native OS input hooks.
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.force_release_all(true);
@@ -477,6 +526,8 @@ impl KvmService {
         windows_backend::stop();
     }
 
+    /// Starts native OS input hooks, binds the encrypted TCP listener on `INPUT_PORT` (58286),
+    /// and launches the background peer connector / topology failover loop.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         // Sync initial edge probe config on Windows
         self.sync_platform_probe();
@@ -749,6 +800,7 @@ impl KvmService {
         Ok(())
     }
 
+    /// Refreshes the cached local virtual-desktop bounds from the active OS display backend.
     pub fn refresh_local_rect(&self) {
         #[cfg(target_os = "macos")]
         let rect = macos_backend::get_primary_screen_rect();
@@ -764,6 +816,8 @@ impl KvmService {
         *self.local_rect.write().unwrap_or_else(|e| e.into_inner()) = rect;
     }
 
+    /// Synchronizes the Windows invisible screen-edge OLE drag probe window with current
+    /// feature flags, connection status, and configured `peer_edge`.
     fn sync_platform_probe(&self) {
         #[cfg(target_os = "windows")]
         {
@@ -783,10 +837,18 @@ impl KvmService {
         }
     }
 
+    /// Returns a cloned snapshot of the current KVM desk layout configuration.
     pub fn get_layout(&self) -> KvmLayoutConfig {
         self.layout.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Sanitizes, timestamps, atomically persists, and mirrors a new `KvmLayoutConfig` to the peer.
+    ///
+    /// # Arguments
+    /// * `cfg` - Candidate layout configuration submitted from local UI/RPC.
+    ///
+    /// # Returns
+    /// The sanitized and persisted `KvmLayoutConfig`, or an I/O error if persistence fails.
     pub fn update_layout(&self, mut cfg: KvmLayoutConfig) -> Result<KvmLayoutConfig> {
         sanitize_layout(&mut cfg);
         cfg.updated_at_ms = SystemTime::now()
@@ -802,6 +864,7 @@ impl KvmService {
         Ok(cfg)
     }
 
+    /// Captures a point-in-time `KvmStatusSnapshot` for UI and telemetry consumers.
     pub fn get_status_snapshot(&self) -> KvmStatusSnapshot {
         let role_str = match *self.role.lock().unwrap_or_else(|e| e.into_inner()) {
             KvmRole::Idle => "idle".to_string(),
@@ -837,11 +900,9 @@ impl KvmService {
         self.boundary_locked.load(Ordering::Acquire)
     }
 
-    /// Engages or disengages KVM Gaming Boundary Lock (freezes cursor edge-hopping).
-    ///
-    /// When `sync_peer` is `true`, propagates `KvmWireMessage::SetBoundaryLock` over the
-    /// live KVM transport session so both Mac and PC honor the boundary lock synchronously.
-    pub fn set_boundary_locked(&self, locked: bool, sync_peer: bool) -> bool {
+    /// Applies a boundary lock update under `boundary_lock_mutex` so atomic flag state,
+    /// outbound wire sync, and Touch Bar HUD updates always execute in matching order.
+    fn apply_boundary_locked_inner(&self, locked: bool, sync_peer: bool) -> bool {
         self.boundary_locked.store(locked, Ordering::SeqCst);
         if locked {
             *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -857,10 +918,26 @@ impl KvmService {
         locked
     }
 
-    /// Toggles KVM Gaming Boundary Lock and synchronizes state with the peer.
+    /// Engages or disengages KVM Gaming Boundary Lock (freezes cursor edge-hopping).
+    ///
+    /// When `sync_peer` is `true`, propagates `KvmWireMessage::SetBoundaryLock` over the
+    /// live KVM transport session so both Mac and PC honor the boundary lock synchronously.
+    pub fn set_boundary_locked(&self, locked: bool, sync_peer: bool) -> bool {
+        let _guard = self
+            .boundary_lock_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.apply_boundary_locked_inner(locked, sync_peer)
+    }
+
+    /// Atomically toggles KVM Gaming Boundary Lock and synchronizes state with the peer.
     pub fn toggle_boundary_locked(&self) -> bool {
-        let next = !self.is_boundary_locked();
-        self.set_boundary_locked(next, true)
+        let _guard = self
+            .boundary_lock_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let next = !self.boundary_locked.load(Ordering::SeqCst);
+        self.apply_boundary_locked_inner(next, true)
     }
 
     /// Immediately tears down any active KVM session associated with the specified peer device ID hex.
@@ -872,9 +949,9 @@ impl KvmService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(id) = connected_id {
-            if id == clean_id {
+            if id.eq_ignore_ascii_case(&clean_id) {
                 info!("🛑 KVM tearing down active session for revoked peer {}", clean_id);
-                self.force_release_all(false);
+                self.active_session_id.store(0, Ordering::Release);
                 self.abort_active_session_tasks();
                 *self
                     .connected_peer_device_id
@@ -885,15 +962,23 @@ impl KvmService {
                     .write()
                     .unwrap_or_else(|e| e.into_inner()) = None;
                 *self
+                    .peer_os
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                *self
                     .outbound_tx
                     .write()
                     .unwrap_or_else(|e| e.into_inner()) = None;
-                self.active_session_id.store(0, Ordering::Release);
+                self.force_release_all(false);
                 self.sync_platform_probe();
             }
         }
     }
 
+    /// Immediately releases all locally or remotely held keys/buttons, cancels any active drag
+    /// staging/session, and resets the KVM state machine to `Idle`.
+    ///
+    /// When `notify_peer` is `true`, emits `KvmWireMessage::ReleaseAll` before clearing local state.
     pub fn force_release_all(&self, notify_peer: bool) {
         if notify_peer {
             self.try_send_wire(KvmWireMessage::ReleaseAll);
@@ -930,7 +1015,6 @@ impl KvmService {
                 restore_x,
                 restore_y,
                 active_drag_session,
-                ..
             } => {
                 if let Some(sid) = active_drag_session {
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -946,11 +1030,18 @@ impl KvmService {
                 cur_x,
                 cur_y,
                 active_drag_session,
+                native_drag_started,
                 ..
             } => {
                 if active_drag_session.is_some() {
                     #[cfg(target_os = "windows")]
                     windows_backend::cancel_remote_drag();
+                    #[cfg(target_os = "macos")]
+                    if native_drag_started {
+                        macos_backend::cancel_local_drag_after_handoff();
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = native_drag_started;
                 }
                 self.release_all_injected_inputs(cur_x, cur_y);
                 Self::platform_hide_ghost();
@@ -964,6 +1055,9 @@ impl KvmService {
     // TransportV2 Full-Duplex Reader / Writer Loop
     // =========================================================================
 
+    /// Attaches an authenticated `TransportSessionV2` stream, spawns dedicated reader/writer
+    /// loops, exchanges initial display geometry / layout / boundary lock state, and tears down
+    /// cleanly upon disconnect.
     async fn attach_transport_session(
         self: &Arc<Self>,
         peer_ip: String,
@@ -1018,7 +1112,7 @@ impl KvmService {
         self.sync_platform_probe();
         info!("⌨️🖱️ Encrypted Universal Control KVM session linked with {}", peer_ip);
 
-        // Send initial geometry & layout
+        // Send initial geometry, layout, and active boundary lock state
         let rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
         let layout_cfg = self.get_layout();
         let _ = tx.try_send(KvmOutboundCmd::Wire(KvmWireMessage::ScreenGeometry {
@@ -1029,6 +1123,11 @@ impl KvmService {
             let _ = tx.try_send(KvmOutboundCmd::Wire(KvmWireMessage::SyncLayout(
                 mirror_layout_for_peer(&layout_cfg),
             )));
+        }
+        if self.boundary_locked.load(Ordering::Acquire) {
+            let _ = tx.try_send(KvmOutboundCmd::Wire(KvmWireMessage::SetBoundaryLock {
+                locked: true,
+            }));
         }
 
         let svc_w = Arc::clone(self);
@@ -1082,6 +1181,10 @@ impl KvmService {
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = None;
             *self
+                .peer_os
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
                 .outbound_tx
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = None;
@@ -1091,6 +1194,9 @@ impl KvmService {
         info!("🔌 Universal Control KVM session disconnected from {}", peer_ip);
     }
 
+    /// Asynchronous writer actor loop draining `rx`, collecting drag metadata for
+    /// `EnterWithDragPaths`, sending 1-second keep-alive `Ping` frames while active, and framing
+    /// encrypted messages up to `MAX_WIRE_MESSAGE_BYTES`.
     async fn run_writer_loop(
         svc: &Arc<Self>,
         mut writer: TransportWriterV2<tokio::net::tcp::OwnedWriteHalf>,
@@ -1125,7 +1231,7 @@ impl KvmService {
                 }
             };
 
-            let msg = match cmd {
+            let mut msg = match cmd {
                 KvmOutboundCmd::Wire(m) => m,
                 KvmOutboundCmd::EnterWithDragPaths {
                     entry_edge,
@@ -1195,7 +1301,24 @@ impl KvmService {
                 }
             };
 
-            match serde_json::to_vec(&msg) {
+            let encoded = match serde_json::to_vec(&msg) {
+                Ok(bytes) if bytes.len() > MAX_WIRE_MESSAGE_BYTES => {
+                    // Never drop EnterScreen due to an oversized icon thumbnail; strip icon and retry.
+                    if let KvmWireMessage::EnterScreen {
+                        drag_offer: Some(ref mut offer),
+                        ..
+                    } = msg
+                    {
+                        offer.icon_png_b64 = None;
+                        serde_json::to_vec(&msg)
+                    } else {
+                        Ok(bytes)
+                    }
+                }
+                other => other,
+            };
+
+            match encoded {
                 Ok(bytes) => {
                     if bytes.len() > MAX_WIRE_MESSAGE_BYTES {
                         warn!("Skipping oversized KVM wire frame ({} B)", bytes.len());
@@ -1213,6 +1336,8 @@ impl KvmService {
         }
     }
 
+    /// Asynchronous reader loop enforcing `MAX_WIRE_MESSAGE_BYTES` frame limits and a 5-second
+    /// silence watchdog that releases active control if the remote peer stalls mid-session.
     async fn run_reader_loop(
         svc: &Arc<Self>,
         reader: &mut TransportReaderV2<tokio::net::tcp::OwnedReadHalf>,
@@ -1246,6 +1371,8 @@ impl KvmService {
         }
     }
 
+    /// Processes a single authenticated inbound `KvmWireMessage` from `peer_ip`, updating
+    /// state machine transitions, display geometry, input injection, and drag-drop staging.
     async fn handle_inbound_message(self: &Arc<Self>, peer_ip: &str, msg: KvmWireMessage) {
         if !self.features.is_enabled("input_kvm") {
             return;
@@ -1319,7 +1446,7 @@ impl KvmService {
                 let drag_sid = offer_opt.as_ref().map(|o| o.session_id.clone());
                 let drag_label = offer_opt.as_ref().map(|o| o.root_name.clone());
 
-                {
+                let prev_role = {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1329,15 +1456,36 @@ impl KvmService {
                     self.set_role_locked(
                         &mut role,
                         KvmRole::ControlledByPeer {
-                            peer_ip: peer_ip.to_string(),
                             entry_edge,
                             cur_x: ex,
                             cur_y: ey,
                             active_drag_session: drag_sid.clone(),
-                            active_drag_label: drag_label.clone(),
                             native_drag_started: false,
                         },
-                    );
+                    )
+                };
+                // If an earlier ControlledByPeer session was superseded without LeaveScreen/ReleaseAll,
+                // release its held inputs and cancel any lingering native drag before starting the new one.
+                if let KvmRole::ControlledByPeer {
+                    cur_x: prev_x,
+                    cur_y: prev_y,
+                    active_drag_session: prev_sid,
+                    native_drag_started: prev_native_drag,
+                    ..
+                } = prev_role
+                {
+                    if prev_sid.is_some() {
+                        #[cfg(target_os = "windows")]
+                        windows_backend::cancel_remote_drag();
+                        #[cfg(target_os = "macos")]
+                        if prev_native_drag {
+                            macos_backend::cancel_local_drag_after_handoff();
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = prev_native_drag;
+                        Self::platform_hide_ghost();
+                    }
+                    self.release_all_injected_inputs(prev_x, prev_y);
                 }
                 *self.last_edge_transition.lock().unwrap_or_else(|e| e.into_inner()) =
                     Instant::now();
@@ -1418,7 +1566,6 @@ impl KvmService {
                                         .unwrap_or_else(|e| e.into_inner());
                                     if let KvmRole::ControlledByPeer {
                                         ref mut active_drag_session,
-                                        ref mut active_drag_label,
                                         ..
                                     } = *role
                                     {
@@ -1426,7 +1573,6 @@ impl KvmService {
                                             == Some(offer.session_id.as_str())
                                         {
                                             *active_drag_session = None;
-                                            *active_drag_label = None;
                                         }
                                     }
                                 }
@@ -1507,6 +1653,11 @@ impl KvmService {
                     return;
                 }
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
+                // Ensure min <= max even on degenerate/narrow ScreenRects so f32::clamp never panics.
+                let min_x = local_rect.x + 1.0;
+                let max_x = (local_rect.max_x() - 1.0).max(min_x);
+                let min_y = local_rect.y + 1.0;
+                let max_y = (local_rect.max_y() - 1.0).max(min_y);
                 let cfg = self.get_layout();
                 let (new_x, new_y, left_down, crossed_back) = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
@@ -1524,6 +1675,7 @@ impl KvmService {
                     let next_x = *cur_x + dx;
                     let next_y = *cur_y + dy;
 
+                    // Detect crossing back across the entry edge where control originally entered.
                     let crossed = match entry_edge {
                         ScreenEdge::Left => next_x < local_rect.x,
                         ScreenEdge::Right => next_x > local_rect.max_x(),
@@ -1539,6 +1691,8 @@ impl KvmService {
                         >= EDGE_TRANSITION_COOLDOWN;
 
                     let boundary_locked = self.boundary_locked.load(Ordering::Acquire);
+                    // Suppress edge return while Gaming Boundary Lock is engaged, while a file drag
+                    // handoff is in flight, or inside the post-entry anti-bounce cooldown window.
                     if crossed && !boundary_locked && active_drag_session.is_none() && cooldown_elapsed {
                         let dead = cfg.dead_corners
                             && is_in_dead_corner(local_rect, entry_edge, next_x, next_y);
@@ -1553,8 +1707,8 @@ impl KvmService {
                             self.set_role_locked(&mut role, KvmRole::Idle);
                             (next_x, next_y, false, Some((entry_edge, norm)))
                         } else {
-                            *cur_x = next_x.clamp(local_rect.x + 1.0, local_rect.max_x() - 1.0);
-                            *cur_y = next_y.clamp(local_rect.y + 1.0, local_rect.max_y() - 1.0);
+                            *cur_x = next_x.clamp(min_x, max_x);
+                            *cur_y = next_y.clamp(min_y, max_y);
                             (
                                 *cur_x,
                                 *cur_y,
@@ -1563,8 +1717,8 @@ impl KvmService {
                             )
                         }
                     } else {
-                        *cur_x = next_x.clamp(local_rect.x + 1.0, local_rect.max_x() - 1.0);
-                        *cur_y = next_y.clamp(local_rect.y + 1.0, local_rect.max_y() - 1.0);
+                        *cur_x = next_x.clamp(min_x, max_x);
+                        *cur_y = next_y.clamp(min_y, max_y);
                         (
                             *cur_x,
                             *cur_y,
@@ -1666,25 +1820,21 @@ impl KvmService {
                 {
                     handle.abort();
                 }
-                #[cfg(target_os = "windows")]
-                windows_backend::cancel_remote_drag();
-                Self::platform_hide_ghost();
-                self.remote_left_down.store(false, Ordering::Release);
-                *self
-                    .pending_drag_drop_label
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-                {
+                let was_native_started = {
                     let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                     match *role {
                         KvmRole::ControlledByPeer {
                             ref mut active_drag_session,
-                            ref mut active_drag_label,
+                            ref mut native_drag_started,
                             ..
                         } => {
                             if active_drag_session.as_deref() == Some(session_id.as_str()) {
+                                let started = *native_drag_started;
                                 *active_drag_session = None;
-                                *active_drag_label = None;
+                                *native_drag_started = false;
+                                started
+                            } else {
+                                false
                             }
                         }
                         KvmRole::ControllingPeer {
@@ -1694,10 +1844,25 @@ impl KvmService {
                             if active_drag_session.as_deref() == Some(session_id.as_str()) {
                                 *active_drag_session = None;
                             }
+                            false
                         }
-                        KvmRole::Idle => {}
+                        KvmRole::Idle => false,
                     }
+                };
+                #[cfg(target_os = "windows")]
+                windows_backend::cancel_remote_drag();
+                #[cfg(target_os = "macos")]
+                if was_native_started {
+                    macos_backend::cancel_local_drag_after_handoff();
                 }
+                #[cfg(not(target_os = "macos"))]
+                let _ = was_native_started;
+                Self::platform_hide_ghost();
+                self.remote_left_down.store(false, Ordering::Release);
+                *self
+                    .pending_drag_drop_label
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
                 self.remove_drag_stage_dir(&session_id);
                 self.clipboard.remove_drag_session(&session_id).await;
             }
@@ -1743,6 +1908,9 @@ impl KvmService {
         }
     }
 
+    /// Invoked once remote drag payload staging completes on disk; either hands off the staged
+    /// paths to a native OS drag session (if the remote left button is still held) or commits
+    /// them atomically into the configured fallback drop folder (`Downloads` / `Desktop` / `Cache`).
     async fn on_drag_staging_ready(self: &Arc<Self>, session_id: &str, top_paths: Vec<PathBuf>) {
         if top_paths.is_empty() {
             Self::platform_hide_ghost();
@@ -1755,17 +1923,20 @@ impl KvmService {
                 let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                 if let KvmRole::ControlledByPeer {
                     ref mut active_drag_session,
-                    ref mut active_drag_label,
                     ..
                 } = *role
                 {
                     if active_drag_session.as_deref() == Some(session_id) {
                         *active_drag_session = None;
-                        *active_drag_label = None;
                     }
                 }
             }
             self.remove_drag_stage_dir(session_id);
+            self.try_send_wire(KvmWireMessage::DragDropResult {
+                session_id: session_id.to_string(),
+                accepted: false,
+                message: "No files staged for drop".to_string(),
+            });
             return;
         }
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -1798,9 +1969,21 @@ impl KvmService {
         let left_still_held = self.remote_left_down.load(Ordering::Acquire);
         if left_still_held {
             #[cfg(target_os = "macos")]
-            macos_backend::begin_native_drop_drag(&top_paths, session_id, cx, cy);
+            let dispatched = macos_backend::begin_native_drop_drag(&top_paths, session_id, cx, cy);
             #[cfg(target_os = "windows")]
-            windows_backend::begin_native_drop_drag(&top_paths, session_id, true);
+            let dispatched = windows_backend::begin_native_drop_drag(
+                &top_paths,
+                session_id,
+                self.remote_left_down.load(Ordering::Acquire),
+            );
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let dispatched = {
+                let _ = (cx, cy);
+                false
+            };
+            if !dispatched {
+                self.on_native_drag_ended(session_id, false);
+            }
         } else {
             // User already released the mouse button while a larger file was finishing SHA-256 verification.
             // Commit atomically into the configured fallback folder (`Downloads` / `Desktop` / `Cache`).
@@ -1827,13 +2010,11 @@ impl KvmService {
                 let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
                 if let KvmRole::ControlledByPeer {
                     ref mut active_drag_session,
-                    ref mut active_drag_label,
                     ..
                 } = *role
                 {
                     if active_drag_session.as_deref() == Some(session_id) {
                         *active_drag_session = None;
-                        *active_drag_label = None;
                     }
                 }
             }
@@ -1861,6 +2042,8 @@ impl KvmService {
         }
     }
 
+    /// Callback invoked by the native macOS/Windows drag backend when an active `NSDraggingSession`
+    /// or OLE `DoDragDrop` completes or is cancelled; cleans up staged temp files and notifies peer.
     pub fn on_native_drag_ended(&self, session_id: &str, accepted: bool) {
         Self::platform_hide_ghost();
         self.remote_left_down.store(false, Ordering::Release);
@@ -1872,13 +2055,13 @@ impl KvmService {
             let mut role = self.role.lock().unwrap_or_else(|e| e.into_inner());
             if let KvmRole::ControlledByPeer {
                 ref mut active_drag_session,
-                ref mut active_drag_label,
+                ref mut native_drag_started,
                 ..
             } = *role
             {
                 if active_drag_session.as_deref() == Some(session_id) {
                     *active_drag_session = None;
-                    *active_drag_label = None;
+                    *native_drag_started = false;
                 }
             }
         }
@@ -1899,6 +2082,9 @@ impl KvmService {
     // Low-Level OS Hook Decision Handlers (MUST BE SUB-MILLISECOND & NON-BLOCKING)
     // =========================================================================
 
+    /// Hot-path OS mouse movement hook handler: forwards relative deltas while `ControllingPeer`,
+    /// handles physical mouse takeover while `ControlledByPeer`, and evaluates edge dwell,
+    /// corner guards, and active file drags when `Idle`.
     pub fn on_local_mouse_move(
         &self,
         x: f32,
@@ -1931,6 +2117,7 @@ impl KvmService {
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let entered_at = self.last_controlled_entry_ms.load(Ordering::Acquire);
+                    // Ignore tiny pointer jitter during the first 150ms after remote entry warp.
                     if now_ms.saturating_sub(entered_at) > 150 && (dx.abs() > 3.0 || dy.abs() > 3.0) {
                         info!("👋 Local physical mouse motion detected while controlled; taking back control");
                         self.force_release_all(true);
@@ -1955,9 +2142,9 @@ impl KvmService {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let Some(peer_ip) = connected_ip else {
+        if connected_ip.is_none() {
             return HookDecision::PassThrough;
-        };
+        }
 
         {
             let last = self
@@ -1972,6 +2159,7 @@ impl KvmService {
         let layout_cfg = self.get_layout();
         let rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
 
+        // Check proximity against the configured virtual-desktop boundary (`peer_edge`).
         let at_edge = match layout_cfg.peer_edge {
             ScreenEdge::Left => x <= rect.x + EDGE_PROXIMITY_INSET_PX,
             ScreenEdge::Right => x >= rect.max_x() - EDGE_PROXIMITY_OUTSET_PX,
@@ -1984,11 +2172,13 @@ impl KvmService {
             return HookDecision::PassThrough;
         }
 
+        // Suppress transition in corner dead-zones (Apple menu, window close/minimize, taskbar tray).
         if layout_cfg.dead_corners && is_in_dead_corner(rect, layout_cfg.peer_edge, x, y) {
             *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return HookDecision::PassThrough;
         }
 
+        // Enforce edge dwell delay (`hop_delay_ms`, at least 25 ms during drags) before crossing.
         let effective_delay_ms = if left_button_held && self.features.is_enabled("dragdrop") {
             layout_cfg.hop_delay_ms.max(MIN_DRAG_HOP_DELAY_MS)
         } else {
@@ -2040,7 +2230,6 @@ impl KvmService {
             self.set_role_locked(
                 &mut role,
                 KvmRole::ControllingPeer {
-                    peer_ip,
                     active_drag_session: None,
                     restore_x: x,
                     restore_y: y,
@@ -2060,17 +2249,30 @@ impl KvmService {
 
         let entry_edge = layout_cfg.peer_edge.opposite();
         if !drag_paths.is_empty() {
-            if let Some(tx) = self
-                .outbound_tx
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                let _ = tx.try_send(KvmOutboundCmd::EnterWithDragPaths {
+            let queued = {
+                if let Some(tx) = self
+                    .outbound_tx
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    tx.try_send(KvmOutboundCmd::EnterWithDragPaths {
+                        entry_edge,
+                        norm_pos,
+                        left_button_held,
+                        paths: drag_paths,
+                    })
+                    .is_ok()
+                } else {
+                    false
+                }
+            };
+            if !queued {
+                self.try_send_wire(KvmWireMessage::EnterScreen {
                     entry_edge,
                     norm_pos,
                     left_button_held,
-                    paths: drag_paths,
+                    drag_offer: None,
                 });
             }
         } else {
@@ -2085,6 +2287,8 @@ impl KvmService {
         HookDecision::SwallowAndParkCenter
     }
 
+    /// Hot-path OS mouse button hook handler: releases control on local click when
+    /// `ControlledByPeer` or forwards clicks to the peer while `ControllingPeer`.
     pub fn on_local_mouse_button(
         &self,
         button: RemoteMouseButton,
@@ -2115,6 +2319,7 @@ impl KvmService {
         }
     }
 
+    /// Hot-path OS scroll/trackpad hook handler: forwards finite scroll deltas while `ControllingPeer`.
     pub fn on_local_mouse_scroll(&self, dx: f32, dy: f32) -> HookDecision {
         if !self.features.is_enabled("input_kvm") {
             return HookDecision::PassThrough;
@@ -2133,6 +2338,9 @@ impl KvmService {
         HookDecision::Swallow
     }
 
+    /// Hot-path OS keyboard hook handler: processes the `Ctrl+Alt+Shift+Esc` panic release,
+    /// triggers physical local takeover when `ControlledByPeer`, and translates/forwards key
+    /// events while `ControllingPeer` (passing through releases of keys pressed before hop).
     pub fn on_local_key_event(
         &self,
         key: LogicalKey,
@@ -2191,10 +2399,14 @@ impl KvmService {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
             if let Some((prev_key, _prev_mods)) = prev {
+                // Always release the exact remote LogicalKey originally sent on key-down even
+                // if `modifier_translation` toggled mid-hold, while reflecting current modifiers.
                 let (_, cur_mods) = self.translate_key_for_peer(key, modifiers);
                 (prev_key, cur_mods)
             } else {
-                self.translate_key_for_peer(key, modifiers)
+                // Key was pressed locally prior to entering ControllingPeer; pass the key-up
+                // through to the local OS so local modifiers/keys never stay stuck down.
+                return HookDecision::PassThrough;
             }
         } else {
             self.translate_key_for_peer(key, modifiers)
@@ -2208,6 +2420,8 @@ impl KvmService {
         HookDecision::Swallow
     }
 
+    /// Maps a local `(LogicalKey, ModifierMask)` for the remote peer, swapping `Command ⌘` and
+    /// `Control` when `modifier_translation` is enabled and the peer runs a different OS.
     pub fn translate_key_for_peer(
         &self,
         key: LogicalKey,
@@ -2224,6 +2438,7 @@ impl KvmService {
     // Internal Helpers
     // =========================================================================
 
+    /// Removes and asynchronously deletes the temporary drag staging directory for `session_id`.
     fn remove_drag_stage_dir(&self, session_id: &str) {
         let dir = self
             .drag_stage_dirs
@@ -2235,6 +2450,7 @@ impl KvmService {
         }
     }
 
+    /// Drains and deletes all tracked temporary drag staging directories.
     fn cleanup_all_drag_stage_dirs(&self) {
         let dirs: Vec<PathBuf> = self
             .drag_stage_dirs
@@ -2248,6 +2464,7 @@ impl KvmService {
         }
     }
 
+    /// Deletes `dir` on Tokio's blocking pool when running normally, or synchronously during shutdown.
     fn spawn_or_sync_remove_dir(&self, dir: PathBuf) {
         if !self.shutting_down.load(Ordering::Acquire) {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -2260,6 +2477,8 @@ impl KvmService {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Non-blocking enqueue of `msg` onto `outbound_tx`, reserving `RESERVED_CONTROL_SLOTS`
+    /// for critical key/button/release messages by shedding excess lossy move/scroll frames.
     fn try_send_wire(&self, msg: KvmWireMessage) {
         if let Some(tx) = self
             .outbound_tx
@@ -2278,6 +2497,8 @@ impl KvmService {
         }
     }
 
+    /// Releases all remotely injected mouse buttons and keyboard keys on the local OS,
+    /// releasing non-modifier keys first and modifier keys last to avoid stuck modifiers.
     fn release_all_injected_inputs(&self, cx: f32, cy: f32) {
         let btns: Vec<RemoteMouseButton> = {
             let mut b = self
@@ -2297,11 +2518,29 @@ impl KvmService {
                 .unwrap_or_else(|e| e.into_inner());
             k.drain().collect()
         };
-        for key in keys {
+        let is_mod = |k: LogicalKey| {
+            matches!(
+                k,
+                LogicalKey::ShiftLeft
+                    | LogicalKey::ShiftRight
+                    | LogicalKey::ControlLeft
+                    | LogicalKey::ControlRight
+                    | LogicalKey::AltLeft
+                    | LogicalKey::AltRight
+                    | LogicalKey::MetaLeft
+                    | LogicalKey::MetaRight
+            )
+        };
+        for &key in keys.iter().filter(|&&k| !is_mod(k)) {
+            Self::platform_inject_key(key, false, ModifierMask::default());
+        }
+        for &key in keys.iter().filter(|&&k| is_mod(k)) {
             Self::platform_inject_key(key, false, ModifierMask::default());
         }
     }
 
+    /// Resolves the user-configured fallback destination directory (`"desktop"`, `"cache"`, or
+    /// `"downloads"`) and moves/copies staged drag items into it.
     fn commit_staged_to_fallback_folder(top_paths: &[PathBuf], drop_pref: &str) -> Result<PathBuf> {
         let home = crate::system_info::user_home_dir();
         let dest_dir = match drop_pref {
@@ -2313,6 +2552,8 @@ impl KvmService {
         Ok(dest_dir)
     }
 
+    /// Atomically moves or copies `top_paths` into `dest_dir`, validating filenames against
+    /// traversal and disambiguating existing entries/symlinks via `symlink_metadata`.
     fn commit_staged_to_dest_dir(top_paths: &[PathBuf], dest_dir: &Path) -> Result<()> {
         const MAX_COLLISION_INDEX: usize = 10_000;
         std::fs::create_dir_all(dest_dir)?;
@@ -2369,6 +2610,7 @@ impl KvmService {
         Ok(())
     }
 
+    /// Queries the native OS backend to determine whether the low-level input hook is active.
     fn platform_is_hook_active() -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -2384,6 +2626,7 @@ impl KvmService {
         }
     }
 
+    /// Updates native controlling-mode cursor hiding/parking state across supported OS backends.
     fn platform_set_controlling(
         controlling: bool,
         park_x: f32,
@@ -2399,6 +2642,7 @@ impl KvmService {
         let _ = (controlling, park_x, park_y, restore_x, restore_y);
     }
 
+    /// Updates native controlled-mode cursor visibility and warps to `(entry_x, entry_y)`.
     fn platform_set_controlled(controlled: bool, entry_x: f32, entry_y: f32) {
         #[cfg(target_os = "macos")]
         macos_backend::set_controlled_mode(controlled, entry_x, entry_y);
@@ -2408,6 +2652,7 @@ impl KvmService {
         let _ = (controlled, entry_x, entry_y);
     }
 
+    /// Queries the native drag pasteboard / `IDataObject` probe for active dragged file paths.
     fn platform_probe_drag_paths() -> Vec<PathBuf> {
         #[cfg(target_os = "macos")]
         {
@@ -2423,6 +2668,7 @@ impl KvmService {
         }
     }
 
+    /// Cancels the local OS drag session once ownership has transitioned across the screen border.
     fn platform_cancel_local_drag() {
         #[cfg(target_os = "macos")]
         macos_backend::cancel_local_drag_after_handoff();
@@ -2430,6 +2676,7 @@ impl KvmService {
         windows_backend::cancel_local_drag_after_handoff();
     }
 
+    /// Extracts an optional Base64-encoded PNG icon thumbnail for the primary dragged file.
     fn extract_icon_b64(first_path: Option<&Path>) -> Option<String> {
         #[cfg(target_os = "macos")]
         {
@@ -2442,6 +2689,7 @@ impl KvmService {
         }
     }
 
+    /// Synthesizes a remote pointer move at `(x, y)` via the native OS backend.
     fn platform_inject_mouse_move(x: f32, y: f32, left_held: bool) {
         #[cfg(target_os = "macos")]
         macos_backend::inject_mouse_move(x, y, left_held);
@@ -2451,6 +2699,7 @@ impl KvmService {
         let _ = (x, y, left_held);
     }
 
+    /// Synthesizes a remote mouse button press/release at `(x, y)` via the native OS backend.
     fn platform_inject_mouse_button(button: RemoteMouseButton, pressed: bool, x: f32, y: f32) {
         #[cfg(target_os = "macos")]
         macos_backend::inject_mouse_button(button, pressed, x, y);
@@ -2460,6 +2709,7 @@ impl KvmService {
         let _ = (button, pressed, x, y);
     }
 
+    /// Synthesizes remote scroll wheel deltas via the native OS backend.
     fn platform_inject_scroll(dx: f32, dy: f32) {
         #[cfg(target_os = "macos")]
         macos_backend::inject_scroll(dx, dy);
@@ -2469,6 +2719,7 @@ impl KvmService {
         let _ = (dx, dy);
     }
 
+    /// Synthesizes a remote keyboard key press/release via the native OS backend.
     fn platform_inject_key(key: LogicalKey, pressed: bool, mods: ModifierMask) {
         #[cfg(target_os = "macos")]
         macos_backend::inject_key(key, pressed, mods);
@@ -2478,6 +2729,7 @@ impl KvmService {
         let _ = (key, pressed, mods);
     }
 
+    /// Displays the translucent drag ghost HUD overlay at `(x, y)` on supported OS backends.
     fn platform_show_ghost(
         x: f32,
         y: f32,
@@ -2493,6 +2745,7 @@ impl KvmService {
         let _ = (x, y, title, subtitle, icon_b64);
     }
 
+    /// Moves the active drag ghost HUD overlay to `(x, y)` on supported OS backends.
     fn platform_move_ghost(x: f32, y: f32) {
         #[cfg(target_os = "macos")]
         macos_backend::move_drag_ghost(x, y);
@@ -2502,6 +2755,7 @@ impl KvmService {
         let _ = (x, y);
     }
 
+    /// Hides the drag ghost HUD overlay on supported OS backends.
     fn platform_hide_ghost() {
         #[cfg(target_os = "macos")]
         macos_backend::hide_drag_ghost();
@@ -2510,6 +2764,8 @@ impl KvmService {
     }
 }
 
+/// Symmetrically swaps `Meta` (`Command ⌘` / `Win`) and `Control` for both discrete modifier
+/// key codes (`MetaLeft/Right <-> ControlLeft/Right`) and the companion `ModifierMask` flags.
 pub fn translate_command_ctrl_pair(
     key: LogicalKey,
     mods: ModifierMask,
@@ -2661,12 +2917,10 @@ mod tests {
             svc.set_role_locked(
                 &mut r,
                 KvmRole::ControlledByPeer {
-                    peer_ip: "10.99.99.2".to_string(),
                     entry_edge: ScreenEdge::Left,
                     cur_x: 100.0,
                     cur_y: 200.0,
                     active_drag_session: None,
-                    active_drag_label: None,
                     native_drag_started: false,
                 },
             );
@@ -2701,7 +2955,6 @@ mod tests {
             svc.set_role_locked(
                 &mut r,
                 KvmRole::ControllingPeer {
-                    peer_ip: "10.99.99.2".to_string(),
                     active_drag_session: None,
                     restore_x: 10.0,
                     restore_y: 10.0,
@@ -2830,12 +3083,10 @@ mod tests {
             svc.set_role_locked(
                 &mut r,
                 KvmRole::ControlledByPeer {
-                    peer_ip: "10.99.99.2".to_string(),
                     entry_edge: ScreenEdge::Left,
                     cur_x: 100.0,
                     cur_y: 200.0,
                     active_drag_session: None,
-                    active_drag_label: None,
                     native_drag_started: false,
                 },
             );
@@ -2854,12 +3105,10 @@ mod tests {
             svc.set_role_locked(
                 &mut r,
                 KvmRole::ControlledByPeer {
-                    peer_ip: "10.99.99.2".to_string(),
                     entry_edge: ScreenEdge::Left,
                     cur_x: 100.0,
                     cur_y: 200.0,
                     active_drag_session: None,
-                    active_drag_label: None,
                     native_drag_started: false,
                 },
             );
@@ -2877,12 +3126,10 @@ mod tests {
             svc.set_role_locked(
                 &mut r,
                 KvmRole::ControlledByPeer {
-                    peer_ip: "10.99.99.2".to_string(),
                     entry_edge: ScreenEdge::Left,
                     cur_x: 100.0,
                     cur_y: 200.0,
                     active_drag_session: None,
-                    active_drag_label: None,
                     native_drag_started: false,
                 },
             );
@@ -2891,5 +3138,82 @@ mod tests {
         let motion_decision = svc.on_local_mouse_move(100.0, 200.0, 5.0, 5.0, false);
         assert_eq!(motion_decision, HookDecision::PassThrough);
         assert!(matches!(*svc.role.lock().unwrap(), KvmRole::Idle));
+    }
+
+    #[test]
+    fn pre_hop_held_modifier_release_passes_through_without_sticking_locally() {
+        let svc = make_test_kvm_service();
+        let (tx, mut rx) = mpsc::channel(32);
+        *svc.outbound_tx.write().unwrap() = Some(tx);
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControllingPeer {
+                    active_drag_session: None,
+                    restore_x: 50.0,
+                    restore_y: 50.0,
+                },
+            );
+        }
+        // ShiftLeft was pressed locally before crossing the edge, so it is absent from sent_remote_keys.
+        let decision = svc.on_local_key_event(LogicalKey::ShiftLeft, false, ModifierMask::default());
+        assert_eq!(decision, HookDecision::PassThrough);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn mouse_move_delta_degenerate_local_rect_does_not_panic_and_boundary_lock_syncs() {
+        let svc = make_test_kvm_service();
+        let (tx, mut rx) = mpsc::channel(32);
+        *svc.outbound_tx.write().unwrap() = Some(tx);
+        *svc.local_rect.write().unwrap() = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        {
+            let mut r = svc.role.lock().unwrap();
+            svc.set_role_locked(
+                &mut r,
+                KvmRole::ControlledByPeer {
+                    entry_edge: ScreenEdge::Left,
+                    cur_x: 0.5,
+                    cur_y: 0.5,
+                    active_drag_session: None,
+                    native_drag_started: false,
+                },
+            );
+        }
+        svc.handle_inbound_message(
+            "10.99.99.2",
+            KvmWireMessage::MouseMoveDelta { dx: 10.0, dy: 10.0 },
+        )
+        .await;
+
+        assert!(!svc.is_boundary_locked());
+        assert!(svc.toggle_boundary_locked());
+        assert!(svc.is_boundary_locked());
+        let msg = rx.try_recv().expect("SetBoundaryLock wire message");
+        assert!(matches!(
+            msg,
+            KvmOutboundCmd::Wire(KvmWireMessage::SetBoundaryLock { locked: true })
+        ));
+    }
+
+    #[test]
+    fn teardown_peer_if_connected_matches_case_insensitively_and_clears_peer_os() {
+        let svc = make_test_kvm_service();
+        *svc.connected_peer_device_id.write().unwrap() = Some("AABBCCDD".to_string());
+        *svc.connected_peer_ip.write().unwrap() = Some("10.99.99.2".to_string());
+        *svc.peer_os.write().unwrap() = Some("windows".to_string());
+        svc.active_session_id.store(7, Ordering::SeqCst);
+
+        svc.teardown_peer_if_connected("aabbccdd");
+        assert!(svc.connected_peer_device_id.read().unwrap().is_none());
+        assert!(svc.connected_peer_ip.read().unwrap().is_none());
+        assert!(svc.peer_os.read().unwrap().is_none());
+        assert_eq!(svc.active_session_id.load(Ordering::SeqCst), 0);
     }
 }

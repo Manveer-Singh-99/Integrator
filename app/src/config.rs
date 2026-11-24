@@ -13,9 +13,12 @@
 //! ## 2. Architectural Linkages & Dependencies
 //! ### Upstream Callers:
 //! - `core.rs`: Initializes background listener daemons, firewall rules, and client transport sessions.
-//! - `discovery.rs`: Broadcasts discovery beacons containing control and service port metadata.
+//! - `discovery.rs`, `ble_discovery.rs`, `bonjour_discovery.rs`: Broadcasts and parses UDP, BLE, and mDNS
+//!   discovery beacons containing control and service port metadata.
 //! - `bridge.rs`: Performs TCP RTT probes against peer service endpoints using `CONTROL_PORT`.
-//! - `display/`, `kvm/`, `clipboard/`, `audio/`, `camera/`, `storage/`, `truetone/`, `telemetry/`:
+//! - `setup.rs`, `autostart.rs`, `system_info.rs`: Queries canonical binary paths, registry keys,
+//!   deep-link Settings URLs, and guided package installer identifiers.
+//! - `display/`, `kvm/`, `clipboard/`, `audio/`, `camera/`, `storage/`, `truetone/`, `telemetry/`, `security/`:
 //!   Subsystems consume canonical ports, defaults, bounds, and OS utility paths from this registry.
 //!
 //! ### Downstream Callees:
@@ -142,10 +145,6 @@ pub const SUNSHINE_WEB_PORT_OFFSET: u16 = 1;
 /// Default primary Sunshine HTTPS web administration port (`47989 + 1 = 47990`).
 #[allow(dead_code)]
 pub const SUNSHINE_DEFAULT_WEB_PORT: u16 = SUNSHINE_DEFAULT_PORT + SUNSHINE_WEB_PORT_OFFSET;
-
-/// Default secondary Sunshine HTTPS web administration port (`48989 + 1 = 48990`).
-#[allow(dead_code)]
-pub const SUNSHINE_SECONDARY_WEB_PORT: u16 = SUNSHINE_SECONDARY_PORT + SUNSHINE_WEB_PORT_OFFSET;
 
 /// RFC 3927 IPv4 link-local (APIPA) CIDR range (`169.254.0.0/16`) for zero-conf direct cable links.
 #[allow(dead_code)]
@@ -412,15 +411,7 @@ pub const DEFAULT_CAMERA_FPS: u32 = 30;
 #[allow(dead_code)]
 pub const DEFAULT_CAMERA_FRIENDLY_NAME: &str = "Integrator Mac Camera";
 
-/// Default bidirectional audio sample rate in Hz (48 kHz).
-#[allow(dead_code)]
-pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 48_000;
-
-/// Default bidirectional audio PCM bit depth.
-#[allow(dead_code)]
-pub const DEFAULT_AUDIO_BIT_DEPTH: u8 = 24;
-
-/// CIE D65 standard daylight white point color temperature in Kelvin.
+/// CIE D65 standard daylight white point color temperature in Kelvin (6500 K).
 #[allow(dead_code)]
 pub const D65_CCT_KELVIN: u32 = 6500;
 
@@ -497,10 +488,6 @@ pub const MACOS_DEFAULTS_BIN: &str = "/usr/bin/defaults";
 #[allow(dead_code)]
 pub const MACOS_PGREP_BIN: &str = "/usr/bin/pgrep";
 
-/// Qualified path to macOS `killall` process termination tool (SIP-protected).
-#[allow(dead_code)]
-pub const MACOS_KILLALL_BIN: &str = "/usr/bin/killall";
-
 /// Qualified path to macOS AppleScript interpreter `osascript` (SIP-protected).
 #[allow(dead_code)]
 pub const MACOS_OSASCRIPT_BIN: &str = "/usr/bin/osascript";
@@ -572,10 +559,6 @@ pub const MACOS_NETWORKSETUP_BIN: &str = "/usr/sbin/networksetup";
 /// Qualified path to macOS `ifconfig` network interface utility (SIP-protected).
 #[allow(dead_code)]
 pub const MACOS_IFCONFIG_BIN: &str = "/sbin/ifconfig";
-
-/// Qualified path to macOS `/bin/bash` shell interpreter (SIP-protected).
-#[allow(dead_code)]
-pub const MACOS_BASH_BIN: &str = "/bin/bash";
 
 // ============================================================================
 // Setup, Drivers & OS Permissions Assistant Constants
@@ -805,10 +788,6 @@ pub const BONJOUR_TXT_KEY_PORT: &str = "port";
 /// so nearby iPhones, iPads, Apple TVs, and AirPods completely ignore Integrator BLE beacons.
 #[allow(dead_code)]
 pub const BLE_SERVICE_UUID: &str = "7A4E9C10-5B2F-4D81-9E3A-1C6F8B2D4E90";
-
-/// Read-only GATT characteristic UUID mirrored alongside macOS BLE advertisements.
-#[allow(dead_code)]
-pub const BLE_CHARACTERISTIC_UUID: &str = "7A4E9C11-5B2F-4D81-9E3A-1C6F8B2D4E90";
 
 /// Bluetooth SIG reserved internal/custom Manufacturer Company ID (`0xFFFF`) used for Windows
 /// BLE `ManufacturerData` magic packets (never collides with Apple's `0x004C`).

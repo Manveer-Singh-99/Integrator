@@ -41,6 +41,12 @@
 //! - **Configuration & Path Discovery**:
 //!   `config::*` canonical constants and `system_info::*` binary/path locators.
 //!
+//! ### Cross-Platform / Cross-Device Flow:
+//! Permissions and driver readiness are evaluated locally on each machine and embedded in
+//! `BridgeStatus.setup_status` so paired Mac ↔ Windows frontends can guide users to enable
+//! prerequisite OS capabilities (e.g., Sunshine ↔ Moonlight, Mac Camera ↔ Windows VCam,
+//! USB-C NCM direct-link daemons) before streaming begins.
+//!
 //! ## 3. Threading & Concurrency Model
 //! - **Subprocess Probe Cache (`SETUP_CACHE`)**: Expensive OS subprocess and filesystem probes
 //!   (`netsh`, `sc.exe`, `Get-NetConnectionProfile`, `sharing -l`, `pgrep`, `schtasks`) are cached
@@ -68,7 +74,9 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -96,7 +104,7 @@ const MACOS_SHARING_FALLBACK_BIN: &str = "/usr/bin/sharing";
 const WINDOWS_WINGET_LOCALAPPDATA_REL_PATH: &str = r"Microsoft\WindowsApps\winget.exe";
 
 /// Windows Registry subkey under `WINDOWS_CAMERA_CONSENT_REG_KEY` controlling Win32 desktop app camera access.
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const WINDOWS_CAMERA_CONSENT_NONPACKAGED_SUBKEY: &str = "NonPackaged";
 
 /// Expected registry value data indicating camera access is permitted in Windows CapabilityAccessManager.
@@ -108,20 +116,20 @@ const WINDOWS_CONSENT_ALLOW_TOKEN: &str = "allow";
 const WINDOWS_CONSENT_DENY_TOKEN: &str = "deny";
 
 /// Guided terminal command for running the macOS USB-C NCM LaunchDaemon installer script.
-#[allow(dead_code)]
+#[cfg(any(not(target_os = "windows"), test))]
 const MACOS_USBNCM_DEFAULT_INSTALL_CMD: &str = "sudo bash macos/install-macos.sh";
 
 /// Guided PowerShell command for running the Windows USB-C NCM WinTun bridge installer script.
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const WINDOWS_USBNCM_DEFAULT_INSTALL_CMD: &str =
     r"powershell -ExecutionPolicy Bypass -File .\windows\Install-AppleUsbNcm.ps1";
 
 /// Guided command for registering the Windows 11 Virtual Camera COM server DLL.
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const WINDOWS_VCAM_DEFAULT_INSTALL_CMD: &str = r#"regsvr32 /s "integrator_vcam.dll""#;
 
 /// Guided manual installation summary for the Windows Virtual Display Driver.
-#[allow(dead_code)]
+#[cfg(target_os = "windows")]
 const WINDOWS_VDD_INSTALL_CMD: &str =
     "Download & run the signed Virtual Display Driver (VDD) installer from GitHub Releases";
 
@@ -456,9 +464,11 @@ impl SetupHealthSnapshot {
 struct CachedSubprocessProbes {
     /// Whether the current process token is elevated.
     is_elevated: bool,
-    /// Cached platform-specific non-FFI permission statuses (or supplementary probe flags).
+    /// `true` when macOS SMB File Sharing (`sharing -l`) reports at least one active share.
     mac_file_sharing_granted: bool,
+    /// Human-readable status summary for macOS File Sharing.
     mac_file_sharing_detail: String,
+    /// Cached Windows permission audit statuses (empty on non-Windows hosts).
     win_permissions: Vec<PermissionStatus>,
     /// Cached companion dependencies list.
     dependencies: Vec<DependencyStatus>,
@@ -586,8 +596,11 @@ pub(crate) fn parse_windows_vcam_clsid_reg(reg_output: &str) -> (bool, Option<St
     }
     for line in reg_output.lines() {
         let trimmed = line.trim();
-        if let Some(pos) = trimmed.find("REG_SZ") {
-            let val = trimmed[pos + 6..].trim();
+        let val_opt = trimmed
+            .find("REG_EXPAND_SZ")
+            .map(|pos| trimmed[pos + 13..].trim())
+            .or_else(|| trimmed.find("REG_SZ").map(|pos| trimmed[pos + 6..].trim()));
+        if let Some(val) = val_opt {
             if val
                 .to_ascii_lowercase()
                 .ends_with(config::WINDOWS_VCAM_DLL_FILENAME)
@@ -678,7 +691,7 @@ pub(crate) fn parse_windows_vdd_pnp_output(ps_output: &str) -> Option<(String, b
 
 /// Parses macOS `sharing -l -f json` or plain-text `sharing -l` output to determine whether at least
 /// one SMB shared folder (`smb_shared == 1` or `shared: 1`) is actively published.
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_macos_sharing_active(sharing_output: &str) -> (bool, Vec<String>) {
     let trimmed = sharing_output.trim();
     if trimmed.is_empty() {
@@ -736,7 +749,7 @@ pub(crate) fn parse_macos_sharing_active(sharing_output: &str) -> (bool, Vec<Str
 }
 
 /// Validates whether a macOS LaunchDaemon plist content string defines the `com.integrator.usbncm` watchdog service.
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_macos_usbncm_plist_installed(plist_content: &str) -> bool {
     let trimmed = plist_content.trim();
     trimmed.contains("<plist")
@@ -824,7 +837,7 @@ fn is_local_tcp_port_open(port: u16) -> bool {
 }
 
 /// Locates the Homebrew executable (`brew`) on macOS in standard Apple Silicon, Intel, or `PATH` locations.
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 pub(crate) fn find_homebrew_binary() -> Option<PathBuf> {
     for candidate in [
         config::MACOS_BREW_APPLE_SILICON_BIN,
@@ -1562,11 +1575,16 @@ pub fn collect_setup_health_snapshot(
 
     #[cfg(target_os = "macos")]
     let permissions = {
-        let ax_granted = unsafe { integrator_mac_perm_accessibility_granted() };
-        let im_granted = unsafe { integrator_mac_perm_input_monitoring_granted() };
-        let sr_granted = unsafe { integrator_mac_perm_screen_recording_granted() };
-        let cam_status = unsafe { integrator_mac_perm_camera_status() };
-        let has_cam_hw = unsafe { integrator_mac_camera_has_hardware() } != 0;
+        // SAFETY: Parameterless macOS Swift TCC status queries (`permissions_macos.swift` / `camera_macos.swift`).
+        let (ax_granted, im_granted, sr_granted, cam_status, has_cam_hw) = unsafe {
+            (
+                integrator_mac_perm_accessibility_granted(),
+                integrator_mac_perm_input_monitoring_granted(),
+                integrator_mac_perm_screen_recording_granted(),
+                integrator_mac_perm_camera_status(),
+                integrator_mac_camera_has_hardware() != 0,
+            )
+        };
         let cam_granted = cam_status == 2;
         let cam_required = camera_feature_enabled && has_cam_hw;
 
@@ -1762,6 +1780,7 @@ fn request_permission_by_id(perm_id: PermissionId) -> Result<String, String> {
     {
         match perm_id {
             PermissionId::Accessibility => {
+                // SAFETY: Parameterless Swift FFI trigger invoking `AXIsProcessTrustedWithOptions`.
                 let granted = unsafe { integrator_mac_perm_accessibility_request() };
                 if granted {
                     Ok("Accessibility permission is granted.".to_string())
@@ -1771,6 +1790,7 @@ fn request_permission_by_id(perm_id: PermissionId) -> Result<String, String> {
                 }
             }
             PermissionId::InputMonitoring => {
+                // SAFETY: Parameterless Swift FFI trigger invoking `CGRequestListenEventAccess`.
                 let granted = unsafe { integrator_mac_perm_input_monitoring_request() };
                 if granted {
                     Ok("Input Monitoring permission is granted.".to_string())
@@ -1780,6 +1800,7 @@ fn request_permission_by_id(perm_id: PermissionId) -> Result<String, String> {
                 }
             }
             PermissionId::ScreenRecording => {
+                // SAFETY: Parameterless Swift FFI trigger invoking `CGRequestScreenCaptureAccess`.
                 let granted = unsafe { integrator_mac_perm_screen_recording_request() };
                 if granted {
                     Ok("Screen Recording permission is granted.".to_string())
@@ -1789,10 +1810,13 @@ fn request_permission_by_id(perm_id: PermissionId) -> Result<String, String> {
                 }
             }
             PermissionId::Camera => {
+                // SAFETY: Parameterless Swift FFI helpers checking/requesting `AVCaptureDevice` camera access.
                 let status_before = unsafe { integrator_mac_perm_camera_status() };
                 if status_before == 0 {
+                    // SAFETY: Parameterless AVFoundation authorization prompt trigger.
                     unsafe { integrator_mac_perm_camera_request() };
                 }
+                // SAFETY: Parameterless AVFoundation authorization status query.
                 let status_after = unsafe { integrator_mac_perm_camera_status() };
                 if status_after == 2 {
                     Ok("Camera permission is granted.".to_string())

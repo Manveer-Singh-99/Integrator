@@ -105,16 +105,37 @@
 //! Because sequence numbers increment monotonically and never repeat within a session,
 //! $(K_{\text{audio}}, \text{Nonce}_{96})$ uniqueness invariant is guaranteed.
 //!
+//! ## 2.6 Threading, Concurrency & Fail-Closed Lifecycle Model
+//! - **Two-Tier Locking for Lock-Free Global Demux**: `AudioSessionRegistry` is wrapped in a
+//!   process-global `std::sync::Mutex` in `crate::audio`, while each registered
+//!   [`AudioSessionReceiver`] is wrapped in its own `Arc<std::sync::Mutex<AudioSessionReceiver>>`.
+//!   The UDP receive loop acquires the global registry lock only briefly via [`AudioSessionRegistry::get_session`]
+//!   to clone the per-session `Arc`, then releases the global lock before invoking
+//!   [`AudioSessionRegistry::open_datagram_detached_with_meta`].
+//! - **Detached Handle Fail-Closed Invalidation (`AUD-1G7-08`)**: Whenever a session is evicted,
+//!   expired, cleared via [`AudioSessionRegistry::clear_all`], or revoked via
+//!   [`AudioSessionRegistry::revoke_peer_sessions`], `AudioSessionReceiver::invalidate()` sets
+//!   `invalidated = true` and immediately zeroizes `k_audio` and `nonce_salt` in place so any
+//!   in-flight detached `Arc` handle fails closed with [`AudioUdpError::SessionRevoked`].
+//! - **Monotonic Session Ordering (`NEW-08`)**: `NEXT_AUDIO_SESSION_ORDER` (`AtomicU64`) assigns
+//!   each receiver session a strictly increasing `session_order`, preventing late UDP packets from
+//!   an older superseded session from resetting the active `JitterBuffer` playhead and providing
+//!   deterministic FIFO tie-breaking during session capacity eviction.
+//!
 //! # 3. Callers & Callees
-//! - **Callers**:
-//!   - `crate::audio::AudioManager`: Initializes sender sessions on macOS audio capture, sends PCM frames.
-//!   - `crate::rpc::server`: Receives `NegotiateAudioSession` over TCP port 58281, interacts with `AudioSessionRegistry`.
-//!   - Windows UDP audio daemon: Binds UDP socket 58284, passes datagrams to `AudioSessionRegistry::open_incoming_datagram()`.
-//! - **Callees**:
+//! - **Upstream Callers**:
+//!   - `crate::audio::AudioManager`: Negotiates outbound sender sessions (`AudioSessionSender::seal_datagram`)
+//!     from the capture host (e.g. Windows 11 WASAPI loopback) and demultiplexes inbound UDP datagrams
+//!     on port `58284` (`AudioSessionRegistry::get_session`, `AudioSessionRegistry::open_datagram_detached_with_meta`)
+//!     on the playback sink host (e.g. macOS CoreAudio HAL).
+//!   - `crate::display::controller`: Handles `DisplayRpcRequest::NegotiateAudioSession` over
+//!     authenticated TCP `TransportSessionV2` (port `58281`) and registers sessions in `AudioSessionRegistry`.
+//! - **Downstream Callees**:
 //!   - `chacha20poly1305`: Authenticated Encryption with Associated Data (AEAD).
-//!   - `hkdf`: Key derivation from master $K_{\text{root}}$.
-//!   - `sha2`: Cryptographic hashing for salt generation.
-//!   - `crate::security::keystore::KeystoreV2`: Sources pinned master root keys.
+//!   - `hkdf` & `sha2`: RFC 5869 HKDF-SHA256 session key and IV salt derivation from master $K_{\text{root}}$.
+//!   - `crate::security::transport::check_peer_trust_generation_fail_closed`: Enforces fail-closed
+//!     trust generation and immediate revocation checks (`SEC-1C-05` / `AUD-1G7-16`).
+//!   - `zeroize`: Deterministic memory erasure (`Zeroize`, `ZeroizeOnDrop`, `Zeroizing`) of session keys and nonces.
 //! ============================================================================
 
 use crate::security::{constant_time_eq, csprng_array};
@@ -179,7 +200,8 @@ pub const MAX_ACTIVE_AUDIO_SESSIONS: usize = 16;
 /// Maximum number of concurrent active UDP audio sessions permitted per paired peer device (2 sessions).
 pub const MAX_PER_PEER_AUDIO_SESSIONS: usize = 2;
 
-/// Maximum allowable packet sequence number ($2^{48}-1$) before forcing session rotation to prevent sequence rollover.
+/// Exclusive upper bound ($2^{48}-1$) for valid packet sequence numbers (`1..MAX_AUDIO_PACKET_SEQ`)
+/// before forcing session rotation to prevent sequence rollover.
 pub const MAX_AUDIO_PACKET_SEQ: u64 = (1u64 << 48) - 1;
 
 /// Datagram header flag indicating standard uncompressed PCM audio payload (0x0001).
@@ -220,7 +242,7 @@ pub enum AudioUdpError {
     UnsupportedVersion(u16),
     /// Header flags are unrecognized or conflicting (must be `AUDIO_FLAG_PCM_FRAME`, `AUDIO_FLAG_KEEPALIVE`, or `AUDIO_FLAG_SILENCE`).
     InvalidFlags(u16),
-    /// Sequence number is 0 or exceeds `MAX_AUDIO_PACKET_SEQ`.
+    /// Sequence number is 0 or reaches/exceeds `MAX_AUDIO_PACKET_SEQ` (`2^48 - 1`).
     InvalidSequenceNumber(u64),
     /// Declared payload length in header does not match actual received datagram payload length.
     PayloadLengthMismatch { header_len: usize, actual_len: usize },
@@ -286,19 +308,19 @@ impl std::error::Error for AudioUdpError {}
 /// In-memory representation of the 32-byte `IUA2` header authenticated as AEAD `AAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioDatagramHeader {
-    /// Protocol version (must equal 2).
+    /// Protocol version (must equal `AUDIO_UDP_PROTOCOL_VERSION` = 2).
     pub version: u16,
-    /// Frame flags (`AUDIO_FLAG_PCM_FRAME` or `AUDIO_FLAG_KEEPALIVE`).
+    /// Frame type flags (`AUDIO_FLAG_PCM_FRAME`, `AUDIO_FLAG_KEEPALIVE`, or `AUDIO_FLAG_SILENCE`).
     pub flags: u16,
     /// 8-byte session identifier assigned during control-plane negotiation.
     pub session_id: [u8; 8],
-    /// Monotonically incrementing 64-bit packet sequence number (1..=2^48 - 1).
+    /// Monotonically incrementing 64-bit packet sequence number (`1..MAX_AUDIO_PACKET_SEQ`).
     pub pkt_seq: u64,
-    /// Microsecond timestamp modulo 2^32 for jitter buffer scheduling and audio sync.
+    /// Microsecond timestamp modulo $2^{32}$ for jitter buffer scheduling and audio sync.
     pub timestamp_us: u32,
-    /// Number of audio sample frames encapsulated in this datagram (e.g. 96 for 2ms at 48kHz).
+    /// Number of audio sample frames per channel encapsulated in this datagram (e.g. `240` for canonical 5ms at 48kHz).
     pub frame_samples: u16,
-    /// Byte length of the encrypted audio payload (1..=4096 bytes).
+    /// Byte length of the encrypted audio plaintext payload (`1..=4096` bytes; excludes 32B header and 16B tag).
     pub payload_len: u16,
 }
 
@@ -451,9 +473,10 @@ pub fn derive_audio_session_keys(
     hasher.update(sender_nonce);
     hasher.update(receiver_nonce);
     hasher.update(session_id);
-    let salt_audio = hasher.finalize();
+    let mut salt_audio: [u8; 32] = hasher.finalize().into();
 
     let hk = Hkdf::<Sha256>::new(Some(&salt_audio), k_root);
+    salt_audio.zeroize();
     let mut k_audio = Zeroizing::new([0u8; 32]);
     let mut nonce_salt = [0u8; 4];
     hk.expand(b"integrator-udp-audio-key-v2", &mut *k_audio)
@@ -506,11 +529,10 @@ impl AudioSessionSender {
         }
     }
 
-    /// Seals a PCM audio payload or keepalive frame into a complete `IUA2` wire datagram.
+    /// Seals a PCM audio payload, compact silence frame, or keepalive frame into a complete `IUA2` wire datagram.
     ///
     /// Constructs the 32-byte header, serializes it as AAD, derives the 96-bit nonce,
     /// executes ChaCha20-Poly1305 encryption, and returns the assembled datagram.
-    #[allow(dead_code)]
     pub fn seal_datagram(
         &mut self,
         flags: u16,
@@ -552,18 +574,18 @@ impl AudioSessionSender {
         header_bytes[24..28].copy_from_slice(&timestamp_us.to_be_bytes());
         header_bytes[28..30].copy_from_slice(&frame_samples.to_be_bytes());
         header_bytes[30..32].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
-        let nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, pkt_seq);
+        let mut nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, pkt_seq);
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.k_audio));
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: plaintext,
-                    aad: &header_bytes,
-                },
-            )
-            .map_err(|_| AudioUdpError::AeadFailed)?;
+        let ciphertext_res = cipher.encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &header_bytes,
+            },
+        );
+        nonce_bytes.zeroize();
+        let ciphertext = ciphertext_res.map_err(|_| AudioUdpError::AeadFailed)?;
 
         let mut datagram = Vec::with_capacity(AUDIO_UDP_HEADER_LEN + ciphertext.len());
         datagram.extend_from_slice(&header_bytes);
@@ -603,10 +625,15 @@ pub struct AudioSessionReceiver {
     invalidated: bool,
 }
 
+/// Process-global monotonically increasing counter assigning each [`AudioSessionReceiver`]
+/// a unique `session_order` (`NEW-08`) to isolate jitter buffer state across re-negotiations
+/// and provide deterministic FIFO eviction tie-breaking.
 static NEXT_AUDIO_SESSION_ORDER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 impl Drop for AudioSessionReceiver {
+    /// Zeroizes cryptographic key material (`nonce_salt`, `session_id`, `k_audio`) and marks
+    /// the session invalidated on drop (`AUD-1G7-08`, `AUD-1G7-20`).
     fn drop(&mut self) {
         self.nonce_salt.zeroize();
         self.session_id.zeroize();
@@ -713,24 +740,28 @@ impl AudioSessionReceiver {
         self.replay_window.check_before_aead(header.pkt_seq)?;
 
         // Step 2: AEAD decryption & Poly1305 tag verification (authenticates entire header AAD first)
-        let nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, header.pkt_seq);
+        let mut nonce_bytes = build_audio_aead_nonce(&self.nonce_salt, header.pkt_seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.k_audio));
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &datagram[AUDIO_UDP_HEADER_LEN..],
-                    aad: &datagram[..AUDIO_UDP_HEADER_LEN],
-                },
-            )
-            .map_err(|_| AudioUdpError::AeadFailed)?;
+        let decrypt_res = cipher.decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &datagram[AUDIO_UDP_HEADER_LEN..],
+                aad: &datagram[..AUDIO_UDP_HEADER_LEN],
+            },
+        );
+        nonce_bytes.zeroize();
+        let mut plaintext = decrypt_res.map_err(|_| AudioUdpError::AeadFailed)?;
 
+        // Framing consistency checks execute strictly AFTER Poly1305 AAD verification so tampered
+        // unauthenticated header fields (`frame_samples`, `flags`) always fail with `AeadFailed`
+        // rather than leaking a pre-auth framing oracle.
         if header.flags == AUDIO_FLAG_PCM_FRAME {
             let bytes_per_sample_frame =
                 (self.channels as usize).saturating_mul((self.bit_depth as usize) / 8);
             let expected_pcm_len =
                 (header.frame_samples as usize).saturating_mul(bytes_per_sample_frame);
             if (header.payload_len as usize) != expected_pcm_len {
+                plaintext.zeroize();
                 return Err(AudioUdpError::PayloadLengthMismatch {
                     header_len: expected_pcm_len,
                     actual_len: header.payload_len as usize,
@@ -738,6 +769,7 @@ impl AudioSessionReceiver {
             }
         } else if header.flags == AUDIO_FLAG_SILENCE {
             if header.payload_len as usize != 1 {
+                plaintext.zeroize();
                 return Err(AudioUdpError::PayloadLengthMismatch {
                     header_len: 1,
                     actual_len: header.payload_len as usize,
@@ -769,6 +801,8 @@ pub struct NegotiatedAudioSessionWire {
 /// Manages session lifecycle, concurrent session limits, and datagram demultiplexing.
 #[derive(Default)]
 pub struct AudioSessionRegistry {
+    /// Active receiver sessions indexed by 8-byte CSPRNG `session_id`, bounded to at most
+    /// `MAX_ACTIVE_AUDIO_SESSIONS` globally and `MAX_PER_PEER_AUDIO_SESSIONS` per peer.
     sessions: HashMap<[u8; 8], Arc<std::sync::Mutex<AudioSessionReceiver>>>,
 }
 
@@ -842,6 +876,11 @@ impl AudioSessionRegistry {
             }
         }
 
+        if constant_time_eq(k_root, &[0u8; 32]) {
+            return Err(AudioUdpError::InvalidHandshakeParam(
+                "k_root must be non-zero",
+            ));
+        }
         if constant_time_eq(sender_nonce, &[0u8; 32]) {
             return Err(AudioUdpError::InvalidHandshakeParam(
                 "sender_nonce must be non-zero",
@@ -864,12 +903,13 @@ impl AudioSessionRegistry {
         self.prune_expired(now_secs);
 
         // Enforce per-peer concurrent session cap by evicting and invalidating this peer's oldest session first.
+        // Tie-breaks identical `last_activity_secs` by monotonic `session_order` for deterministic FIFO eviction.
         while self
             .sessions
             .values()
             .filter(|s| {
                 let guard = s.lock().unwrap_or_else(|e| e.into_inner());
-                guard.peer_device_id == peer_device_id && !guard.is_invalidated()
+                constant_time_eq(&guard.peer_device_id, &peer_device_id) && !guard.is_invalidated()
             })
             .count()
             >= MAX_PER_PEER_AUDIO_SESSIONS
@@ -879,9 +919,12 @@ impl AudioSessionRegistry {
                 .iter()
                 .filter(|(_, s)| {
                     let guard = s.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.peer_device_id == peer_device_id
+                    constant_time_eq(&guard.peer_device_id, &peer_device_id)
                 })
-                .min_by_key(|(_, s)| s.lock().unwrap_or_else(|e| e.into_inner()).last_activity_secs)
+                .min_by_key(|(_, s)| {
+                    let guard = s.lock().unwrap_or_else(|e| e.into_inner());
+                    (guard.last_activity_secs, guard.session_order)
+                })
                 .map(|(k, _)| *k)
             {
                 self.evict_session(&oldest_peer_id);
@@ -890,12 +933,15 @@ impl AudioSessionRegistry {
             }
         }
 
-        // Enforce global session table bound.
+        // Enforce global session table bound with deterministic `(last_activity_secs, session_order)` tie-breaking.
         while self.sessions.len() >= MAX_ACTIVE_AUDIO_SESSIONS {
             if let Some(oldest_id) = self
                 .sessions
                 .iter()
-                .min_by_key(|(_, s)| s.lock().unwrap_or_else(|e| e.into_inner()).last_activity_secs)
+                .min_by_key(|(_, s)| {
+                    let guard = s.lock().unwrap_or_else(|e| e.into_inner());
+                    (guard.last_activity_secs, guard.session_order)
+                })
                 .map(|(k, _)| *k)
             {
                 self.evict_session(&oldest_id);
@@ -962,7 +1008,7 @@ impl AudioSessionRegistry {
     }
 
     /// Verifies and decrypts an incoming `IUA2` UDP datagram against the matching session.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_incoming_datagram(
         &mut self,
         datagram: &[u8],
@@ -1051,10 +1097,11 @@ impl AudioSessionRegistry {
         let peer_id = session.peer_device_id;
         let session_order = session.session_order;
         let is_canonical = session.is_canonical_stage1_pcm();
-        let (hdr, plain) = session.open_datagram(datagram, now_secs)?;
+        let (hdr, mut plain) = session.open_datagram(datagram, now_secs)?;
 
         // Revalidate invalidation and fail-closed trust state after AEAD decryption
         if session.is_invalidated() {
+            plain.zeroize();
             return Err(AudioUdpError::SessionRevoked);
         }
         match crate::security::transport::check_peer_trust_generation_fail_closed(
@@ -1064,19 +1111,21 @@ impl AudioSessionRegistry {
             crate::security::transport::PeerTrustCheck::Valid => {}
             crate::security::transport::PeerTrustCheck::Revoked => {
                 session.invalidate();
+                plain.zeroize();
                 return Err(AudioUdpError::SessionRevoked);
             }
             crate::security::transport::PeerTrustCheck::StaleOrUnregisteredGeneration => {
                 session.invalidate();
+                plain.zeroize();
                 return Err(AudioUdpError::SessionStaleGeneration);
             }
         }
         Ok((peer_id, session_order, is_canonical, hdr, plain))
     }
 
-    /// Detached packet processing helper: verifies and decrypts a datagram under per-session
+    /// Detached packet processing test helper: verifies and decrypts a datagram under per-session
     /// synchronisation without holding the global registry lock.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_datagram_detached(
         session_arc: &Arc<std::sync::Mutex<AudioSessionReceiver>>,
         datagram: &[u8],
@@ -1087,17 +1136,14 @@ impl AudioSessionRegistry {
         Ok((peer_id, hdr, plain))
     }
 
-    /// Returns the number of currently active, non-expired sessions at `now_secs`.
+    /// Returns the number of currently active, non-invalidated, non-expired sessions at `now_secs`.
     #[cfg(test)]
     pub fn active_session_count_at(&self, now_secs: u64) -> usize {
         self.sessions
             .values()
             .filter(|s| {
-                if let Ok(guard) = s.lock() {
-                    !guard.is_expired(now_secs)
-                } else {
-                    false
-                }
+                let guard = s.lock().unwrap_or_else(|e| e.into_inner());
+                !guard.is_invalidated() && !guard.is_expired(now_secs)
             })
             .count()
     }

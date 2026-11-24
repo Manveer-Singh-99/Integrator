@@ -53,9 +53,9 @@
 //!                                          ▼
 //!                         ┌─────────────────────────────────┐
 //!                         │       TransportSessionV2        │
-//!                         │   (ServiceId::ClipboardSync)    │
+//!                         │  (ServiceId::ClipboardTransfer) │
 //!                         │   ChaCha20-Poly1305 over TCP    │
-//!                         │   Port CLIPBOARD_PORT (58285)   │
+//!                         │   Port CLIPBOARD_PORT (58283)   │
 //!                         └─────────────────────────────────┘
 //! ```
 //!
@@ -72,7 +72,7 @@
 //! - `os_seq`: Fast OS-level clipboard change sequence probe and fail-closed privacy inspector.
 //! - `file_helper`: Native OS clipboard file list ingestion and serialization (`NSPasteboard` / `CF_HDROP`).
 //! - `arboard`: Cross-platform text and image clipboard access.
-//! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58285.
+//! - `crate::security::transport::TransportSessionV2`: Encrypted bi-directional framing over port 58283.
 //!
 //! ## 3. Threading & Concurrency Model
 //! - **Tokio Multi-Threaded Runtime**: Manages connection establishment, inbound packet deserialization,
@@ -90,13 +90,19 @@
 //! - **Isolated Staging**: Transferred files land in private temporary staging directories before
 //!   atomic promotion to the local clipboard cache.
 
+/// Native OS file clipboard ingestion, `NSPasteboard` / `CF_HDROP` serialization, and disk cache pruning.
 pub(crate) mod file_helper;
+/// Sub-microsecond monotonic OS clipboard sequence number probe and fail-closed tri-state privacy engine.
 pub(crate) mod os_seq;
+/// Wire protocol framing tags, payload DTOs, resource limits, and canonical Base64 codecs.
 pub(crate) mod protocol;
+/// Full-duplex authenticated clipboard synchronization engine and zero-RAM file streaming service.
 pub(crate) mod service;
 
+/// Re-exported tri-state privacy status outcome (`SafeToSync`, `ConcealedOrTransient`, `InspectionUnavailable`).
 #[allow(unused_imports)]
 pub use os_seq::ClipboardPrivacyStatus;
+/// Re-exported clipboard service handle, operation-scoped cancellation primitives, and global FFI singletons.
 #[allow(unused_imports)]
 pub use service::{
     ClipboardService, TransferCancellation, TransferPurpose, CLIPBOARD_INSTANCE, TOKIO_HANDLE,

@@ -100,12 +100,24 @@
 //!
 //! ---
 //!
+//! ## Threading & Concurrency Model
+//!
+//! - **Blocking Offload**: All mount, unmount, and status queries invoke synchronous OS subprocesses
+//!   (`osascript`, `smbutil`, `mount`, `diskutil`, `umount`, `net.exe`) and must be executed inside
+//!   `tokio::task::spawn_blocking` by upstream callers (`core.rs`, `display/controller.rs`).
+//! - **macOS Mount Watchdog**: `mount_with_share` polls `osascript` child completion and live OS mount
+//!   tables every 250 ms up to a 25-second deadline, unconditionally terminating/reaping orphaned children.
+//! - **Serialized Disk State**: `MOUNT_STATE_LOCK` serializes all reads, atomic writes, and removals of
+//!   `active_mount.json`.
+//!
+//! ---
+//!
 //! ## Safety & Concurrency Invariants
 //!
 //! - **Locking**: Active mount disk operations are guarded by [`MOUNT_STATE_LOCK`], ensuring concurrent
 //!   mount/unmount requests do not corrupt the on-disk JSON metadata.
-//! - **Atomic Persistence**: Files are written to temporary unique paths (`active_mount.json.<pid>.<seq>.tmp`)
-//!   and renamed atomically. Unix permissions are restricted to `0o600`.
+//! - **Atomic Persistence**: Files are persisted via `system_info::atomic_write_private` (symlink check,
+//!   `O_EXCL` temp file, POSIX `0o600`/`0o700` permissions, atomic rename).
 //! - **Subprocess Isolation**: On Windows, all child processes are spawned with `CREATE_NO_WINDOW`
 //!   to avoid GUI console flashes or interactive prompts hanging the runtime.
 
@@ -119,7 +131,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Default fallback SMB share name used when anonymous peer share enumeration is unavailable.
@@ -132,9 +143,6 @@ const MACOS_VOLUMES_PREFIX: &str = "/Volumes";
 
 /// Process-wide mutual exclusion lock for active mount state file operations.
 static MOUNT_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-/// Monotonically increasing counter for temporary mount state file generation.
-static MOUNT_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Returns the shared process-wide lock for serializing active mount state reads and writes.
 fn mount_state_lock() -> &'static Mutex<()> {
@@ -217,6 +225,12 @@ impl StorageManager {
         let mut prefs = system_info::load_path_preferences();
         let validated = match folder.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(path_str) => {
+                if path_str.chars().any(|c| c.is_control() || c == '"') {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Shared folder path contains invalid control or quote characters",
+                    ));
+                }
                 let path = std::path::Path::new(path_str);
                 if !path.exists() || !path.is_dir() {
                     return Err(std::io::Error::new(
@@ -285,8 +299,8 @@ impl StorageManager {
             anyhow::bail!("No shared storage volume is currently mounted");
         };
         let path = rec.mount_path.trim();
-        if path.is_empty() {
-            anyhow::bail!("Mounted storage path is empty");
+        if path.is_empty() || path.chars().any(|c| c.is_control()) {
+            anyhow::bail!("Mounted storage path is empty or invalid");
         }
         #[cfg(target_os = "macos")]
         {
@@ -296,7 +310,8 @@ impl StorageManager {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            let _ = Command::new("explorer.exe")
+            let explorer = system_info::windows_root_dir().join("explorer.exe");
+            let _ = Command::new(explorer)
                 .arg(path)
                 .creation_flags(0x08000000)
                 .status()?;
@@ -343,18 +358,6 @@ impl StorageManager {
         let mut prefs = system_info::load_path_preferences();
         prefs.auto_mount_on_peer_detect = enabled;
         system_info::save_path_preferences(&prefs)
-    }
-
-    /// Checks whether an SMB share is currently active and mounted locally.
-    #[allow(dead_code)]
-    pub fn is_mounted() -> bool {
-        detect_active_mount(None).is_some()
-    }
-
-    /// Mounts the default or auto-discovered SMB share from the specified peer IP.
-    #[allow(dead_code)]
-    pub fn mount(peer_ip: &str) -> Result<StorageStatus> {
-        Self::mount_with_share(peer_ip, None)
     }
 
     /// Mounts an SMB share from the given peer IP, with an optional explicit share hint.
@@ -662,12 +665,6 @@ impl StorageManager {
         }
     }
 
-    /// Queries the current storage mount status for an optional peer IP filter.
-    #[allow(dead_code)]
-    pub fn status(peer_ip: Option<&str>) -> StorageStatus {
-        Self::status_with_share(peer_ip, None)
-    }
-
     /// Queries current storage mount status with optional peer IP and share hint filters.
     pub fn status_with_share(peer_ip: Option<&str>, share_hint: Option<&str>) -> StorageStatus {
         let valid_hint = share_hint.and_then(|h| validate_smb_share_name(h).ok());
@@ -721,33 +718,12 @@ fn load_active_mount() -> Option<ActiveMountRecord> {
     }
 }
 
-/// Atomically saves the active mount record to disk under [`MOUNT_STATE_LOCK`] using a tempfile and rename.
+/// Atomically saves the active mount record to disk under [`MOUNT_STATE_LOCK`] via [`system_info::atomic_write_private`].
 fn save_active_mount(rec: &ActiveMountRecord) {
     let _guard = mount_state_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = active_mount_file();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
     if let Ok(json) = serde_json::to_string_pretty(rec) {
-        let seq = MOUNT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), seq));
-        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-            let _ = std::fs::remove_file(&tmp);
-            tracing::warn!("Failed to write temp active mount state {}: {}", tmp.display(), e);
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = system_info::atomic_write_private(&path, json.as_bytes()) {
             tracing::warn!("Failed to persist active mount state to {}: {}", path.display(), e);
         }
     }

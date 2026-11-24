@@ -13,7 +13,17 @@
 //! 5. Windows DirectX GPU routing via `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`, directing
 //!    discrete GPUs for hardware video encoding (NVENC / AMF) and decoding (D3D11 / NVDEC).
 //!
-//! ## 2. Cross-Platform Architectural Pipelines
+//! ## 2. Architectural Linkages & Cross-Platform Pipelines
+//! - **Upstream Callers**:
+//!   - [`super::controller::DisplayController`]: Drives `enable_vdd_device`, `disable_vdd_device`,
+//!     `is_vdd_active`, `call_sunshine_api`, `start_moonlight_client`, and `stop_moonlight_client`.
+//!   - [`crate::core::IntegratorCore`]: Calls [`WinDisplayManager::get_gpu_preferences`] and
+//!     [`WinDisplayManager::set_gpu_preferences`] for native UI Settings cards.
+//! - **Downstream Callees**:
+//!   - [`crate::system_info`]: Hardware GPU enumeration (`enumerate_gpus`), binary/config discovery,
+//!     System32 executable path resolution (`system32_exe`), and atomic private writes.
+//!   - Windows utilities & drivers: `VddCtl.exe`, `Enable-PnpDevice` / `Get-PnpDevice` (`powershell.exe`),
+//!     `reg.exe`, `sc.exe`, `schtasks.exe`, `tasklist.exe`, `curl.exe`, `Moonlight.exe`, `sunshine.exe`.
 //!
 //! ### Windows-as-Host Extended Desktop
 //! - **VDD PnP Activation**: Discovers the display adapter under `ROOT\DISPLAY` and enables it via
@@ -35,15 +45,18 @@
 //! the Shared Camera subsystem operates simultaneously over port 58287:
 //! - macOS captures FaceTime HD camera at 720p30 NV12 (`camera_macos.swift`).
 //! - Frames stream directly across `TransportSessionV2` into `camera_windows.cpp` and `vcam_windows.cpp`.
-//! - Windows 11 Media Foundation FrameServer (`integrator_vcam.dll`) exposes "Integrator MacBook Camera"
+//! - Windows 11 Media Foundation FrameServer (`integrator_vcam.dll`) exposes `"Integrator Mac Camera"`
 //!   system-wide to Teams, Zoom, OBS, and browsers without requiring third-party drivers or physical camera
 //!   source wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
 //! The display and camera subsystems run concurrently without port conflicts or GPU encoder resource starvation.
 //!
 //! ## 3. Threading & Process Management Model
 //! - **Hidden Process Spawning**: All Windows process executions (`reg.exe`, `sc.exe`, `schtasks.exe`,
-//!   `powershell.exe`, `taskkill.exe`) use `CREATE_NO_WINDOW` (0x08000000) to avoid flashing command prompts.
-//! - **Zombie Reaping**: Background worker threads ([`reap_child`]) wait for spawned child processes.
+//!   `powershell.exe`, `tasklist.exe`, `curl.exe`) use `CREATE_NO_WINDOW` (`0x08000000`) via `hidden_cmd`
+//!   to avoid flashing console windows and are awaited synchronously inside `tokio::task::spawn_blocking`.
+//! - **Owned Process Tracking (SEC-1D-16)**: [`OWNED_MOONLIGHT_PROCESS`] retains the spawned `Child`
+//!   handle for `Moonlight.exe` so teardown kills and waits on only the Integrator-owned PID, sparing
+//!   any unrelated user-launched gaming sessions.
 //! - **Registry Synchronization**: Registry updates are executed before launching `Moonlight.exe` to
 //!   prevent races with Qt `QSettings` flushes.
 //!
@@ -54,6 +67,8 @@
 //!   [`ps_single_quote`], doubling embedded single quotes.
 //! - **Non-Destructive Registry Updates**: Existing user preferences (`AutoHDREnable`, `SwapEffectUpgradeEnable`)
 //!   in `UserGpuPreferences` are preserved during GPU routing updates.
+//! - **Credential Hygiene**: Sunshine REST API credentials are piped to `curl.exe -K -` over `stdin`
+//!   rather than passed via command-line arguments.
 
 use crate::{config, system_info};
 use anyhow::{Context, Result};
@@ -64,45 +79,27 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-#[cfg(target_os = "windows")]
-use std::time::Duration;
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
-/// Spawns a dedicated thread to wait on and reap an exiting child process, preventing zombies.
-///
-/// # Arguments
-/// - `child`: Spawned child process handle.
 /// Retained handle to the Integrator-owned Moonlight child process on Windows (SEC-1D-16).
-#[allow(dead_code)]
 static OWNED_MOONLIGHT_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
-/// Retained handle to the Integrator-owned Sunshine host child process on Windows (SEC-1D-16).
+/// Retained handle to the Integrator-owned fallback Sunshine child process when spawned directly (not via SCM/Task).
+#[cfg(target_os = "windows")]
 #[allow(dead_code)]
 static OWNED_SUNSHINE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Sets the mock/test child handle for owned Moonlight process testing on Windows.
-#[cfg(test)]
-#[allow(dead_code)]
+#[cfg(all(test, target_os = "windows"))]
 pub fn set_owned_moonlight_child(child: Child) {
     *OWNED_MOONLIGHT_PROCESS.lock().unwrap() = Some(child);
 }
 
 /// Returns whether an owned Moonlight process handle is currently retained on Windows.
-#[cfg(test)]
-#[allow(dead_code)]
+#[cfg(all(test, target_os = "windows"))]
 pub fn has_owned_moonlight_child() -> bool {
     OWNED_MOONLIGHT_PROCESS.lock().unwrap().is_some()
-}
-
-/// - `label`: Diagnostic label naming the reaper thread.
-#[allow(dead_code)]
-fn reap_child(mut child: Child, label: &'static str) {
-    let _ = std::thread::Builder::new()
-        .name(format!("reap-{}", label))
-        .spawn(move || {
-            let _ = child.wait();
-        });
 }
 
 /// Windows process creation flag suppressing visible console window creation.
@@ -113,21 +110,9 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const SUNSHINE_API_TIMEOUT_SECS: &str = "2";
 
-/// Canonical Windows image filename for the Moonlight client process.
-#[cfg(target_os = "windows")]
-const MOONLIGHT_WINDOWS_IMAGE_NAME: &str = "Moonlight.exe";
-
 /// Canonical Windows image filename for the Sunshine host process.
 #[cfg(target_os = "windows")]
 const SUNSHINE_WINDOWS_IMAGE_NAME: &str = "sunshine.exe";
-
-/// Maximum number of `tasklist` polling attempts when waiting for Moonlight to terminate.
-#[cfg(target_os = "windows")]
-const MOONLIGHT_STOP_POLL_ATTEMPTS: usize = 8;
-
-/// Interval between `tasklist` polling checks during Moonlight termination.
-#[cfg(target_os = "windows")]
-const MOONLIGHT_STOP_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Environment variables searched when locating legacy Windows Moonlight installations.
 #[cfg(target_os = "windows")]
@@ -281,7 +266,7 @@ impl WinDisplayManager {
             anyhow::bail!("Invalid Moonlight host target '{}'", target);
         }
 
-        // 3. Build CLI arguments
+        // 3. Build CLI arguments (mask & !1 forces even pixel dimensions required by H.264/HEVC)
         let app_name = system_info::resolve_moonlight_app_name();
         let w = width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH) & !1;
         let h = height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT) & !1;
@@ -308,6 +293,7 @@ impl WinDisplayManager {
             "fullscreen",
             "--no-vsync",
             "--no-frame-pacing",
+            // Exit Moonlight cleanly once the remote Sunshine session terminates.
             "--quit-after",
         ]);
         if audio_on_host {
@@ -344,8 +330,10 @@ impl WinDisplayManager {
         if let Some(mut child) = lock.take() {
             let pid = child.id();
             info!("Stopping Integrator-owned Moonlight client process (PID {})", pid);
-            let _ = child.kill();
-            let _ = child.wait();
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             info!("Stopped Integrator-owned Moonlight client on Windows (PID {})", pid);
         }
         Ok(())
@@ -908,6 +896,7 @@ fn resolve_or_refresh_win_moonlight_slot(mac_ip: &str, port: u16, host_name: &st
         return mac_ip.to_string();
     }
 
+    // Lossy UTF-8 conversion safely handles non-UTF8 Windows ANSI/OEM codepage hostnames without failing.
     let text = String::from_utf8_lossy(&out.stdout);
     let slots = parse_moonlight_hosts_reg(&text);
     let Some(slot) = select_moonlight_host_slot(&slots, mac_ip, port, host_name) else {
@@ -1317,6 +1306,8 @@ fn select_moonlight_host_slot<'a>(
             continue;
         }
 
+        // Rank matching slots: 5 = port + hostname, 4 = port + IP, 3 = empty port + hostname,
+        // 2 = empty port + IP (or port-unset IP match), 1 = different-port hostname fallback.
         let score = if port > 0 {
             if slot.ports.contains(&port) {
                 if name_match {
@@ -1348,6 +1339,8 @@ fn select_moonlight_host_slot<'a>(
         }
     }
 
+    // Reuse an unlabeled/raw-IP slot only when uniquely present for this port,
+    // avoiding cross-routing between distinct servers sharing primary/secondary ports.
     if best.is_none() && raw_ip_port_candidates.len() == 1 {
         return Some(raw_ip_port_candidates[0]);
     }

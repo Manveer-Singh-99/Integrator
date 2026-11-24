@@ -29,7 +29,7 @@
 //    - Card 8: True Tone & Chromatic Sync (Ambient light sensor readings, manual CCT/gamma calibration).
 //    - Card 9: Touch Bar Hardware HUD (Touch Bar telemetry strip status and toggle invocation).
 //    - Card 10: Dynamic Audio Routing (ChaCha20-Poly1305 encrypted spatial UDP sink, test chime invocation).
-//    - Card 10B: Mac -> PC Shared Camera (Windows Virtual Camera driver receiving 720p30 video over TCP :58287).
+//    - Card 10B: Mac -> PC Shared Camera & Mic (Windows Virtual Camera driver + shared Mac microphone routing over TCP :58287).
 //    - Card 11: System & Autostart (Windows Task Scheduler logon autostart, dynamic glass intensity slider).
 //    - Card 12: Live Telemetry & Security Logs (Monospaced tailing log console with ANSI/log-level visual highlighting).
 //
@@ -47,8 +47,11 @@
 //      automatically suspended when the window is minimized or hidden to the taskbar system tray.
 //
 // 6. Security & Safety Invariants:
-//    - Form State Preservation: Dirty flags (`_kvmLayoutDirty`, `_encodeGpuDirty`, `_decodeGpuDirty`, `_preferredShareDirty`)
-//      prevent periodic status polling updates from overwriting user inputs in-flight.
+//    - Form State Preservation: Dirty flags (`_kvmLayoutDirty`, `_encodeGpuDirty`, `_decodeGpuDirty`, `_preferredShareDirty`,
+//      `_micGainDirty`) prevent periodic status polling updates from overwriting user inputs in-flight.
+//    - Mutual Exclusion Guard: Extended Screen (Moonlight/Sunshine desktop streaming) and Universal Input KVM
+//      (low-level input hooks + screen-edge cursor hopping) are guarded by an explicit confirmation dialog and
+//      atomic backend flag switch so they never conflict over cursor capture or modifier key states.
 //    - Input Validation: IP address inputs are strictly validated with `IPAddress.TryParse` prior to dispatch.
 //    - Failure Containment: Network and RPC failures are surfaced via non-blocking toast banners.
 // ==============================================================================================
@@ -101,6 +104,10 @@ namespace IntegratorUI
         private const int ToastDismissSeconds = 4;
         /// <summary>Periodic interval in seconds for polling get_bridge_status from the native core.</summary>
         private const int StatusPollIntervalSeconds = 2;
+        /// <summary>Debounce interval in milliseconds before dispatching microphone gain slider updates.</summary>
+        private const int MicGainDebounceMs = 300;
+        /// <summary>Minimum interval in seconds between background camera/microphone device enumeration queries.</summary>
+        private const double DeviceListRefreshCooldownSeconds = 10.0;
         /// <summary>Fallback local workstation label shown in the desk schematic when hostname is unavailable.</summary>
         private const string DefaultLocalHostname = "This PC";
         /// <summary>Fallback remote peer label shown in the desk schematic when peer hostname is unavailable.</summary>
@@ -122,6 +129,8 @@ namespace IntegratorUI
         private readonly DispatcherTimer _pollTimer;
         /// <summary>Timer for auto-dismissing ephemeral toast notifications.</summary>
         private readonly DispatcherTimer _toastTimer;
+        /// <summary>Debounce timer dispatching microphone gain updates after slider adjustments settle.</summary>
+        private readonly DispatcherTimer _micGainDebounceTimer;
         /// <summary>Array of all thirteen card container borders for responsive layout and styling.</summary>
         private readonly Border[] _allCards;
         /// <summary>Array of category navigation buttons.</summary>
@@ -169,6 +178,8 @@ namespace IntegratorUI
         private bool _didShowLaunchSetupPrompt;
         /// <summary>Reentrancy guard preventing overlapping Setup Assistant ContentDialog instances.</summary>
         private bool _isSetupDialogOpen;
+        /// <summary>Reentrancy guard preventing overlapping KVM/Extended Screen mutual-exclusion ContentDialog instances.</summary>
+        private bool _isMutualExclusionDialogOpen;
         /// <summary>Reentrancy guard preventing overlapping quit confirmation or shutdown progress flows.</summary>
         private bool _isQuitFlowRunning;
         /// <summary>Guard suppressing SwitchConfirmQuit.Toggled during programmatic state initialization.</summary>
@@ -179,6 +190,18 @@ namespace IntegratorUI
         private int _cameraRefreshInFlight;
         /// <summary>Timestamp of last camera enumeration query to throttle polling.</summary>
         private DateTime _lastCameraRefresh = DateTime.MinValue;
+        /// <summary>Guard flag preventing microphone selection event during programmatic ComboBox population.</summary>
+        private bool _populatingMics;
+        /// <summary>Atomic guard preventing overlapping background microphone enumeration calls.</summary>
+        private int _micRefreshInFlight;
+        /// <summary>Timestamp of last microphone enumeration query to throttle polling.</summary>
+        private DateTime _lastMicRefresh = DateTime.MinValue;
+        /// <summary>Cached composite key of camera devices to avoid disrupting open ComboBox dropdowns.</summary>
+        private string? _lastCameraListKey;
+        /// <summary>Cached composite key of microphone devices to avoid disrupting open ComboBox dropdowns.</summary>
+        private string? _lastMicListKey;
+        /// <summary>True if user has modified the microphone gain slider without applying to the core.</summary>
+        private bool _micGainDirty;
 
         /// <summary>
         /// Resolves the platform default public shared directory label dynamically from OS environment
@@ -251,6 +274,16 @@ namespace IntegratorUI
                 ToastBanner.Visibility = Visibility.Collapsed;
             };
 
+            _micGainDebounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(MicGainDebounceMs) };
+            _micGainDebounceTimer.Tick += (_, _) =>
+            {
+                _micGainDebounceTimer.Stop();
+                if (!_disposedForExit && _micGainDirty)
+                {
+                    DispatchMicGainSettings();
+                }
+            };
+
             _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(StatusPollIntervalSeconds) };
             _pollTimer.Tick += (_, _) => _ = RefreshStatusAsync();
             if (!startHidden)
@@ -262,9 +295,11 @@ namespace IntegratorUI
 
         /// <summary>
         /// Win32 User32 function querying the dots per inch (DPI) of the specified window.
+        /// Restricted to <see cref="DllImportSearchPath.System32"/> to prevent DLL pre-loading attacks.
         /// </summary>
         /// <param name="hwnd">Window handle.</param>
         /// <returns>DPI value (e.g., 96 for 100%, 144 for 150%).</returns>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("user32.dll")]
         private static extern uint GetDpiForWindow(IntPtr hwnd);
 
@@ -391,6 +426,7 @@ namespace IntegratorUI
             _disposedForExit = true;
             _pollTimer.Stop();
             _toastTimer.Stop();
+            _micGainDebounceTimer.Stop();
         }
 
         /// <summary>
@@ -441,6 +477,10 @@ namespace IntegratorUI
                 }
 
                 ApplyStatusToUi(s);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Integrator] RefreshStatusAsync error: {ex.Message}");
             }
             finally
             {
@@ -521,12 +561,17 @@ namespace IntegratorUI
                 EncodeGpuCombo.IsEnabled = f.Display;
                 DecodeGpuCombo.IsEnabled = f.Display;
                 BtnApplyGpu.IsEnabled = f.Display;
-                BtnExtendMacToPc.IsEnabled = f.Display;
-                BtnExtendPcToMac.IsEnabled = f.Display;
-                string? displayTip = f.Display ? null : "Extended Screen is disabled in feature flags.";
-                ToolTipService.SetToolTip(EncodeGpuCombo, displayTip);
-                ToolTipService.SetToolTip(DecodeGpuCombo, displayTip);
-                ToolTipService.SetToolTip(BtnApplyGpu, displayTip);
+                BtnExtendMacToPc.IsEnabled = f.Display || f.InputKvm;
+                BtnExtendPcToMac.IsEnabled = f.Display || f.InputKvm;
+                string? gpuTip = f.Display ? null : "Extended Screen is disabled in feature flags.";
+                string? displayTip = f.Display
+                    ? null
+                    : (f.InputKvm
+                        ? "Universal Input KVM is active. Click to switch to Extended Screen."
+                        : "Extended Screen is disabled in feature flags.");
+                ToolTipService.SetToolTip(EncodeGpuCombo, gpuTip);
+                ToolTipService.SetToolTip(DecodeGpuCombo, gpuTip);
+                ToolTipService.SetToolTip(BtnApplyGpu, gpuTip);
                 ToolTipService.SetToolTip(BtnExtendMacToPc, displayTip);
                 ToolTipService.SetToolTip(BtnExtendPcToMac, displayTip);
 
@@ -659,28 +704,34 @@ namespace IntegratorUI
                 BtnToggleMount.IsEnabled = f.Storage;
                 ToolTipService.SetToolTip(BtnToggleMount, f.Storage ? null : "Shared Storage is disabled in feature flags.");
 
-                // Card 8: True Tone
+                // Card 8: True Tone (exact macOS status pill parity: never "Manual" when toggled ON)
                 SwitchTrueTone.IsOn = f.Truetone;
-                if (s.AmbientSupported && s.AmbientCct.HasValue && s.AmbientCct.Value >= 2500 && s.AmbientCct.Value <= 9000)
+                if (!f.Truetone)
                 {
-                    TrueTonePillText.Text = string.Format(CultureInfo.InvariantCulture, "Auto • {0:0} lux • {1}K", s.AmbientLux ?? 0f, s.AmbientCct.Value);
-                    if (CctSlider != null && CctValueText != null && !_applyingStatus)
-                    {
-                        double targetVal = Math.Clamp((double)s.AmbientCct.Value, CctSlider.Minimum, CctSlider.Maximum);
-                        if (Math.Abs(CctSlider.Value - targetVal) >= 50)
-                        {
-                            CctSlider.Value = targetVal;
-                            CctValueText.Text = $"{(int)targetVal}K";
-                        }
-                    }
+                    TrueTonePillText.Text = "Paused";
+                    SetPillStyle(TrueTonePill, TrueTonePillDot, Color.FromArgb(255, 136, 136, 136));
                 }
                 else
                 {
-                    TrueTonePillText.Text = "Manual";
+                    if (s.AmbientSupported && s.AmbientCct.HasValue && s.AmbientCct.Value >= 2500 && s.AmbientCct.Value <= 9000)
+                    {
+                        TrueTonePillText.Text = $"Auto • {s.AmbientLux ?? 0f:0} lux • {s.AmbientCct.Value}K";
+                        if (CctSlider != null && CctValueText != null)
+                        {
+                            double targetVal = Math.Clamp((double)s.AmbientCct.Value, CctSlider.Minimum, CctSlider.Maximum);
+                            if (Math.Abs(CctSlider.Value - targetVal) >= 50)
+                            {
+                                CctSlider.Value = targetVal;
+                                CctValueText.Text = $"{(int)targetVal}K";
+                            }
+                        }
+                    }
+                    else
+                    {
+                        TrueTonePillText.Text = $"Active • {(int)(CctSlider?.Value ?? DefaultAmbientCctKelvin)}K";
+                    }
+                    SetPillStyle(TrueTonePill, TrueTonePillDot, Color.FromArgb(255, 232, 192, 27));
                 }
-                SetPillStyle(TrueTonePill, TrueTonePillDot, f.Truetone
-                    ? Color.FromArgb(255, 232, 192, 27)
-                    : Color.FromArgb(255, 136, 136, 136));
                 BtnSyncCalibration.IsEnabled = f.Truetone;
 
                 // Card 9: Touch Bar Hardware HUD
@@ -703,7 +754,7 @@ namespace IntegratorUI
                     : s.AudioStatus.Topology;
                 BtnPlayChime.IsEnabled = f.Audio;
 
-                // Card 10B: Mac -> PC Shared Camera
+                // Card 10B: Mac -> PC Shared Camera & Mic
                 SwitchCamera.IsOn = f.Camera;
                 var cam = s.CameraStatus;
                 uint camWidth = cam.Width > 0 ? cam.Width : CameraStatusModel.DefaultCameraWidth;
@@ -737,6 +788,65 @@ namespace IntegratorUI
                 }
                 BtnToggleCamera.Content = cam.Active ? "Stop Virtual Camera" : "Enable Virtual Camera";
 
+                // Shared Microphone controls within Card 10B (parity with macOS SwiftUI: Share Mac Microphone
+                // toggle remains usable whenever peer is linked; mute & gain controls follow MicEnabled state).
+                if (SwitchCameraMic != null)
+                {
+                    SwitchCameraMic.IsOn = cam.MicEnabled;
+                    SwitchCameraMic.IsEnabled = s.PeerConnected || cam.MicEnabled || f.Camera;
+                }
+                if (BtnToggleMicMute != null)
+                {
+                    BtnToggleMicMute.Content = cam.MicMuted ? "Mic Muted" : "Mute Mic";
+                    BtnToggleMicMute.IsEnabled = cam.MicEnabled;
+                    if (cam.MicEnabled && cam.MicMuted)
+                    {
+                        BtnToggleMicMute.Style = (Style)Application.Current.Resources["AccentButtonStyle"];
+                    }
+                    else
+                    {
+                        BtnToggleMicMute.ClearValue(FrameworkElement.StyleProperty);
+                    }
+                }
+                if (MicSummaryText != null)
+                {
+                    if (!cam.MicPermissionGranted)
+                    {
+                        MicSummaryText.Text = "Microphone permission required on Mac.";
+                    }
+                    else if (!cam.MicEnabled)
+                    {
+                        MicSummaryText.Text = "Mac microphone sharing is paused.";
+                    }
+                    else
+                    {
+                        string micName = string.IsNullOrWhiteSpace(cam.MicDeviceName) ? "Mac Microphone" : cam.MicDeviceName;
+                        string muteState = cam.MicMuted ? "Muted" : "Live";
+                        int gainPct = (int)Math.Round(Math.Clamp(cam.MicGain, 0f, 2f) * 100f);
+                        MicSummaryText.Text = string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{0} • {1} • Gain {2}%",
+                            micName, muteState, gainPct);
+                    }
+                }
+                if (MicGainSlider != null && MicGainText != null)
+                {
+                    if (!_micGainDirty)
+                    {
+                        double clampedGainPct = Math.Clamp(
+                            Math.Round(cam.MicGain * 100.0 / 5.0) * 5.0,
+                            MicGainSlider.Minimum,
+                            MicGainSlider.Maximum);
+                        MicGainSlider.Value = clampedGainPct;
+                        MicGainText.Text = $"{(int)clampedGainPct}%";
+                    }
+                    MicGainSlider.IsEnabled = cam.MicEnabled;
+                }
+                if (BtnApplyMicGain != null)
+                {
+                    BtnApplyMicGain.IsEnabled = cam.MicEnabled;
+                }
+
                 if (f.Camera)
                 {
                     _ = RefreshCameraDevicesAsync();
@@ -744,6 +854,15 @@ namespace IntegratorUI
                 else
                 {
                     CameraSelectionPanel.Visibility = Visibility.Collapsed;
+                }
+
+                if (s.PeerConnected)
+                {
+                    _ = RefreshMicDevicesAsync();
+                }
+                else if (MicSelectionPanel != null)
+                {
+                    MicSelectionPanel.Visibility = Visibility.Collapsed;
                 }
 
                 // Card 11: Autostart
@@ -1433,41 +1552,48 @@ namespace IntegratorUI
             bool preserveNulls = false,
             Action<bool>? onCompleted = null)
         {
-            var res = await Task.Run(() => CoreBridge.Invoke<JsonElement>(method, parameters, preserveNulls));
-            if (_disposedForExit) return;
+            try
+            {
+                var res = await Task.Run(() => CoreBridge.Invoke<JsonElement>(method, parameters, preserveNulls));
+                if (_disposedForExit) return;
 
-            if (!res.Ok)
-            {
-                ShowToast(string.IsNullOrWhiteSpace(res.Error) ? $"{method} failed" : res.Error!, "error");
-            }
-            else if (method == "regenerate_pairing_pin")
-            {
-                ShowToast("New pairing PIN generated", "success");
-            }
-            else if (res.Data.ValueKind == JsonValueKind.String)
-            {
-                string? msg = res.Data.GetString();
-                if (!string.IsNullOrWhiteSpace(msg))
+                if (!res.Ok)
                 {
-                    ShowToast(msg!, "success");
+                    ShowToast(string.IsNullOrWhiteSpace(res.Error) ? $"{method} failed" : res.Error!, "error");
+                }
+                else if (method == "regenerate_pairing_pin")
+                {
+                    ShowToast("New pairing PIN generated", "success");
+                }
+                else if (res.Data.ValueKind == JsonValueKind.String)
+                {
+                    string? msg = res.Data.GetString();
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        ShowToast(msg!, "success");
+                    }
+                }
+                else if (res.Data.ValueKind == JsonValueKind.Object &&
+                         res.Data.TryGetProperty("message", out JsonElement msgElem) &&
+                         msgElem.ValueKind == JsonValueKind.String)
+                {
+                    string? msg = msgElem.GetString();
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        ShowToast(msg!, "success");
+                    }
+                }
+
+                onCompleted?.Invoke(res.Ok);
+
+                if (refreshAfter)
+                {
+                    await RefreshStatusAsync();
                 }
             }
-            else if (res.Data.ValueKind == JsonValueKind.Object &&
-                     res.Data.TryGetProperty("message", out JsonElement msgElem) &&
-                     msgElem.ValueKind == JsonValueKind.String)
+            catch (Exception ex)
             {
-                string? msg = msgElem.GetString();
-                if (!string.IsNullOrWhiteSpace(msg))
-                {
-                    ShowToast(msg!, "success");
-                }
-            }
-
-            onCompleted?.Invoke(res.Ok);
-
-            if (refreshAfter)
-            {
-                await RefreshStatusAsync();
+                System.Diagnostics.Debug.WriteLine($"[Integrator] RunInvoke('{method}') error: {ex.Message}");
             }
         }
 
@@ -1531,6 +1657,8 @@ namespace IntegratorUI
 
         /// <summary>
         /// Handles toggle switches for subsystem feature flags and dispatches set_feature_flag RPCs.
+        /// Enforces mutual exclusion between Extended Screen ("display") and Universal Input KVM ("input_kvm")
+        /// by presenting an explanatory confirmation dialog before switching active subsystems.
         /// </summary>
         private void FeatureSwitch_Toggled(object sender, RoutedEventArgs e)
         {
@@ -1554,15 +1682,126 @@ namespace IntegratorUI
                     _ => enabled
                 };
                 if (current == enabled) return;
+
+                // Mutual exclusion check: Extended Screen ("display") vs Universal Input KVM ("input_kvm").
+                if (enabled && feature == "display" && f.InputKvm)
+                {
+                    _applyingStatus = true;
+                    try
+                    {
+                        ts.IsOn = false;
+                    }
+                    finally
+                    {
+                        _applyingStatus = false;
+                    }
+                    _ = ShowDisplayKvmMutualExclusionDialogAsync(targetFeature: "display", postSwitchAction: null);
+                    return;
+                }
+                if (enabled && feature == "input_kvm" && (f.Display || _status.DisplayActive))
+                {
+                    _applyingStatus = true;
+                    try
+                    {
+                        ts.IsOn = false;
+                    }
+                    finally
+                    {
+                        _applyingStatus = false;
+                    }
+                    _ = ShowDisplayKvmMutualExclusionDialogAsync(targetFeature: "input_kvm", postSwitchAction: null);
+                    return;
+                }
+
                 RunInvoke("set_feature_flag", new { feature, enabled });
             }
         }
 
         /// <summary>
+        /// Presents a modal WinUI 3 ContentDialog explaining why Extended Screen and Universal Input KVM
+        /// cannot run simultaneously, and upon confirmation switches atomically to the requested feature.
+        /// </summary>
+        /// <param name="targetFeature">Target feature flag to enable ("display" or "input_kvm").</param>
+        /// <param name="postSwitchAction">Optional RPC method (e.g., "toggle_mac_to_pc") to invoke after switching.</param>
+        private async Task ShowDisplayKvmMutualExclusionDialogAsync(string targetFeature, string? postSwitchAction)
+        {
+            if (_isMutualExclusionDialogOpen || _isSetupDialogOpen || _isQuitFlowRunning || _disposedForExit || RootGrid?.XamlRoot == null)
+            {
+                return;
+            }
+            _isMutualExclusionDialogOpen = true;
+            try
+            {
+                bool switchingToDisplay = string.Equals(targetFeature, "display", StringComparison.OrdinalIgnoreCase);
+                string primaryLabel = switchingToDisplay
+                    ? "Switch to Extended Screen"
+                    : "Switch to Universal Input KVM";
+                string consequenceLine = switchingToDisplay
+                    ? "Switching to Extended Screen will automatically disable Universal Input KVM and release its input hooks."
+                    : "Switching to Universal Input KVM will automatically disable Extended Screen and stop any active display stream.";
+
+                var dlg = new ContentDialog
+                {
+                    Title = "Extended Screen & Universal Input KVM Cannot Run Together",
+                    Content = new TextBlock
+                    {
+                        Text = "Extended Screen streams your desktop over Moonlight/Sunshine, which captures mouse and keyboard input directly inside the stream window. " +
+                               "Running Universal Input KVM's low-level input hooks and screen-edge cursor hopping at the same time causes cursor capture conflicts, stuck modifier keys, or phantom screen hops.\n\n" +
+                               "Only one of these features can be active at a time. " + consequenceLine,
+                        FontSize = 13,
+                        TextWrapping = TextWrapping.Wrap,
+                        MaxWidth = 440
+                    },
+                    PrimaryButtonText = primaryLabel,
+                    CloseButtonText = "Cancel",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = RootGrid.XamlRoot
+                };
+
+                ContentDialogResult result = await dlg.ShowAsync();
+                if (result == ContentDialogResult.Primary && !_disposedForExit)
+                {
+                    RunInvoke(
+                        "set_feature_flag",
+                        new { feature = targetFeature, enabled = true },
+                        refreshAfter: string.IsNullOrEmpty(postSwitchAction),
+                        onCompleted: ok =>
+                        {
+                            if (ok && !string.IsNullOrEmpty(postSwitchAction))
+                            {
+                                RunInvoke(postSwitchAction!);
+                            }
+                            else if (!ok && !string.IsNullOrEmpty(postSwitchAction))
+                            {
+                                _ = RefreshStatusAsync();
+                            }
+                        });
+                }
+            }
+            catch
+            {
+                // Suppress dialog presentation race if another modal is opening concurrently.
+            }
+            finally
+            {
+                _isMutualExclusionDialogOpen = false;
+            }
+        }
+
+        /// <summary>
         /// Initiates or toggles extended screen display streaming from Mac to Windows PC.
+        /// Prompts for mutual-exclusion confirmation if Universal Input KVM is currently active.
         /// </summary>
         private void ExtendMacToPc_Click(object sender, RoutedEventArgs e)
         {
+            bool isMacToPcActive = _status != null && _status.DisplayActive &&
+                (_status.ActiveMode?.IndexOf("Mac -> PC", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!isMacToPcActive && _status?.FeatureFlags.InputKvm == true)
+            {
+                _ = ShowDisplayKvmMutualExclusionDialogAsync(targetFeature: "display", postSwitchAction: "toggle_mac_to_pc");
+                return;
+            }
+
             if (BtnExtendMacToPc != null) BtnExtendMacToPc.IsEnabled = false;
             RunInvoke("toggle_mac_to_pc", onCompleted: _ =>
             {
@@ -1572,9 +1811,18 @@ namespace IntegratorUI
 
         /// <summary>
         /// Initiates or toggles extended screen display streaming from Windows PC to Mac.
+        /// Prompts for mutual-exclusion confirmation if Universal Input KVM is currently active.
         /// </summary>
         private void ExtendPcToMac_Click(object sender, RoutedEventArgs e)
         {
+            bool isPcToMacActive = _status != null && _status.DisplayActive &&
+                (_status.ActiveMode?.IndexOf("PC -> Mac", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!isPcToMacActive && _status?.FeatureFlags.InputKvm == true)
+            {
+                _ = ShowDisplayKvmMutualExclusionDialogAsync(targetFeature: "display", postSwitchAction: "toggle_pc_to_mac");
+                return;
+            }
+
             if (BtnExtendPcToMac != null) BtnExtendPcToMac.IsEnabled = false;
             RunInvoke("toggle_pc_to_mac", onCompleted: _ =>
             {
@@ -1991,13 +2239,21 @@ namespace IntegratorUI
         }
 
         /// <summary>
-        /// Updates preview labels for True Tone CCT (Kelvin) and gamma compensation factor sliders.
+        /// Updates preview labels for True Tone CCT (Kelvin) and gamma compensation factor sliders,
+        /// and refreshes the active True Tone status pill when operating in manual CCT mode.
         /// </summary>
         private void TrueToneSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
         {
             if (CctValueText == null || GammaValueText == null) return;
-            CctValueText.Text = $"{(int)CctSlider.Value}K";
+            int cctK = (int)CctSlider.Value;
+            CctValueText.Text = $"{cctK}K";
             GammaValueText.Text = string.Format(CultureInfo.InvariantCulture, "{0:0.00}x", GammaSlider.Value);
+            if (_status?.FeatureFlags.Truetone == true &&
+                !(_status.AmbientSupported && _status.AmbientCct.HasValue && _status.AmbientCct.Value >= 2500 && _status.AmbientCct.Value <= 9000) &&
+                TrueTonePillText != null)
+            {
+                TrueTonePillText.Text = $"Active • {cctK}K";
+            }
         }
 
         /// <summary>
@@ -2030,16 +2286,18 @@ namespace IntegratorUI
             RunInvoke("toggle_camera", null, true, false, ok =>
             {
                 _ = RefreshCameraDevicesAsync(true);
+                _ = RefreshMicDevicesAsync(true);
             });
         }
 
         /// <summary>
         /// Queries the paired Mac for connected camera devices.
         /// Shows the camera selection dropdown strictly when 2 or more cameras are connected.
+        /// Caches device lists via <see cref="_lastCameraListKey"/> to avoid dismissing an open dropdown.
         /// </summary>
         private async Task RefreshCameraDevicesAsync(bool force = false)
         {
-            if (!force && (DateTime.UtcNow - _lastCameraRefresh).TotalSeconds < 10)
+            if (!force && (DateTime.UtcNow - _lastCameraRefresh).TotalSeconds < DeviceListRefreshCooldownSeconds)
             {
                 return;
             }
@@ -2057,6 +2315,7 @@ namespace IntegratorUI
                 var cameras = res.Data;
                 if (!res.Ok || cameras == null || cameras.Count < 2)
                 {
+                    _lastCameraListKey = null;
                     DispatcherQueue.TryEnqueue(() =>
                     {
                         if (CameraSelectionPanel != null)
@@ -2067,9 +2326,15 @@ namespace IntegratorUI
                     return;
                 }
 
+                string listKey = string.Join("|", cameras.Select(c => $"{c.Id}:{c.Name}:{c.IsActive}"));
                 DispatcherQueue.TryEnqueue(() =>
                 {
-                    if (CameraSelectionCombo == null || CameraSelectionPanel == null) return;
+                    if (_disposedForExit || CameraSelectionCombo == null || CameraSelectionPanel == null) return;
+                    if (_lastCameraListKey == listKey && CameraSelectionPanel.Visibility == Visibility.Visible)
+                    {
+                        return;
+                    }
+                    _lastCameraListKey = listKey;
                     _populatingCameras = true;
                     try
                     {
@@ -2112,11 +2377,191 @@ namespace IntegratorUI
         /// </summary>
         private void CameraSelectionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_populatingCameras) return;
+            if (_populatingCameras || _applyingStatus) return;
             if (CameraSelectionCombo?.SelectedItem is ComboBoxItem item && item.Tag is string devId)
             {
                 RunInvoke("select_camera", new { device_id = devId });
             }
+        }
+
+        /// <summary>
+        /// Queries the paired Mac for available microphone audio input devices via the "list_mics" RPC endpoint.
+        /// Populates the microphone source selection dropdown safely under the _populatingMics reentrancy guard,
+        /// caching the list key to avoid disrupting open dropdown menus on 10-second background refreshes.
+        /// </summary>
+        /// <param name="force">True to bypass the 10-second polling throttle window.</param>
+        private async Task RefreshMicDevicesAsync(bool force = false)
+        {
+            if (!force && (DateTime.UtcNow - _lastMicRefresh).TotalSeconds < DeviceListRefreshCooldownSeconds)
+            {
+                return;
+            }
+            if (System.Threading.Interlocked.CompareExchange(ref _micRefreshInFlight, 1, 0) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                _lastMicRefresh = DateTime.UtcNow;
+                var res = await Task.Run(() => CoreBridge.Invoke<List<MicDeviceModel>>("list_mics"));
+                if (_disposedForExit) return;
+
+                var mics = res.Data;
+                if (!res.Ok || mics == null || mics.Count == 0)
+                {
+                    _lastMicListKey = null;
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        if (MicSelectionPanel != null)
+                        {
+                            MicSelectionPanel.Visibility = Visibility.Collapsed;
+                        }
+                    });
+                    return;
+                }
+
+                string activeMicName = _status?.CameraStatus.MicDeviceName ?? string.Empty;
+                string listKey = string.Join("|", mics.Select(m => $"{m.Id}:{m.Name}:{m.IsDefault}")) + "##" + activeMicName;
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    if (_disposedForExit || MicSelectionCombo == null || MicSelectionPanel == null) return;
+                    if (_lastMicListKey == listKey && MicSelectionPanel.Visibility == Visibility.Visible)
+                    {
+                        return;
+                    }
+                    _lastMicListKey = listKey;
+                    _populatingMics = true;
+                    try
+                    {
+                        MicSelectionCombo.Items.Clear();
+                        int selectedIndex = 0;
+                        bool matchedByName = false;
+                        for (int i = 0; i < mics.Count; i++)
+                        {
+                            var item = new ComboBoxItem
+                            {
+                                Content = mics[i].Name,
+                                Tag = mics[i].Id
+                            };
+                            MicSelectionCombo.Items.Add(item);
+                            if (!string.IsNullOrWhiteSpace(activeMicName) &&
+                                string.Equals(mics[i].Name, activeMicName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                selectedIndex = i;
+                                matchedByName = true;
+                            }
+                            else if (!matchedByName && mics[i].IsDefault)
+                            {
+                                selectedIndex = i;
+                            }
+                        }
+                        MicSelectionCombo.SelectedIndex = selectedIndex;
+                        MicSelectionPanel.Visibility = Visibility.Visible;
+                    }
+                    finally
+                    {
+                        _populatingMics = false;
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Integrator] Failed to refresh microphones: {ex.Message}");
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref _micRefreshInFlight, 0);
+            }
+        }
+
+        /// <summary>
+        /// Handles microphone input device selection changes from the dropdown, dispatching "select_mic" to the core.
+        /// </summary>
+        private void MicSelectionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_populatingMics || _applyingStatus) return;
+            if (MicSelectionCombo?.SelectedItem is ComboBoxItem item && item.Tag is string deviceId)
+            {
+                RunInvoke("select_mic", new { deviceId });
+            }
+        }
+
+        /// <summary>
+        /// Handles toggling of the "Share Mac Microphone" switch inside the Shared Camera &amp; Mic card.
+        /// Dispatches updated microphone settings (enabled, muted, gain) via "set_mic_settings".
+        /// </summary>
+        private void CameraMicSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (_applyingStatus || _status == null) return;
+            bool enabled = SwitchCameraMic.IsOn;
+            if (_status.CameraStatus.MicEnabled == enabled) return;
+            _micGainDebounceTimer.Stop();
+            bool muted = _status.CameraStatus.MicMuted;
+            float gain = (float)Math.Clamp((MicGainSlider?.Value ?? 100.0) / 100.0, 0.0, 2.0);
+            RunInvoke("set_mic_settings", new { enabled, muted, gain }, onCompleted: ok =>
+            {
+                if (ok)
+                {
+                    _micGainDirty = false;
+                    _ = RefreshMicDevicesAsync(true);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Toggles the mute state of the shared Mac microphone stream via "set_mic_settings".
+        /// </summary>
+        private void ToggleMicMute_Click(object sender, RoutedEventArgs e)
+        {
+            if (_applyingStatus || _status == null) return;
+            _micGainDebounceTimer.Stop();
+            bool enabled = SwitchCameraMic?.IsOn ?? _status.CameraStatus.MicEnabled;
+            bool muted = !_status.CameraStatus.MicMuted;
+            float gain = (float)Math.Clamp((MicGainSlider?.Value ?? 100.0) / 100.0, 0.0, 2.0);
+            RunInvoke("set_mic_settings", new { enabled, muted, gain }, onCompleted: ok =>
+            {
+                if (ok) _micGainDirty = false;
+            });
+        }
+
+        /// <summary>
+        /// Updates the microphone gain percentage preview label, marks the gain slider dirty while adjusted
+        /// by the user, and arms the 300ms debounce timer to synchronize gain changes smoothly.
+        /// </summary>
+        private void MicGainSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+        {
+            if (MicGainText == null) return;
+            MicGainText.Text = $"{(int)Math.Round(MicGainSlider.Value)}%";
+            if (_applyingStatus || _status == null) return;
+            _micGainDirty = true;
+            _micGainDebounceTimer.Stop();
+            _micGainDebounceTimer.Start();
+        }
+
+        /// <summary>
+        /// Immediately dispatches the user-configured microphone gain percentage (cancelling any pending debounce).
+        /// </summary>
+        private void ApplyMicGain_Click(object sender, RoutedEventArgs e)
+        {
+            _micGainDebounceTimer.Stop();
+            DispatchMicGainSettings();
+        }
+
+        /// <summary>
+        /// Serializes and sends the current microphone enabled, muted, and linear gain multiplier
+        /// (<c>0.0</c> to <c>2.0</c>) settings to the core via <c>"set_mic_settings"</c>.
+        /// </summary>
+        private void DispatchMicGainSettings()
+        {
+            if (_status == null) return;
+            bool enabled = SwitchCameraMic?.IsOn ?? _status.CameraStatus.MicEnabled;
+            bool muted = _status.CameraStatus.MicMuted;
+            float gain = (float)Math.Clamp((MicGainSlider?.Value ?? 100.0) / 100.0, 0.0, 2.0);
+            RunInvoke("set_mic_settings", new { enabled, muted, gain }, onCompleted: ok =>
+            {
+                if (ok) _micGainDirty = false;
+            });
         }
 
         /// <summary>
@@ -2194,17 +2639,28 @@ namespace IntegratorUI
 
         // MARK: - Setup Assistant First-Launch Wizard Event Handlers
 
+        /// <summary>
+        /// Opens the full-window Setup Assistant wizard overlay from the left navigation sidebar
+        /// and refreshes live component installation statuses.
+        /// </summary>
         private void NavSetupBtn_Click(object sender, RoutedEventArgs e)
         {
             SetupAssistantOverlay.Visibility = Visibility.Visible;
             UpdateSetupAssistantCardStatuses();
         }
 
+        /// <summary>
+        /// Dismisses the Setup Assistant wizard overlay without modifying persisted completion preferences.
+        /// </summary>
         private void SetupAssistantClose_Click(object sender, RoutedEventArgs e)
         {
             SetupAssistantOverlay.Visibility = Visibility.Collapsed;
         }
 
+        /// <summary>
+        /// Completes the Setup Assistant wizard flow, persists the "Don't show automatically on launch" preference
+        /// if checked, and reveals the primary dashboard workspace.
+        /// </summary>
         private void SetupAssistantDone_Click(object sender, RoutedEventArgs e)
         {
             if (SetupDontShowAgainCheck.IsChecked == true)
@@ -2215,17 +2671,33 @@ namespace IntegratorUI
             ShowToast("Setup Assistant completed! Welcome to Integrator.", "success");
         }
 
+        /// <summary>
+        /// Triggers 1-click background installation of Sunshine and Moonlight streaming dependencies via WinGet.
+        /// </summary>
         private async void SetupInstallStreamingBtn_Click(object sender, RoutedEventArgs e)
         {
             SetupInstallStreamingBtn.IsEnabled = false;
             SetupDisplayStatusText.Text = "Status: Installing Sunshine & Moonlight via WinGet…";
             var r1 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "sunshine" }));
             var r2 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "moonlight" }));
-            SetupDisplayStatusText.Text = "Status: WinGet installer launched in background. Approve prompts if shown.";
-            ShowToast("Started Sunshine & Moonlight automated installation.", "info");
+            if (_disposedForExit) return;
+            if (!r1.Ok && !r2.Ok)
+            {
+                SetupDisplayStatusText.Text = $"Status: WinGet launch failed ({r1.Error ?? r2.Error ?? "unknown error"}).";
+                ShowToast(r1.Error ?? r2.Error ?? "Failed to launch streaming tools installer.", "error");
+            }
+            else
+            {
+                SetupDisplayStatusText.Text = "Status: WinGet installer launched in background. Approve prompts if shown.";
+                ShowToast("Started Sunshine & Moonlight automated installation.", "info");
+            }
             SetupInstallStreamingBtn.IsEnabled = true;
         }
 
+        /// <summary>
+        /// Registers Integrator's COM out-of-process WebAuthn Passkey Authenticator plugin with Windows 11
+        /// so websites can authenticate passkeys using the paired Mac's Touch ID sensor.
+        /// </summary>
         private async void SetupEnablePasskeyBtn_Click(object sender, RoutedEventArgs e)
         {
             SetupEnablePasskeyBtn.IsEnabled = false;
@@ -2243,6 +2715,7 @@ namespace IntegratorUI
                     System.Diagnostics.Debug.WriteLine($"[SetupPasskey] Failed: {ex}");
                 }
             });
+            if (_disposedForExit) return;
             if (ok)
             {
                 SetupPasskeyStatusText.Text = "Status: Active! Ready to authenticate in Chrome & Edge.";
@@ -2256,17 +2729,34 @@ namespace IntegratorUI
             SetupEnablePasskeyBtn.IsEnabled = true;
         }
 
+        /// <summary>
+        /// Triggers 1-click guided configuration of the Apple USB-C NCM direct link driver and Windows SMB file server.
+        /// </summary>
         private async void SetupEnableUsbNcmBtn_Click(object sender, RoutedEventArgs e)
         {
             SetupEnableUsbNcmBtn.IsEnabled = false;
             SetupUsbNcmStatusText.Text = "Status: Setting up USB-C NCM & SMB server…";
             var r1 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "usb_ncm" }));
             var r2 = await Task.Run(() => CoreBridge.Invoke<string>("request_permission", new { id = "smb_server" }));
-            SetupUsbNcmStatusText.Text = "Status: USB-C NCM bridge configured. SMB server ready.";
-            ShowToast("USB-C NCM & SMB sharing configured.", "success");
+            if (_disposedForExit) return;
+            if (!r1.Ok && !r2.Ok)
+            {
+                SetupUsbNcmStatusText.Text = $"Status: Setup failed ({r1.Error ?? r2.Error ?? "unknown error"}).";
+                ShowToast(r1.Error ?? r2.Error ?? "Failed to configure USB-C NCM & SMB.", "error");
+            }
+            else
+            {
+                SetupUsbNcmStatusText.Text = "Status: USB-C NCM bridge configured. SMB server ready.";
+                ShowToast("USB-C NCM & SMB sharing configured.", "success");
+            }
             SetupEnableUsbNcmBtn.IsEnabled = true;
         }
 
+        /// <summary>
+        /// Evaluates current setup health and Passkey registration status to update the visual indicators
+        /// and action buttons on all Setup Assistant wizard cards.
+        /// </summary>
+        /// <returns>True if all setup dependencies, passkey plugin, and permissions are already configured.</returns>
         private bool UpdateSetupAssistantCardStatuses()
         {
             bool allConfigured = true;
@@ -2416,13 +2906,19 @@ namespace IntegratorUI
                     {
                         fixAllBtn.IsEnabled = false;
                         var r = await Task.Run(() => CoreBridge.Invoke<string>("request_all_missing_permissions"));
+                        if (_disposedForExit) return;
                         if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
                         else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
                         var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                        if (_disposedForExit) return;
                         if (refreshed.Ok && refreshed.Data != null)
                         {
                             RebuildDialogContent(refreshed.Data);
                             await RefreshStatusAsync();
+                        }
+                        else
+                        {
+                            fixAllBtn.IsEnabled = true;
                         }
                     };
                     Grid.SetColumn(fixAllBtn, 1);
@@ -2438,10 +2934,15 @@ namespace IntegratorUI
                     {
                         refreshBtn.IsEnabled = false;
                         var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                        if (_disposedForExit) return;
                         if (refreshed.Ok && refreshed.Data != null)
                         {
                             RebuildDialogContent(refreshed.Data);
                             await RefreshStatusAsync();
+                        }
+                        else
+                        {
+                            refreshBtn.IsEnabled = true;
                         }
                     };
                     Grid.SetColumn(refreshBtn, 2);
@@ -2520,13 +3021,19 @@ namespace IntegratorUI
                             {
                                 fixBtn.IsEnabled = false;
                                 var r = await Task.Run(() => CoreBridge.Invoke<string>("request_permission", new { id = permId }));
+                                if (_disposedForExit) return;
                                 if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
                                 else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
                                 var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                                if (_disposedForExit) return;
                                 if (refreshed.Ok && refreshed.Data != null)
                                 {
                                     RebuildDialogContent(refreshed.Data);
                                     await RefreshStatusAsync();
+                                }
+                                else
+                                {
+                                    fixBtn.IsEnabled = true;
                                 }
                             };
                             btnPanel.Children.Add(fixBtn);
@@ -2634,13 +3141,19 @@ namespace IntegratorUI
                         {
                             installBtn.IsEnabled = false;
                             var r = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = depId }));
+                            if (_disposedForExit) return;
                             if (!string.IsNullOrWhiteSpace(r.Data)) ShowToast(r.Data!, r.Ok ? "success" : "warn");
                             else if (!r.Ok && !string.IsNullOrWhiteSpace(r.Error)) ShowToast(r.Error!, "error");
                             var refreshed = await Task.Run(() => CoreBridge.Invoke<SetupHealthSnapshotModel>("get_setup_status"));
+                            if (_disposedForExit) return;
                             if (refreshed.Ok && refreshed.Data != null)
                             {
                                 RebuildDialogContent(refreshed.Data);
                                 await RefreshStatusAsync();
+                            }
+                            else
+                            {
+                                installBtn.IsEnabled = true;
                             }
                         };
                         Grid.SetColumn(installBtn, 1);
@@ -3010,20 +3523,31 @@ namespace IntegratorUI
     /// </summary>
     internal static class UiPreferences
     {
+        /// <summary>
+        /// On-disk JSON serialization model for local Windows UI preferences.
+        /// </summary>
         private sealed class PrefsModel
         {
+            /// <summary>True if the user opted out of the quit confirmation dialog.</summary>
             [System.Text.Json.Serialization.JsonPropertyName("skip_quit_confirmation")]
             public bool SkipQuitConfirmation { get; set; }
 
+            /// <summary>True if the user has completed or dismissed the first-launch Setup Assistant wizard.</summary>
             [System.Text.Json.Serialization.JsonPropertyName("has_completed_initial_setup")]
             public bool HasCompletedInitialSetup { get; set; }
         }
 
+        /// <summary>
+        /// Resolves the canonical file path for ui_prefs.json under %LOCALAPPDATA%\Integrator.
+        /// </summary>
         private static string PrefsPath => System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Integrator",
             "ui_prefs.json");
 
+        /// <summary>
+        /// Reads and deserializes the UI preferences JSON file from disk, returning default settings on missing or corrupt files.
+        /// </summary>
         private static PrefsModel LoadModel()
         {
             try
@@ -3038,6 +3562,9 @@ namespace IntegratorUI
             return new PrefsModel();
         }
 
+        /// <summary>
+        /// Serializes and writes the UI preferences model to %LOCALAPPDATA%\Integrator\ui_prefs.json.
+        /// </summary>
         private static void SaveModel(PrefsModel model)
         {
             try
@@ -3053,6 +3580,9 @@ namespace IntegratorUI
             catch { }
         }
 
+        /// <summary>
+        /// Gets or sets whether the quit confirmation dialog should be skipped when exiting Integrator.
+        /// </summary>
         public static bool SkipQuitConfirmation
         {
             get => LoadModel().SkipQuitConfirmation;
@@ -3064,6 +3594,9 @@ namespace IntegratorUI
             }
         }
 
+        /// <summary>
+        /// Gets or sets whether the first-launch Setup Assistant wizard has been completed.
+        /// </summary>
         public static bool HasCompletedInitialSetup
         {
             get => LoadModel().HasCompletedInitialSetup;

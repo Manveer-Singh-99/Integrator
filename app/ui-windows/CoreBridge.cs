@@ -24,6 +24,11 @@
 //        * `App.xaml.cs`: Event routing, tray actions, and application lifecycle termination.
 //        * `MainWindow.xaml.cs`: 2-second polling loop, button click RPC dispatches, feature toggles.
 //        * `TrayIconManager.cs`: Context menu action triggers dispatched via thread pool.
+//        * `PasskeyAuthenticatorPlugin.cs`: WebAuthn remote MakeCredential/GetAssertion RPCs.
+//    - Cross-Platform / Cross-Device Flow:
+//        * Serializes Windows UI requests into JSON-RPC calls routed by `integrator_core.dll` to the
+//          paired macOS workstation over authenticated `TransportSessionV2` (TCP :58281-:58287) and
+//          deserializes Rust `BridgeStatus` snapshots mirroring macOS SwiftUI data contracts.
 //
 // 3. Threading & Concurrency Model:
 //    - Thread-Safe RPC Invocations: `Invoke<T>` can be safely invoked concurrently from any thread
@@ -48,6 +53,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 
 namespace IntegratorUI
 {
@@ -56,6 +62,7 @@ namespace IntegratorUI
     /// </summary>
     internal static class CoreNative
     {
+        /// <summary>Native Rust core shared library filename loaded from the application directory.</summary>
         private const string DllName = "integrator_core.dll";
 
         /// <summary>
@@ -131,12 +138,14 @@ namespace IntegratorUI
     /// </summary>
     internal static class CoreBridge
     {
+        /// <summary>Default JSON serializer options omitting null properties and matching fields case-insensitively.</summary>
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
             PropertyNameCaseInsensitive = true,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
+        /// <summary>JSON serializer options preserving explicit null properties (e.g., resetting folder/share overrides).</summary>
         private static readonly JsonSerializerOptions JsonOptionsIncludeNulls = new()
         {
             PropertyNameCaseInsensitive = true
@@ -148,7 +157,7 @@ namespace IntegratorUI
         private static CoreNative.UiEventCallback? _nativeCallback;
 
         /// <summary>
-        /// Atomic flag ensuring core shutdown logic is executed exactly once.
+        /// Atomic flag ensuring core shutdown logic is executed exactly once (0 = active, 1 = shut down).
         /// </summary>
         private static int _shutdownDone;
 
@@ -158,8 +167,11 @@ namespace IntegratorUI
         public static event Action<string, string>? UiEventReceived;
 
         /// <summary>
-        /// Allocates a null-terminated UTF-8 byte array in unmanaged process memory.
+        /// Allocates a null-terminated UTF-8 byte array in unmanaged process memory via <see cref="Marshal.AllocHGlobal(int)"/>.
+        /// Strips embedded NUL characters to prevent C-string truncation; caller must free with <see cref="Marshal.FreeHGlobal"/>.
         /// </summary>
+        /// <param name="value">Managed string to encode into unmanaged UTF-8 memory.</param>
+        /// <returns>Pointer to null-terminated unmanaged UTF-8 buffer.</returns>
         private static IntPtr AllocUtf8(string value)
         {
             string sanitized = (value ?? string.Empty).Replace("\0", string.Empty);
@@ -172,6 +184,8 @@ namespace IntegratorUI
         /// <summary>
         /// Marshals an unmanaged null-terminated UTF-8 byte array into a managed string.
         /// </summary>
+        /// <param name="ptr">Pointer to null-terminated UTF-8 native memory (<see cref="IntPtr.Zero"/> yields empty string).</param>
+        /// <returns>Decoded managed string, or <see cref="string.Empty"/> when <paramref name="ptr"/> is zero.</returns>
         private static string ReadUtf8(IntPtr ptr)
         {
             if (ptr == IntPtr.Zero) return string.Empty;
@@ -181,8 +195,11 @@ namespace IntegratorUI
         /// <summary>
         /// Executes CLI subcommands via the native core if requested by command-line arguments.
         /// </summary>
-        public static int RunCliIfRequested(string[] args)
+        /// <param name="args">Command-line arguments (excluding executable path); null is treated as empty.</param>
+        /// <returns>Non-negative exit code if a CLI mode executed; <c>-1</c> if normal GUI startup should proceed.</returns>
+        public static int RunCliIfRequested(string[]? args)
         {
+            args ??= Array.Empty<string>();
             string exePath = Environment.ProcessPath ?? "Integrator.exe";
             string[] fullArgs = new string[args.Length + 1];
             fullArgs[0] = exePath;
@@ -209,6 +226,7 @@ namespace IntegratorUI
         /// <summary>
         /// Signals an existing running instance of Integrator to bring its window to the foreground.
         /// </summary>
+        /// <returns>True if an existing instance acknowledged the activation signal; false otherwise.</returns>
         public static bool TryFocusExisting()
         {
             return CoreNative.integrator_core_try_focus_existing();
@@ -217,9 +235,10 @@ namespace IntegratorUI
         /// <summary>
         /// Initializes the native core backend runtime and registers the reverse UI event callback.
         /// </summary>
+        /// <returns>True if <c>integrator_core_init</c> succeeded (exit code 0); false on initialization failure.</returns>
         public static bool Initialize()
         {
-            System.Threading.Interlocked.Exchange(ref _shutdownDone, 0);
+            Interlocked.Exchange(ref _shutdownDone, 0);
             _nativeCallback = OnNativeUiEvent;
             return CoreNative.integrator_core_init(_nativeCallback) == 0;
         }
@@ -227,6 +246,8 @@ namespace IntegratorUI
         /// <summary>
         /// Internal Cdecl callback trampoline receiving asynchronous events from the native Rust runtime.
         /// </summary>
+        /// <param name="eventPtr">Unmanaged pointer to null-terminated UTF-8 event name.</param>
+        /// <param name="payloadPtr">Unmanaged pointer to null-terminated UTF-8 JSON payload.</param>
         private static void OnNativeUiEvent(IntPtr eventPtr, IntPtr payloadPtr)
         {
             try
@@ -251,6 +272,11 @@ namespace IntegratorUI
         /// <returns>RpcResult containing success status, data payload, or error message.</returns>
         public static RpcResult<T> Invoke<T>(string method, object? parameters = null, bool preserveNulls = false)
         {
+            if (string.IsNullOrWhiteSpace(method))
+            {
+                return new RpcResult<T>(false, default, "RPC method name must not be empty");
+            }
+
             string paramsJson = parameters switch
             {
                 null => "{}",
@@ -292,15 +318,24 @@ namespace IntegratorUI
 
         /// <summary>
         /// Dispatches a one-way notification action into the native core's tray handler.
+        /// Safe to call from background <see cref="ThreadPool"/> workers; no-ops after shutdown begins.
         /// </summary>
         /// <param name="action">Action key string (e.g., "paste_remote", "toggle_display").</param>
         public static void TrayAction(string action)
         {
+            if (Volatile.Read(ref _shutdownDone) != 0 || string.IsNullOrWhiteSpace(action))
+            {
+                return;
+            }
             IntPtr aPtr = IntPtr.Zero;
             try
             {
                 aPtr = AllocUtf8(action);
                 CoreNative.integrator_core_tray_action(aPtr);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[CoreBridge] TrayAction('{action}') failed: {ex.Message}");
             }
             finally
             {
@@ -310,16 +345,17 @@ namespace IntegratorUI
 
         /// <summary>
         /// Performs idempotent graceful shutdown of the native core runtime.
+        /// Keeps the native delegate pinned until <c>integrator_core_shutdown</c> finishes joining worker threads.
         /// </summary>
         public static void Shutdown()
         {
-            if (System.Threading.Interlocked.Exchange(ref _shutdownDone, 1) != 0)
+            if (Interlocked.Exchange(ref _shutdownDone, 1) != 0)
             {
                 return;
             }
             try { CoreNative.integrator_core_set_ui_callback(null); } catch { }
-            _nativeCallback = null;
             try { CoreNative.integrator_core_shutdown(); } catch { }
+            _nativeCallback = null;
         }
     }
 
@@ -612,16 +648,42 @@ namespace IntegratorUI
         [JsonPropertyName("device_name")] public string DeviceName { get; set; } = DefaultCameraDeviceName;
         /// <summary>True if the hardware camera privacy shutter killswitch is engaged.</summary>
         [JsonPropertyName("privacy_muted")] public bool PrivacyMuted { get; set; }
+        /// <summary>True if Mac-to-PC microphone audio forwarding is enabled alongside the shared camera.</summary>
+        [JsonPropertyName("mic_enabled")] public bool MicEnabled { get; set; }
+        /// <summary>True if the shared Mac microphone stream is currently muted.</summary>
+        [JsonPropertyName("mic_muted")] public bool MicMuted { get; set; }
+        /// <summary>Friendly name of the currently active Mac microphone input device.</summary>
+        [JsonPropertyName("mic_device_name")] public string MicDeviceName { get; set; } = "";
+        /// <summary>True if macOS microphone capture permission has been granted.</summary>
+        [JsonPropertyName("mic_permission_granted")] public bool MicPermissionGranted { get; set; } = true;
+        /// <summary>Linear microphone software gain multiplier (0.0 to 2.0, where 1.0 is unity 100% gain).</summary>
+        [JsonPropertyName("mic_gain")] public float MicGain { get; set; } = 1.0f;
     }
 
     /// <summary>
-    /// Discovered camera hardware/continuity device.
+    /// Discovered camera hardware or Continuity Camera capture device on the Mac peer.
     /// </summary>
     internal sealed class CameraDeviceModel
     {
+        /// <summary>Unique hardware video capture device identifier string.</summary>
         [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        /// <summary>Human-readable camera display name.</summary>
         [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+        /// <summary>True if this camera is currently selected as the active video source.</summary>
         [JsonPropertyName("is_active")] public bool IsActive { get; set; }
+    }
+
+    /// <summary>
+    /// Discovered microphone audio capture hardware device on the Mac peer.
+    /// </summary>
+    internal sealed class MicDeviceModel
+    {
+        /// <summary>Unique hardware audio input device identifier string.</summary>
+        [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        /// <summary>Human-readable microphone display name.</summary>
+        [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+        /// <summary>True if this microphone is currently selected or the system default input.</summary>
+        [JsonPropertyName("is_default")] public bool IsDefault { get; set; }
     }
 
     /// <summary>

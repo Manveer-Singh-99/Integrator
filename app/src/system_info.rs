@@ -287,6 +287,7 @@ pub(crate) fn windows_root_dir() -> PathBuf {
     }
 
     let mut buf = [0u16; WINDOWS_MAX_PATH_BUF_LEN];
+    // SAFETY: `buf` is a writable 260-element stack `u16` buffer matching `uSize = buf.len() as u32`.
     let len = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     if len > 0 && (len as usize) < buf.len() {
         let p = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
@@ -310,7 +311,6 @@ pub(crate) fn windows_root_dir() -> PathBuf {
 /// Resolves the Windows system drive root (e.g., `C:`) dynamically from `%SystemDrive%`
 /// or the resolved Windows installation directory.
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
 pub(crate) fn windows_system_drive() -> String {
     if let Ok(drive) = std::env::var("SystemDrive") {
         let trimmed = drive.trim().trim_end_matches('\\');
@@ -337,6 +337,7 @@ pub(crate) fn system32_exe(name: &str) -> PathBuf {
     }
 
     let mut buf = [0u16; WINDOWS_MAX_PATH_BUF_LEN];
+    // SAFETY: `buf` is a writable 260-element stack `u16` buffer matching `uSize = buf.len() as u32`.
     let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     if len > 0 && (len as usize) < buf.len() {
         let p = PathBuf::from(OsString::from_wide(&buf[..len as usize])).join(name);
@@ -811,6 +812,7 @@ extern "C" {
     fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
 }
 
+/// CoreGraphics `CGSize` value type representing physical dimensions in millimeters.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -819,6 +821,7 @@ struct CGSize {
     height: f64,
 }
 
+/// Darwin `struct ifaddrs` node returned by POSIX/BSD `getifaddrs`.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct DarwinIfAddrs {
@@ -831,6 +834,7 @@ struct DarwinIfAddrs {
     ifa_data: *mut std::ffi::c_void,
 }
 
+/// Darwin generic `struct sockaddr` header with explicit `sa_len` byte length.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct DarwinSockAddr {
@@ -839,6 +843,7 @@ struct DarwinSockAddr {
     sa_data: [u8; 14],
 }
 
+/// Darwin IPv4 `struct sockaddr_in` socket address layout.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct DarwinSockAddrIn {
@@ -1210,7 +1215,7 @@ fn reg_query_sz(key: &str, value: &str) -> Option<String> {
 /// Apple Silicon Macs (`Mac14,*`, `Mac15,*`, `Mac16,*`) use generic `MacX,Y` model identifiers for both
 /// MacBooks and desktop Macs (Mac mini, Mac Studio, iMac, Mac Pro). Inspecting `AppleSmartBattery`
 /// presence reliably distinguishes Mac laptops from Mac desktops.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn parse_mac_ioreg_battery_present(ioreg_output: &str) -> bool {
     let trimmed = ioreg_output.trim();
     if trimmed.is_empty() || !trimmed.contains("AppleSmartBattery") {
@@ -1363,6 +1368,7 @@ pub fn detect_device_form_factor(hw_model: &str) -> DeviceFormFactor {
 /// `BatteryFlag == 128` (`0x80`) indicates "No system battery" (desktop PC); `255` (`0xFF`) indicates unknown status.
 #[cfg(target_os = "windows")]
 fn query_windows_has_battery() -> Option<bool> {
+    /// Win32 `SYSTEM_POWER_STATUS` structure populated by `GetSystemPowerStatus`.
     #[repr(C)]
     struct SystemPowerStatus {
         ac_line_status: u8,
@@ -1389,6 +1395,7 @@ fn query_windows_has_battery() -> Option<bool> {
         battery_life_time: u32::MAX,
         battery_full_life_time: u32::MAX,
     };
+    // SAFETY: `status` is a valid mutable stack-allocated `#[repr(C)]` `SystemPowerStatus` struct.
     let ok = unsafe { GetSystemPowerStatus(&mut status) };
     if ok == 0 || status.battery_flag == BATTERY_FLAG_UNKNOWN {
         None
@@ -1439,9 +1446,12 @@ pub fn get_primary_display_info() -> PrimaryDisplayInfo {
         let mut w: u32 = 0;
         let mut h: u32 = 0;
         let mut fps: u32 = 0;
+        // SAFETY: Passes valid mutable pointers to stack-allocated `u32` display dimensions and FPS.
         unsafe {
             get_primary_display_info_mac(&mut w, &mut h, &mut fps);
         }
+        // SAFETY: CoreGraphics `CGMainDisplayID`/`CGDisplay*` calls use a valid display ID and
+        // immediately release any non-null `CGDisplayModeRef` returned by `CGDisplayCopyDisplayMode`.
         let scale = unsafe {
             let main_id = CGMainDisplayID();
             let logical_w = CGDisplayPixelsWide(main_id) as f64;
@@ -1490,6 +1500,7 @@ pub fn get_primary_display_info() -> PrimaryDisplayInfo {
 /// Windows implementation querying primary display metrics via `EnumDisplaySettingsW` and `GetDpiForSystem`.
 #[cfg(target_os = "windows")]
 fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
+    /// Win32 `DEVMODEW` structure populated by `EnumDisplaySettingsW` (220 bytes).
     #[repr(C)]
     struct DevModeW {
         dm_device_name: [u16; 32],
@@ -1532,10 +1543,13 @@ fn win_primary_display_info() -> Option<PrimaryDisplayInfo> {
     }
 
     const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
+    // SAFETY: `DevModeW` is a C POD struct of integers and `[u16; _]`/`[u8; _]` arrays for which all-zeros is valid.
     let mut dm: DevModeW = unsafe { std::mem::zeroed() };
     dm.dm_size = std::mem::size_of::<DevModeW>() as u16;
+    // SAFETY: `dm.dm_size` matches `sizeof(DEVMODEW)` and `lp_dev_mode` points to valid writable storage.
     let ok = unsafe { EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) };
     if ok != 0 && dm.dm_pels_width > 0 && dm.dm_pels_height > 0 {
+        // SAFETY: `GetDpiForSystem` is a parameterless Win32 user32 query.
         let sys_dpi = unsafe { GetDpiForSystem() };
         let scale = if (dm.dm_log_pixels as u32) >= WINDOWS_STANDARD_DPI {
             dm.dm_log_pixels as f64 / WINDOWS_STANDARD_DPI_F64
@@ -1719,6 +1733,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
 
         // Query Win32 EnumDisplayDevicesW to ensure all physical adapters (Intel, AMD, NVIDIA) are captured
         {
+            /// Win32 `DISPLAY_DEVICEW` structure populated by `EnumDisplayDevicesW`.
             #[repr(C)]
             struct DisplayDeviceW {
                 cb: u32,
@@ -1749,6 +1764,7 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
                     device_id: [0; 128],
                     device_key: [0; 128],
                 };
+                // SAFETY: `dd.cb` equals `sizeof(DISPLAY_DEVICEW)` and `dd` is writable on the stack.
                 let ret = unsafe {
                     EnumDisplayDevicesW(std::ptr::null(), dev_idx, &mut dd, 0)
                 };
@@ -1831,7 +1847,7 @@ fn infer_vendor(name: &str) -> &'static str {
 }
 
 /// Parses video memory size string in MB or GB into integer Megabytes.
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 fn parse_vram_mb(s: &str) -> Option<u64> {
     let mut digits = String::new();
     for ch in s.chars() {
@@ -2130,7 +2146,7 @@ fn validate_sunshine_adapter_name(raw: &str) -> anyhow::Result<String> {
 }
 
 /// Modifies `adapter_name` inside `sunshine.conf` atomically.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn write_sunshine_adapter_name(adapter_name: &str) -> anyhow::Result<bool> {
     let clean_name = validate_sunshine_adapter_name(adapter_name)?;
     let conf_path = find_sunshine_conf()
@@ -2418,7 +2434,7 @@ pub fn is_valid_contiguous_netmask(mask: Ipv4Addr) -> bool {
 
 /// Converts a CIDR prefix length (`1..=32`) into its canonical IPv4 subnet mask.
 #[inline]
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn prefix_to_mask(prefix: u8) -> Option<Ipv4Addr> {
     if !(1..=32).contains(&prefix) {
         return None;
@@ -2433,14 +2449,14 @@ pub fn prefix_to_mask(prefix: u8) -> Option<Ipv4Addr> {
 
 /// Computes the canonical network base address (`ip & mask`) for a given IPv4 address and subnet mask.
 #[inline]
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn compute_network_addr(ip: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(ip) & u32::from(mask))
 }
 
 /// Computes the canonical CIDR network string (e.g. `"172.20.10.0/28"`, `"192.168.48.0/22"`)
 /// for an IPv4 address and subnet mask without assuming `/24`.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn compute_network_cidr(ip: Ipv4Addr, mask: Ipv4Addr) -> Option<String> {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() {
         return None;
@@ -2484,14 +2500,6 @@ pub fn is_same_subnet_as_peer(local_ip: Option<&str>, peer_ip: &str) -> bool {
         }
     }
     false
-}
-
-/// Looks up which local network interface owns the specified `local_ip`.
-#[allow(dead_code)]
-pub fn interface_for_local_ip(local_ip: &str) -> Option<LocalInterfaceInfo> {
-    list_local_ipv4_interfaces()
-        .into_iter()
-        .find(|iface| iface.ip == local_ip)
 }
 
 /// Pure helper resolving the best route characterization `(transport, speed_mbps, description, local_ip, same_subnet)`
@@ -2616,23 +2624,6 @@ pub fn is_direct_cable_route(peer_ip: &str) -> bool {
     let (transport, _, _, _, same_subnet) =
         resolve_route_from_interfaces(peer_v4, local_ip.as_deref(), &interfaces);
     transport.is_direct_cable() && same_subnet
-}
-
-/// Returns a deduplicated list of directed broadcast target addresses across all active interfaces plus `255.255.255.255`.
-#[allow(dead_code)]
-pub fn discovery_broadcast_targets() -> Vec<String> {
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    for iface in list_local_ipv4_interfaces() {
-        if !iface.broadcast.is_empty() && seen.insert(iface.broadcast.clone()) {
-            targets.push(iface.broadcast);
-        }
-    }
-    let global = Ipv4Addr::BROADCAST.to_string();
-    if seen.insert(global.clone()) {
-        targets.push(global);
-    }
-    targets
 }
 
 /// Enumerates `(iface_name, local_ip, broadcast_ip, transport)` tuples across all active physical and virtual interfaces.
@@ -2856,6 +2847,7 @@ struct IfAddrsGuard(*mut DarwinIfAddrs);
 impl Drop for IfAddrsGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: `self.0` was populated by a successful `getifaddrs` call and has not yet been freed.
             unsafe { freeifaddrs(self.0) };
         }
     }
@@ -2866,6 +2858,7 @@ impl Drop for IfAddrsGuard {
 fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     let port_map = cached_mac_hardware_ports();
     let mut ifap: *mut DarwinIfAddrs = std::ptr::null_mut();
+    // SAFETY: `ifap` is a valid mutable pointer initialized by `getifaddrs` and guarded by `IfAddrsGuard`.
     let rc = unsafe { getifaddrs(&mut ifap) };
     if rc != 0 || ifap.is_null() {
         return Vec::new();
@@ -2879,6 +2872,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     let mut out = Vec::new();
     let mut cur = ifap;
     while !cur.is_null() {
+        // SAFETY: `cur` points to a valid node in the active `getifaddrs` linked list.
         let entry = unsafe { &*cur };
         cur = entry.ifa_next;
 
@@ -2889,24 +2883,28 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         if entry.ifa_addr.is_null() || entry.ifa_name.is_null() {
             continue;
         }
+        // SAFETY: `entry.ifa_addr` is verified non-null and holds at least a `DarwinSockAddr` header.
         let sa = unsafe { &*entry.ifa_addr };
         if sa.sa_family != AF_INET
             || (sa.sa_len as usize) < std::mem::size_of::<DarwinSockAddrIn>()
         {
             continue;
         }
-        let sin = unsafe { &*(entry.ifa_addr as *const DarwinSockAddrIn) };
+        // SAFETY: `sa_family == AF_INET` and `sa_len >= sizeof(DarwinSockAddrIn)`; `read_unaligned` handles arbitrary kernel alignment.
+        let sin = unsafe { std::ptr::read_unaligned(entry.ifa_addr as *const DarwinSockAddrIn) };
         let ip = Ipv4Addr::from(sin.sin_addr.to_ne_bytes());
         if ip.is_loopback() || ip.is_unspecified() {
             continue;
         }
 
         let raw_mask = if !entry.ifa_netmask.is_null() {
+            // SAFETY: `entry.ifa_netmask` is non-null and kernel-populated for this AF_INET entry.
             let nsa = unsafe { &*entry.ifa_netmask };
             let nlen = nsa.sa_len as usize;
             if nlen >= 5 && (nsa.sa_family == AF_INET || nsa.sa_family == 0) {
                 let copy_len = (nlen - 4).min(4);
                 let mut mask_bytes = [0u8; 4];
+                // SAFETY: Netmask length check guarantees `[4..4+copy_len]` bytes are within the `sockaddr` allocation.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         (entry.ifa_netmask as *const u8).add(4),
@@ -2928,6 +2926,7 @@ fn list_mac_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         };
 
         let broadcast = compute_broadcast(ip, mask);
+        // SAFETY: `entry.ifa_name` was checked non-null and is a C NUL-terminated BSD interface name.
         let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
             .to_string_lossy()
             .into_owned();
@@ -3235,6 +3234,7 @@ fn parse_ioreg_usb_ncm_bsd_names(ioreg_output: &str) -> std::collections::HashSe
 /// Windows network interface enumerator using `GetIpAddrTable` and PowerShell metadata cache.
 #[cfg(target_os = "windows")]
 fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
+    /// Win32 `MIB_IPADDRROW` IPv4 address entry returned inside `MIB_IPADDRTABLE`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct MibIpAddrRow {
@@ -3254,6 +3254,7 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
 
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     let mut size: u32 = 0;
+    // SAFETY: Passing NULL with `&mut size` queries the required buffer size without writing table data.
     let _ = unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
     if size < 4 {
         return Vec::new();
@@ -3261,6 +3262,7 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
     let mut buf = vec![0u8; size as usize];
     let mut succeeded = false;
     for _ in 0..3 {
+        // SAFETY: `buf` is allocated to `size` bytes matching `pdw_size`.
         let rc = unsafe { GetIpAddrTable(buf.as_mut_ptr(), &mut size, 1) };
         if rc == 0 {
             succeeded = true;
@@ -3289,6 +3291,7 @@ fn list_windows_ipv4_interfaces() -> Vec<LocalInterfaceInfo> {
         if offset + row_size > buf.len() {
             break;
         }
+        // SAFETY: `offset + row_size <= buf.len()` is verified immediately above.
         let row = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const MibIpAddrRow) };
         if (row.w_type & (0x0008 | 0x0040)) != 0 {
             continue;
@@ -3535,12 +3538,6 @@ fn parse_windows_link_speed(raw: &str) -> Option<u32> {
 /// Validates whether the given string is a valid IPv4 address.
 pub fn is_valid_ipv4(ip: &str) -> bool {
     ip.trim().parse::<Ipv4Addr>().is_ok()
-}
-
-/// Checks whether a given path exists on the local filesystem.
-#[allow(dead_code)]
-pub fn is_local_file_path(path: &Path) -> bool {
-    path.exists()
 }
 
 #[cfg(test)]

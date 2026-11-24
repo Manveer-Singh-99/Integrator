@@ -6,47 +6,69 @@
 //    - Manages the lifecycle of the primary window (`MainWindow`) and the native Win32 system tray
 //      notification icon (`TrayIconManager`).
 //    - Bridges asynchronous reverse events received from `integrator_core.dll` via `CoreBridge.UiEventReceived`
-//      onto the WinUI 3 UI DispatcherQueue.
+//      onto the WinUI 3 UI `DispatcherQueue`.
 //
-// 2. Architectural Linkages & Native Core Bridge:
-//    - Upstream Caller: `Program.cs` instantiates `App` inside `Application.Start`.
-//    - Downstream Components:
+// 2. Architectural Linkages & Dependencies:
+//    - Upstream Callers:
+//        * `Program.cs`: Instantiates `App` inside `Microsoft.UI.Xaml.Application.Start` on the STA thread.
+//        * `MainWindow.xaml.cs`: Calls `RequestQuit`, `ExitApplication`, `DisposeTrayIcon`,
+//          `TerminateSessionPasskeyHosts`, and `FinishExitAfterVisualShutdown` during shutdown workflows.
+//        * `TrayIconManager.cs`: Invokes `ShowMainWindow` and `RequestQuit` callbacks on tray interactions.
+//    - Downstream Callees:
 //        * `MainWindow`: The primary XAML dashboard displaying all 13 subsystem cards.
 //        * `TrayIconManager`: Pure Win32 `Shell_NotifyIconW` tray icon and context menu.
-//        * `CoreBridge`: Static P/Invoke bridge into `integrator_core.dll`.
-//    - Cross-Platform & Remote Coordination:
-//        * Listens for core-driven window commands (`show_window`, `hide_window`) triggered by global hotkeys
-//          or secondary instance activations.
-//        * Forwards remote notifications (e.g., peer discovery, pairing requests, toasts) to the active window.
+//        * `CoreBridge`: Static P/Invoke bridge into `integrator_core.dll` (`TrayAction`, `Shutdown`).
+//        * `PasskeyAuthenticatorPlugin`: In-process COM passkey revocation during application exit.
+//    - Cross-Platform / Cross-Device Flow:
+//        * Listens for core-driven window commands (`show_window`, `hide_window`, `quit`) triggered by
+//          global hotkeys, secondary instance activations, or paired macOS control signals.
+//        * Forwards remote peer notifications (e.g., peer discovery, SPAKE2 pairing requests, camera/clipboard
+//          toasts received over TCP :58281-:58287 / UDP :58280-:58284) to `MainWindow.HandleCoreEvent`.
 //
 // 3. Threading & Concurrency Model:
 //    - STA Thread Affinity: All WinUI 3 controls, windows, and timers must be accessed exclusively on the
-//      Single-Threaded Apartment (STA) UI thread.
-//    - Cross-Thread Marshaling: Native C-ABI callback events originate from background Tokio threads in Rust.
-//      The `_uiEventHandler` uses `_window.DispatcherQueue.TryEnqueue(...)` to safely marshal payloads
-//      onto the UI thread without risking deadlocks or COM RPC apartment violations.
+//      Single-Threaded Apartment (STA) UI thread. Public lifecycle entry points (`ShowMainWindow`,
+//      `RequestQuit`) verify `DispatcherQueue.HasThreadAccess` and marshal onto the UI thread when invoked
+//      from background worker threads.
+//    - Cross-Thread Marshaling: Native C-ABI callback events originate from background Tokio worker threads
+//      in Rust. The `_uiEventHandler` uses `_window.DispatcherQueue.TryEnqueue(...)` to asynchronously
+//      marshal payloads onto the STA UI thread without risking deadlocks or COM RPC apartment violations.
 //
 // 4. Security & Safety Invariants:
-//    - Idempotent Shutdown: The `_exiting` atomic guard prevents re-entrant teardown during simultaneous
-//      tray exit clicks, window close events, and native core termination signals.
-//    - Clean Native Teardown: Unregisters C-ABI callbacks and disposes the Win32 notification icon before
-//      invoking `CoreBridge.Shutdown()`, ensuring zero memory or resource leaks.
+//    - Atomic Idempotent Shutdown: The `_exiting` atomic guard (`Interlocked.Exchange`) prevents re-entrant
+//      teardown during simultaneous tray exit clicks, window close events, and native core termination signals.
+//    - Clean Native & Helper Teardown: Unregisters C-ABI callbacks, disposes the Win32 notification icon,
+//      terminates session-scoped `IntegratorPasskeyHost.exe` COM servers, and invokes `CoreBridge.Shutdown()`,
+//      ensuring zero unmanaged memory, socket, or process handle leaks.
 // ==============================================================================================
 
 using System;
+using System.Threading;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 
 namespace IntegratorUI
 {
     /// <summary>
-    /// Provides application-specific behavior to supplement the default Application class.
+    /// Provides application-specific behavior to supplement the default WinUI 3 <see cref="Application"/> class.
     /// Manages window lifecycle, system tray integration, and reverse C-ABI event marshaling.
     /// </summary>
     public partial class App : Application
     {
         /// <summary>
-        /// Main application dashboard window instance.
+        /// Maximum time in milliseconds (1500 ms, range: 100..5000 ms) to wait for a killed
+        /// <c>IntegratorPasskeyHost.exe</c> helper process to release kernel handles during shutdown.
+        /// Chosen to keep UI teardown responsive while allowing clean OS handle reclamation.
+        /// </summary>
+        private const int PasskeyHostWaitForExitTimeoutMs = 1500;
+
+        /// <summary>
+        /// Executable base name (without <c>.exe</c> extension) of the out-of-process COM passkey helper.
+        /// </summary>
+        private const string PasskeyHostProcessName = "IntegratorPasskeyHost";
+
+        /// <summary>
+        /// Main application dashboard window instance, created once on the STA thread during <see cref="OnLaunched"/>.
         /// </summary>
         private MainWindow? _window;
 
@@ -56,19 +78,21 @@ namespace IntegratorUI
         private TrayIconManager? _tray;
 
         /// <summary>
-        /// Indicates whether the application was launched in headless/minimized mode.
+        /// Indicates whether the application was launched in headless/minimized mode (<c>--minimized</c>, <c>--hidden</c>, <c>--daemon</c>).
         /// </summary>
         private readonly bool _startHidden;
 
         /// <summary>
-        /// Strongly held event handler delegate for reverse core notifications, preventing GC collection.
+        /// Strongly held event handler delegate for reverse core notifications, preventing premature GC collection
+        /// while registered with <see cref="CoreBridge.UiEventReceived"/>.
         /// </summary>
-        private System.Action<string, string>? _uiEventHandler;
+        private Action<string, string>? _uiEventHandler;
 
         /// <summary>
-        /// Reentrancy guard ensuring application exit sequence runs exactly once.
+        /// Atomic reentrancy guard (0 = running, 1 = exiting) ensuring the application exit sequence runs at most once.
+        /// Manipulated via <see cref="Interlocked.Exchange(ref int, int)"/> and <see cref="Volatile.Read(ref int)"/>.
         /// </summary>
-        private bool _exiting;
+        private int _exiting;
 
         /// <summary>
         /// Initializes the singleton application object with default visible window presentation.
@@ -78,7 +102,7 @@ namespace IntegratorUI
         /// <summary>
         /// Initializes the singleton application object with configurable startup visibility.
         /// </summary>
-        /// <param name="startHidden">True to launch minimized directly to the system tray.</param>
+        /// <param name="startHidden">True to launch minimized directly to the system tray; false to activate the dashboard window.</param>
         public App(bool startHidden)
         {
             _startHidden = startHidden;
@@ -86,7 +110,9 @@ namespace IntegratorUI
         }
 
         /// <summary>
-        /// Invoked when the application is launched normally by the end user or Windows startup.
+        /// Invoked by the WinUI 3 framework on the STA thread when the application is launched.
+        /// Initializes <see cref="MainWindow"/>, registers the Win32 system tray icon, wires reverse
+        /// C-ABI event listeners from <c>integrator_core.dll</c>, and sets initial window visibility.
         /// </summary>
         /// <param name="args">Details about the launch request and process activation.</param>
         protected override void OnLaunched(LaunchActivatedEventArgs args)
@@ -95,7 +121,7 @@ namespace IntegratorUI
             _window = new MainWindow(this, _startHidden);
             DispatcherQueue dispatcher = _window.DispatcherQueue;
 
-            // 2. Initialize the native Win32 system tray icon with action callbacks
+            // 2. Initialize the native Win32 system tray icon with STA-marshaled action callbacks
             _tray = new TrayIconManager(
                 onShowWindow: () => dispatcher.TryEnqueue(ShowMainWindow),
                 onQuit: () => dispatcher.TryEnqueue(RequestQuit)
@@ -104,12 +130,14 @@ namespace IntegratorUI
             // 3. Register reverse event handler for asynchronous events pushed from integrator_core.dll
             _uiEventHandler = (evt, payload) =>
             {
-                // High-frequency log entry pushes are ignored at the boundary; UI polls logs on a timer.
+                // High-frequency log entry pushes are ignored at the event boundary; UI polls logs on a 2s timer.
                 if (evt == "log_entry") { return; }
 
                 // Marshal all other events (window visibility, toasts, quit) onto the WinUI STA thread.
                 dispatcher.TryEnqueue(() =>
                 {
+                    if (Volatile.Read(ref _exiting) != 0) { return; }
+
                     if (evt == "show_window" || evt == "show-window")
                     {
                         ShowMainWindow();
@@ -143,22 +171,43 @@ namespace IntegratorUI
 
         /// <summary>
         /// Restores and activates the main dashboard window, bringing it to the foreground.
+        /// Automatically marshals onto the WinUI 3 STA <see cref="DispatcherQueue"/> if called from a background thread.
         /// </summary>
         public void ShowMainWindow()
         {
-            _window?.RestoreAndActivate();
+            MainWindow? win = _window;
+            if (win == null) { return; }
+
+            // Enforce STA UI-thread affinity before touching WinUI 3 window APIs
+            DispatcherQueue? dispatcher = win.DispatcherQueue;
+            if (dispatcher != null && !dispatcher.HasThreadAccess)
+            {
+                dispatcher.TryEnqueue(() => win.RestoreAndActivate());
+                return;
+            }
+
+            win.RestoreAndActivate();
         }
 
         /// <summary>
-        /// Initiates user-requested quit flow (shows quit confirmation unless suppressed,
-        /// then displays live step-by-step process shutdown progress before terminating).
+        /// Initiates the user-requested quit flow. Displays a quit confirmation dialog (unless suppressed by user preference),
+        /// then runs the live step-by-step subsystem shutdown progress modal before terminating the process.
+        /// Safe to invoke from any thread; marshals onto the STA UI thread if needed.
         /// </summary>
         public void RequestQuit()
         {
-            if (_exiting) { return; }
-            if (_window != null)
+            if (Volatile.Read(ref _exiting) != 0) { return; }
+
+            MainWindow? win = _window;
+            if (win != null)
             {
-                _ = _window.RequestQuitAsync();
+                DispatcherQueue? dispatcher = win.DispatcherQueue;
+                if (dispatcher != null && !dispatcher.HasThreadAccess)
+                {
+                    dispatcher.TryEnqueue(() => _ = win.RequestQuitAsync());
+                    return;
+                }
+                _ = win.RequestQuitAsync();
             }
             else
             {
@@ -167,55 +216,67 @@ namespace IntegratorUI
         }
 
         /// <summary>
-        /// Terminates any lingering IntegratorPasskeyHost processes owned by the current Windows session
-        /// so no background Integrator helper processes remain running after full Quit.
+        /// Terminates any lingering <c>IntegratorPasskeyHost.exe</c> COM helper processes owned by the current
+        /// Windows logon session so no background Integrator helper processes remain running after full Quit.
+        /// Explicitly disposes all <see cref="System.Diagnostics.Process"/> handles to prevent kernel handle leaks.
         /// </summary>
         internal static void TerminateSessionPasskeyHosts()
         {
             try
             {
-                int currentSession = System.Diagnostics.Process.GetCurrentProcess().SessionId;
-                foreach (var proc in System.Diagnostics.Process.GetProcessesByName("IntegratorPasskeyHost"))
+                // Dispose the current process wrapper immediately after reading its Windows Terminal Services session ID.
+                using var currentProc = System.Diagnostics.Process.GetCurrentProcess();
+                int currentSession = currentProc.SessionId;
+
+                foreach (var proc in System.Diagnostics.Process.GetProcessesByName(PasskeyHostProcessName))
                 {
                     try
                     {
                         if (proc.SessionId == currentSession && !proc.HasExited)
                         {
                             proc.Kill();
-                            proc.WaitForExit(1500);
+                            proc.WaitForExit(PasskeyHostWaitForExitTimeoutMs);
                         }
                     }
-                    catch { }
+                    catch
+                    {
+                        // Ignore access denied or race conditions if the process exited concurrently.
+                    }
                     finally
                     {
                         proc.Dispose();
                     }
                 }
             }
-            catch { }
+            catch
+            {
+                // Swallow process enumeration failures during teardown to guarantee non-throwing exit.
+            }
         }
 
         /// <summary>
-        /// Disposes the Win32 system tray icon safely during graceful shutdown.
+        /// Disposes the Win32 system tray icon safely and idempotently during graceful shutdown.
         /// </summary>
         internal void DisposeTrayIcon()
         {
             try
             {
-                _tray?.Dispose();
-                _tray = null;
+                TrayIconManager? tray = Interlocked.Exchange(ref _tray, null);
+                tray?.Dispose();
             }
-            catch { }
+            catch
+            {
+                // Never allow tray cleanup errors to interrupt application exit.
+            }
         }
 
         /// <summary>
         /// Completes process exit after <see cref="MainWindow"/> has finished executing and
-        /// displaying all subsystem teardown steps.
+        /// displaying all interactive subsystem teardown steps.
         /// </summary>
         internal void FinishExitAfterVisualShutdown()
         {
-            if (_exiting) { return; }
-            _exiting = true;
+            if (Interlocked.Exchange(ref _exiting, 1) != 0) { return; }
 
             if (_uiEventHandler != null)
             {
@@ -230,41 +291,53 @@ namespace IntegratorUI
             catch { }
 
             DisposeTrayIcon();
+
+            // Idempotent safety net: ensure passkey COM registration and native Rust runtime are torn down
+            try
+            {
+                PasskeyAuthenticatorPlugin.Shutdown();
+            }
+            catch { }
+
+            CoreBridge.Shutdown();
             Exit();
         }
 
         /// <summary>
-        /// Initiates normal user-requested application termination sequence.
+        /// Initiates the normal user-requested application termination sequence without interactive modal confirmation.
         /// </summary>
         public void ExitApplication() => ExitApplication(fromCoreQuitEvent: false);
 
         /// <summary>
-        /// Coordinates graceful shutdown of the window, system tray icon, and native Rust backend.
+        /// Coordinates graceful synchronous shutdown of the window, system tray icon, passkey helper processes,
+        /// and native Rust backend runtime. Guarded by atomic <see cref="_exiting"/> state to prevent double-dispose.
         /// </summary>
-        /// <param name="fromCoreQuitEvent">True if shutdown was triggered by a core termination event.</param>
+        /// <param name="fromCoreQuitEvent">
+        /// True if shutdown was triggered by an incoming core termination event (skipping redundant <c>TrayAction("quit")</c>);
+        /// false if initiated from the Windows UI layer.
+        /// </param>
         private void ExitApplication(bool fromCoreQuitEvent)
         {
-            if (_exiting) { return; }
-            _exiting = true;
+            if (Interlocked.Exchange(ref _exiting, 1) != 0) { return; }
 
-            // Unsubscribe reverse event callback to prevent invoking disposed dispatchers
+            // 1. Unsubscribe reverse event callback to prevent invoking disposed dispatchers
             if (_uiEventHandler != null)
             {
                 CoreBridge.UiEventReceived -= _uiEventHandler;
                 _uiEventHandler = null;
             }
 
-            // Cleanup window timers and event subscriptions
+            // 2. Cleanup window timers and event subscriptions
             try
             {
                 _window?.CleanupForExit();
             }
             catch { }
 
-            // Destroy the Win32 notification icon and unregister its window class
+            // 3. Destroy the Win32 notification icon and unregister its window class
             DisposeTrayIcon();
 
-            // Notify core backend of user exit if initiated from UI
+            // 4. Notify core backend of user exit if initiated from UI
             if (!fromCoreQuitEvent)
             {
                 try
@@ -274,7 +347,7 @@ namespace IntegratorUI
                 catch { }
             }
 
-            // Stop Windows passkey helper process in this session
+            // 5. Stop Windows passkey COM registration and helper process in this session
             try
             {
                 PasskeyAuthenticatorPlugin.Shutdown();
@@ -282,10 +355,10 @@ namespace IntegratorUI
             }
             catch { }
 
-            // Perform synchronous shutdown of Rust runtime (Tokio listeners, network sockets)
+            // 6. Perform synchronous idempotent shutdown of Rust runtime (Tokio listeners, network sockets)
             CoreBridge.Shutdown();
 
-            // Terminate WinUI 3 application message loop
+            // 7. Terminate WinUI 3 application message loop
             Exit();
         }
     }

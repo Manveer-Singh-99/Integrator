@@ -12,14 +12,12 @@
 //!
 //! ## 2. Architectural Linkages & Dependencies
 //! ### Upstream Callers:
-//! - `core.rs`: Spawns watchdog monitoring tasks during peer session connection to keep tabs
-//!   on link degradation or physical cable disconnects.
-//! - UI View Models (via `ffi.rs` / `core.rs`): Call `measure_peer_rtt_ms` on demand to populate
-//!   connection diagnostic widgets and status overlays.
+//! - `discovery.rs`: Calls `LinkMonitor::measure_peer_rtt_ms` to measure TCP three-way handshake RTT
+//!   across discovered peer routes during candidate scoring and Bonjour/BLE ingestion.
 //!
 //! ### Downstream Callees:
 //! - `system_info::describe_route_to_peer`: Resolves the OS routing table and network interface
-//!   hardware model to determine physical link transport medium (Thunderbolt, Ethernet, Wi-Fi).
+//!   hardware model in test watchdog mode to classify physical link transport media.
 //! - `tokio::net::TcpStream`: Establishes lightweight TCP handshakes to compute physical round-trip times.
 //!
 //! ### Cross-Platform / Cross-Device Flow:
@@ -44,25 +42,27 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use tokio::net::TcpStream;
+#[cfg(test)]
 use tokio::time::sleep;
+#[cfg(test)]
 use tracing::{info, warn};
 
+#[cfg(test)]
 use crate::system_info;
 
 /// Default bounded timeout duration for each periodic watchdog TCP RTT probe.
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Network link health monitor and latency prober targeting a specific peer endpoint.
-#[allow(dead_code)]
 pub struct LinkMonitor {
     /// Target socket address (IPv4 or IPv6) of the peer service.
     peer_addr: SocketAddr,
     /// Time to wait between successive watchdog link probes.
+    #[cfg(test)]
     check_interval: Duration,
 }
 
-#[allow(dead_code)]
 impl LinkMonitor {
     /// Creates a new `LinkMonitor` instance for the specified IP address string and port.
     ///
@@ -82,25 +82,17 @@ impl LinkMonitor {
             .parse()
             .with_context(|| format!("Invalid peer IP address: {}", peer_ip))?;
 
-        // Initialize with default 1000ms polling interval
         Ok(Self {
             peer_addr: SocketAddr::new(ip, port),
+            #[cfg(test)]
             check_interval: Duration::from_millis(1000),
         })
     }
 
     /// Returns the resolved socket address of the monitored peer.
+    #[cfg(test)]
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
-    }
-
-    /// Builder method to configure the watchdog polling interval.
-    ///
-    /// Clamps the minimum polling interval to 100 milliseconds to avoid socket starvation.
-    pub fn with_check_interval(mut self, interval: Duration) -> Self {
-        // Enforce lower bound of 100ms to prevent CPU spinning and socket descriptor churn
-        self.check_interval = interval.max(Duration::from_millis(100));
-        self
     }
 
     /// Measures TCP round-trip time (RTT) to the peer endpoint.
@@ -163,6 +155,7 @@ impl LinkMonitor {
     ///
     /// Emits structured `info!` logs when connection is established or re-established,
     /// and `warn!` logs when link connectivity is severed.
+    #[cfg(test)]
     pub async fn run_watchdog_until(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         if *shutdown.borrow() {
             return;
@@ -235,18 +228,13 @@ impl LinkMonitor {
             }
         }
     }
-
-    /// Background loop monitoring link health indefinitely until program termination.
-    pub async fn run_watchdog(&self) {
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        self.run_watchdog_until(rx).await;
-    }
 }
 
 /// Helper function to asynchronously query the OS routing table and interface description.
 ///
 /// Offloads synchronous system socket / routing table lookups to `tokio::task::spawn_blocking`
 /// to protect async executor worker threads from I/O pauses.
+#[cfg(test)]
 async fn describe_route_async(peer_ip: String) -> (system_info::LinkTransport, String) {
     tokio::task::spawn_blocking(move || {
         let (transport, _, desc, _) = system_info::describe_route_to_peer(&peer_ip);

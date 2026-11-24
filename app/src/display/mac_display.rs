@@ -5,16 +5,28 @@
 //! It provides:
 //! 1. In-process virtual display lifecycle management via CoreGraphics private SPI (`virtual_display.m`).
 //! 2. Dynamic discovery and output targeting for the Sunshine streaming server (`sunshine.conf`).
-//! 3. LaunchServices-based execution of `Sunshine.app` ensuring proper macOS Screen Recording TCC permissions.
+//! 3. Direct child-process management of the discovered Sunshine host binary (preserving explicit PID
+//!    ownership for clean teardown per SEC-1D-16).
 //! 4. Non-destructive resolution and execution of the Moonlight client CLI on macOS.
 //! 5. Desktop user notifications via AppleScript (`osascript`).
 //!
-//! ## 2. Cross-Platform Architectural Pipelines
+//! ## 2. Architectural Linkages & Cross-Platform Pipelines
+//! - **Upstream Callers**:
+//!   - [`super::controller::DisplayController`]: Orchestrates `start_virtual_display`, `stop_virtual_display`,
+//!     `configure_sunshine_output`, `start_sunshine`, `stop_sunshine`, `start_moonlight_client`, and
+//!     `stop_moonlight_client` across display toggles and peer revocation teardown.
+//! - **Downstream Callees**:
+//!   - `virtual_display.m` (Objective-C C-ABI FFI): `start_virtual_display_in_app`,
+//!     `stop_virtual_display_in_app`, `get_virtual_display_id_in_app`, `is_virtual_display_active_in_app`.
+//!   - [`crate::system_info`]: Binary discovery (`find_sunshine_binary`, `find_moonlight_binary`,
+//!     `find_sunshine_conf`), private file writes (`atomic_write_private`), and Sunshine API credentials.
+//!   - External macOS processes & preferences: `sunshine`, `Moonlight`, `com.moonlight-stream.Moonlight`
+//!     (`defaults`), `/usr/bin/curl`, `/usr/bin/osascript`, and POSIX `libc::kill`.
 //!
 //! ### Mac-as-Host Extended Desktop
-//! - **Virtual Display**: Creates a private `CGVirtualDisplay` in-process with Integrator Vendor ID `0x494E`
-//!   and Product ID `0x0165`. Because it is created in-process, it is recognized natively by macOS
-//!   window server without requiring third-party kernel extensions or driver bundles.
+//! - **Virtual Display**: Creates a private `CGVirtualDisplay` in-process with Integrator Vendor ID
+//!   `0x494E` and Product ID `0x0165`. Because it is created in-process, it is recognized natively by
+//!   macOS window server without requiring third-party kernel extensions or driver bundles.
 //! - **Sunshine Output Targeting**: Reads `sunshine.conf` and rewrites `output_name = <display_id>`
 //!   dynamically so Sunshine captures the virtual display exclusively.
 //! - **Hardware Acceleration**: Sunshine captures frames via ScreenCaptureKit / Desktop Duplication
@@ -24,30 +36,35 @@
 //! ### Mac-as-Client Extended Desktop
 //! - Receives a stream from a Windows host (which encodes via NVIDIA NVENC, AMD AMF, or Intel QuickSync).
 //! - Reads existing paired hosts non-destructively from `com.moonlight-stream.Moonlight` preferences via
-//!   `defaults read`, refreshes the matching host's direct IP route, and spawns `Moonlight.app` with
+//!   `defaults read`, refreshes the matching host's direct IP route, and spawns `Moonlight` with
 //!   VideoToolbox hardware decoding, `--no-vsync`, and `--no-frame-pacing`.
 //!
 //! ### Shared Camera Coexistence
 //! While high-resolution display streaming runs over ports 47989/48989, the FaceTime HD camera stream
 //! runs independently over port 58287 in uncompressed 720p30 NV12 into Windows 11 FrameServer
-//! (`integrator_vcam.dll` / `Integrator MacBook Camera`). Display streaming and camera capture
+//! (`integrator_vcam.dll` / `"Integrator Mac Camera"`). Display streaming and camera capture
 //! execute simultaneously across distinct threads and network ports with zero mutual interference.
 //!
 //! ## 3. Threading & Process Management Model
-//! - **Process Spawning**: Processes (`open`, `killall`, `defaults`, `osascript`) are launched via
-//!   standard `std::process::Command` within `tokio::task::spawn_blocking` blocks.
-//! - **Zombie Prevention**: Every spawned child process is handed off to a dedicated reaping thread
-//!   ([`reap_child`]) which blocks until the child exits, preventing zombie process accumulation.
+//! - **Process Spawning**: Processes (`sunshine`, `Moonlight`, `defaults`, `osascript`, `curl`) are
+//!   launched via `std::process::Command` within `tokio::task::spawn_blocking` blocks.
+//! - **Owned Process Tracking (SEC-1D-16)**: [`OWNED_SUNSHINE_PROCESS`] and [`OWNED_MOONLIGHT_PROCESS`]
+//!   store `Child` handles spawned by Integrator so teardown terminates only owned PIDs and never kills
+//!   unrelated user-launched instances.
+//! - **Zombie Prevention**: Short-lived fire-and-forget notification processes (`osascript`) are handed
+//!   off to a dedicated reaping thread ([`reap_child`]) which blocks until exit.
 //!
 //! ## 4. Security & Safety Invariants
-//! - **LaunchServices TCC Inheritance**: When Sunshine is installed as a `.app` bundle, it is launched
-//!   via `/usr/bin/open` rather than directly as a POSIX binary. This ensures macOS attributes Screen
-//!   Recording permissions directly to `Sunshine.app` rather than requiring `Integrator.app` to
-//!   request Screen Recording rights.
-//! - **Private Log File Permissions**: Output log files (`sunshine.log`, `sunshine.err.log`) are created
-//!   with POSIX mode `0600` (read/write by owner only), rejecting symlinks to mitigate symlink traversal.
+//! - **Non-Detached Child Ownership**: Sunshine and Moonlight binaries are spawned directly (rather
+//!   than via `/usr/bin/open`) so Integrator maintains strict PID ownership for graceful SIGTERM/SIGKILL
+//!   shutdown and exit reaping without leaving orphan daemons running.
+//! - **Private Log File Permissions & Symlink Defense**: Output log files (`sunshine.log`,
+//!   `sunshine.err.log`) are verified via `symlink_metadata` and opened with POSIX mode `0600` +
+//!   `O_NOFOLLOW` to prevent TOCTOU symlink traversal privilege escalation.
 //! - **AppleScript Sanitization**: Notification titles and messages are filtered to strip control
-//!   characters and truncated to safe length limits before passing to `osascript`.
+//!   characters and truncated to safe length limits before passing as `argv` arguments to `osascript`.
+//! - **Credential Hygiene**: Sunshine REST API credentials are piped to `curl -K -` over `stdin`
+//!   so secrets never appear in `argv` or `ps aux`.
 
 use crate::{config, system_info};
 use anyhow::{Context, Result};
@@ -95,6 +112,14 @@ const MOONLIGHT_STOP_POLL_ATTEMPTS: usize = 8;
 /// Interval between Moonlight process-exit polling checks.
 const MOONLIGHT_STOP_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
+/// Maximum number of teardown polling iterations while waiting for `CGVirtualDisplay` deallocation.
+#[cfg(target_os = "macos")]
+const VIRTUAL_DISPLAY_STOP_POLL_ATTEMPTS: usize = 10;
+
+/// Polling interval while waiting for `CGVirtualDisplay` teardown completion (10 × 50ms = 500ms budget).
+#[cfg(target_os = "macos")]
+const VIRTUAL_DISPLAY_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Maximum safe character length for macOS notification titles passed to `osascript`.
 const MAX_NOTIFICATION_TITLE_LEN: usize = 128;
 
@@ -108,13 +133,13 @@ static OWNED_MOONLIGHT_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static OWNED_SUNSHINE_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Sets the mock/test child handle for owned Moonlight process testing.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn set_owned_moonlight_child(child: Child) {
     *OWNED_MOONLIGHT_PROCESS.lock().unwrap() = Some(child);
 }
 
 /// Returns whether an owned Moonlight process handle is currently retained.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn has_owned_moonlight_child() -> bool {
     OWNED_MOONLIGHT_PROCESS.lock().unwrap().is_some()
 }
@@ -152,7 +177,9 @@ fn create_private_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // Set private 0600 permissions and O_NOFOLLOW to close any TOCTOU symlink race at open(2).
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     opts.open(path)
 }
@@ -188,9 +215,14 @@ pub(crate) fn update_sunshine_output_content(content: &str, display_id: u32) -> 
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Creates an in-process `CGVirtualDisplay` with width/height (pixels), refresh rate (`fps`),
+    /// and HiDPI scaling flag; returns the CoreGraphics display ID or `0` (`kCGNullDirectDisplay`) on failure.
     fn start_virtual_display_in_app(width: u32, height: u32, fps: u32, hi_dpi: bool) -> u32;
+    /// Destroys the active in-process `CGVirtualDisplay` instance if present.
     fn stop_virtual_display_in_app();
+    /// Returns the active CoreGraphics display ID, or `0` (`kCGNullDirectDisplay`) if none is running.
     fn get_virtual_display_id_in_app() -> u32;
+    /// Returns `true` while an in-process `CGVirtualDisplay` instance is currently instantiated.
     fn is_virtual_display_active_in_app() -> bool;
 }
 
@@ -204,6 +236,7 @@ impl MacDisplayManager {
     /// Guarantees that physical external displays are never misidentified as Integrator virtual displays.
     #[cfg(target_os = "macos")]
     pub fn get_active_virtual_display() -> Option<u32> {
+        // SAFETY: Thread-safe FFI query into `virtual_display.m` returning `kCGNullDirectDisplay` (`0`) when inactive.
         let in_app_id = unsafe { get_virtual_display_id_in_app() };
         if in_app_id != 0 {
             Some(in_app_id)
@@ -212,6 +245,7 @@ impl MacDisplayManager {
         }
     }
 
+    /// Non-macOS stub matching macOS `get_active_virtual_display` public API (always `None`).
     #[cfg(not(target_os = "macos"))]
     #[allow(dead_code)]
     pub fn get_active_virtual_display() -> Option<u32> {
@@ -282,18 +316,18 @@ impl MacDisplayManager {
         }
     }
 
-    /// Tears down the in-process virtual display cleanly.
+    /// Tears down the in-process virtual display cleanly, polling up to 500 ms for CoreGraphics release.
     pub fn stop_virtual_display() -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             unsafe {
                 stop_virtual_display_in_app();
             }
-            for _ in 0..10 {
+            for _ in 0..VIRTUAL_DISPLAY_STOP_POLL_ATTEMPTS {
                 if !Self::is_virtual_display_active() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(VIRTUAL_DISPLAY_STOP_POLL_INTERVAL);
             }
             if Self::is_virtual_display_active() {
                 anyhow::bail!("Virtual display remains active on macOS after stop request");
@@ -316,10 +350,11 @@ impl MacDisplayManager {
         }
     }
 
-    /// Launches the Sunshine streaming server daemon using dynamic binary and bundle discovery.
+    /// Launches the Sunshine streaming server daemon directly as an owned child process
+    /// using dynamic binary discovery and stores its `Child` handle in [`OWNED_SUNSHINE_PROCESS`].
     ///
-    /// When Sunshine is packaged inside a `.app` bundle, it is launched via `/usr/bin/open`
-    /// to preserve Screen Recording TCC permissions.
+    /// Direct child spawning (rather than detaching via `open`) ensures [`Self::stop_sunshine`]
+    /// can cleanly stop and reap only the Integrator-owned host PID (SEC-1D-16).
     pub fn start_sunshine() -> Result<()> {
         let _ = Self::stop_sunshine();
         std::thread::sleep(SUNSHINE_RESTART_DELAY);
@@ -409,22 +444,24 @@ impl MacDisplayManager {
         if let Some(mut child) = lock.take() {
             let pid = child.id() as i32;
             info!("Stopping Integrator-owned Sunshine host process (PID {})", pid);
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let mut exited = false;
-            for _ in 0..SUNSHINE_STOP_POLL_ATTEMPTS {
-                if let Ok(Some(_)) = child.try_wait() {
-                    exited = true;
-                    break;
-                }
-                std::thread::sleep(SUNSHINE_STOP_POLL_INTERVAL);
-            }
+            let mut exited = matches!(child.try_wait(), Ok(Some(_)));
             if !exited {
-                warn!("Escalating to SIGKILL for owned Sunshine host (PID {})", pid);
-                let _ = child.kill();
-                let _ = child.wait();
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                for _ in 0..SUNSHINE_STOP_POLL_ATTEMPTS {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        exited = true;
+                        break;
+                    }
+                    std::thread::sleep(SUNSHINE_STOP_POLL_INTERVAL);
+                }
+                if !exited {
+                    warn!("Escalating to SIGKILL for owned Sunshine host (PID {})", pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
             info!("Stopped Integrator-owned Sunshine host process (PID {})", pid);
         }
@@ -440,7 +477,11 @@ impl MacDisplayManager {
 
     /// Probes a TCP port until connection succeeds or `timeout` expires.
     pub async fn wait_for_port(ip: &str, port: u16, timeout: Duration) -> bool {
-        let addr = format!("{}:{}", ip, port);
+        let addr = if let Ok(parsed) = ip.trim().parse::<std::net::IpAddr>() {
+            std::net::SocketAddr::new(parsed, port).to_string()
+        } else {
+            format!("{}:{}", ip.trim(), port)
+        };
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             if matches!(
@@ -497,6 +538,7 @@ impl MacDisplayManager {
         }
 
         let app_name = system_info::resolve_moonlight_app_name();
+        // Even width/height bitmask (& !1) satisfies H.264/HEVC chroma subsampling alignment.
         let w = width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH) & !1;
         let h = height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT) & !1;
         let res_arg = format!("{}x{}", w, h);
@@ -522,6 +564,7 @@ impl MacDisplayManager {
             "fullscreen",
             "--no-vsync",
             "--no-frame-pacing",
+            // Exit Moonlight cleanly once Sunshine terminates the remote stream instead of lingering in GUI menu.
             "--quit-after",
         ]);
         if audio_on_host {
@@ -552,22 +595,24 @@ impl MacDisplayManager {
         if let Some(mut child) = lock.take() {
             let pid = child.id() as i32;
             info!("Stopping Integrator-owned Moonlight client process (PID {})", pid);
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let mut exited = false;
-            for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
-                if let Ok(Some(_)) = child.try_wait() {
-                    exited = true;
-                    break;
-                }
-                std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
-            }
+            let mut exited = matches!(child.try_wait(), Ok(Some(_)));
             if !exited {
-                warn!("Escalating to SIGKILL for owned Moonlight client (PID {})", pid);
-                let _ = child.kill();
-                let _ = child.wait();
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                for _ in 0..MOONLIGHT_STOP_POLL_ATTEMPTS {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        exited = true;
+                        break;
+                    }
+                    std::thread::sleep(MOONLIGHT_STOP_POLL_INTERVAL);
+                }
+                if !exited {
+                    warn!("Escalating to SIGKILL for owned Moonlight client (PID {})", pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
             info!("Stopped Integrator-owned Moonlight client process (PID {})", pid);
         }
@@ -718,6 +763,8 @@ fn parse_and_select_mac_moonlight_slot(
             raw_ip_port_candidates.push(idx);
         }
 
+        // Rank host slots strictly by port compatibility and mDNS/IP match:
+        // 5 = hostname+port match, 4 = IP+port match, 2 = hostname-only, 1 = IP-only.
         let score = if name_match && port_match {
             5
         } else if ip_match && port_match {
@@ -736,6 +783,8 @@ fn parse_and_select_mac_moonlight_slot(
         }
     }
 
+    // Only reuse an unlabeled/raw-IP slot if unambiguously unique on the target port
+    // (avoiding misrouting across multiple hosts sharing primary/secondary Sunshine ports).
     if best_slot.is_none() && raw_ip_port_candidates.len() == 1 {
         best_slot = Some(raw_ip_port_candidates[0]);
     }

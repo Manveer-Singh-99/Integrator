@@ -1,19 +1,49 @@
-//! Multi-Peer Camera Frame Distribution Subsystem
+//! # Multi-Peer Camera Frame Distribution Subsystem
 //!
-//! Replaces single-slot destructive `take()` buffer with an isolated, reference-counted,
-//! multi-subscriber frame distribution architecture.
+//! ## 1. Module Purpose & Scope
+//! This module implements [`CameraFrameHub`] and [`SubscriberMailbox`], an isolated,
+//! reference-counted, multi-subscriber video frame distribution hub for the **Shared Camera
+//! Subsystem** (`camera` feature).
 //!
-//! ========================================================================================
-//! 1. MODULE SCOPE & INVARIANTS
-//! ========================================================================================
-//! - One physical hardware capture operation serves multiple authorized remote peers simultaneously.
-//! - Video frames use immutable, reference-counted ownership (`Arc<Vec<u8>>`).
-//! - Each authorized peer maintains an independent, bounded single-frame mailbox (`SubscriberMailbox`).
-//! - A slow receiver or stalled network connection never starves, intercepts, or slows down another peer.
-//! - Stale unread frames are dropped cleanly by overwriting the subscriber's single-slot mailbox,
-//!   guaranteeing bounded $O(N)$ memory consumption where $N$ is the number of active peers.
-//! - Local camera preview maintains an independent mailbox, decoupled from remote peer subscriptions.
-//! - Revoking consent immediately unlinks the peer from the distribution hub, ceasing dispatch.
+//! It replaces legacy single-slot destructive `take()` buffering with a zero-copy fan-out
+//! architecture so one physical macOS AVFoundation 720p30 NV12 capture session can feed
+//! multiple authorized remote peers and local preview simultaneously without head-of-line
+//! blocking or per-peer frame buffer duplication.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - [`crate::camera::integrator_on_mac_camera_frame`]: Encodes incoming AVFoundation NV12
+//!     sample buffers into 22-byte `ICAM` + 1,382,400-byte payload packets and invokes
+//!     [`CameraFrameHub::publish_frame`].
+//!   - [`crate::camera::CameraService`]: Subscribes per-peer sender tasks via
+//!     [`CameraFrameHub::subscribe`], unsubscribes on stream teardown or consent revocation via
+//!     [`CameraFrameHub::unsubscribe`], and clears all mailboxes on shutdown via
+//!     [`CameraFrameHub::clear_all`].
+//! - **Downstream Callees**:
+//!   - `tokio::sync::Notify`: Wakes async per-peer sender loops (`run_mac_sender_for_peer`)
+//!     immediately upon new frame arrival.
+//! - **Cross-Platform / Cross-Device Flow**:
+//!   - Wraps each serialized `ICAM` NV12 frame in a single [`SharedCameraFrame`] (`Arc<Vec<u8>>`)
+//!     on macOS and fans out `Arc` pointers into each authorized peer's [`SubscriberMailbox`],
+//!     which `run_mac_sender_for_peer` transmits over encrypted `TransportSessionV2` (`TCP :58287`)
+//!     to the Windows 11 Media Foundation FrameServer virtual webcam (`integrator_vcam.dll`).
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Producer Thread**: CoreMedia / AVFoundation real-time capture dispatch queue invokes
+//!   [`CameraFrameHub::publish_frame`], holding the `subscribers` `std::sync::Mutex` only long
+//!   enough to clone `Arc` pointers into per-subscriber single-slot mutexes and signal `Notify`.
+//! - **Consumer Tasks**: Independent Tokio async tasks wait on `SubscriberMailbox::notify` and
+//!   extract the latest frame via [`SubscriberMailbox::take`].
+//! - **Zero Head-of-Line Blocking**: A slow receiver or stalled network connection never starves,
+//!   intercepts, or slows down another peer. Stale unread frames are overwritten in place.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Bounded $O(N)$ Memory**: Each subscriber holds at most one unread [`SharedCameraFrame`],
+//!   preventing unbounded queue growth under network congestion.
+//! - **Immediate Revocation Isolation**: Calling [`CameraFrameHub::unsubscribe`] immediately
+//!   removes the peer's mailbox, purges any buffered frame, and wakes any blocked sender task.
+//! - **Poison-Resilient Locking**: All internal mutex locks recover gracefully via
+//!   `unwrap_or_else(|e| e.into_inner())` so a panic in one consumer cannot DoS other peers.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,7 +74,9 @@ impl SubscriberMailbox {
         if let Ok(mut guard) = self.latest.lock() {
             *guard = Some(frame);
         }
-        self.notify.notify_waiters();
+        // Use `notify_one` so a frame arriving between `take()` and `.notified().await`
+        // stores a wakeup permit instead of dropping the edge notification.
+        self.notify.notify_one();
     }
 
     /// Takes the pending frame out of the mailbox, leaving it empty until the next frame arrives.

@@ -8,10 +8,23 @@
 //! coordinating native virtual display creation, Sunshine streaming server configuration,
 //! non-destructive Moonlight client resolution, and dynamic bitrate/resolution adaptation.
 //! It also serves as the command dispatcher for all incoming [`DisplayRpcRequest`] messages,
-//! including Shared Camera management, True Tone gamma synchronization, remote clipboard pasting,
-//! storage filesystem mounting, and low-latency UDP audio negotiation.
+//! including Shared Camera & Microphone management, True Tone gamma synchronization, remote
+//! clipboard pasting, storage filesystem mounting, and low-latency UDP audio negotiation.
 //!
-//! ## 2. Cross-Platform Architectural Pipelines
+//! ## 2. Architectural Linkages & Cross-Platform Pipelines
+//! - **Upstream Callers**:
+//!   - [`crate::core::IntegratorCore`]: Owns the [`DisplayController`] singleton and calls toggle/mode/RPC
+//!     client helpers.
+//!   - [`super::server::DisplayServer`]: Feeds incoming authenticated [`DisplayRpcRequest`] messages into
+//!     [`DisplayController::handle_rpc`].
+//!   - [`fetch_rust_gpu_telemetry_json`]: C-ABI bridge polled by the macOS Touch Bar GPU HUD
+//!     (`touchbar_hud.swift`).
+//! - **Downstream Callees**:
+//!   - [`super::mac_display::MacDisplayManager`] and [`super::win_display::WinDisplayManager`]: Native
+//!     virtual display, Sunshine, and Moonlight execution layers.
+//!   - [`crate::camera::CameraService`], [`crate::audio::AudioManager`], [`crate::truetone`],
+//!     [`crate::storage::StorageManager`], [`crate::trust`], [`crate::security::passkey`],
+//!     [`crate::media`], [`crate::telemetry`], [`crate::clipboard::ClipboardService`].
 //!
 //! ### Mac-to-PC Extended Display Pipeline (`start_mac_to_pc_locked`)
 //! 1. **Peer Discovery & Resolution**: Resolves target peer display dimensions (`width`, `height`),
@@ -39,13 +52,20 @@
 //! 4. **Remote Moonlight Invocation**: Sends [`DisplayRpcRequest::StartMoonlight`] to the Mac peer.
 //!    The Mac launches fullscreen Moonlight decoding with VideoToolbox hardware acceleration.
 //!
-//! ### Shared Camera Interaction
+//! ### Shared Camera & Microphone Interaction
 //! While display streaming operates over Sunshine/Moonlight (ports 47989/48989), the Shared Camera
-//! operates concurrently over `TransportSessionV2` on port 58287. Camera commands ([`DisplayRpcRequest::StartCamera`],
-//! [`DisplayRpcRequest::ToggleCamera`], [`DisplayRpcRequest::StopCamera`], [`DisplayRpcRequest::GetCameraStatus`])
-//! are dispatched directly to [`crate::camera::CameraService`], activating FaceTime HD capture on Mac
+//! operates concurrently over `TransportSessionV2` on port 58287. Camera and microphone commands
+//! ([`DisplayRpcRequest::StartCamera`], [`DisplayRpcRequest::ToggleCamera`], [`DisplayRpcRequest::StopCamera`],
+//! [`DisplayRpcRequest::GetCameraStatus`], [`DisplayRpcRequest::ListCameras`], [`DisplayRpcRequest::SelectCamera`],
+//! [`DisplayRpcRequest::ListMics`], [`DisplayRpcRequest::SelectMic`], [`DisplayRpcRequest::SetMicSettings`])
+//! delegate to [`crate::camera::CameraService`], activating AVFoundation capture/audio selection on Mac
 //! and the driverless Windows 11 Media Foundation FrameServer virtual webcam (`integrator_vcam.dll`)
 //! without mutual interference or encoder resource contention.
+//!
+//! ### Cross-Screen True Tone Sync
+//! Inbound [`DisplayRpcRequest::SyncTrueTone`] RPCs validate finite illuminance, color temperature, and
+//! gamma bounds, program the Windows GPU LUT (`apply_hardware_gamma_ramp`), and record the synced Mac
+//! ambient reading (`crate::truetone::record_synced_ambient`) so Windows surfaces live lux/CCT status.
 //!
 //! ## 3. Threading & Concurrency Model
 //! - **Transition Serialization**: An internal async `Mutex<()>` (`transition_lock`) serializes
@@ -232,6 +252,8 @@ pub struct DisplayModeOverride {
 struct TouchBarTouchIdGuard;
 
 impl TouchBarTouchIdGuard {
+    /// Illuminates the Touch Bar Touch ID sensor guidance indicator with `label` and returns an RAII
+    /// guard that dismisses it automatically when dropped.
     fn activate(label: &str) -> Self {
         crate::core::notify_touchbar_touchid_prompt(label, true);
         Self
@@ -327,17 +349,20 @@ impl DisplayController {
         let is_client = *self.client_active.read().await;
 
         // If we are currently hosting an extended display, hot-reconfigure the active stream
+        // (re-check `host_active` after acquiring `transition_lock` to close TOCTOU stop race).
         if is_host {
             let _tx = self.transition_lock.lock().await;
-            #[cfg(target_os = "macos")]
-            {
-                let _ = self.stop_mac_to_pc_locked().await;
-                self.start_mac_to_pc_locked().await?;
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let _ = self.stop_pc_to_mac_locked().await;
-                self.start_pc_to_mac_locked().await?;
+            if *self.host_active.read().await {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = self.stop_mac_to_pc_locked().await;
+                    self.start_mac_to_pc_locked().await?;
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = self.stop_pc_to_mac_locked().await;
+                    self.start_pc_to_mac_locked().await?;
+                }
             }
         } else if is_client {
             // Forward the mode update to the peer currently hosting our extended display
@@ -1433,6 +1458,8 @@ impl DisplayController {
                 }
                 *self.host_active.write().await = false;
                 *self.client_active.write().await = false;
+                *self.host_peer_id.write().await = None;
+                *self.client_peer_id.write().await = None;
                 *self.active_peer_ip.write().await = None;
                 *self.active_mode.write().await = None;
                 self.base_response(true, "All display extensions stopped")
@@ -1496,7 +1523,9 @@ impl DisplayController {
                         .await;
                 }
                 let res = tokio::task::spawn_blocking(move || {
-                    crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp)
+                    crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp)?;
+                    crate::truetone::record_synced_ambient(lux, cct);
+                    Ok(())
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("TrueTone task panicked: {}", e)));
@@ -1512,7 +1541,7 @@ impl DisplayController {
                 resp.ambient_light = Some(crate::truetone::AmbientLightData {
                     lux,
                     cct_kelvin: cct,
-                    supported: lux >= 0.0,
+                    supported: success && lux >= 0.0,
                     updated_at_secs: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1889,21 +1918,137 @@ impl DisplayController {
                 if !self.features.is_enabled("camera") {
                     return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
                 }
+                if let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if crate::security::transport::is_peer_revoked(&auth_id.to_ascii_lowercase()) {
+                        return self.base_response(false, "Rejected: requesting peer is revoked").await;
+                    }
+                }
+                let cams = tokio::task::spawn_blocking(crate::camera::list_available_cameras)
+                    .await
+                    .unwrap_or_default();
                 let mut resp = self.base_response(true, "Camera list retrieved").await;
-                resp.available_cameras = Some(crate::camera::list_available_cameras());
+                resp.available_cameras = Some(cams);
                 resp
             }
             DisplayRpcRequest::SelectCamera { device_id } => {
                 if !self.features.is_enabled("camera") {
                     return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
                 }
-                let ok = crate::camera::select_camera_device(&device_id);
+                if let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if crate::security::transport::is_peer_revoked(&auth_id.to_ascii_lowercase()) {
+                        return self.base_response(false, "Rejected: requesting peer is revoked").await;
+                    }
+                }
+                let trimmed = device_id.trim().to_string();
+                let clean_label = crate::media::sanitize_media_text(&trimmed, 64);
+                if trimmed.is_empty() || trimmed.len() > 256 || trimmed.chars().any(|c| c.is_control()) {
+                    return self
+                        .base_response(false, format!("Rejected SelectCamera: invalid device_id '{}'", clean_label))
+                        .await;
+                }
+                let ok = tokio::task::spawn_blocking(move || crate::camera::select_camera_device(&trimmed))
+                    .await
+                    .unwrap_or(false);
                 let msg = if ok {
-                    format!("Selected camera '{}'", device_id)
+                    format!("Selected camera '{}'", clean_label)
                 } else {
-                    format!("Failed to select camera '{}'", device_id)
+                    format!("Failed to select camera '{}'", clean_label)
                 };
                 self.base_response(ok, msg).await
+            }
+            DisplayRpcRequest::ListMics => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                if let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if crate::security::transport::is_peer_revoked(&auth_id.to_ascii_lowercase()) {
+                        return self.base_response(false, "Rejected: requesting peer is revoked").await;
+                    }
+                }
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    let cam = Arc::clone(&core.camera);
+                    let mics = tokio::task::spawn_blocking(move || cam.list_mics())
+                        .await
+                        .unwrap_or_default();
+                    let mut resp = self
+                        .base_response(true, format!("Retrieved {} microphone device(s)", mics.len()))
+                        .await;
+                    resp.available_mics = Some(mics);
+                    resp.camera_status = Some(core.camera.status());
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::SelectMic { device_id } => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                if let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if crate::security::transport::is_peer_revoked(&auth_id.to_ascii_lowercase()) {
+                        return self.base_response(false, "Rejected: requesting peer is revoked").await;
+                    }
+                }
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    let cam = Arc::clone(&core.camera);
+                    let res = tokio::task::spawn_blocking(move || cam.select_mic(&device_id))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("SelectMic task panicked: {}", e)));
+                    match res {
+                        Ok(mic_name) => {
+                            let mut resp = self
+                                .base_response(true, format!("Selected microphone '{}'", mic_name))
+                                .await;
+                            resp.camera_status = Some(core.camera.status());
+                            resp
+                        }
+                        Err(e) => self.base_response(false, e).await,
+                    }
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
+            }
+            DisplayRpcRequest::SetMicSettings {
+                enabled,
+                muted,
+                gain,
+            } => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                if let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if crate::security::transport::is_peer_revoked(&auth_id.to_ascii_lowercase()) {
+                        return self.base_response(false, "Rejected: requesting peer is revoked").await;
+                    }
+                }
+                if !gain.is_finite() {
+                    return self
+                        .base_response(false, "Rejected SetMicSettings: non-finite gain value")
+                        .await;
+                }
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    let cam = Arc::clone(&core.camera);
+                    let status = tokio::task::spawn_blocking(move || {
+                        cam.set_mic_settings(enabled, muted, gain)
+                    })
+                    .await
+                    .unwrap_or_else(|_| core.camera.status());
+                    let mut resp = self
+                        .base_response(
+                            true,
+                            format!(
+                                "Shared microphone {} (muted={}, gain={:.0}%)",
+                                if status.mic_enabled { "enabled" } else { "disabled" },
+                                status.mic_muted,
+                                status.mic_gain * 100.0
+                            ),
+                        )
+                        .await;
+                    resp.camera_status = Some(status);
+                    resp
+                } else {
+                    self.base_response(false, "Core not initialized").await
+                }
             }
             DisplayRpcRequest::VerifyTouchId {
                 challenge_nonce_hex,
@@ -2207,6 +2352,7 @@ pub extern "C" fn fetch_rust_gpu_telemetry_json(
         if peer_ip_ptr.is_null() || out_buf.is_null() || cap < 2 {
             return 0;
         }
+        // SAFETY: `peer_ip_ptr` was validated non-null above and points to a NUL-terminated C string.
         let peer_ip = unsafe { std::ffi::CStr::from_ptr(peer_ip_ptr) }
             .to_string_lossy()
             .trim()
@@ -2248,6 +2394,7 @@ pub extern "C" fn fetch_rust_gpu_telemetry_json(
             return 0;
         }
 
+        // SAFETY: `json_bytes.len() < cap` ensures buffer capacity for payload plus NUL terminator.
         unsafe {
             std::ptr::copy_nonoverlapping(json_bytes.as_ptr(), out_buf, json_bytes.len());
             *out_buf.add(json_bytes.len()) = 0;
@@ -2647,5 +2794,132 @@ mod tests {
             .await;
         assert!(resp.success);
         assert!(resp.audio_status.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mic_rpc_feature_gate_revocation_and_gain_validation() {
+        let remote_ip: IpAddr = "192.168.1.50".parse().unwrap();
+
+        // Disabled camera feature rejects ListMics, SelectMic, and SetMicSettings.
+        let flags_off = crate::features::FeatureFlags {
+            camera: false,
+            ..Default::default()
+        };
+        let ctrl_off = DisplayController::new(
+            DiscoveryManager::new("disp_mic_off_test"),
+            Arc::new(FeatureManager::from_flags_for_test(flags_off)),
+        );
+        assert!(
+            !ctrl_off
+                .handle_rpc(DisplayRpcRequest::ListMics, Some(remote_ip), None)
+                .await
+                .success
+        );
+        assert!(
+            !ctrl_off
+                .handle_rpc(
+                    DisplayRpcRequest::SelectMic {
+                        device_id: "mic-1".into(),
+                    },
+                    Some(remote_ip),
+                    None,
+                )
+                .await
+                .success
+        );
+        assert!(
+            !ctrl_off
+                .handle_rpc(
+                    DisplayRpcRequest::SetMicSettings {
+                        enabled: true,
+                        muted: false,
+                        gain: 1.0,
+                    },
+                    Some(remote_ip),
+                    None,
+                )
+                .await
+                .success
+        );
+
+        // Enabled camera feature still rejects revoked peers and non-finite gain inputs.
+        let flags_on = crate::features::FeatureFlags {
+            camera: true,
+            ..Default::default()
+        };
+        let ctrl_on = DisplayController::new(
+            DiscoveryManager::new("disp_mic_on_test"),
+            Arc::new(FeatureManager::from_flags_for_test(flags_on)),
+        );
+        let revoked_peer = "7777777777777777777777777777777777777777777777777777777777777777";
+        crate::security::transport::invalidate_peer_trust(revoked_peer, 2);
+
+        let revoked_resp = ctrl_on
+            .handle_rpc(DisplayRpcRequest::ListMics, Some(remote_ip), Some(revoked_peer))
+            .await;
+        assert!(!revoked_resp.success);
+        assert!(revoked_resp.message.contains("revoked"));
+        crate::security::transport::clear_peer_revocation(revoked_peer);
+
+        let nan_resp = ctrl_on
+            .handle_rpc(
+                DisplayRpcRequest::SetMicSettings {
+                    enabled: true,
+                    muted: false,
+                    gain: f32::NAN,
+                },
+                Some(remote_ip),
+                None,
+            )
+            .await;
+        assert!(!nan_resp.success);
+        assert!(nan_resp.message.contains("non-finite gain"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_truetone_validation_and_ambient_recording() {
+        let flags = crate::features::FeatureFlags {
+            truetone: true,
+            ..Default::default()
+        };
+        let ctrl = DisplayController::new(
+            DiscoveryManager::new("disp_tt_test"),
+            Arc::new(FeatureManager::from_flags_for_test(flags)),
+        );
+        let peer_ip: IpAddr = "192.168.1.50".parse().unwrap();
+
+        // Out-of-range CCT or non-finite lux must be rejected before applying LUT.
+        let bad = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::SyncTrueTone {
+                    lux: f32::NAN,
+                    cct: 6500,
+                    gamma_comp: 1.0,
+                },
+                Some(peer_ip),
+                None,
+            )
+            .await;
+        assert!(!bad.success);
+
+        crate::truetone::clear_synced_ambient();
+        let ok = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::SyncTrueTone {
+                    lux: 245.5,
+                    cct: 5200,
+                    gamma_comp: 1.0,
+                },
+                Some(peer_ip),
+                None,
+            )
+            .await;
+        if ok.success {
+            let synced = crate::truetone::get_last_synced_ambient()
+                .expect("successful SyncTrueTone must record ambient telemetry");
+            assert!((synced.0 - 245.5).abs() < 0.2);
+            assert_eq!(synced.1, 5200);
+        }
+        crate::truetone::clear_synced_ambient();
     }
 }

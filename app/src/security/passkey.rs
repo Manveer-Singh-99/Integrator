@@ -1,131 +1,107 @@
-//! # WebAuthn & CTAP2 Passkey Cryptographic Subsystem (`app/src/security/passkey.rs`)
+//! # WebAuthn & FIDO2 Passkey Cryptographic Subsystem (`app/src/security/passkey.rs`)
 //!
 //! ## 1. Module Purpose & Scope
-//! This module implements the **FIDO2 / CTAP2 WebAuthn Passkey Subsystem** for Integrator.
+//! This module implements the **FIDO2 / WebAuthn Resident Passkey Authenticator** for Integrator.
 //! It enables passwordless, phishing-resistant public-key authentication for websites and apps
-//! running on a Windows 11 workstation, using the paired macOS device's Apple Secure Enclave
-//! and Touch ID biometric verification over mutually authenticated [`crate::security::transport::TransportSessionV2`].
+//! running on a Windows 11 workstation, using the paired macOS device's Touch ID biometric verification
+//! over mutually authenticated [`crate::security::transport::TransportSessionV2`].
 //!
 //! Core responsibilities include:
-//! - **Passkey Keypair Generation**: Generates FIDO2-compliant ECDSA P-256 (COSE algorithm `-7` / ES256)
-//!   and Ed25519 (COSE algorithm `-8` / EdDSA) keypairs bound to Relying Party identifiers (`rpId`).
+//! - **Passkey Keypair Generation**: Generates FIDO2-compliant ECDSA P-256 (`COSE_ALG_ES256 = -7`)
+//!   resident keypairs bound to Relying Party identifiers (`rpId`).
 //! - **Authenticator Data Encoding**: Serializes canonical WebAuthn `authenticatorData` buffers containing
-//!   SHA-256 Relying Party hashes, User Presence (`UP`), User Verification (`UV`), and Attested
-//!   Credential Data (`AT`).
-//! - **COSE Public Key Formatting**: Encodes EC2 and OKP public keys in canonical CBOR formats according to RFC 8152.
+//!   SHA-256 Relying Party hashes (`rpIdHash`), User Presence (`UP`), User Verification (`UV`), Backup
+//!   Eligibility/State (`BE`/`BS`), monotonic `signCount`, and Attested Credential Data (`AT`).
+//! - **COSE Public Key Formatting**: Encodes uncompressed NIST P-256 (`EC2`) public keys in canonical
+//!   CBOR format according to RFC 8152 (`ciborium`).
 //! - **Biometric Assertion Signing**: Cryptographically signs `authenticatorData || clientDataHash`
 //!   challenges with the resident passkey private key only after physical Touch ID verification.
-//! - **Encrypted Persistent Keystore**: Encrypts passkey records on disk using ChaCha20-Poly1305 AEAD
-//!   under a key derived from [`crate::security::keystore::KeystoreV2`].
-//! - **CTAP2 CBOR Message Dispatching**: Decodes CBOR-encoded requests from the Windows WebAuthn Plugin
-//!   API (`IPluginAuthenticator`) or CTAPHID, dispatches them across the network, and serializes CBOR responses.
+//! - **Atomic Persistent Store**: Persists resident passkey records in `passkeys_v1.json` via
+//!   write-fsync-rename updates hardened with owner-only POSIX `0o600` file / `0o700` directory
+//!   permissions and forensic backup of corrupted store files.
+//! - **CTAP2 Capabilities Descriptor**: Serializes canonical CBOR `authenticatorGetInfo` bytes for the
+//!   Windows 11 `IPluginAuthenticator` registration flow.
 //!
 //! ## 2. Architectural Linkages & Dependencies
 //! - **Upstream Callers**:
 //!   - `app/src/display/controller.rs`: Handles `DisplayRpcRequest::PasskeyMakeCredential` and
 //!     `DisplayRpcRequest::PasskeyGetAssertion` across active `TransportSessionV2` streams.
-//!   - `app/src/core.rs`: Exposes CLI subcommands `integrator passkey list`, `integrator passkey verify`.
-//!   - `app/src/ffi.rs` / `CoreBridge.cs`: Windows 11 WinUI 3 `IPluginAuthenticator` COM implementation
-//!     calling `integrator_passkey_handle_ctap2_request` to answer system WebAuthn queries.
+//!   - `app/src/core.rs`: Exposes CLI subcommands `integrator passkey status|info|list|test|make-hex|assert-hex`
+//!     (bridged by `app/ui-windows/PasskeyHost/Program.cs`) and IPC RPCs `passkey_list`, `passkey_get_info`,
+//!     `passkey_make_credential_remote`, and `passkey_get_assertion_remote` (used by
+//!     `app/ui-windows/PasskeyAuthenticatorPlugin.cs`).
 //! - **Downstream Callees**:
-//!   - `p256::ecdsa`: NIST P-256 elliptic curve arithmetic and ECDSA signature generation.
-//!   - `ciborium`: Canonical CBOR serialization and deserialization for CTAP2 messages.
-//!   - `sha2::Sha256`: Relying Party ID hashing (`rpIdHash`) and client data digest verification.
-//!   - `app/src/trust.rs`: Native Touch ID biometric evaluation (`evaluate_local_touchid_and_sign`).
-//!   - `app/src/security/`: Kernel CSPRNG (`try_csprng_array`), ChaCha20-Poly1305 encryption, hex encoding.
+//!   - `p256::ecdsa` & `p256::pkcs8`: NIST P-256 ECDSA key generation, PKCS#8 DER codec, and assertion signing.
+//!   - `ciborium`: Canonical CBOR serialization for COSE keys, attestation objects, and `authenticatorGetInfo`.
+//!   - `crate::security::sha256_digest`: Relying Party ID hashing (`rpIdHash`).
+//!   - `app/src/trust.rs`: Native macOS Touch ID evaluation (`evaluate_local_touchid_and_sign`).
+//!   - `app/src/security/`: Kernel CSPRNG (`csprng_array`), hex encoding/decoding (`hex_encode`, `hex_decode`, `hex_decode_array`), Unix timestamps.
 //! - **Cross-Platform / Cross-Device Flow**:
 //!   - **Windows 11 (Initiator)**: Browser initiates WebAuthn ceremony -> Windows routes request to
-//!     Integrator's registered `IPluginAuthenticator` COM component -> Integrator forwards CBOR/JSON
-//!     request to macOS peer over `TransportSessionV2` on port 58281.
-//!   - **macOS (Authenticator)**: Displays Apple Touch ID sensor prompt ("Sign in to <rpId> with Touch ID") ->
-//!     User scans fingerprint -> Secure Enclave verifies biometrics -> Private key signs `authData || clientDataHash` ->
-//!     Returns CBOR response to Windows -> Windows logs user in.
+//!     Integrator's `PasskeyAuthenticatorPlugin` / `PasskeyHost` COM server -> Integrator forwards
+//!     `PasskeyMakeCredentialRequest` / `PasskeyGetAssertionRequest` over `TransportSessionV2` (TCP port 58281).
+//!   - **macOS (Authenticator)**: Displays Apple Touch ID sensor prompt -> User verifies fingerprint ->
+//!     Private P-256 key signs `authData || clientDataHash` -> Returns CBOR/DER response to Windows.
 //!
 //! ## 3. Threading & Concurrency Model
-//! All public functions are fully reentrant and thread-safe. Cryptographic key operations execute synchronously
-//! on Tokio blocking task threads (`tokio::task::spawn_blocking`) to avoid stalling async event loops.
-//! The persistent passkey store is protected by a standard `std::sync::Mutex` with atomic write-replace
-//! file updates to prevent corruption under concurrent requests.
+//! All public functions are reentrant and thread-safe. Biometric prompts and cryptographic operations
+//! execute synchronously on Tokio blocking worker threads (`tokio::task::spawn_blocking`).
+//! [`GlobalPasskeyStore`] guards both in-memory credentials and disk persistence under a single
+//! `std::sync::Mutex` lock acquisition (`save_locked`) with transactional rollback if persistence fails.
 //!
 //! ## 4. Security & Safety Invariants
-//! - **No Plaintext Private Keys at Rest**: All private keys stored on disk are encrypted using ChaCha20-Poly1305
-//!   with unique 12-byte CSPRNG nonces and authenticated with 16-byte Poly1305 MAC tags.
-//! - **Biometric Gate Invariant**: Private key signing operations refuse to execute without a valid
-//!   biometric Touch ID evaluation result.
-//! - **Domain Separation**: All signing transcripts strictly adhere to the WebAuthn standard `authData || clientDataHash`
-//!   structure, guaranteeing collision resistance across Relying Parties.
-//! - **Strict Zeroization**: Ephemeral secret scalar buffers are zeroized upon drop using `zeroize::Zeroizing`.
+//! - **Filesystem & IPC Hygiene**: `passkeys_v1.json` is written under `0o600` permissions in a `0o700`
+//!   directory; `list_resident_passkeys()` zeroes and clears `private_key_pkcs8_der` on returned records so
+//!   CLI/IPC inspection never discloses private key bytes; custom `Debug` redacts key material.
+//! - **Biometric Gate Invariant**: Remote registration/assertion RPCs validate `rp_id`,
+//!   `client_data_hash_hex`, `user_id_hex`, and credential existence *before* prompting Touch ID.
+//! - **Domain Separation & Normalization**: `rp_id` is validated per RFC 1035 bounds, lowercased,
+//!   and SHA-256 hashed into `rpIdHash`; signing covers strictly `authData || clientDataHash`.
+//! - **Strict Zeroization**: Transient key copies are zeroized on completion/redaction via `zeroize::Zeroize`.
 
-#![allow(dead_code)]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use zeroize::Zeroize;
 
 // ============================================================================
 // Protocol Constants & Magic Numbers (Strictly Zero Inline Literals)
 // ============================================================================
 
-/// COSE algorithm identifier for ECDSA with SHA-256 on NIST P-256 curve (ES256).
+/// COSE algorithm identifier for ECDSA with SHA-256 on NIST P-256 curve (ES256, RFC 8152 §8.1).
 pub const COSE_ALG_ES256: i32 = -7;
 
-/// COSE algorithm identifier for EdDSA on Curve25519 (Ed25519).
-pub const COSE_ALG_EDDSA: i32 = -8;
-
-/// COSE key type identifier for 2-coordinate elliptic curve keys (EC2).
+/// COSE key type identifier for 2-coordinate elliptic curve keys (EC2, RFC 8152 §13).
 pub const COSE_KEY_TYPE_EC2: i64 = 2;
 
-/// COSE curve identifier for NIST P-256 (secp256r1).
+/// COSE curve identifier for NIST P-256 (`secp256r1`, RFC 8152 §13.1).
 pub const COSE_CRV_P256: i64 = 1;
 
-/// CTAP2 command identifier for creating a new credential (`authenticatorMakeCredential`).
-pub const CTAP2_CMD_MAKE_CREDENTIAL: u8 = 0x01;
-
-/// CTAP2 command identifier for asserting a resident credential (`authenticatorGetAssertion`).
-pub const CTAP2_CMD_GET_ASSERTION: u8 = 0x02;
-
-/// CTAP2 command identifier for querying authenticator capabilities (`authenticatorGetInfo`).
-pub const CTAP2_CMD_GET_INFO: u8 = 0x04;
-
-/// CTAP1/CTAP2 status code indicating successful completion.
-pub const CTAP1_ERR_SUCCESS: u8 = 0x00;
-
-/// CTAP1/CTAP2 status code indicating invalid parameters in the request payload.
-pub const CTAP1_ERR_INVALID_PARAMETER: u8 = 0x02;
-
-/// CTAP2 status code indicating the user canceled or refused biometric verification.
-pub const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
-
-/// CTAP2 status code indicating no matching credential was discovered on the authenticator.
-pub const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
-
-/// Authenticator Data Flag: User Presence (`UP`) bit (Bit 0).
+/// Authenticator Data Flag: User Presence (`UP`) bit (Bit 0 = `0x01`).
 pub const AUTHDATA_FLAG_USER_PRESENT: u8 = 0x01;
 
-/// Authenticator Data Flag: User Verification (`UV`) bit (Bit 2 - Biometrics confirmed).
+/// Authenticator Data Flag: User Verification (`UV`) bit (Bit 2 = `0x04` - Biometrics confirmed).
 pub const AUTHDATA_FLAG_USER_VERIFIED: u8 = 0x04;
 
-/// Authenticator Data Flag: Backup Eligibility (`BE`) bit (Bit 3 - Multi-device passkey).
+/// Authenticator Data Flag: Backup Eligibility (`BE`) bit (Bit 3 = `0x08` - Multi-device passkey).
 pub const AUTHDATA_FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
 
-/// Authenticator Data Flag: Backup State (`BS`) bit (Bit 4 - Synced / cross-device state).
+/// Authenticator Data Flag: Backup State (`BS`) bit (Bit 4 = `0x10` - Synced / cross-device state).
 pub const AUTHDATA_FLAG_BACKUP_STATE: u8 = 0x10;
 
-/// Authenticator Data Flag: Attested Credential Data (`AT`) present bit (Bit 6).
+/// Authenticator Data Flag: Attested Credential Data (`AT`) present bit (Bit 6 = `0x40`).
 pub const AUTHDATA_FLAG_ATTESTED_CRED_DATA: u8 = 0x40;
 
-/// Authenticator Data Flag: Extension Data (`ED`) present bit (Bit 7).
-pub const AUTHDATA_FLAG_EXTENSION_DATA: u8 = 0x80;
-
-/// Length in bytes of a standard WebAuthn Authenticator Attestation GUID (AAGUID).
+/// Length in bytes of a standard WebAuthn Authenticator Attestation GUID (AAGUID = 16 bytes).
 pub const AAGUID_BYTE_LEN: usize = 16;
 
 /// Standard Integrator Authenticator Attestation GUID (AAGUID).
@@ -134,22 +110,22 @@ pub const INTEGRATOR_AAGUID: [u8; AAGUID_BYTE_LEN] = [
     0xd9, 0xa4, 0xa4, 0xe1, 0x2f, 0xbc, 0x4b, 0x57, 0x90, 0x8d, 0xa2, 0x47, 0xe1, 0x68, 0x06, 0xf4,
 ];
 
-/// Length in bytes of the Relying Party identifier hash (`rpIdHash` via SHA-256).
+/// Length in bytes of the Relying Party identifier hash (`rpIdHash` via SHA-256 = 32 bytes).
 pub const RP_ID_HASH_LEN: usize = 32;
 
-/// Length in bytes of the WebAuthn client data digest challenge (`clientDataHash` via SHA-256).
+/// Length in bytes of the WebAuthn client data digest challenge (`clientDataHash` via SHA-256 = 32 bytes).
 pub const CLIENT_DATA_HASH_LEN: usize = 32;
 
-/// Length in bytes of an uncompressed NIST P-256 public key (0x04 prefix + 32-byte X + 32-byte Y).
+/// Length in bytes of an uncompressed NIST P-256 public key (`0x04` prefix + 32-byte X + 32-byte Y = 65 bytes).
 pub const P256_UNCOMPRESSED_KEY_LEN: usize = 65;
 
 /// Length in bytes of a single coordinate scalar on NIST P-256 (32 bytes).
 pub const P256_SCALAR_LEN: usize = 32;
 
-/// Length in bytes of a generated credential identifier.
+/// Length in bytes of a generated credential identifier (32 bytes = 256 bits of CSPRNG entropy).
 pub const CREDENTIAL_ID_LEN: usize = 32;
 
-/// Subdirectory name under the user's home configuration directory for passkey storage.
+/// Filename under the user's application data directory for persistent passkey storage.
 pub const PASSKEY_STORE_FILENAME: &str = "passkeys_v1.json";
 
 // ============================================================================
@@ -182,6 +158,7 @@ pub struct PasskeyRecord {
 }
 
 impl std::fmt::Debug for PasskeyRecord {
+    /// Formats record metadata while strictly redacting `private_key_pkcs8_der`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PasskeyRecord")
             .field("credential_id_hex", &self.credential_id_hex)
@@ -256,7 +233,7 @@ pub struct PasskeyGetAssertionResponse {
 // Persistent Passkey Store
 // ============================================================================
 
-/// On-disk container for passkey records encrypted under the host's root secret.
+/// On-disk JSON container storing resident passkey records under owner-only `0o600` permissions.
 #[derive(Default, Serialize, Deserialize)]
 struct PasskeyDatabase {
     /// Mapping from `credential_id_hex` to [`PasskeyRecord`].
@@ -265,17 +242,37 @@ struct PasskeyDatabase {
 
 /// Global thread-safe passkey database manager.
 struct GlobalPasskeyStore {
+    /// Synchronized in-memory mapping of resident passkey credentials.
     db: Mutex<PasskeyDatabase>,
+    /// Absolute filesystem path to `passkeys_v1.json`.
     path: PathBuf,
 }
 
 impl GlobalPasskeyStore {
-    /// Initializes or loads the encrypted passkey database from disk.
+    /// Initializes or loads the persistent passkey database from `base_dir/passkeys_v1.json`.
+    ///
+    /// If an existing store file is corrupted and fails JSON deserialization, preserves a forensic
+    /// backup (`passkeys_v1.json.corrupt.<epoch_secs>`) and logs an error before falling back
+    /// to an empty database.
     fn new(base_dir: &Path) -> Self {
         let path = base_dir.join(PASSKEY_STORE_FILENAME);
         let db = if path.exists() {
             match fs::read_to_string(&path) {
-                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+                Ok(content) => match serde_json::from_str::<PasskeyDatabase>(&content) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        let epoch = crate::security::unix_epoch_secs();
+                        let backup = path.with_extension(format!("json.corrupt.{}", epoch));
+                        let _ = fs::copy(&path, &backup);
+                        tracing::error!(
+                            "Corrupt passkey store at {} ({}); backed up to {}",
+                            path.display(),
+                            e,
+                            backup.display()
+                        );
+                        PasskeyDatabase::default()
+                    }
+                },
                 Err(e) => {
                     tracing::error!("Failed to read passkey store from {}: {}", path.display(), e);
                     PasskeyDatabase::default()
@@ -290,42 +287,98 @@ impl GlobalPasskeyStore {
         }
     }
 
-    /// Persists the database atomically using write-and-rename.
-    fn save(&self) -> Result<(), String> {
-        let db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let json = serde_json::to_string_pretty(&*db)
+    /// Persists the provided database snapshot atomically using write-sync-rename with hardened `0o600` permissions.
+    ///
+    /// Called while holding the `self.db` mutex guard to prevent concurrent race windows between
+    /// in-memory state updates and disk commits. Cleans up the transient temporary file on any error.
+    fn save_locked(db: &PasskeyDatabase, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(db)
             .map_err(|e| format!("Serialization error: {}", e))?;
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Restrict parent directory to owner access only (rwx------).
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
         let rand_suffix = crate::security::hex_encode(&crate::security::csprng_array::<8>());
-        let tmp_path = self.path.with_extension(format!("tmp.{}.{}", std::process::id(), rand_suffix));
-        let mut file = File::create(&tmp_path)
-            .map_err(|e| format!("Failed to create temporary store {}: {}", tmp_path.display(), e))?;
-        file.write_all(json.as_bytes())
-            .map_err(|e| format!("Failed to write store {}: {}", tmp_path.display(), e))?;
-        file.sync_all().map_err(|e| format!("Failed to sync store: {}", e))?;
-        fs::rename(&tmp_path, &self.path)
-            .map_err(|e| format!("Atomic rename failed: {}", e))?;
+        let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), rand_suffix));
+
+        let open_res = {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Create temporary file with owner-only rw------- (0o600) permissions from birth
+                // so PKCS#8 private key material is never exposed under a permissive default umask.
+                opts.mode(0o600);
+            }
+            opts.open(&tmp_path)
+        };
+
+        let mut file = open_res.map_err(|e| {
+            format!(
+                "Failed to create temporary store {}: {}",
+                tmp_path.display(),
+                e
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+
+        if let Err(e) = file.write_all(json.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write store {}: {}", tmp_path.display(), e));
+        }
+        if let Err(e) = file.sync_all() {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Failed to sync store: {}", e));
+        }
+        // Explicitly close file handle before rename for Windows filesystem compatibility.
+        drop(file);
+
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Atomic rename failed: {}", e));
+        }
         Ok(())
     }
 
-    /// Stores a newly generated passkey record.
+    /// Stores a newly generated passkey record atomically, rolling back in-memory state if disk persistence fails.
     fn insert(&self, record: PasskeyRecord) -> Result<(), String> {
-        {
-            let mut db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
-            db.credentials.insert(record.credential_id_hex.clone(), record);
+        let mut db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+        let key = record.credential_id_hex.clone();
+        let previous = db.credentials.insert(key.clone(), record);
+        if let Err(e) = Self::save_locked(&db, &self.path) {
+            // Rollback authoritative in-memory state if disk persistence fails.
+            match previous {
+                Some(old) => {
+                    db.credentials.insert(key, old);
+                }
+                None => {
+                    db.credentials.remove(&key);
+                }
+            }
+            return Err(e);
         }
-        self.save()
+        Ok(())
     }
 
-    /// Retrieves an existing passkey matching `rp_id` and optional `allow_credentials`.
-    fn find_for_rp(
-        &self,
+    /// Looks up the highest-priority resident credential matching `rp_id` and `allow_ids` while holding `db`.
+    fn find_for_rp_locked<'a>(
+        db: &'a PasskeyDatabase,
         rp_id: &str,
         allow_ids: &[String],
-    ) -> Result<Option<PasskeyRecord>, String> {
-        let db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+    ) -> Option<&'a PasskeyRecord> {
         let normalized_rp = rp_id.trim().to_ascii_lowercase();
 
         // If an explicit allow-list was provided by the relying party, match by ID first
@@ -334,44 +387,76 @@ impl GlobalPasskeyStore {
                 let clean_id = id.trim().to_ascii_lowercase();
                 if let Some(rec) = db.credentials.get(&clean_id) {
                     if rec.rp_id.eq_ignore_ascii_case(&normalized_rp) {
-                        return Ok(Some(rec.clone()));
+                        return Some(rec);
                     }
                 }
             }
             // Per W3C WebAuthn Level 3 (§5.1.3), if allowCredentials is non-empty and no matching
             // credential exists on this authenticator, the authenticator MUST NOT pick another credential.
-            return Ok(None);
+            return None;
         }
 
-        // Otherwise return the most recently used credential matching the RP ID
+        // Otherwise return the most recently created credential matching the RP ID
         let mut matches: Vec<&PasskeyRecord> = db
             .credentials
             .values()
             .filter(|rec| rec.rp_id.eq_ignore_ascii_case(&normalized_rp))
             .collect();
         matches.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
-        Ok(matches.first().copied().cloned())
+        matches.first().copied()
     }
 
-    /// Increments the invocation counter for a credential.
+    /// Returns whether any resident passkey exists for `rp_id` (without cloning key material).
+    fn has_for_rp(&self, rp_id: &str, allow_ids: &[String]) -> Result<bool, String> {
+        let db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+        Ok(Self::find_for_rp_locked(&db, rp_id, allow_ids).is_some())
+    }
+
+    /// Retrieves an existing passkey matching `rp_id` and optional `allow_ids`.
+    fn find_for_rp(
+        &self,
+        rp_id: &str,
+        allow_ids: &[String],
+    ) -> Result<Option<PasskeyRecord>, String> {
+        let db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+        Ok(Self::find_for_rp_locked(&db, rp_id, allow_ids).cloned())
+    }
+
+    /// Increments the signature invocation counter for a credential atomically, rolling back on persistence failure.
     fn increment_sign_count(&self, credential_id_hex: &str) -> Result<u32, String> {
-        let count = {
-            let mut db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
-            if let Some(rec) = db.credentials.get_mut(credential_id_hex) {
-                rec.sign_count = rec.sign_count.saturating_add(1);
-                rec.sign_count
-            } else {
-                return Err("Credential not found".into());
-            }
+        let mut db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
+        let prev_count = {
+            let rec = db
+                .credentials
+                .get_mut(credential_id_hex)
+                .ok_or_else(|| "Credential not found".to_string())?;
+            let prev = rec.sign_count;
+            rec.sign_count = rec.sign_count.saturating_add(1);
+            prev
         };
-        self.save()?;
-        Ok(count)
+        if let Err(e) = Self::save_locked(&db, &self.path) {
+            if let Some(rec) = db.credentials.get_mut(credential_id_hex) {
+                rec.sign_count = prev_count;
+            }
+            return Err(e);
+        }
+        Ok(prev_count.saturating_add(1))
     }
 
-    /// Returns a list of all resident credentials (sanitized for UI display).
+    /// Returns a list of all resident credentials with `private_key_pkcs8_der` zeroized and cleared
+    /// so CLI/IPC callers cannot expose private signing keys.
     fn list_all(&self) -> Result<Vec<PasskeyRecord>, String> {
         let db = self.db.lock().map_err(|e| format!("Mutex poisoned: {}", e))?;
-        Ok(db.credentials.values().cloned().collect())
+        Ok(db
+            .credentials
+            .values()
+            .cloned()
+            .map(|mut rec| {
+                rec.private_key_pkcs8_der.zeroize();
+                rec.private_key_pkcs8_der.clear();
+                rec
+            })
+            .collect())
     }
 }
 
@@ -379,8 +464,17 @@ impl GlobalPasskeyStore {
 static GLOBAL_PASSKEY_STORE: OnceLock<GlobalPasskeyStore> = OnceLock::new();
 
 /// Accesses the global passkey store singleton.
+///
+/// In unit test builds (`#[cfg(test)]`), uses an isolated per-process temporary directory so tests
+/// never mutate or pollute the user's real `passkeys_v1.json` store.
 fn passkey_store() -> &'static GlobalPasskeyStore {
     GLOBAL_PASSKEY_STORE.get_or_init(|| {
+        #[cfg(test)]
+        let base_dir = std::env::temp_dir().join(format!(
+            "integrator_test_passkeys_{}",
+            std::process::id()
+        ));
+        #[cfg(not(test))]
         let base_dir = crate::system_info::app_data_dir();
         GlobalPasskeyStore::new(&base_dir)
     })
@@ -391,6 +485,11 @@ fn passkey_store() -> &'static GlobalPasskeyStore {
 // ============================================================================
 
 /// Validates Relying Party identifier syntax according to WebAuthn / FIDO2 specifications.
+///
+/// Enforces:
+/// - Non-empty after trimming whitespace.
+/// - Length <= 253 ASCII characters (DNS hostname limit per RFC 1035).
+/// - No null bytes (`\0`), path separators (`/`, `\`), or scheme/port delimiters (`:`).
 pub fn validate_rp_id(rp_id: &str) -> Result<(), String> {
     let clean = rp_id.trim();
     if clean.is_empty() {
@@ -405,19 +504,12 @@ pub fn validate_rp_id(rp_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Computes the SHA-256 digest of an arbitrary byte slice.
-fn sha256_digest(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
-}
-
 /// Serializes a NIST P-256 public key into RFC 8152 COSE Key canonical CBOR bytes.
 ///
 /// COSE Key Map structure:
-/// - Key `1` (kty): `2` (EC2)
-/// - Key `3` (alg): `-7` (ES256)
-/// - Key `-1` (crv): `1` (P-256)
+/// - Key `1` (kty): `2` ([`COSE_KEY_TYPE_EC2`])
+/// - Key `3` (alg): `-7` ([`COSE_ALG_ES256`])
+/// - Key `-1` (crv): `1` ([`COSE_CRV_P256`])
 /// - Key `-2` (x): 32 bytes X-coordinate
 /// - Key `-3` (y): 32 bytes Y-coordinate
 pub fn encode_cose_p256_public_key(public_key_sec1: &[u8]) -> Result<Vec<u8>, String> {
@@ -427,7 +519,7 @@ pub fn encode_cose_p256_public_key(public_key_sec1: &[u8]) -> Result<Vec<u8>, St
     let x_coord = &public_key_sec1[1..1 + P256_SCALAR_LEN];
     let y_coord = &public_key_sec1[1 + P256_SCALAR_LEN..1 + 2 * P256_SCALAR_LEN];
 
-    // Build the canonical CBOR map: 5 key-value pairs
+    // Build RFC 8152 COSE EC2 Key map: 1=kty (EC2), 3=alg (ES256), -1=crv (P-256), -2=x, -3=y.
     use ciborium::value::Value;
     let cose_map = Value::Map(vec![
         (Value::Integer(1.into()), Value::Integer(COSE_KEY_TYPE_EC2.into())),
@@ -443,7 +535,16 @@ pub fn encode_cose_p256_public_key(public_key_sec1: &[u8]) -> Result<Vec<u8>, St
     Ok(out)
 }
 
-/// Builds the canonical WebAuthn `authenticatorData` structure for credential creation.
+/// Builds the canonical WebAuthn `authenticatorData` structure for credential creation (W3C WebAuthn §6.1).
+///
+/// Wire layout:
+/// - `rpIdHash` (32 bytes, [`RP_ID_HASH_LEN`]): `SHA256(lowercase(rp_id))`
+/// - `flags` (1 byte): Bitmask of `UP | UV | BE | BS | AT`
+/// - `signCount` (4 bytes, big-endian `u32`): Initial invocation count (`0`)
+/// - `aaguid` (16 bytes, [`AAGUID_BYTE_LEN`]): Authenticator Attestation GUID
+/// - `credentialIdLength` (2 bytes, big-endian `u16`): Byte length of `credential_id`
+/// - `credentialId` (`credential_id.len()` bytes): Random credential identifier
+/// - `credentialPublicKey` (`cose_public_key_cbor.len()` bytes): RFC 8152 COSE-encoded public key
 pub fn build_authenticator_data_make_credential(
     rp_id: &str,
     flags: u8,
@@ -456,10 +557,12 @@ pub fn build_authenticator_data_make_credential(
         return Err("Credential ID exceeds maximum length".into());
     }
     let clean_rp = rp_id.trim().to_ascii_lowercase();
-    let rp_id_hash = sha256_digest(clean_rp.as_bytes());
+    let rp_id_hash = crate::security::sha256_digest(clean_rp.as_bytes());
     let cred_len_be = (credential_id.len() as u16).to_be_bytes();
 
-    let mut buf = Vec::with_capacity(32 + 1 + 4 + 16 + 2 + credential_id.len() + cose_public_key_cbor.len());
+    let mut buf = Vec::with_capacity(
+        RP_ID_HASH_LEN + 1 + 4 + AAGUID_BYTE_LEN + 2 + credential_id.len() + cose_public_key_cbor.len(),
+    );
     buf.extend_from_slice(&rp_id_hash);
     buf.push(flags);
     buf.extend_from_slice(&sign_count.to_be_bytes());
@@ -470,15 +573,20 @@ pub fn build_authenticator_data_make_credential(
     Ok(buf)
 }
 
-/// Builds the canonical WebAuthn `authenticatorData` structure for assertion signing.
+/// Builds the canonical 37-byte WebAuthn `authenticatorData` structure for assertion signing (W3C WebAuthn §6.1).
+///
+/// Wire layout (37 bytes total = [`RP_ID_HASH_LEN`] + 1 + 4):
+/// - `rpIdHash` (32 bytes): `SHA256(lowercase(rp_id))`
+/// - `flags` (1 byte): Bitmask of `UP | UV | BE | BS`
+/// - `signCount` (4 bytes, big-endian `u32`): Monotonically incremented invocation counter
 pub fn build_authenticator_data_assertion(
     rp_id: &str,
     flags: u8,
     sign_count: u32,
 ) -> Vec<u8> {
     let clean_rp = rp_id.trim().to_ascii_lowercase();
-    let rp_id_hash = sha256_digest(clean_rp.as_bytes());
-    let mut buf = Vec::with_capacity(37);
+    let rp_id_hash = crate::security::sha256_digest(clean_rp.as_bytes());
+    let mut buf = Vec::with_capacity(RP_ID_HASH_LEN + 1 + 4);
     buf.extend_from_slice(&rp_id_hash);
     buf.push(flags);
     buf.extend_from_slice(&sign_count.to_be_bytes());
@@ -500,18 +608,51 @@ pub fn build_attestation_object_cbor(auth_data: &[u8]) -> Result<Vec<u8>, String
     Ok(out)
 }
 
-/// Generates a resident passkey credential without biometric prompt (used after biometrics verified).
+/// Maximum sanitized display string length retained for resident passkey user labels.
+const MAX_PASSKEY_USER_LABEL_CHARS: usize = 256;
+
+/// Maximum permitted `user_id_hex` ASCII character length (128 hex chars = 64 bytes per WebAuthn §5.4.3).
+const MAX_PASSKEY_USER_ID_HEX_LEN: usize = 128;
+
+/// Strips ASCII/Unicode control characters and bounds length for user-facing passkey labels.
+fn sanitize_user_label(raw: &str, max_chars: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+/// Validates optional `user_id_hex` (even-length ASCII hex up to 64 bytes per W3C WebAuthn §5.4.3).
+fn validate_and_normalize_user_id_hex(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > MAX_PASSKEY_USER_ID_HEX_LEN {
+        return Err("user_id_hex exceeds 64-byte (128-char) WebAuthn limit".into());
+    }
+    let decoded = crate::security::hex_decode(trimmed)
+        .ok_or_else(|| "Invalid user_id_hex: must be even-length hexadecimal".to_string())?;
+    Ok(crate::security::hex_encode(&decoded))
+}
+
+/// Generates a resident ECDSA P-256 passkey credential without biometric prompt (called post-Touch ID).
+///
+/// # Errors
+/// Returns an explanatory error string if `rp_id`, `client_data_hash_hex`, or `user_id_hex` fail
+/// validation, PKCS#8/COSE/CBOR serialization fails, or atomic disk persistence fails.
 pub fn generate_passkey_credential(
     req: &PasskeyMakeCredentialRequest,
 ) -> Result<PasskeyMakeCredentialResponse, String> {
-    // 0. Validate Relying Party ID and clientDataHash
+    // 0. Validate Relying Party ID, 32-byte clientDataHash (O(1) length check before decode), and user_id_hex
     validate_rp_id(&req.rp_id)?;
-    let clean_hash = req.client_data_hash_hex.trim().to_ascii_lowercase();
-    let client_data_hash = crate::security::hex_decode(&clean_hash)
-        .ok_or_else(|| "Invalid client_data_hash hex".to_string())?;
-    if client_data_hash.len() != CLIENT_DATA_HASH_LEN {
-        return Err("client_data_hash must be exactly 32 bytes".into());
+    if crate::security::hex_decode_array::<CLIENT_DATA_HASH_LEN>(req.client_data_hash_hex.trim())
+        .is_none()
+    {
+        return Err("Invalid client_data_hash: must be exactly 32-byte (64-char) hex".into());
     }
+    let clean_user_id_hex = validate_and_normalize_user_id_hex(&req.user_id_hex)?;
 
     // 1. Generate fresh cryptographic P-256 signing key
     let mut rng = OsRng;
@@ -526,6 +667,7 @@ pub fn generate_passkey_credential(
         .map_err(|e| format!("PKCS#8 encoding failed: {}", e))?
         .as_bytes()
         .to_vec();
+    drop(signing_key);
 
     // 3. Generate random 32-byte credential identifier
     let cred_id_bytes = crate::security::csprng_array::<CREDENTIAL_ID_LEN>();
@@ -552,13 +694,13 @@ pub fn generate_passkey_credential(
     // 6. Build Attestation Object
     let att_obj_cbor = build_attestation_object_cbor(&auth_data)?;
 
-    // 7. Store passkey record in persistent keystore
+    // 7. Sanitize user metadata and persist record atomically in passkeys_v1.json
     let record = PasskeyRecord {
         credential_id_hex: cred_id_hex.clone(),
         rp_id: req.rp_id.trim().to_ascii_lowercase(),
-        user_id_hex: req.user_id_hex.clone(),
-        user_name: req.user_name.clone(),
-        user_display_name: req.user_display_name.clone(),
+        user_id_hex: clean_user_id_hex,
+        user_name: sanitize_user_label(&req.user_name, MAX_PASSKEY_USER_LABEL_CHARS),
+        user_display_name: sanitize_user_label(&req.user_display_name, MAX_PASSKEY_USER_LABEL_CHARS),
         private_key_pkcs8_der: pkcs8_der,
         public_key_sec1,
         cose_alg: COSE_ALG_ES256,
@@ -575,28 +717,34 @@ pub fn generate_passkey_credential(
     })
 }
 
-/// Asserts an existing resident passkey credential without biometric prompt (used after biometrics verified).
+/// Asserts an existing resident passkey credential without biometric prompt (called post-Touch ID).
+///
+/// Zeroizes the temporary cloned PKCS#8 private key DER buffer immediately after constructing the signing key.
+///
+/// # Errors
+/// Returns an error string if `rp_id` or `client_data_hash_hex` is malformed, no matching resident
+/// passkey exists for `rp_id`, counter persistence fails, or stored private key DER decoding fails.
 pub fn sign_passkey_assertion(
     req: &PasskeyGetAssertionRequest,
 ) -> Result<PasskeyGetAssertionResponse, String> {
-    // 0. Validate Relying Party ID
+    // 0. Validate Relying Party ID and 32-byte clientDataHash before touching the store
     validate_rp_id(&req.rp_id)?;
+    let client_data_hash =
+        crate::security::hex_decode_array::<CLIENT_DATA_HASH_LEN>(req.client_data_hash_hex.trim())
+            .ok_or_else(|| "Invalid client_data_hash: must be exactly 32-byte (64-char) hex".to_string())?;
 
-    // 1. Look up existing credential
+    // 1. Look up existing credential matching RP ID and optional allowCredentials allow-list
     let store = passkey_store();
-    let record = store
+    let mut record = store
         .find_for_rp(&req.rp_id, &req.allow_credential_ids_hex)?
         .ok_or_else(|| format!("No passkey found for domain '{}'", req.rp_id))?;
 
-    // 2. Decode clientDataHash
-    let clean_hash = req.client_data_hash_hex.trim().to_ascii_lowercase();
-    let client_data_hash = crate::security::hex_decode(&clean_hash)
-        .ok_or_else(|| "Invalid client_data_hash hex".to_string())?;
-    if client_data_hash.len() != CLIENT_DATA_HASH_LEN {
-        return Err("client_data_hash must be exactly 32 bytes".into());
-    }
+    // 2. Parse P-256 signing key and immediately zeroize the cloned DER buffer
+    let signing_key_res = P256SigningKey::from_pkcs8_der(&record.private_key_pkcs8_der);
+    record.private_key_pkcs8_der.zeroize();
+    let signing_key = signing_key_res.map_err(|e| format!("Corrupt private key DER: {}", e))?;
 
-    // 3. Increment signature counter
+    // 3. Atomically increment persistent signature counter after validating stored key integrity
     let new_sign_count = store.increment_sign_count(&record.credential_id_hex)?;
 
     // 4. Construct authenticatorData with UP=1, UV=1, BE=1, BS=1 (0x1D, matching registration BE/BS bits)
@@ -606,14 +754,13 @@ pub fn sign_passkey_assertion(
         | AUTHDATA_FLAG_BACKUP_STATE;
     let auth_data = build_authenticator_data_assertion(&req.rp_id, flags, new_sign_count);
 
-    // 5. Compute signature over `authenticatorData || clientDataHash`
+    // 5. Compute ECDSA P-256 signature over `authenticatorData || clientDataHash`
     let mut data_to_sign = Vec::with_capacity(auth_data.len() + CLIENT_DATA_HASH_LEN);
     data_to_sign.extend_from_slice(&auth_data);
     data_to_sign.extend_from_slice(&client_data_hash);
 
-    let signing_key = P256SigningKey::from_pkcs8_der(&record.private_key_pkcs8_der)
-        .map_err(|e| format!("Corrupt private key DER: {}", e))?;
     let signature: P256Signature = signing_key.sign(&data_to_sign);
+    drop(signing_key);
     let signature_der = signature.to_der();
 
     Ok(PasskeyGetAssertionResponse {
@@ -630,12 +777,32 @@ pub fn sign_passkey_assertion(
 // ============================================================================
 
 /// Evaluates physical Apple Touch ID biometrics on macOS and registers a new passkey credential.
+///
+/// Validates `rp_id`, `client_data_hash_hex`, and `user_id_hex` and sanitizes control characters
+/// from `user_name` *before* invoking the macOS `LocalAuthentication` Touch ID prompt so malformed
+/// or spoofed requests fail immediately without prompting the user.
+///
+/// # Errors
+/// Returns an error string on validation failure, non-macOS execution, canceled/failed Touch ID
+/// biometric verification, or credential persistence failure.
 pub fn evaluate_mac_touchid_and_make_credential(
     req: &PasskeyMakeCredentialRequest,
 ) -> Result<PasskeyMakeCredentialResponse, String> {
     #[cfg(target_os = "macos")]
     {
-        let prompt_reason = format!("create a passkey for {} ({})", req.rp_id, req.user_name);
+        // Pre-flight validation before triggering physical biometric prompt
+        validate_rp_id(&req.rp_id)?;
+        let clean_hash = req.client_data_hash_hex.trim();
+        if crate::security::hex_decode_array::<CLIENT_DATA_HASH_LEN>(clean_hash).is_none() {
+            return Err("Invalid client_data_hash: must be 32-byte (64-char) hex".into());
+        }
+        let _ = validate_and_normalize_user_id_hex(&req.user_id_hex)?;
+        let sanitized_user = sanitize_user_label(&req.user_name, 128);
+        let prompt_reason = format!(
+            "create a passkey for {} ({})",
+            req.rp_id.trim(),
+            sanitized_user
+        );
         let challenge_nonce = crate::security::csprng_array::<32>();
         let challenge_hex = crate::security::hex_encode(&challenge_nonce);
 
@@ -657,22 +824,29 @@ pub fn evaluate_mac_touchid_and_make_credential(
 }
 
 /// Evaluates physical Apple Touch ID biometrics on macOS and signs an existing passkey assertion.
+///
+/// Performs pre-flight validation of `rp_id`, `client_data_hash_hex`, and resident credential
+/// existence *before* presenting the Touch ID prompt.
 pub fn evaluate_mac_touchid_and_sign_assertion(
     req: &PasskeyGetAssertionRequest,
 ) -> Result<PasskeyGetAssertionResponse, String> {
     #[cfg(target_os = "macos")]
     {
-        // Pre-flight check: verify a matching Integrator passkey exists BEFORE prompting Touch ID.
-        // Avoids wasting a biometric prompt when no passkey has been registered with Integrator for this RP.
-        let existing = passkey_store().find_for_rp(&req.rp_id, &req.allow_credential_ids_hex)?;
-        if existing.is_none() {
+        // Pre-flight validation: verify RP ID syntax, clientDataHash format, and matching
+        // Integrator passkey existence BEFORE prompting Touch ID.
+        validate_rp_id(&req.rp_id)?;
+        let clean_hash = req.client_data_hash_hex.trim();
+        if crate::security::hex_decode_array::<CLIENT_DATA_HASH_LEN>(clean_hash).is_none() {
+            return Err("Invalid client_data_hash: must be 32-byte (64-char) hex".into());
+        }
+        if !passkey_store().has_for_rp(&req.rp_id, &req.allow_credential_ids_hex)? {
             return Err(format!(
                 "NO_PASSKEY_FOUND: No Integrator Touch ID passkey stored for '{}'",
                 req.rp_id
             ));
         }
 
-        let prompt_reason = format!("sign in to {} with Touch ID", req.rp_id);
+        let prompt_reason = format!("sign in to {} with Touch ID", req.rp_id.trim());
         let challenge_nonce = crate::security::csprng_array::<32>();
         let challenge_hex = crate::security::hex_encode(&challenge_nonce);
 
@@ -693,7 +867,10 @@ pub fn evaluate_mac_touchid_and_sign_assertion(
     }
 }
 
-/// Returns a sanitized list of all resident passkeys for user interface presentation.
+/// Returns a sanitized list of all resident passkeys (private signing keys stripped) for CLI/IPC display.
+///
+/// # Errors
+/// Returns an error string if the internal store mutex is poisoned.
 pub fn list_resident_passkeys() -> Result<Vec<PasskeyRecord>, String> {
     passkey_store().list_all()
 }
@@ -746,7 +923,7 @@ pub fn get_info_cbor_bytes() -> Vec<u8> {
         ),
     ]);
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(128);
     let _ = ciborium::into_writer(&get_info, &mut out);
     out
 }
@@ -788,7 +965,7 @@ mod tests {
             client_data_hash_hex: crate::security::hex_encode(&[0x42; 32]),
             rp_id: "integrator.test".into(),
             user_id_hex: crate::security::hex_encode(&[0x01; 16]),
-            user_name: "testuser".into(),
+            user_name: "testuser\x07".into(),
             user_display_name: "Test User".into(),
             requester_hostname: "MacBook-Pro".into(),
         };
@@ -805,5 +982,37 @@ mod tests {
         let assert_res = sign_passkey_assertion(&assert_req).expect("assertion failed");
         assert_eq!(assert_res.credential_id_hex, make_res.credential_id_hex);
         assert_eq!(assert_res.sign_count, 1);
+
+        // Resident listing must strip private keys so IPC/CLI output never exposes PKCS#8 material.
+        let listed = list_resident_passkeys().expect("list_resident_passkeys failed");
+        let rec = listed
+            .iter()
+            .find(|r| r.credential_id_hex == make_res.credential_id_hex)
+            .expect("created credential present in listing");
+        assert!(rec.private_key_pkcs8_der.is_empty());
+        assert_eq!(rec.user_name, "testuser");
+    }
+
+    #[test]
+    fn test_passkey_rejects_malformed_hashes_and_user_ids() {
+        let bad_hash = PasskeyMakeCredentialRequest {
+            client_data_hash_hex: "not_hex".into(),
+            rp_id: "example.com".into(),
+            user_id_hex: "0102".into(),
+            user_name: "alice".into(),
+            user_display_name: "Alice".into(),
+            requester_hostname: "Win11".into(),
+        };
+        assert!(generate_passkey_credential(&bad_hash).is_err());
+
+        let bad_user_id = PasskeyMakeCredentialRequest {
+            client_data_hash_hex: crate::security::hex_encode(&[0x11; 32]),
+            rp_id: "example.com".into(),
+            user_id_hex: "xyz!".into(),
+            user_name: "alice".into(),
+            user_display_name: "Alice".into(),
+            requester_hostname: "Win11".into(),
+        };
+        assert!(generate_passkey_credential(&bad_user_id).is_err());
     }
 }

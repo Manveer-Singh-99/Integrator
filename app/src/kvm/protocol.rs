@@ -36,7 +36,7 @@
 //!                         │  - EnterScreen / Leave    │
 //!                         │  - DragOffer / DragResult │
 //!                         └────────────┬──────────────┘
-//!                                      │ Bincode / JSON Serialization
+//!                                      │ JSON Serialization (serde_json)
 //!                                      ▼
 //!                         ┌───────────────────────────┐
 //!                         │    TransportSessionV2     │
@@ -56,7 +56,7 @@
 //! - `src/kvm/layout.rs`: References `ScreenEdge` and `KvmLayoutConfig` for desk layout calculations.
 //!
 //! ### Downstream Callees:
-//! - `serde`: High-performance JSON/binary serialization and deserialization.
+//! - `serde`: JSON serialization and deserialization across the KVM wire channel.
 //! - Network transport: Transferred through encrypted frames over `TransportWriterV2` / `TransportReaderV2`.
 //!
 //! ## 3. Threading & Concurrency Model
@@ -66,11 +66,12 @@
 //!
 //! ## 4. Security & Safety Invariants
 //! - **Bounded Message Size**: Wire messages are enforced to reside within `MAX_WIRE_MESSAGE_BYTES` (96 KiB)
-//!   by the transport layer, preventing memory exhaustion attacks.
+//!   by `kvm/service.rs` on both encode and decode paths, preventing memory exhaustion attacks.
 //! - **Sanitized Numerical Ranges**: Relative deltas (`dx`, `dy`) and normalized coordinates (`norm_pos`)
-//!   are clamped to finite, safe ranges to eliminate `NaN` / infinite floating-point propagation.
-//! - **Safe String Parsing**: String conversions (`ScreenEdge::from_str_lossy`) employ case-insensitive,
-//!   trimmed matching with safe fallback defaults.
+//!   are validated for finiteness (`is_finite()`) and clamped to safe ranges to eliminate `NaN` / infinite
+//!   floating-point propagation.
+//! - **Strict Enum Deserialization**: Serde rejects unrecognized `ScreenEdge`, `LogicalKey`, and
+//!   `RemoteMouseButton` variants cleanly at frame decode time without panicking.
 
 use serde::{Deserialize, Serialize};
 
@@ -107,39 +108,6 @@ impl ScreenEdge {
             ScreenEdge::Right => ScreenEdge::Left,
             ScreenEdge::Top => ScreenEdge::Bottom,
             ScreenEdge::Bottom => ScreenEdge::Top,
-        }
-    }
-
-    /// Returns a human-readable title-cased label for display in UI logs and settings panels.
-    pub fn label(self) -> &'static str {
-        match self {
-            ScreenEdge::Left => "Left",
-            ScreenEdge::Right => "Right",
-            ScreenEdge::Top => "Top",
-            ScreenEdge::Bottom => "Bottom",
-        }
-    }
-
-    /// Parses a string into a `ScreenEdge` variant in a case-insensitive, whitespace-tolerant manner.
-    ///
-    /// Recognizes colloquial directional synonyms:
-    /// - `"left"` -> `Some(ScreenEdge::Left)`
-    /// - `"right"` -> `Some(ScreenEdge::Right)`
-    /// - `"top"`, `"up"` -> `Some(ScreenEdge::Top)`
-    /// - `"bottom"`, `"down"` -> `Some(ScreenEdge::Bottom)`
-    ///
-    /// # Arguments
-    /// * `raw` - Raw string slice to inspect.
-    ///
-    /// # Returns
-    /// `Some(ScreenEdge)` if matched, otherwise `None`.
-    pub fn from_str_lossy(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "left" => Some(ScreenEdge::Left),
-            "right" => Some(ScreenEdge::Right),
-            "top" | "up" => Some(ScreenEdge::Top),
-            "bottom" | "down" => Some(ScreenEdge::Bottom),
-            _ => None,
         }
     }
 }

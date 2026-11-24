@@ -41,7 +41,8 @@
 //!     and display sync (ProMotion 120Hz).
 //!   - On Windows headless mode: Sleeps in a 500ms polling loop monitoring the atomic shutdown flag.
 //! - **Signal Watcher Thread**: A dedicated background OS thread (`"signal-watcher"`) monitors the atomic
-//!   `SHUTDOWN_REQUESTED` flag on Unix systems and triggers `core_instance.shutdown()` asynchronously.
+//!   `SHUTDOWN_REQUESTED` flag on Unix systems, notifies the UI to quit, and invokes `core_instance.shutdown()`
+//!   synchronously on that watcher thread.
 //! - **Asynchronous Runtime**: `IntegratorCore` hosts the Tokio multi-thread worker pool for all network and IPC activity.
 //!
 //! ## 4. Security & Safety Invariants
@@ -50,6 +51,7 @@
 //! - **Single-Instance Enforcement**: `try_focus_existing_instance()` ensures only one Integrator engine accesses local
 //!   hardware devices (display capture, virtual camera DAL, audio endpoints) at a time, preventing driver conflicts.
 
+// Suppress creating a visible Win32 console window when launching the standalone binary on Windows GUI sessions.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,7 +192,9 @@ fn main() -> Result<()> {
                 while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     std::thread::sleep(SIGNAL_POLL_INTERVAL);
                 }
-                // Initiate orderly subsystem shutdown
+                // Notify any active native UI (e.g., macOS AppKit runloop) before unregistering callbacks
+                core::emit_ui_event("quit", "{}");
+                // Initiate orderly subsystem shutdown (idempotent if main() also calls shutdown())
                 core_for_sig.shutdown();
             })
             .ok();

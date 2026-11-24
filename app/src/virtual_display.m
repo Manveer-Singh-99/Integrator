@@ -101,7 +101,15 @@ static NSString * const kDefaultVirtualDisplayName = @"Integrator Extended Displ
 /// Fallback GCD queue label when host application has no bundle identifier.
 static NSString * const kFallbackVdQueueLabel = @"com.integrator.vd";
 
+/// Maximum supported virtual display pixel width or height (16K upper bound).
+static const uint32_t kMaxVirtualDisplayDimension = 16384;
+
+/// Maximum supported virtual display refresh rate in Hertz (`480 Hz`).
+static const uint32_t kMaxVirtualDisplayFps = 480;
+
 /// Objective-C protocol interface describing the private `CGVirtualDisplayMode` class.
+/// Parameter types (`uint32_t`, `double`, `BOOL`) match Apple CoreGraphics SPI ObjC type encodings
+/// (`I`, `d`, `B`) verified directly on macOS ARM64.
 @interface IntegratorVDModeProto : NSObject
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height refreshRate:(double)refreshRate;
 @end
@@ -154,11 +162,11 @@ static NSObject *vd_lock_obj(void) {
 /// Instantiates an in-process virtual display on macOS using private CoreGraphics SPI.
 ///
 /// - Parameters:
-///   - width: Display width in pixels (e.g. 1920, 2560, 3840).
-///   - height: Display height in pixels (e.g. 1080, 1440, 2160).
-///   - fps: Refresh rate in Hertz (e.g. 60, 120, 144).
+///   - width: Display width in pixels (`1..16384`; defaults to `1920` when `0` or out-of-range).
+///   - height: Display height in pixels (`1..16384`; defaults to `1080` when `0` or out-of-range).
+///   - fps: Refresh rate in Hertz (`1..480`; defaults to `60` when `0` or out-of-range).
 ///   - hi_dpi: Whether to synthesize 2x HiDPI scaled logical modes.
-/// - Returns: CoreGraphics `CGDirectDisplayID` on success, or 0 on failure.
+/// - Returns: CoreGraphics `CGDirectDisplayID` on success, or `0` on failure.
 uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi) {
     @autoreleasepool {
         @try {
@@ -173,9 +181,9 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                 return 0;
             }
 
-            if (width == 0) width = kDefaultVirtualDisplayWidth;
-            if (height == 0) height = kDefaultVirtualDisplayHeight;
-            if (fps == 0) fps = kDefaultVirtualDisplayFps;
+            if (width == 0 || width > kMaxVirtualDisplayDimension) width = kDefaultVirtualDisplayWidth;
+            if (height == 0 || height > kMaxVirtualDisplayDimension) height = kDefaultVirtualDisplayHeight;
+            if (fps == 0 || fps > kMaxVirtualDisplayFps) fps = kDefaultVirtualDisplayFps;
 
             @synchronized(vd_lock_obj()) {
                 if (!g_vd_queue) {
@@ -270,9 +278,12 @@ uint32_t start_virtual_display_in_app(uint32_t width, uint32_t height, uint32_t 
                     uint32_t logicalW = (width / 2) & ~1u;
                     uint32_t logicalH = (height / 2) & ~1u;
                     if (logicalW >= 800 && logicalH >= 600) {
-                        id loDpiMode = [(IntegratorVDModeProto *)[modeCls alloc] initWithWidth:logicalW height:logicalH refreshRate:(double)fps];
-                        if (loDpiMode) {
-                            [modes addObject:loDpiMode];
+                        id loAlloc = [modeCls alloc];
+                        if ([loAlloc respondsToSelector:@selector(initWithWidth:height:refreshRate:)]) {
+                            id loDpiMode = [(IntegratorVDModeProto *)loAlloc initWithWidth:logicalW height:logicalH refreshRate:(double)fps];
+                            if (loDpiMode) {
+                                [modes addObject:loDpiMode];
+                            }
                         }
                     }
                 }
@@ -322,39 +333,47 @@ void stop_virtual_display_in_app(void) {
     }
 }
 
-/// Returns the `CGDirectDisplayID` of the active Integrator virtual display, or 0 if inactive.
+/// Returns the `CGDirectDisplayID` of the active Integrator virtual display, or `0` if inactive.
 uint32_t get_virtual_display_id_in_app(void) {
-    @synchronized(vd_lock_obj()) {
-        if (g_virtual_display != nil && g_virtual_display_id != 0) {
-            if (CGDisplayIsOnline(g_virtual_display_id)) {
-                return (uint32_t)g_virtual_display_id;
-            }
-            // Clear stale display state if CoreGraphics dropped the virtual display across sleep/wake.
-            g_virtual_display = nil;
-            g_virtual_display_id = 0;
-        }
-    }
-
-    // Fallback scan for an active virtual display created by Integrator (even in a sibling CLI/process)
-    uint32_t count = 0;
-    if (CGGetOnlineDisplayList(0, NULL, &count) == kCGErrorSuccess && count > 0) {
-        CGDirectDisplayID *list = (CGDirectDisplayID *)calloc(count, sizeof(CGDirectDisplayID));
-        if (list) {
-            if (CGGetOnlineDisplayList(count, list, &count) == kCGErrorSuccess) {
-                for (uint32_t i = 0; i < count; i++) {
-                    if (CGDisplayIsOnline(list[i]) &&
-                        CGDisplayVendorNumber(list[i]) == INTEGRATOR_VD_VENDOR &&
-                        CGDisplayModelNumber(list[i]) == INTEGRATOR_VD_PRODUCT) {
-                        uint32_t found = (uint32_t)list[i];
-                        free(list);
-                        return found;
+    @autoreleasepool {
+        @try {
+            @synchronized(vd_lock_obj()) {
+                if (g_virtual_display != nil && g_virtual_display_id != 0) {
+                    if (CGDisplayIsOnline(g_virtual_display_id)) {
+                        return (uint32_t)g_virtual_display_id;
                     }
+                    // Clear stale display state if CoreGraphics dropped the virtual display across sleep/wake.
+                    g_virtual_display = nil;
+                    g_virtual_display_id = 0;
                 }
             }
-            free(list);
+
+            // Fallback scan for an active virtual display created by Integrator (even in a sibling CLI/process)
+            uint32_t count = 0;
+            if (CGGetOnlineDisplayList(0, NULL, &count) == kCGErrorSuccess && count > 0) {
+                uint32_t cap = (count > 64u) ? 64u : count;
+                CGDirectDisplayID *list = (CGDirectDisplayID *)calloc(cap, sizeof(CGDirectDisplayID));
+                if (list) {
+                    uint32_t actual = 0;
+                    if (CGGetOnlineDisplayList(cap, list, &actual) == kCGErrorSuccess) {
+                        for (uint32_t i = 0; i < actual; i++) {
+                            if (CGDisplayIsOnline(list[i]) &&
+                                CGDisplayVendorNumber(list[i]) == INTEGRATOR_VD_VENDOR &&
+                                CGDisplayModelNumber(list[i]) == INTEGRATOR_VD_PRODUCT) {
+                                uint32_t found = (uint32_t)list[i];
+                                free(list);
+                                return found;
+                            }
+                        }
+                    }
+                    free(list);
+                }
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[Integrator] Exception in get_virtual_display_id_in_app: %@ (%@)", ex.name, ex.reason);
         }
+        return 0;
     }
-    return 0;
 }
 
 /// Returns whether an Integrator virtual display is currently active.
@@ -362,30 +381,78 @@ bool is_virtual_display_active_in_app(void) {
     return get_virtual_display_id_in_app() != 0;
 }
 
-/// Queries the primary display dimensions and refresh rate on macOS.
-///
-/// - Parameters:
-///   - out_w: Pointer receiving primary width in pixels.
-///   - out_h: Pointer receiving primary height in pixels.
-///   - out_fps: Pointer receiving refresh rate in Hertz.
-void get_primary_display_info_mac(uint32_t *out_w, uint32_t *out_h, uint32_t *out_fps) {
+/// Selects the primary physical online display on macOS, ignoring Integrator's own virtual display.
+static CGDirectDisplayID select_physical_primary_display(void) {
     CGDirectDisplayID main_id = CGMainDisplayID();
-    uint32_t w = (uint32_t)CGDisplayPixelsWide(main_id);
-    uint32_t h = (uint32_t)CGDisplayPixelsHigh(main_id);
-    uint32_t fps = kDefaultVirtualDisplayFps;
-
-    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_id);
-    if (mode != NULL) {
-        size_t pw = CGDisplayModeGetPixelWidth(mode);
-        size_t ph = CGDisplayModeGetPixelHeight(mode);
-        double rr = CGDisplayModeGetRefreshRate(mode);
-        if (pw > 0) w = (uint32_t)pw;
-        if (ph > 0) h = (uint32_t)ph;
-        if (rr > 1.0) fps = (uint32_t)llround(rr);
-        CGDisplayModeRelease(mode);
+    if (main_id != kCGNullDirectDisplay &&
+        CGDisplayIsOnline(main_id) &&
+        !(CGDisplayVendorNumber(main_id) == INTEGRATOR_VD_VENDOR &&
+          CGDisplayModelNumber(main_id) == INTEGRATOR_VD_PRODUCT)) {
+        return main_id;
     }
 
-    if (out_w) *out_w = w;
-    if (out_h) *out_h = h;
-    if (out_fps) *out_fps = fps;
+    uint32_t count = 0;
+    if (CGGetOnlineDisplayList(0, NULL, &count) == kCGErrorSuccess && count > 0) {
+        uint32_t cap = (count > 64u) ? 64u : count;
+        CGDirectDisplayID *list = (CGDirectDisplayID *)calloc(cap, sizeof(CGDirectDisplayID));
+        if (list) {
+            uint32_t actual = 0;
+            if (CGGetOnlineDisplayList(cap, list, &actual) == kCGErrorSuccess) {
+                for (uint32_t i = 0; i < actual; i++) {
+                    if (CGDisplayIsOnline(list[i]) &&
+                        !(CGDisplayVendorNumber(list[i]) == INTEGRATOR_VD_VENDOR &&
+                          CGDisplayModelNumber(list[i]) == INTEGRATOR_VD_PRODUCT)) {
+                        CGDirectDisplayID phys = list[i];
+                        free(list);
+                        return phys;
+                    }
+                }
+            }
+            free(list);
+        }
+    }
+    return main_id;
+}
+
+/// Queries the primary physical display dimensions and refresh rate on macOS.
+///
+/// Falls back cleanly to `1920x1080 @ 60Hz` if headless or when ProMotion/VRR reports `0.0` Hz.
+///
+/// - Parameters:
+///   - out_w: Optional pointer receiving primary width in pixels.
+///   - out_h: Optional pointer receiving primary height in pixels.
+///   - out_fps: Optional pointer receiving refresh rate in Hertz (`1..480`).
+void get_primary_display_info_mac(uint32_t *out_w, uint32_t *out_h, uint32_t *out_fps) {
+    @autoreleasepool {
+        CGDirectDisplayID target_id = select_physical_primary_display();
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint32_t fps = kDefaultVirtualDisplayFps;
+
+        if (target_id != kCGNullDirectDisplay && CGDisplayIsOnline(target_id)) {
+            w = (uint32_t)CGDisplayPixelsWide(target_id);
+            h = (uint32_t)CGDisplayPixelsHigh(target_id);
+
+            CGDisplayModeRef mode = CGDisplayCopyDisplayMode(target_id);
+            if (mode != NULL) {
+                size_t pw = CGDisplayModeGetPixelWidth(mode);
+                size_t ph = CGDisplayModeGetPixelHeight(mode);
+                double rr = CGDisplayModeGetRefreshRate(mode);
+                if (pw > 0 && pw <= kMaxVirtualDisplayDimension) w = (uint32_t)pw;
+                if (ph > 0 && ph <= kMaxVirtualDisplayDimension) h = (uint32_t)ph;
+                if (isfinite(rr) && rr > 1.0 && rr <= (double)kMaxVirtualDisplayFps) {
+                    fps = (uint32_t)llround(rr);
+                }
+                CGDisplayModeRelease(mode);
+            }
+        }
+
+        if (w == 0) w = kDefaultVirtualDisplayWidth;
+        if (h == 0) h = kDefaultVirtualDisplayHeight;
+        if (fps == 0) fps = kDefaultVirtualDisplayFps;
+
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_fps) *out_fps = fps;
+    }
 }

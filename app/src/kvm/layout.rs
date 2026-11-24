@@ -223,9 +223,16 @@ pub fn sanitize_layout(cfg: &mut KvmLayoutConfig) {
 /// # Returns
 /// The geometrically inverted `KvmLayoutConfig` for the peer workstation.
 pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
+    // Invert alignment_offset so a positive local offset (peer shifted down/right) maps cleanly
+    // to a negative offset on the peer's side, keeping edge crossings geometrically symmetric.
+    let safe_offset = if local.alignment_offset.is_finite() {
+        (-local.alignment_offset).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
     KvmLayoutConfig {
         peer_edge: local.peer_edge.opposite(),
-        alignment_offset: (-local.alignment_offset).clamp(-0.5, 0.5),
+        alignment_offset: safe_offset,
         hop_delay_ms: local.hop_delay_ms.min(MAX_HOP_DELAY_MS),
         dead_corners: local.dead_corners,
         modifier_translation: local.modifier_translation,
@@ -233,6 +240,8 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
         ghost_thumbnail: local.ghost_thumbnail,
         qos_clamp: local.qos_clamp,
         drop_folder: local.drop_folder.clone(),
+        // Always advertise allow_remote_control = true in the peer-mirrored config so local
+        // inbound privacy policy never accidentally disables outgoing control on the peer.
         allow_remote_control: true,
         updated_at_ms: local.updated_at_ms,
     }
@@ -251,8 +260,23 @@ pub fn mirror_layout_for_peer(local: &KvmLayoutConfig) -> KvmLayoutConfig {
 /// * `y` - Pointer Y coordinate.
 ///
 /// # Returns
-/// `true` if within a dead corner, suppressing KVM hopping.
+/// `true` if within a dead corner (or if inputs/bounds are non-finite or degenerate),
+/// suppressing KVM hopping.
 pub fn is_in_dead_corner(rect: ScreenRect, edge: ScreenEdge, x: f32, y: f32) -> bool {
+    // Fail closed (suppress hop) if coordinates or display dimensions are malformed/non-finite.
+    if !x.is_finite()
+        || !y.is_finite()
+        || !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.width.is_finite()
+        || !rect.height.is_finite()
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+    {
+        return true;
+    }
+    // Cap corner guard band at 15% of the active edge length so small/headless displays keep a
+    // usable middle crossing region instead of overlapping top and bottom guards.
     let guard_y = DEAD_CORNER_PX.min(rect.height * MAX_DEAD_CORNER_RATIO);
     let guard_x = DEAD_CORNER_PX.min(rect.width * MAX_DEAD_CORNER_RATIO);
     match edge {
@@ -265,7 +289,7 @@ pub fn is_in_dead_corner(rect: ScreenRect, edge: ScreenEdge, x: f32, y: f32) -> 
     }
 }
 
-/// Converts a local coordinate `(x, y)` exiting `exit_edge` into a normalized `[0.0, 1.0]`
+/// Converts a local coordinate `(x, y)` exiting `exit_edge` into a normalized `[0.02, 0.98]`
 /// coordinate along that edge, accounting for perpendicular desk `alignment_offset`.
 ///
 /// Clamps output within `[0.02, 0.98]` to guarantee the cursor lands cleanly on the active
@@ -287,16 +311,18 @@ pub fn compute_normalized_edge_pos(
     y: f32,
     alignment_offset: f32,
 ) -> f32 {
+    // Project along the axis perpendicular to the crossed boundary; guard sub-pixel bounds
+    // against division by zero or extreme magnification.
     let raw = match exit_edge {
         ScreenEdge::Left | ScreenEdge::Right => {
-            if rect.height <= 1.0 {
+            if !rect.height.is_finite() || rect.height <= 1.0 {
                 0.5
             } else {
                 (y - rect.y) / rect.height
             }
         }
         ScreenEdge::Top | ScreenEdge::Bottom => {
-            if rect.width <= 1.0 {
+            if !rect.width.is_finite() || rect.width <= 1.0 {
                 0.5
             } else {
                 (x - rect.x) / rect.width
@@ -311,14 +337,16 @@ pub fn compute_normalized_edge_pos(
     if !raw.is_finite() {
         return 0.5;
     }
+    // Subtract alignment_offset so the peer's resolve_entry_point maps the cursor symmetrically
+    // across physically misaligned monitors, then clamp away from 0.0/1.0 corner singularities.
     (raw - offset).clamp(EDGE_NORM_MIN, EDGE_NORM_MAX)
 }
 
 /// Resolves an entry point `(px, py)` just inside `entry_edge` on the destination display.
 ///
 /// Maps the incoming normalized position `norm_pos` to the target screen's dimensions,
-/// applying an inward inset (typically 6.0 px) so the cursor is immediately recognized
-/// as inside the target workstation's display bounds.
+/// applying an inward inset (typically 6.0 px to 24.0 px) so the cursor is immediately
+/// recognized as inside the target workstation's display bounds and does not bounce back.
 ///
 /// # Arguments
 /// * `target_rect` - Destination screen bounding box.
@@ -339,27 +367,31 @@ pub fn resolve_entry_point(
     } else {
         0.5
     };
-    let inset = if inset_px.is_finite() {
+    let raw_inset = if inset_px.is_finite() {
         inset_px.max(MIN_ENTRY_INSET_PX)
     } else {
         DEFAULT_ENTRY_INSET_PX
     };
+    // Bound inward inset to at most half the display span along the crossing axis so small
+    // viewports never overshoot the opposite display edge.
+    let x_inset = raw_inset.min((target_rect.width * 0.5).max(0.0));
+    let y_inset = raw_inset.min((target_rect.height * 0.5).max(0.0));
     match entry_edge {
         ScreenEdge::Left => (
-            target_rect.x + inset,
+            target_rect.x + x_inset,
             target_rect.y + n * target_rect.height,
         ),
         ScreenEdge::Right => (
-            target_rect.max_x() - inset,
+            target_rect.max_x() - x_inset,
             target_rect.y + n * target_rect.height,
         ),
         ScreenEdge::Top => (
             target_rect.x + n * target_rect.width,
-            target_rect.y + inset,
+            target_rect.y + y_inset,
         ),
         ScreenEdge::Bottom => (
             target_rect.x + n * target_rect.width,
-            target_rect.max_y() - inset,
+            target_rect.max_y() - y_inset,
         ),
     }
 }
@@ -476,5 +508,37 @@ mod tests {
             resolve_entry_point(multi_desk_rect, ScreenEdge::Right, 0.5, 6.0);
         assert!((enter_rx - 2554.0).abs() < 1e-4);
         assert!((enter_ry - 560.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_dead_corner_and_entry_point_degenerate_bounds_do_not_panic() {
+        let normal = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        assert!(is_in_dead_corner(normal, ScreenEdge::Left, f32::NAN, 500.0));
+        assert!(is_in_dead_corner(
+            ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 100.0
+            },
+            ScreenEdge::Left,
+            0.0,
+            50.0
+        ));
+
+        let tiny = ScreenRect {
+            x: 10.0,
+            y: 20.0,
+            width: 8.0,
+            height: 8.0,
+        };
+        let (rx, ry) = resolve_entry_point(tiny, ScreenEdge::Left, 0.5, 24.0);
+        assert!(rx >= tiny.x && rx <= tiny.max_x());
+        assert!(ry >= tiny.y && ry <= tiny.max_y());
     }
 }

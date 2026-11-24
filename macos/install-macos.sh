@@ -1,7 +1,36 @@
 #!/usr/bin/env bash
-# Standalone macOS installer for Mac <-> Windows USB-C Direct Link.
-# Runs an event-driven LaunchDaemon watchdog via scutil dynamic store notifications (0% CPU, zero polling).
-# Automatically adapts to macOS Internet Sharing (bridge100) and Apple USB-C NCM ports.
+# ==============================================================================
+# Integrator USB-C CDC-NCM Dynamic Link Installer (`install-macos.sh`)
+# ==============================================================================
+#
+# 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+#    Installs a root-owned macOS LaunchDaemon watchdog (`com.integrator.usbncm`)
+#    driven by `scutil` dynamic store notifications (`0%` CPU, zero polling).
+#    Automatically maintains the macOS USB-C CDC-NCM direct link IPv4 address
+#    (`MAC_DIRECT_IP`, defaulting to `10.99.99.2/24`) whether macOS Internet
+#    Sharing (`bridge100`) is active or idle, and transmits lightweight UDP sharing
+#    hint packets (`ON` / `OFF`) to the paired Windows NCM bridge service.
+#
+# 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
+#    - Upstream Callers: Guided installer command shown in Integrator Setup
+#      Assistant (`app/src/setup.rs`) or direct `sudo bash macos/install-macos.sh`.
+#    - Downstream Callees: `/usr/sbin/scutil`, `ioreg` (`AppleUSBDeviceNCMData`),
+#      `networksetup`, `ifconfig`, `/dev/udp` (with `/usr/bin/python3` fallback),
+#      `launchctl bootstrap system`.
+#    - Cross-Platform Flow: Coordinates interface aliases with Windows companion
+#      bridge (`windows/AppleUsbNcmBridge.cs`) over UDP port `HINT_PORT` (`47901`).
+#
+# 3. EXECUTION & CONCURRENCY MODEL
+#    Installer writes a root-owned standalone daemon script under
+#    `/Library/PrivilegedHelperTools` and registers a persistent LaunchDaemon plist.
+#    The watchdog daemon reacts purely to `State:/Network/Interface/.*` kernel events.
+#
+# 4. SECURITY & SAFETY INVARIANTS
+#    - Strict Input Validation: All configurable IPs, ports, byte sizes, identifiers,
+#      and paths are strictly validated before generating the privileged script or XML plist.
+#    - Safe Least-Privilege Permissions: Root-owned (`root:wheel`, `0755` / `0644`),
+#      upgrading/cleaning legacy writable scripts in `/usr/local/bin/` and old plists.
+#    - Explicit `PATH`: Daemon pins `/usr/bin:/bin:/usr/sbin:/sbin` to prevent hijacking.
 #
 # Configurable environment variables (override before invoking `sudo -E` or inline):
 #   MAC_DIRECT_IP        macOS Direct Link IPv4 address             (default: 10.99.99.2)
@@ -18,6 +47,7 @@
 #   NEW_PLIST            LaunchDaemon plist destination path        (default: /Library/LaunchDaemons/${PLIST_LABEL}.plist)
 #   OLD_PLIST            Legacy plist path to remove during upgrade (default: /Library/LaunchDaemons/com.antigravity.usbncm.plist)
 #   LEGACY_WATCHDOG_PATH Legacy user-writable watchdog copy path    (default: /usr/local/bin/apple-usb-ncm-watchdog.sh)
+# ==============================================================================
 
 set -euo pipefail
 
@@ -143,6 +173,7 @@ validate_uint_range "MAX_LOG_BYTES" "$MAX_LOG_BYTES" 1024 1073741824
 validate_identifier "BRIDGE_IFACE" "$BRIDGE_IFACE"
 validate_identifier "PLIST_LABEL" "$PLIST_LABEL"
 validate_plist_path "WATCHDOG_PATH" "$WATCHDOG_PATH"
+validate_plist_path "NEW_PLIST" "$NEW_PLIST"
 validate_plist_path "LOG_STDOUT" "$LOG_STDOUT"
 validate_plist_path "LOG_STDERR" "$LOG_STDERR"
 
@@ -173,6 +204,7 @@ cat << 'EOF' >> "$WATCHDOG_PATH"
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Rotates daemon stdout/stderr logs once they exceed MAX_LOG_BYTES (keeps one .1 backup).
 rotate_log_if_needed() {
     local f="$1"
     if [ -f "$f" ]; then
@@ -184,6 +216,7 @@ rotate_log_if_needed() {
     fi
 }
 
+# Returns 0 when interface $1 currently owns exact IPv4 address $2 (`inet <ip>`).
 iface_has_ip() {
     local iface="$1"
     local target_ip="$2"
@@ -193,6 +226,7 @@ iface_has_ip() {
     '
 }
 
+# Sends an authenticated-allowlist "ON"/"OFF" UDP sharing state hint to configured peer IP/port.
 send_hint() {
     local msg="$1"
     local host="$2"
@@ -214,6 +248,7 @@ s.close()' "$msg" "$host" "$port" 2>/dev/null || true
     fi
 }
 
+# Discovers BSD interface names (enX) belonging strictly to Apple USB-C CDC-NCM gadget ports.
 discover_usb_ncm_ifaces() {
     local discovered=""
     # Primary: query IORegistry specifically for Apple USB-C NCM gadget Ethernet interfaces
@@ -246,6 +281,7 @@ discover_usb_ncm_ifaces() {
     echo "$discovered"
 }
 
+# Reconciles bridge100 vs direct USB-C NCM interface IPs and emits Windows sharing state hints.
 sync_network() {
     rotate_log_if_needed "$LOG_STDOUT"
     rotate_log_if_needed "$LOG_STDERR"
@@ -315,12 +351,12 @@ sync_network() {
     fi
 }
 
+# Terminates any background pipeline jobs cleanly when the daemon receives SIGTERM/SIGINT.
 cleanup_children() {
-    local pids
-    pids=$(jobs -p 2>/dev/null || true)
-    if [ -n "$pids" ]; then
-        kill $pids 2>/dev/null || true
-    fi
+    local pid
+    for pid in $(jobs -p 2>/dev/null || true); do
+        kill "$pid" 2>/dev/null || true
+    done
 }
 trap cleanup_children EXIT TERM INT
 

@@ -19,9 +19,9 @@
 //        * `passkey_get_assertion_remote`: Requests remote Mac to prompt Touch ID and sign assertion.
 //    - Downstream Win32 OS APIs:
 //        * `webauthn.dll`: `WebAuthNPluginAddAuthenticator2`, `WebAuthNPluginGetAuthenticatorState`,
-//          `WebAuthNPluginSetAuthenticatorState`, `WebAuthNDecodeMakeCredentialRequest`,
-//          `WebAuthNEncodeMakeCredentialResponse`, `WebAuthNDecodeGetAssertionRequest`,
-//          `WebAuthNEncodeGetAssertionResponse`, `WebAuthNPluginAuthenticatorAddCredentials`.
+//          `WebAuthNDecodeMakeCredentialRequest`, `WebAuthNEncodeMakeCredentialResponse`,
+//          `WebAuthNDecodeGetAssertionRequest`, `WebAuthNEncodeGetAssertionResponse`,
+//          `WebAuthNPluginAuthenticatorAddCredentials`.
 //        * `ole32.dll`: `CoRegisterClassObject`, `CoRevokeClassObject`.
 //    - Cross-Platform & Remote Coordination:
 //        * Windows Browser -> Windows WebAuthn -> COM `IPluginAuthenticator` -> C# -> `TransportSessionV2` ->
@@ -40,12 +40,15 @@
 //      Secure Enclave / Keystore; Windows only processes public keys and signatures.
 //    - Package Identity: The hosting process links to the sparse MSIX package `Integrator.PasskeyProvider`
 //      via `app.manifest` `<msix>` block, satisfying Windows security boundary requirements.
+//    - Native Pointer & DLL Search Hygiene: All P/Invokes enforce `[DefaultDllImportSearchPaths(DllImportSearchPath.System32)]`,
+//      decoded Win32 lengths/counts are bounded, and all unmanaged allocations are deterministically freed in `finally`.
 // ==============================================================================================
 
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
+using System.Threading;
 
 namespace IntegratorUI
 {
@@ -395,53 +398,76 @@ namespace IntegratorUI
     /// <summary>Request DTO dispatched to Rust core to invoke remote Mac passkey creation.</summary>
     internal sealed class RemotePasskeyMakeCredentialDto
     {
+        /// <summary>Optional target Mac peer IP override (null auto-selects best paired Mac).</summary>
         [JsonPropertyName("peer_ip")] public string? PeerIp { get; set; }
+        /// <summary>MakeCredential request payload forwarded to macOS Secure Enclave.</summary>
         [JsonPropertyName("request")] public RemotePasskeyMakeCredRequestData Request { get; set; } = new();
     }
 
     /// <summary>MakeCredential inner request parameters.</summary>
     internal sealed class RemotePasskeyMakeCredRequestData
     {
+        /// <summary>Hex-encoded 32-byte SHA-256 clientDataJSON hash.</summary>
         [JsonPropertyName("client_data_hash_hex")] public string ClientDataHashHex { get; set; } = string.Empty;
+        /// <summary>Relying Party domain identifier (e.g., "github.com").</summary>
         [JsonPropertyName("rp_id")] public string RpId { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn user handle byte array.</summary>
         [JsonPropertyName("user_id_hex")] public string UserIdHex { get; set; } = string.Empty;
+        /// <summary>Account username handle.</summary>
         [JsonPropertyName("user_name")] public string UserName { get; set; } = string.Empty;
+        /// <summary>Human-readable account display name.</summary>
         [JsonPropertyName("user_display_name")] public string UserDisplayName { get; set; } = string.Empty;
+        /// <summary>Windows workstation hostname displayed in the Mac Touch ID prompt.</summary>
         [JsonPropertyName("requester_hostname")] public string RequesterHostname { get; set; } = Environment.MachineName;
     }
 
     /// <summary>Response DTO returned from Rust core for passkey creation.</summary>
     internal sealed class RemotePasskeyMakeCredResponseData
     {
+        /// <summary>Hex-encoded newly generated credential identifier.</summary>
         [JsonPropertyName("credential_id_hex")] public string CredentialIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn authenticatorData bytes.</summary>
         [JsonPropertyName("auth_data_hex")] public string AuthDataHex { get; set; } = string.Empty;
+        /// <summary>WebAuthn attestation statement format (default "none").</summary>
         [JsonPropertyName("attestation_format")] public string AttestationFormat { get; set; } = "none";
+        /// <summary>Optional hex-encoded CBOR attestation object bytes.</summary>
         [JsonPropertyName("attestation_object_cbor_hex")] public string AttestationObjectCborHex { get; set; } = string.Empty;
     }
 
     /// <summary>Request DTO dispatched to Rust core to invoke remote Mac passkey assertion.</summary>
     internal sealed class RemotePasskeyGetAssertionDto
     {
+        /// <summary>Optional target Mac peer IP override (null auto-selects best paired Mac).</summary>
         [JsonPropertyName("peer_ip")] public string? PeerIp { get; set; }
+        /// <summary>GetAssertion request payload forwarded to macOS Secure Enclave.</summary>
         [JsonPropertyName("request")] public RemotePasskeyGetAssertRequestData Request { get; set; } = new();
     }
 
     /// <summary>GetAssertion inner request parameters.</summary>
     internal sealed class RemotePasskeyGetAssertRequestData
     {
+        /// <summary>Hex-encoded 32-byte SHA-256 clientDataJSON hash.</summary>
         [JsonPropertyName("client_data_hash_hex")] public string ClientDataHashHex { get; set; } = string.Empty;
+        /// <summary>Relying Party domain identifier.</summary>
         [JsonPropertyName("rp_id")] public string RpId { get; set; } = string.Empty;
+        /// <summary>Hex-encoded list of allowed credential IDs (empty for discoverable passkeys).</summary>
         [JsonPropertyName("allow_credential_ids_hex")] public List<string> AllowCredentialIdsHex { get; set; } = new();
+        /// <summary>Windows workstation hostname displayed in the Mac Touch ID prompt.</summary>
         [JsonPropertyName("requester_hostname")] public string RequesterHostname { get; set; } = Environment.MachineName;
     }
 
     /// <summary>Response DTO returned from Rust core for passkey assertion.</summary>
     internal sealed class RemotePasskeyGetAssertResponseData
     {
+        /// <summary>Hex-encoded credential identifier that signed the assertion.</summary>
         [JsonPropertyName("credential_id_hex")] public string CredentialIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded user handle associated with the matched resident passkey.</summary>
         [JsonPropertyName("user_id_hex")] public string UserIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn authenticatorData bytes.</summary>
         [JsonPropertyName("auth_data_hex")] public string AuthDataHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded ASN.1 DER ECDSA P-256 assertion signature.</summary>
         [JsonPropertyName("signature_der_hex")] public string SignatureDerHex { get; set; } = string.Empty;
+        /// <summary>Monotonic authenticator signature counter value.</summary>
         [JsonPropertyName("sign_count")] public uint SignCount { get; set; }
     }
 
@@ -471,9 +497,6 @@ namespace IntegratorUI
         /// <summary>IID GUID instance for IPluginAuthenticator.</summary>
         public static readonly Guid IID_IPluginAuthenticator = new(IID_IPluginAuthenticator_String);
 
-        /// <summary>IID GUID instance for IClassFactory.</summary>
-        public static readonly Guid IID_IClassFactory = new("00000001-0000-0000-C000-000000000046");
-
         /// <summary>IID GUID instance for IUnknown.</summary>
         public static readonly Guid IID_IUnknown = new("00000000-0000-0000-C000-000000000046");
 
@@ -495,6 +518,9 @@ namespace IntegratorUI
         /// <summary>Standard COM E_NOINTERFACE status code.</summary>
         private const int E_NOINTERFACE = unchecked((int)0x80004002);
 
+        /// <summary>Standard COM CLASS_E_NOAGGREGATION status code.</summary>
+        private const int CLASS_E_NOAGGREGATION = unchecked((int)0x80040110);
+
         /// <summary>Win32 error code indicating entity already exists.</summary>
         private const int NTE_EXISTS = unchecked((int)0x8009000F);
 
@@ -513,6 +539,12 @@ namespace IntegratorUI
         /// <summary>Current version constant for WEBAUTHN_ASSERTION.</summary>
         private const uint WEBAUTHN_ASSERTION_CURRENT_VERSION = 1u;
 
+        /// <summary>Maximum allowed byte length (4096 bytes) for decoded native WebAuthn byte fields.</summary>
+        private const uint MaxNativeFieldBytes = 4096u;
+
+        /// <summary>Maximum allowed number of credential descriptors (256) read from an allowList.</summary>
+        private const uint MaxAllowCredentialCount = 256u;
+
         /// <summary>Canonical attestation format name for zero/self attestation.</summary>
         private const string WEBAUTHN_ATTESTATION_TYPE_NONE = "none";
 
@@ -523,9 +555,11 @@ namespace IntegratorUI
         private const string PLUGIN_RP_ID = "integrator.local";
 
         // --------------------------------------------------------------------------------------
-        // Win32 API P/Invoke Imports
+        // Win32 API P/Invoke Imports (System32-pinned to prevent DLL search-order hijacking)
         // --------------------------------------------------------------------------------------
 
+        /// <summary>Registers an out-of-process COM class object with the Windows SCM.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll")]
         private static extern int CoRegisterClassObject(
             ref Guid rclsid,
@@ -534,53 +568,72 @@ namespace IntegratorUI
             uint flags,
             out uint lpdwRegister);
 
+        /// <summary>Revokes a previously registered COM class object cookie.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll")]
         private static extern int CoRevokeClassObject(uint dwRegister);
 
+        /// <summary>Registers the plugin authenticator metadata and CBOR capabilities with Windows WebAuthn.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         private static extern int WebAuthNPluginAddAuthenticator2(
             ref WEBAUTHN_PLUGIN_ADD_AUTHENTICATOR_OPTIONS_2 options,
             out IntPtr response);
 
+        /// <summary>Frees the response buffer allocated by <see cref="WebAuthNPluginAddAuthenticator2"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern void WebAuthNPluginFreeAddAuthenticatorResponse(IntPtr response);
 
+        /// <summary>Queries the current enabled/disabled state of a registered WebAuthn plugin authenticator.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern int WebAuthNPluginGetAuthenticatorState(ref Guid rclsid, out int state);
 
-        [DllImport("webauthn.dll")]
-        private static extern int WebAuthNPluginSetAuthenticatorState(ref Guid rclsid, int state);
-
+        /// <summary>Decodes an incoming CTAP2 CBOR MakeCredential request into a structured native descriptor.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         private static extern int WebAuthNDecodeMakeCredentialRequest(
             uint cbEncoded,
             IntPtr pbEncoded,
             out IntPtr ppMakeCredentialRequest);
 
+        /// <summary>Frees a decoded MakeCredential request structure returned by <see cref="WebAuthNDecodeMakeCredentialRequest"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern void WebAuthNFreeDecodedMakeCredentialRequest(IntPtr pMakeCredentialRequest);
 
+        /// <summary>Encodes a WebAuthn attestation structure into a CTAP2 CBOR MakeCredential response buffer.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         private static extern int WebAuthNEncodeMakeCredentialResponse(
             ref WEBAUTHN_CREDENTIAL_ATTESTATION pCredentialAttestation,
             out uint pcbResp,
             out IntPtr ppbResp);
 
+        /// <summary>Decodes an incoming CTAP2 CBOR GetAssertion request into a structured native descriptor.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         private static extern int WebAuthNDecodeGetAssertionRequest(
             uint cbEncoded,
             IntPtr pbEncoded,
             out IntPtr ppGetAssertionRequest);
 
+        /// <summary>Frees a decoded GetAssertion request structure returned by <see cref="WebAuthNDecodeGetAssertionRequest"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern void WebAuthNFreeDecodedGetAssertionRequest(IntPtr pGetAssertionRequest);
 
+        /// <summary>Encodes a WebAuthn assertion response structure into a CTAP2 CBOR GetAssertion response buffer.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern int WebAuthNEncodeGetAssertionResponse(
             ref EXPERIMENTAL_WEBAUTHN_CTAPCBOR_GET_ASSERTION_RESPONSE pGetAssertionResponse,
             out uint pcbResp,
             out IntPtr ppbResp);
 
+        /// <summary>Registers resident passkey metadata in the Windows Credential Manager autofill cache.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         private static extern int WebAuthNPluginAuthenticatorAddCredentials(
             ref Guid rclsid,
@@ -591,16 +644,20 @@ namespace IntegratorUI
         // Singleton State & Registration Cookies
         // --------------------------------------------------------------------------------------
 
+        /// <summary>Mutex protecting initialization, COM registration cookie updates, and teardown.</summary>
         private static readonly object _syncLock = new();
+        /// <summary>Singleton COM factory/authenticator instance.</summary>
         private static PasskeyAuthenticatorPlugin? _instance;
+        /// <summary>Active COM class registration cookie returned by <see cref="CoRegisterClassObject"/>.</summary>
         private static uint _classRegistrationCookie;
-        private static bool _isRegisteredWithWindows;
+        /// <summary>Volatile flag tracking whether Windows WebAuthn reports the plugin as registered and enabled.</summary>
+        private static volatile bool _isRegisteredWithWindows;
 
         /// <summary>Private lock serializing concurrent WebAuthn operations.</summary>
         private readonly object _operationLock = new();
 
         /// <summary>Returns true if the plugin authenticator is initialized and registered.</summary>
-        public static bool IsActive => _isRegisteredWithWindows && _classRegistrationCookie != 0;
+        public static bool IsActive => _isRegisteredWithWindows && Volatile.Read(ref _classRegistrationCookie) != 0;
 
         /// <summary>
         /// Queries Windows 11 WebAuthn subsystem to verify if Integrator Passkey Provider is registered.
@@ -669,18 +726,36 @@ namespace IntegratorUI
 
         /// <summary>
         /// Revokes the COM Class Object and cleans up plugin registration.
+        /// Safe to invoke repeatedly or during partial initialization.
         /// </summary>
         public static void Shutdown()
         {
             lock (_syncLock)
             {
-                if (_classRegistrationCookie != 0)
+                uint cookie = Interlocked.Exchange(ref _classRegistrationCookie, 0u);
+                if (cookie != 0)
                 {
-                    CoRevokeClassObject(_classRegistrationCookie);
-                    _classRegistrationCookie = 0;
+                    try { CoRevokeClassObject(cookie); } catch { }
                 }
                 _instance = null;
             }
+        }
+
+        /// <summary>
+        /// Appends a diagnostic log entry to <c>%USERPROFILE%\.integrator_passkey.log</c> without throwing.
+        /// </summary>
+        /// <param name="message">Formatted diagnostic line including timestamp.</param>
+        private static void AppendDiagnosticLog(string message)
+        {
+            System.Diagnostics.Debug.WriteLine(message);
+            try
+            {
+                string logPath = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".integrator_passkey.log");
+                System.IO.File.AppendAllText(logPath, message);
+            }
+            catch { }
         }
 
         /// <summary>
@@ -688,6 +763,9 @@ namespace IntegratorUI
         /// </summary>
         private static void RegisterWithWindowsSubsystem()
         {
+            IntPtr pClsid = IntPtr.Zero;
+            IntPtr pCbor = IntPtr.Zero;
+            IntPtr pResp = IntPtr.Zero;
             try
             {
                 // Canonical CTAP2 getInfo CBOR bytes:
@@ -700,10 +778,10 @@ namespace IntegratorUI
                 };
 
                 Guid clsid = CLSID_IntegratorPasskeyAuthenticator;
-                IntPtr pClsid = Marshal.AllocHGlobal(Marshal.SizeOf<Guid>());
+                pClsid = Marshal.AllocHGlobal(Marshal.SizeOf<Guid>());
                 Marshal.StructureToPtr(clsid, pClsid, false);
 
-                IntPtr pCbor = Marshal.AllocHGlobal(cborInfo.Length);
+                pCbor = Marshal.AllocHGlobal(cborInfo.Length);
                 Marshal.Copy(cborInfo, 0, pCbor, cborInfo.Length);
 
                 var opts = new WEBAUTHN_PLUGIN_ADD_AUTHENTICATOR_OPTIONS_2
@@ -717,50 +795,26 @@ namespace IntegratorUI
                     ppwszSupportedRpIds = IntPtr.Zero
                 };
 
-                IntPtr pResp;
                 int hr = WebAuthNPluginAddAuthenticator2(ref opts, out pResp);
-                if (pResp != IntPtr.Zero)
-                {
-                    WebAuthNPluginFreeAddAuthenticatorResponse(pResp);
-                }
-
-                Marshal.FreeHGlobal(pClsid);
-                Marshal.FreeHGlobal(pCbor);
-
                 if (hr == S_OK || hr == NTE_EXISTS)
                 {
                     _isRegisteredWithWindows = true;
-                    string logMsg = $"[{DateTime.UtcNow:O}] [PasskeyPlugin] WebAuthn plugin registered successfully (HR=0x{hr:X8})\r\n";
-                    System.Diagnostics.Debug.WriteLine(logMsg);
-                    try
-                    {
-                        string logPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".integrator_passkey.log");
-                        System.IO.File.AppendAllText(logPath, logMsg);
-                    }
-                    catch { }
+                    AppendDiagnosticLog($"[{DateTime.UtcNow:O}] [PasskeyPlugin] WebAuthn plugin registered successfully (HR=0x{hr:X8})\r\n");
                 }
                 else
                 {
-                    string warnMsg = $"[{DateTime.UtcNow:O}] [PasskeyPlugin] WebAuthn plugin registration warning HR=0x{hr:X8}\r\n";
-                    System.Diagnostics.Debug.WriteLine(warnMsg);
-                    try
-                    {
-                        string logPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".integrator_passkey.log");
-                        System.IO.File.AppendAllText(logPath, warnMsg);
-                    }
-                    catch { }
+                    AppendDiagnosticLog($"[{DateTime.UtcNow:O}] [PasskeyPlugin] WebAuthn plugin registration warning HR=0x{hr:X8}\r\n");
                 }
             }
             catch (Exception ex)
             {
-                string err = $"[{DateTime.UtcNow:O}] [PasskeyPlugin] Exception during registration: {ex}\r\n";
-                System.Diagnostics.Debug.WriteLine(err);
-                try
-                {
-                    string logPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".integrator_passkey.log");
-                    System.IO.File.AppendAllText(logPath, err);
-                }
-                catch { }
+                AppendDiagnosticLog($"[{DateTime.UtcNow:O}] [PasskeyPlugin] Exception during registration: {ex}\r\n");
+            }
+            finally
+            {
+                if (pResp != IntPtr.Zero) WebAuthNPluginFreeAddAuthenticatorResponse(pResp);
+                if (pCbor != IntPtr.Zero) Marshal.FreeHGlobal(pCbor);
+                if (pClsid != IntPtr.Zero) Marshal.FreeHGlobal(pClsid);
             }
         }
 
@@ -768,6 +822,7 @@ namespace IntegratorUI
         // IClassFactory Implementation
         // ======================================================================================
 
+        /// <summary>Creates and returns the requested COM interface pointer for this singleton authenticator.</summary>
         int IClassFactory.CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject)
         {
             ppvObject = IntPtr.Zero;
@@ -775,7 +830,7 @@ namespace IntegratorUI
             // Aggregation is not supported for plugin authenticators
             if (pUnkOuter != IntPtr.Zero)
             {
-                return unchecked((int)0x80040110); // CLASS_E_NOAGGREGATION
+                return CLASS_E_NOAGGREGATION;
             }
 
             // Query for IPluginAuthenticator or IUnknown
@@ -788,6 +843,7 @@ namespace IntegratorUI
             return E_NOINTERFACE;
         }
 
+        /// <summary>Implements <c>IClassFactory::LockServer</c> (no-op for process-lifetime singleton).</summary>
         int IClassFactory.LockServer(bool fLock)
         {
             return S_OK;
@@ -828,13 +884,17 @@ namespace IntegratorUI
 
             lock (_operationLock)
             {
+                IntPtr pDecoded = IntPtr.Zero;
+                IntPtr pAuthData = IntPtr.Zero;
+                IntPtr pCredId = IntPtr.Zero;
+                IntPtr pDetails = IntPtr.Zero;
                 try
                 {
                     // 1. Decode incoming CTAP2 CBOR MakeCredential request using Windows native API
                     int hrDecode = WebAuthNDecodeMakeCredentialRequest(
                         request.cbEncodedRequest,
                         request.pbEncodedRequest,
-                        out IntPtr pDecoded);
+                        out pDecoded);
 
                     if (hrDecode != S_OK || pDecoded == IntPtr.Zero)
                     {
@@ -851,18 +911,19 @@ namespace IntegratorUI
                         var rp = Marshal.PtrToStructure<WEBAUTHN_RP_ENTITY_INFORMATION>(decoded.pRpInformation);
                         rpId = rp.pwszId ?? string.Empty;
                     }
-                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.pbRpId != IntPtr.Zero)
+                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.cbRpId <= MaxNativeFieldBytes && decoded.pbRpId != IntPtr.Zero)
                     {
                         byte[] rpBytes = new byte[decoded.cbRpId];
                         Marshal.Copy(decoded.pbRpId, rpBytes, 0, (int)decoded.cbRpId);
                         rpId = System.Text.Encoding.UTF8.GetString(rpBytes);
                     }
 
-                    // 3. Extract Client Data Hash (32 bytes)
-                    byte[] cdhBytes = new byte[decoded.cbClientDataHash];
-                    if (decoded.pbClientDataHash != IntPtr.Zero && decoded.cbClientDataHash > 0)
+                    // 3. Extract Client Data Hash (32 bytes, bounded for safety)
+                    uint cdhLen = decoded.cbClientDataHash <= MaxNativeFieldBytes ? decoded.cbClientDataHash : 0u;
+                    byte[] cdhBytes = new byte[cdhLen];
+                    if (decoded.pbClientDataHash != IntPtr.Zero && cdhLen > 0)
                     {
-                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)decoded.cbClientDataHash);
+                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)cdhLen);
                     }
                     string clientDataHashHex = Convert.ToHexString(cdhBytes).ToLowerInvariant();
 
@@ -875,7 +936,7 @@ namespace IntegratorUI
                         var user = Marshal.PtrToStructure<WEBAUTHN_USER_ENTITY_INFORMATION>(decoded.pUserInformation);
                         userName = user.pwszName ?? "user";
                         userDisplayName = user.pwszDisplayName ?? userName;
-                        if (user.cbId > 0 && user.pbId != IntPtr.Zero)
+                        if (user.cbId > 0 && user.cbId <= MaxNativeFieldBytes && user.pbId != IntPtr.Zero)
                         {
                             byte[] uBytes = new byte[user.cbId];
                             Marshal.Copy(user.pbId, uBytes, 0, (int)user.cbId);
@@ -903,9 +964,10 @@ namespace IntegratorUI
                         "passkey_make_credential_remote",
                         rpcPayload);
 
-                    if (!rpcResult.Ok || rpcResult.Data == null || string.IsNullOrEmpty(rpcResult.Data.AuthDataHex))
+                    if (!rpcResult.Ok || rpcResult.Data == null ||
+                        string.IsNullOrEmpty(rpcResult.Data.AuthDataHex) ||
+                        string.IsNullOrEmpty(rpcResult.Data.CredentialIdHex))
                     {
-                        WebAuthNFreeDecodedMakeCredentialRequest(pDecoded);
                         return NTE_USER_CANCELLED;
                     }
 
@@ -914,11 +976,15 @@ namespace IntegratorUI
                     // 7. Parse authenticatorData and credential ID returned by Mac
                     byte[] authDataBytes = Convert.FromHexString(respDto.AuthDataHex);
                     byte[] credIdBytes = Convert.FromHexString(respDto.CredentialIdHex);
+                    if (authDataBytes.Length == 0 || credIdBytes.Length == 0)
+                    {
+                        return NTE_USER_CANCELLED;
+                    }
 
-                    IntPtr pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
+                    pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
                     Marshal.Copy(authDataBytes, 0, pAuthData, authDataBytes.Length);
 
-                    IntPtr pCredId = Marshal.AllocHGlobal(credIdBytes.Length);
+                    pCredId = Marshal.AllocHGlobal(credIdBytes.Length);
                     Marshal.Copy(credIdBytes, 0, pCredId, credIdBytes.Length);
 
                     // 8. Construct WEBAUTHN_CREDENTIAL_ATTESTATION for Windows encoding
@@ -949,13 +1015,9 @@ namespace IntegratorUI
                         out uint cbResp,
                         out IntPtr pbResp);
 
-                    Marshal.FreeHGlobal(pAuthData);
-
                     if (hrEncode != S_OK || pbResp == IntPtr.Zero)
                     {
                         System.Diagnostics.Debug.WriteLine($"[PasskeyPlugin] EncodeMakeCredential failed: 0x{hrEncode:X8}");
-                        Marshal.FreeHGlobal(pCredId);
-                        WebAuthNFreeDecodedMakeCredentialRequest(pDecoded);
                         return hrEncode != S_OK ? hrEncode : E_FAIL;
                     }
 
@@ -978,25 +1040,30 @@ namespace IntegratorUI
                             bBackedUp = true
                         };
 
-                        IntPtr pDetails = Marshal.AllocHGlobal(Marshal.SizeOf<WEBAUTHN_PLUGIN_CREDENTIAL_DETAILS>());
+                        pDetails = Marshal.AllocHGlobal(Marshal.SizeOf<WEBAUTHN_PLUGIN_CREDENTIAL_DETAILS>());
                         Marshal.StructureToPtr(credDetails, pDetails, false);
                         Guid clsid = CLSID_IntegratorPasskeyAuthenticator;
                         WebAuthNPluginAuthenticatorAddCredentials(ref clsid, 1, pDetails);
-                        Marshal.FreeHGlobal(pDetails);
                     }
                     catch { }
-                    finally
-                    {
-                        Marshal.FreeHGlobal(pCredId);
-                    }
 
-                    WebAuthNFreeDecodedMakeCredentialRequest(pDecoded);
                     return S_OK;
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"[PasskeyPlugin] MakeCredential exception: {ex}");
                     return E_FAIL;
+                }
+                finally
+                {
+                    if (pDetails != IntPtr.Zero)
+                    {
+                        Marshal.DestroyStructure<WEBAUTHN_PLUGIN_CREDENTIAL_DETAILS>(pDetails);
+                        Marshal.FreeHGlobal(pDetails);
+                    }
+                    if (pCredId != IntPtr.Zero) Marshal.FreeHGlobal(pCredId);
+                    if (pAuthData != IntPtr.Zero) Marshal.FreeHGlobal(pAuthData);
+                    if (pDecoded != IntPtr.Zero) WebAuthNFreeDecodedMakeCredentialRequest(pDecoded);
                 }
             }
         }
@@ -1015,13 +1082,18 @@ namespace IntegratorUI
 
             lock (_operationLock)
             {
+                IntPtr pDecoded = IntPtr.Zero;
+                IntPtr pAuthData = IntPtr.Zero;
+                IntPtr pSig = IntPtr.Zero;
+                IntPtr pCredId = IntPtr.Zero;
+                IntPtr pUserId = IntPtr.Zero;
                 try
                 {
                     // 1. Decode incoming CTAP2 CBOR GetAssertion request using Windows native API
                     int hrDecode = WebAuthNDecodeGetAssertionRequest(
                         request.cbEncodedRequest,
                         request.pbEncodedRequest,
-                        out IntPtr pDecoded);
+                        out pDecoded);
 
                     if (hrDecode != S_OK || pDecoded == IntPtr.Zero)
                     {
@@ -1033,33 +1105,35 @@ namespace IntegratorUI
 
                     // 2. Extract Relying Party domain
                     string rpId = decoded.pwszRpId ?? string.Empty;
-                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.pbRpId != IntPtr.Zero)
+                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.cbRpId <= MaxNativeFieldBytes && decoded.pbRpId != IntPtr.Zero)
                     {
                         byte[] rpBytes = new byte[decoded.cbRpId];
                         Marshal.Copy(decoded.pbRpId, rpBytes, 0, (int)decoded.cbRpId);
                         rpId = System.Text.Encoding.UTF8.GetString(rpBytes);
                     }
 
-                    // 3. Extract Client Data Hash (32 bytes)
-                    byte[] cdhBytes = new byte[decoded.cbClientDataHash];
-                    if (decoded.pbClientDataHash != IntPtr.Zero && decoded.cbClientDataHash > 0)
+                    // 3. Extract Client Data Hash (32 bytes, bounded for safety)
+                    uint cdhLen = decoded.cbClientDataHash <= MaxNativeFieldBytes ? decoded.cbClientDataHash : 0u;
+                    byte[] cdhBytes = new byte[cdhLen];
+                    if (decoded.pbClientDataHash != IntPtr.Zero && cdhLen > 0)
                     {
-                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)decoded.cbClientDataHash);
+                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)cdhLen);
                     }
                     string clientDataHashHex = Convert.ToHexString(cdhBytes).ToLowerInvariant();
 
-                    // 4. Extract allowed credential descriptors (if specified by RP)
+                    // 4. Extract allowed credential descriptors (bounded by MaxAllowCredentialCount)
                     var allowList = new List<string>();
                     if (decoded.CredentialList.cCredentials > 0 && decoded.CredentialList.ppCredentials != IntPtr.Zero)
                     {
                         int ptrSize = IntPtr.Size;
-                        for (int i = 0; i < decoded.CredentialList.cCredentials; i++)
+                        uint allowCount = Math.Min(decoded.CredentialList.cCredentials, MaxAllowCredentialCount);
+                        for (int i = 0; i < allowCount; i++)
                         {
                             IntPtr credPtr = Marshal.ReadIntPtr(decoded.CredentialList.ppCredentials, i * ptrSize);
                             if (credPtr != IntPtr.Zero)
                             {
                                 var cred = Marshal.PtrToStructure<WEBAUTHN_CREDENTIAL_EX>(credPtr);
-                                if (cred.cbId > 0 && cred.pbId != IntPtr.Zero)
+                                if (cred.cbId > 0 && cred.cbId <= MaxNativeFieldBytes && cred.pbId != IntPtr.Zero)
                                 {
                                     byte[] idBytes = new byte[cred.cbId];
                                     Marshal.Copy(cred.pbId, idBytes, 0, (int)cred.cbId);
@@ -1087,9 +1161,11 @@ namespace IntegratorUI
                         "passkey_get_assertion_remote",
                         rpcPayload);
 
-                    if (!rpcResult.Ok || rpcResult.Data == null || string.IsNullOrEmpty(rpcResult.Data.SignatureDerHex))
+                    if (!rpcResult.Ok || rpcResult.Data == null ||
+                        string.IsNullOrEmpty(rpcResult.Data.SignatureDerHex) ||
+                        string.IsNullOrEmpty(rpcResult.Data.AuthDataHex) ||
+                        string.IsNullOrEmpty(rpcResult.Data.CredentialIdHex))
                     {
-                        WebAuthNFreeDecodedGetAssertionRequest(pDecoded);
                         return NTE_USER_CANCELLED;
                     }
 
@@ -1102,19 +1178,23 @@ namespace IntegratorUI
                     byte[] userIdBytes = string.IsNullOrEmpty(respDto.UserIdHex)
                         ? Array.Empty<byte>()
                         : Convert.FromHexString(respDto.UserIdHex);
+                    if (authDataBytes.Length == 0 || sigBytes.Length == 0 || credIdBytes.Length == 0)
+                    {
+                        return NTE_USER_CANCELLED;
+                    }
 
-                    IntPtr pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
+                    pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
                     Marshal.Copy(authDataBytes, 0, pAuthData, authDataBytes.Length);
 
-                    IntPtr pSig = Marshal.AllocHGlobal(sigBytes.Length);
+                    pSig = Marshal.AllocHGlobal(sigBytes.Length);
                     Marshal.Copy(sigBytes, 0, pSig, sigBytes.Length);
 
-                    IntPtr pCredId = Marshal.AllocHGlobal(credIdBytes.Length);
+                    pCredId = Marshal.AllocHGlobal(credIdBytes.Length);
                     Marshal.Copy(credIdBytes, 0, pCredId, credIdBytes.Length);
 
-                    IntPtr pUserId = userIdBytes.Length > 0 ? Marshal.AllocHGlobal(userIdBytes.Length) : IntPtr.Zero;
-                    if (pUserId != IntPtr.Zero)
+                    if (userIdBytes.Length > 0)
                     {
+                        pUserId = Marshal.AllocHGlobal(userIdBytes.Length);
                         Marshal.Copy(userIdBytes, 0, pUserId, userIdBytes.Length);
                     }
 
@@ -1153,18 +1233,9 @@ namespace IntegratorUI
                         out uint cbResp,
                         out IntPtr pbResp);
 
-                    Marshal.FreeHGlobal(pAuthData);
-                    Marshal.FreeHGlobal(pSig);
-                    Marshal.FreeHGlobal(pCredId);
-                    if (pUserId != IntPtr.Zero)
-                    {
-                        Marshal.FreeHGlobal(pUserId);
-                    }
-
                     if (hrEncode != S_OK || pbResp == IntPtr.Zero)
                     {
                         System.Diagnostics.Debug.WriteLine($"[PasskeyPlugin] EncodeGetAssertion failed: 0x{hrEncode:X8}");
-                        WebAuthNFreeDecodedGetAssertionRequest(pDecoded);
                         return hrEncode != S_OK ? hrEncode : E_FAIL;
                     }
 
@@ -1172,13 +1243,20 @@ namespace IntegratorUI
                     response.cbEncodedResponse = cbResp;
                     response.pbEncodedResponse = pbResp;
 
-                    WebAuthNFreeDecodedGetAssertionRequest(pDecoded);
                     return S_OK;
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"[PasskeyPlugin] GetAssertion exception: {ex}");
                     return E_FAIL;
+                }
+                finally
+                {
+                    if (pUserId != IntPtr.Zero) Marshal.FreeHGlobal(pUserId);
+                    if (pCredId != IntPtr.Zero) Marshal.FreeHGlobal(pCredId);
+                    if (pSig != IntPtr.Zero) Marshal.FreeHGlobal(pSig);
+                    if (pAuthData != IntPtr.Zero) Marshal.FreeHGlobal(pAuthData);
+                    if (pDecoded != IntPtr.Zero) WebAuthNFreeDecodedGetAssertionRequest(pDecoded);
                 }
             }
         }

@@ -17,7 +17,7 @@
 //! - **macOS**: `ui-macos/` written in Swift. Invokes C functions via Swift-Clang bridging headers
 //!   or module maps (e.g. `IntegratorBridge.swift`).
 //! - **Windows 11**: `ui-windows/` written in C# (.NET 8/9 / WinUI 3). Invokes entry points via
-//!   `[DllImport("integrator.dll")]` or `[LibraryImport]` P/Invoke bindings.
+//!   `[DllImport("integrator_core.dll")]` P/Invoke bindings (`CoreBridge.cs`).
 //! - **Native Process Bootstrap**: Platform launchers checking for existing running instances before UI startup.
 //!
 //! ### Downstream Callees:
@@ -174,7 +174,7 @@ pub extern "C" fn integrator_core_set_ui_callback(callback: Option<UiEventCallba
 /// * `callback` - Optional C function pointer for push event notifications from core to UI.
 ///
 /// # Return Value
-/// Returns `0` on successful initialization, or `-1` if initialization failed or if core was already initialized.
+/// Returns `0` on success (including if core was already initialized), or `-1` if initialization failed.
 #[no_mangle]
 pub extern "C" fn integrator_core_init(callback: Option<UiEventCallback>) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
@@ -196,11 +196,15 @@ pub extern "C" fn integrator_core_init(callback: Option<UiEventCallback>) -> c_i
 /// Primary JSON-RPC dispatch gateway from native UI to Rust core.
 ///
 /// # Arguments
-/// * `method` - NUL-terminated C string specifying the method name (e.g. `"get_status"`, `"start_pairing"`).
+/// * `method` - NUL-terminated C string specifying the method name (e.g. `"get_bridge_status"`, `"pair_with_peer"`).
 /// * `params_json` - NUL-terminated C string containing JSON-encoded arguments.
 ///
 /// # Return Value
 /// Returns a heap-allocated NUL-terminated C string (`*mut c_char`) containing the JSON response.
+///
+/// # Safety
+/// Both `method` and `params_json` must either be null (treated as empty strings) or valid pointers
+/// to NUL-terminated C strings for the duration of this call.
 ///
 /// # Ownership & Memory Management
 /// **IMPORTANT**: The returned pointer is owned by the caller. The caller MUST release this memory
@@ -257,7 +261,11 @@ pub extern "C" fn integrator_core_free_string(ptr: *mut c_char) {
 /// Dispatches a system tray icon action to the core engine.
 ///
 /// # Arguments
-/// * `action` - NUL-terminated C string identifying the tray menu action (e.g. `"toggle_mute"`, `"quit"`).
+/// * `action` - NUL-terminated C string identifying the tray menu action
+///   (`"paste_remote"`, `"toggle_display"`, `"toggle_touchbar"`, `"open_cache"`, or `"quit"`).
+///
+/// # Safety
+/// `action` must either be null (no-op) or point to a valid NUL-terminated C string for the call duration.
 #[no_mangle]
 pub extern "C" fn integrator_core_tray_action(action: *const c_char) {
     let _ = catch_unwind(AssertUnwindSafe(|| {

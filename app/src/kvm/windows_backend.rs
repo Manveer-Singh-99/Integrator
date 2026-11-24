@@ -99,6 +99,10 @@ static KVM_SERVICE_REF: OnceLock<Arc<KvmService>> = OnceLock::new();
 /// Atomic indicator showing whether the Windows low-level input hooks are currently active.
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Atomic shutdown latch preventing the background hook retry worker from re-installing
+/// Win32 low-level hooks after `stop()` has been requested.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Mutual exclusion lock guarding hook thread initialization and teardown routines.
 static START_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -108,6 +112,7 @@ type KvmWinEventCallback = extern "C" fn(i32, f64, f64, f64, f64, u64) -> i32;
 /// C-compatible callback function pointer for OLE drag-and-drop termination.
 type KvmWinDragEndedCallback = extern "C" fn(bool, *const c_char);
 
+// C-ABI entry points exported by `src/kvm_windows.cpp` (`kvm_windows`).
 extern "C" {
     fn integrator_kvm_win_start_hooks(
         cb: Option<KvmWinEventCallback>,
@@ -156,13 +161,15 @@ extern "C" {
 
 /// Initializes the Windows KVM input backend, spawning the hook thread and installing low-level hooks.
 ///
-/// If hook installation fails initially, a background worker thread retries up to 10 times.
+/// If hook installation fails initially, a background worker thread retries up to 10 times
+/// unless `stop()` is called first.
 ///
 /// # Arguments
 /// * `service` - Reference to the core `KvmService` coordinator.
 pub fn start(service: Arc<KvmService>) {
     let _ = KVM_SERVICE_REF.set(service);
     let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    STOP_REQUESTED.store(false, Ordering::Release);
     let ok = unsafe { integrator_kvm_win_start_hooks(Some(on_win_event), Some(on_drag_ended)) };
     HOOK_ACTIVE.store(ok, Ordering::Release);
     if ok {
@@ -174,7 +181,13 @@ pub fn start(service: Arc<KvmService>) {
             .spawn(|| {
                 for _ in 0..HOOK_RETRY_ATTEMPTS {
                     std::thread::sleep(HOOK_RETRY_INTERVAL);
+                    if STOP_REQUESTED.load(Ordering::Acquire) {
+                        break;
+                    }
                     let _g = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    if STOP_REQUESTED.load(Ordering::Acquire) {
+                        break;
+                    }
                     let activated = unsafe {
                         integrator_kvm_win_start_hooks(Some(on_win_event), Some(on_drag_ended))
                     };
@@ -192,6 +205,7 @@ pub fn start(service: Arc<KvmService>) {
 /// Uninstalls the Windows low-level hooks and terminates the hook message-pump thread.
 pub fn stop() {
     let _guard = START_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    STOP_REQUESTED.store(true, Ordering::Release);
     HOOK_ACTIVE.store(false, Ordering::Release);
     unsafe {
         integrator_kvm_win_stop_hooks();
@@ -222,10 +236,11 @@ pub fn sync_edge_probe(enabled: bool, peer_edge: ScreenEdge) {
     }
 }
 
-/// Queries the primary display bounds in virtual desktop coordinates via `GetSystemMetrics`.
+/// Queries the virtual desktop bounds across all Windows monitors via `GetSystemMetrics`.
 ///
 /// # Returns
-/// A `ScreenRect` describing the primary display dimensions.
+/// A `ScreenRect` describing the virtual desktop dimensions, with safe fallbacks for non-finite
+/// or sub-minimum values.
 pub fn get_primary_screen_rect() -> ScreenRect {
     let mut x = 0.0;
     let mut y = 0.0;
@@ -235,8 +250,8 @@ pub fn get_primary_screen_rect() -> ScreenRect {
         integrator_kvm_win_screen_rect(&mut x, &mut y, &mut w, &mut h);
     }
     ScreenRect {
-        x: x as f32,
-        y: y as f32,
+        x: if x.is_finite() { x as f32 } else { 0.0 },
+        y: if y.is_finite() { y as f32 } else { 0.0 },
         width: (w as f32).max(crate::config::MIN_KVM_DISPLAY_WIDTH),
         height: (h as f32).max(crate::config::MIN_KVM_DISPLAY_HEIGHT),
     }
@@ -250,6 +265,9 @@ pub fn set_controlling_mode(
     restore_x: f32,
     restore_y: f32,
 ) {
+    if !park_x.is_finite() || !park_y.is_finite() || !restore_x.is_finite() || !restore_y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_win_set_controlling(
             controlling,
@@ -263,6 +281,9 @@ pub fn set_controlling_mode(
 
 /// Sets controlled mode on Windows, restoring cursor visibility and warping to `(entry_x, entry_y)`.
 pub fn set_controlled_mode(controlled: bool, entry_x: f32, entry_y: f32) {
+    if !entry_x.is_finite() || !entry_y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_win_set_controlled(
             controlled,
@@ -310,6 +331,9 @@ pub fn cancel_remote_drag() {
 
 /// Injects synthetic pointer movement using Win32 `SendInput` (`MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE`).
 pub fn inject_mouse_move(x: f32, y: f32, _left_held: bool) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_win_inject_mouse_move(x.round() as i32, y.round() as i32);
     }
@@ -338,6 +362,8 @@ pub fn inject_scroll(dx: f32, dy: f32) {
 
 /// Injects a synthetic keyboard key transition via Win32 `SendInput` (`KEYEVENTF_KEYUP`, `KEYEVENTF_EXTENDEDKEY`).
 pub fn inject_key(key: LogicalKey, pressed: bool, _mods: ModifierMask) {
+    // Win32 SendInput updates the global kernel keyboard state directly from individual modifier
+    // key transitions rather than stamping per-event flags, so `_mods` is intentionally unused.
     if let Some((vk, ext)) = logical_to_win_vk(key) {
         unsafe {
             integrator_kvm_win_inject_key(vk, pressed, ext);
@@ -347,6 +373,9 @@ pub fn inject_key(key: LogicalKey, pressed: bool, _mods: ModifierMask) {
 
 /// Displays the translucent GDI drag ghost window at coordinates `(x, y)`.
 pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, _icon_b64: Option<&str>) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     let Ok(c_title) = CString::new(title) else { return };
     let Ok(c_sub) = CString::new(subtitle) else { return };
     unsafe {
@@ -361,6 +390,9 @@ pub fn show_drag_ghost(x: f32, y: f32, title: &str, subtitle: &str, _icon_b64: O
 
 /// Moves the drag ghost window to updated pointer coordinates `(x, y)`.
 pub fn move_drag_ghost(x: f32, y: f32) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
     unsafe {
         integrator_kvm_win_move_drag_ghost(x.round() as i32, y.round() as i32);
     }
@@ -376,21 +408,25 @@ pub fn hide_drag_ghost() {
 /// Initiates a native OLE `DoDragDrop` session on Windows using staged payload files.
 ///
 /// Executed on a dedicated COM STA worker thread to prevent blocking the input message loop.
+///
+/// # Returns
+/// `true` if the payload was handed off to the Windows OLE STA thread, or `false` if path or
+/// C-string validation failed.
 pub fn begin_native_drop_drag(
     paths: &[PathBuf],
     session_id: &str,
     remote_left_still_held: bool,
-) {
+) -> bool {
     let c_strings: Vec<CString> = paths
         .iter()
         .filter_map(|p| p.to_str())
         .filter_map(|s| CString::new(s).ok())
         .collect();
     if c_strings.is_empty() {
-        return;
+        return false;
     }
     let ptrs: Vec<*const c_char> = c_strings.iter().map(|c| c.as_ptr()).collect();
-    let Ok(c_sid) = CString::new(session_id) else { return };
+    let Ok(c_sid) = CString::new(session_id) else { return false };
     unsafe {
         integrator_kvm_win_begin_native_drag(
             ptrs.as_ptr(),
@@ -399,6 +435,7 @@ pub fn begin_native_drop_drag(
             remote_left_still_held,
         );
     }
+    true
 }
 
 /// Callback invoked when an active Windows OLE drag session finishes.
@@ -440,9 +477,16 @@ extern "C" fn on_win_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64
         }
         3 => svc.on_local_mouse_scroll(a as f32, b as f32),
         4 => {
-            let vk = a as u16;
-            if let Some(key) = win_vk_to_logical(vk) {
-                svc.on_local_key_event(key, b > 0.5, win_flags_to_modifiers(extra))
+            // Bounds-check VK code before truncating to u16 so malformed FFI floats cannot alias.
+            if a.is_finite() && a >= 0.0 && a <= u16::MAX as f64 {
+                let vk = a as u16;
+                if let Some(key) = win_vk_to_logical(vk) {
+                    svc.on_local_key_event(key, b > 0.5, win_flags_to_modifiers(extra))
+                } else if svc.is_controlling_peer_fast() {
+                    HookDecision::Swallow
+                } else {
+                    HookDecision::PassThrough
+                }
             } else if svc.is_controlling_peer_fast() {
                 HookDecision::Swallow
             } else {
@@ -459,7 +503,8 @@ extern "C" fn on_win_event(kind: i32, a: f64, b: f64, c: f64, d: f64, extra: u64
     }
 }
 
-/// Translates raw bitfield modifier flags into a canonical `ModifierMask`.
+/// Translates raw 4-bit modifier bitfield from `kvm_windows.cpp` (`read_current_modifiers_with_swallowed`)
+/// into a canonical `ModifierMask` (`bit 0` = Shift, `bit 1` = Control, `bit 2` = Alt, `bit 3` = Win/Meta).
 fn win_flags_to_modifiers(raw: u64) -> ModifierMask {
     ModifierMask {
         shift: (raw & 1) != 0,

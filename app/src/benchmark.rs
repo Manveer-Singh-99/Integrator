@@ -25,12 +25,12 @@
 //!
 //! ### Cross-Platform / Cross-Device Flow:
 //! The client machine initiates a TCP connection to the peer's `TELEMETRY_PORT` (58285).
-//! Upon mutual authentication, the test executes three sequential phases:
+//! Upon mutual authentication, the test executes four sequential steps:
 //! 1. **Latency Phase (Ping)**: Sends 5 sequential 9-byte echo packets containing 64-bit monotonic
 //!    sequence numbers. The server echoes the sequence number back. The client computes mean RTT.
-//! 2. **Adaptive Payload Scaling**: If average RTT is under 2.0ms (typical of direct Thunderbolt 4 bridges),
-//!    payload size scales to 64 MiB to fully saturate high-bandwidth links; otherwise, it defaults to 16 MiB
-//!    to prevent lengthy test delays on congested Wi-Fi.
+//! 2. **Bounded Payload Sizing**: Uses a consistent 16 MiB (`DEFAULT_BENCHMARK_BYTES`) transfer volume per
+//!    direction (capped on the server at `MAX_BENCHMARK_BYTES = 128 MiB`) to measure sustained encrypted
+//!    wire speed across both direct Thunderbolt/USB-C bridges and Wi-Fi links without triggering timeouts.
 //! 3. **Upload Phase**: Client streams 256 KiB encrypted chunks to server until target bytes are reached,
 //!    waiting for a 1-byte final ACK.
 //! 4. **Download Phase**: Server streams 256 KiB encrypted chunks back to client until target bytes are reached.

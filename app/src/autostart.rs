@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Canonical LaunchAgent bundle identifier for macOS launchd registration.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 const MAC_LAUNCH_LABEL: &str = "com.manveersingh.integrator";
 
 /// Standard system Applications directory on macOS.
@@ -86,12 +86,16 @@ const MAC_APP_BUNDLE_MACOS_SUBDIR: &str = "Contents/MacOS";
 #[cfg(target_os = "macos")]
 const MAC_APP_EXECUTABLE_NAMES: [&str; 2] = ["Integrator", "integrator"];
 
-/// Task Scheduler task name for elevated startup on Windows.
+/// Task Scheduler task name for least-privilege startup on Windows.
 #[cfg(target_os = "windows")]
 const WIN_TASK_NAME: &str = "IntegratorAutostart";
 
+/// Monotonic sequence counter preventing temporary XML filename collisions across concurrent calls.
+#[cfg(target_os = "windows")]
+static AUTOSTART_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Windows Task Scheduler `<Priority>` level (7 = below normal default for background services).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg(any(target_os = "windows", test))]
 const WIN_TASK_SCHEDULER_PRIORITY: u8 = 7;
 
 /// Legacy registry run key path used in older versions, cleaned up upon activation.
@@ -202,7 +206,7 @@ fn validate_path_for_xml(path: &Path) -> Result<String> {
 ///
 /// Configures `RunAtLoad = true`, `KeepAlive = false`, and `ProcessType = Interactive`
 /// passing `--hidden` to launch the application into the background status bar.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
     let exe_str = validate_path_for_xml(exe_path)?;
     let escaped = xml_escape(&exe_str);
@@ -234,7 +238,7 @@ pub(crate) fn build_macos_plist_xml(exe_path: &Path) -> Result<String> {
 ///
 /// Configures `<LogonTrigger>`, `<RunLevel>LeastPrivilege</RunLevel>`,
 /// and passes `--minimized` to suppress the main window on startup.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> Result<String> {
     let exe_str = validate_path_for_xml(exe_path)?;
     let escaped_exe = xml_escape(&exe_str);
@@ -300,7 +304,7 @@ pub(crate) fn build_windows_task_xml(exe_path: &Path, user_id: Option<&str>) -> 
 /// Encodes a UTF-8 text string into UTF-16 Little-Endian bytes prefixed with a Byte Order Mark (BOM).
 ///
 /// Windows `schtasks.exe /Create /XML` requires a UTF-16LE BOM (`0xFF 0xFE`) when parsing task XML definitions.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn encode_utf16_le_with_bom(text: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + text.len() * 2);
     // Write UTF-16 Little-Endian Byte Order Mark (BOM)
@@ -520,7 +524,8 @@ fn set_enabled_windows(enabled: bool) -> Result<()> {
         std::fs::create_dir_all(&data_dir).with_context(|| {
             format!("Failed to create app data directory {}", data_dir.display())
         })?;
-        let xml_path = data_dir.join(format!("autostart_{}.xml.tmp", std::process::id()));
+        let seq = AUTOSTART_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let xml_path = data_dir.join(format!("autostart_{}_{}.xml.tmp", std::process::id(), seq));
         crate::system_info::atomic_write_private(&xml_path, &xml_bytes)
             .with_context(|| format!("Failed to write task XML {}", xml_path.display()))?;
 
@@ -600,25 +605,16 @@ pub fn migrate_task_to_least_privilege_windows() -> Result<bool> {
 }
 
 /// Checks whether a Windows Task Scheduler XML string contains `HighestAvailable` run level.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+///
+/// Normalizes any embedded NUL bytes (`\0`) so both UTF-8 and UTF-16LE lossy outputs from
+/// `schtasks.exe /Query /XML` are detected reliably.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn task_xml_needs_least_privilege_migration(xml: &str) -> bool {
     xml.contains("<RunLevel>HighestAvailable</RunLevel>")
-}
-
-/// Transforms task XML content with `HighestAvailable` into `LeastPrivilege`.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) fn migrate_task_xml_content_to_least_privilege(xml: &str) -> (String, bool) {
-    if xml.contains("<RunLevel>HighestAvailable</RunLevel>") {
-        (
-            xml.replace(
-                "<RunLevel>HighestAvailable</RunLevel>",
-                "<RunLevel>LeastPrivilege</RunLevel>",
-            ),
-            true,
-        )
-    } else {
-        (xml.to_string(), false)
-    }
+        || (xml.contains('\0')
+            && xml
+                .replace('\0', "")
+                .contains("<RunLevel>HighestAvailable</RunLevel>"))
 }
 
 #[cfg(test)]
@@ -678,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_of_existing_highest_available_task() {
+    fn test_migration_detection_of_existing_highest_available_task() {
         let legacy_xml = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Principals>
@@ -690,15 +686,16 @@ mod tests {
 </Task>"#;
 
         assert!(task_xml_needs_least_privilege_migration(legacy_xml));
-        let (migrated_xml, modified) = migrate_task_xml_content_to_least_privilege(legacy_xml);
-        assert!(modified);
-        assert!(migrated_xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
-        assert!(!migrated_xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
-        assert!(!task_xml_needs_least_privilege_migration(&migrated_xml));
+        // UTF-16LE lossy decoded output with interleaved NUL bytes is also detected
+        let utf16_lossy = String::from_utf8_lossy(&encode_utf16_le_with_bom(legacy_xml)).into_owned();
+        assert!(task_xml_needs_least_privilege_migration(&utf16_lossy));
 
-        // Already migrated XML should not be modified
-        let (re_migrated, re_modified) = migrate_task_xml_content_to_least_privilege(&migrated_xml);
-        assert!(!re_modified);
-        assert_eq!(re_migrated, migrated_xml);
+        // Freshly generated task XML via build_windows_task_xml uses LeastPrivilege and does not need migration
+        let fresh_xml =
+            build_windows_task_xml(Path::new(r"C:\Program Files\Integrator\Integrator.exe"), None)
+                .unwrap();
+        assert!(fresh_xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!fresh_xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(!task_xml_needs_least_privilege_migration(&fresh_xml));
     }
 }

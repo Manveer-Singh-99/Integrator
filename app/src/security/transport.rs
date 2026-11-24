@@ -127,18 +127,24 @@
 //! validated between macOS (Apple Silicon & Intel) and Windows 11 (x86_64 & ARM64).
 //!
 //! # 5. Callers & Callees
-//! - **Callers**:
-//!   - `crate::rpc::server`: Display RPC on port 58281
-//!   - `crate::clipboard::sync`: Clipboard transfer on port 58283
-//!   - `crate::benchmark::runner`: Link benchmark on port 58285
-//!   - `crate::input::server`: KVM input daemon on port 58286
-//!   - `crate::camera::stream`: Camera streaming on port 58287
-//! - **Callees**:
-//!   - `crate::security::keystore::KeystoreV2`: Device identity key, peer trust store, root keys.
+//! - **Upstream Callers**:
+//!   - `crate::trust`: High-level peer session establishment (`connect_transport_to_ip`,
+//!     `connect_transport_to_hinted_ip`, `accept_transport_from_stream`) and revocation orchestration.
+//!   - `crate::display::server` & `crate::display::controller`: Display & Control RPC on port 58281 (`ServiceId::DisplayRpc`).
+//!   - `crate::clipboard::service`: Bidirectional clipboard synchronization and file staging on port 58283 (`ServiceId::ClipboardTransfer`).
+//!   - `crate::benchmark`: Link throughput and latency probing on port 58285 (`ServiceId::Benchmark`).
+//!   - `crate::kvm::service`: Universal KVM input & drag-drop daemon on port 58286 (`ServiceId::InputKvm`).
+//!   - `crate::camera` & `crate::camera::authorization`: Shared camera & mic streaming on port 58287 (`ServiceId::CameraStream`).
+//!   - `crate::audio` & `crate::security::audio_udp`: Fail-closed peer trust generation validation (`check_peer_trust_generation_fail_closed`).
+//!   - `crate::security::keystore` & `crate::security::pairing`: Peer trust lifecycle hooks (`register_local_device_identity`,
+//!     `register_peer_trust_generation`, `invalidate_peer_trust`, `clear_peer_revocation`).
+//! - **Downstream Callees**:
+//!   - `crate::security::keystore::KeystoreV2`: Device identity key, peer trust store, root keys, and Ed25519 signatures.
 //!   - `crate::security::spake2_rfc9382::compute_hmac_sha256`: Constant-time finished HMAC calculation.
-//!   - `chacha20poly1305`: Authenticated Encryption with Associated Data (AEAD).
-//!   - `x25519_dalek`: Ephemeral Diffie-Hellman key agreement.
-//!   - `zeroize`: Secure memory zeroization of session and rekey keys.
+//!   - `chacha20poly1305`: Authenticated Encryption with Associated Data (AEAD) record layer.
+//!   - `x25519_dalek`: Ephemeral Diffie-Hellman key agreement with RFC 7748 contributory validation.
+//!   - `hkdf` / `sha2`: Transcript hashing ($H_2, H_3, H_4$) and HKDF-SHA256 key derivation / epoch ratcheting.
+//!   - `zeroize`: Secure memory zeroization of ephemeral secrets, session keys, IV salts, and rekey keys.
 //! ============================================================================
 
 use crate::security::{
@@ -222,6 +228,10 @@ const REPLAY_CACHE_PRUNE_GRACE_PERIOD_MS: u64 = 60_000;
 
 /// Upper cap in bytes for initial buffer pre-allocation when receiving chunked payloads (1 MiB).
 const INITIAL_CHUNKED_BUFFER_CAPACITY_LIMIT: usize = 1024 * 1024;
+
+/// Maximum consecutive in-band control frames (`Rekey` or `KeepAlive`) allowed within a single
+/// `recv_message()` invocation before aborting the connection (prevents control-frame flood DoS).
+const MAX_CONSECUTIVE_CONTROL_FRAMES: usize = 64;
 
 /// Identifies the subsystem service requesting or hosting an authenticated TransportV2 session.
 ///
@@ -366,13 +376,26 @@ pub enum TransportError {
     /// Received an unexpected or unknown frame type code.
     UnexpectedFrameType(u8),
     /// Handshake `service_id` does not match the service expected by the server listener.
-    ServiceMismatch { expected: u8, received: u8 },
+    ServiceMismatch {
+        /// Expected `ServiceId` discriminant byte configured on the server listener.
+        expected: u8,
+        /// Actual `ServiceId` discriminant byte received in `ClientHello`.
+        received: u8,
+    },
     /// Frame payload exceeds the maximum allowable byte size for the given service or handshake phase.
-    OversizedFrame { len: usize, max: usize },
+    OversizedFrame {
+        /// Actual or declared frame length in bytes.
+        len: usize,
+        /// Maximum permitted length in bytes for this frame context.
+        max: usize,
+    },
     /// Handshake JSON parsing or schema validation failed.
     MalformedHandshake(String),
     /// Handshake timestamp delta exceeds the allowable window (`HANDSHAKE_TIMESTAMP_WINDOW_MS`).
-    TimestampSkewExceeded { skew_ms: u64 },
+    TimestampSkewExceeded {
+        /// Absolute clock difference in milliseconds between peer timestamp and local UTC clock.
+        skew_ms: u64,
+    },
     /// Handshake `client_random` nonce has already been authenticated within the recent replay cache.
     ReplayedHandshakeHello,
     /// Peer device ID is not paired or found in the local `KeystoreV2`.
@@ -388,9 +411,19 @@ pub enum TransportError {
     /// ChaCha20-Poly1305 record authentication failed (tag mismatch or corrupted ciphertext/AAD).
     AeadDecryptionFailed,
     /// Record header epoch does not match the expected active epoch for the directional channel.
-    EpochMismatch { expected: u16, received: u16 },
+    EpochMismatch {
+        /// Active 16-bit ratchet epoch index expected by the local receiver.
+        expected: u16,
+        /// 16-bit ratchet epoch index decoded from the incoming record header.
+        received: u16,
+    },
     /// Record header sequence number did not match the strictly required monotonic sequence number.
-    SequenceMismatch { expected: u64, received: u64 },
+    SequenceMismatch {
+        /// Monotonic 64-bit frame sequence index expected by the local receiver.
+        expected: u64,
+        /// 64-bit frame sequence index decoded from the incoming record header.
+        received: u64,
+    },
     /// Sequence counter reached `u64::MAX` or epoch counter reached `u16::MAX` without ratcheting.
     SequenceExhausted,
     /// Transport session was cleanly closed via `CloseNotify` or connection shutdown.
@@ -480,7 +513,10 @@ impl std::error::Error for TransportError {}
 /// Prevents active replay of historical `ClientHello` frames within the valid timestamp window.
 static HELLO_REPLAY_CACHE: OnceLock<Mutex<VecDeque<([u8; 16], [u8; 32], u64)>>> = OnceLock::new();
 
-/// Prunes entries in `HELLO_REPLAY_CACHE` older than $2 \times \text{HANDSHAKE\_TIMESTAMP\_WINDOW\_MS} + 60\text{s}$.
+/// Prunes entries in `HELLO_REPLAY_CACHE` whose recorded timestamp age exceeds
+/// $2 \times \text{HANDSHAKE\_TIMESTAMP\_WINDOW\_MS} + \text{REPLAY\_CACHE\_PRUNE\_GRACE\_PERIOD\_MS}$ (660s).
+///
+/// Uses saturating arithmetic so clock regressions cannot wrap or panic.
 fn prune_hello_replay_cache(guard: &mut VecDeque<([u8; 16], [u8; 32], u64)>, now_ms: u64) {
     let max_age = HANDSHAKE_TIMESTAMP_WINDOW_MS
         .saturating_mul(2)
@@ -535,9 +571,13 @@ static NEXT_SESSION_REG_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Internal state tracking active sessions, actively revoked peers, and per-peer trust generations.
 struct SessionRegistryState {
+    /// Map from lowercase peer `device_id_hex` (32 hex chars) to active `(reg_id, revocation_watch_tx)` tuples.
     sessions: HashMap<String, Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+    /// Set of lowercase peer `device_id_hex` strings currently marked as revoked or blocked.
     revoked_peers: HashSet<String>,
+    /// Map from lowercase peer `device_id_hex` to its latest authoritative monotonic trust generation (`>= 1`).
     peer_generations: HashMap<String, u64>,
+    /// Set of verified local loopback device identity hex strings permitted to initialize generation 1 on self-connect.
     local_device_ids: HashSet<String>,
 }
 
@@ -577,7 +617,9 @@ pub fn register_local_device_identity(local_device_id_hex: &str) {
 /// RAII guard that unregisters the session from `ACTIVE_SESSION_REGISTRY` upon drop of all references.
 #[derive(Debug)]
 pub struct SessionRevocationGuard {
+    /// Unique registration ID allocated from `NEXT_SESSION_REG_ID` (`0` indicates unregistered).
     reg_id: u64,
+    /// Lowercase hex-encoded 16-byte device UUID (32 hex chars) of the authenticated remote peer.
     peer_device_id_hex: String,
 }
 
@@ -636,7 +678,14 @@ pub fn register_session_revocation(
     Ok((guard, rx))
 }
 
-/// Compatibility registration helper validating an external trust predicate outside the registry lock.
+/// Test-only compatibility registration helper that evaluates an external `is_trusted_fn`
+/// predicate strictly before acquiring `ACTIVE_SESSION_REGISTRY.write()`, preventing lock-order inversion.
+///
+/// Marks `peer_device_id_hex` revoked and returns `Err(TransportError::UntrustedPeer)` if the
+/// predicate returns `false`; otherwise delegates to `register_session_revocation(&key, 1)`.
+/// Production callers should capture `trust_generation` from `KeystoreV2` first and invoke
+/// `register_session_revocation` directly.
+#[cfg(test)]
 pub fn register_session_revocation_checked<F>(
     peer_device_id_hex: &str,
     is_trusted_fn: F,
@@ -654,7 +703,8 @@ where
     register_session_revocation(&key, 1)
 }
 
-/// Unregisters an active session revocation channel when all halves of the session have dropped.
+/// Unregisters the session `reg_id` from `ACTIVE_SESSION_REGISTRY` when its final `SessionRevocationGuard` drops,
+/// pruning the peer's entry from `sessions` once no active watch senders remain.
 fn unregister_session_revocation(peer_device_id_hex: &str, reg_id: u64) {
     let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
     let key = peer_device_id_hex.to_ascii_lowercase();
@@ -705,6 +755,7 @@ pub fn invalidate_peer_trust(peer_device_id_hex: &str, new_generation: u64) -> u
 /// increments its trust generation, and adds the peer device ID to the actively revoked set so pending registrations fail.
 ///
 /// Returns the number of sessions signaled for immediate termination.
+#[cfg(test)]
 pub fn terminate_active_sessions_for_peer(peer_device_id_hex: &str) -> usize {
     let key = peer_device_id_hex.trim().to_ascii_lowercase();
     let next_gen = {
@@ -715,6 +766,7 @@ pub fn terminate_active_sessions_for_peer(peer_device_id_hex: &str) -> usize {
 }
 
 /// Clears the actively revoked flag for `peer_device_id_hex` upon successful explicit pairing.
+#[cfg(test)]
 pub fn clear_peer_revocation(peer_device_id_hex: &str) {
     let key = peer_device_id_hex.trim().to_ascii_lowercase();
     let mut reg = ACTIVE_SESSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
@@ -722,7 +774,6 @@ pub fn clear_peer_revocation(peer_device_id_hex: &str) {
 }
 
 /// Returns true if `peer_device_id_hex` is currently recorded in the active revocation set.
-#[allow(dead_code)]
 pub fn is_peer_revoked(peer_device_id_hex: &str) -> bool {
     let key = peer_device_id_hex.trim().to_ascii_lowercase();
     let reg = ACTIVE_SESSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
@@ -739,8 +790,11 @@ pub fn get_peer_trust_generation(peer_device_id_hex: &str) -> Option<u64> {
 /// Result of fail-closed peer trust and generation verification against `ACTIVE_SESSION_REGISTRY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerTrustCheck {
+    /// Peer is not revoked and its trust generation matches the authoritative registry entry (or verified loopback).
     Valid,
+    /// Peer is explicitly present in `revoked_peers` and must be rejected immediately.
     Revoked,
+    /// Peer generation does not match the current registry value or remote peer has no registered generation.
     StaleOrUnregisteredGeneration,
 }
 
@@ -846,6 +900,8 @@ impl DirectionalCipherState {
     /// Ratchets the directional keys forward to `epoch + 1` via HKDF-SHA256 and resets `seq = 0`.
     ///
     /// Zeroizes previous epoch keys and returns `Err(TransportError::SequenceExhausted)` if epoch reaches `u16::MAX`.
+    /// The internal `HKDF-Expand` calls request 32B/4B outputs (well below SHA-256's 8160-byte RFC 5869 cap)
+    /// and are therefore infallible for valid PRKs.
     pub fn ratchet_epoch(&mut self) -> Result<(), TransportError> {
         let next_epoch = self
             .epoch
@@ -903,13 +959,21 @@ impl DirectionalCipherState {
             return Err(TransportError::SequenceExhausted);
         }
 
+        // Guard against usize/u32 overflow before encoding ciphertext_len into the wire header.
+        let ciphertext_len = plaintext
+            .len()
+            .checked_add(AEAD_TAG_LEN)
+            .and_then(|total| u32::try_from(total).ok())
+            .ok_or(TransportError::OversizedFrame {
+                len: plaintext.len(),
+                max: max_plaintext,
+            })?;
+
         let current_seq = self.seq;
         self.seq = self
             .seq
             .checked_add(1)
             .ok_or(TransportError::SequenceExhausted)?;
-
-        let ciphertext_len = (plaintext.len() + AEAD_TAG_LEN) as u32;
         let mut header = [0u8; RECORD_HEADER_LEN];
         header[0..4].copy_from_slice(&TRANSPORT_WIRE_MAGIC);
         header[4] = TRANSPORT_HEADER_VERSION_BYTE;
@@ -988,6 +1052,8 @@ impl DirectionalCipherState {
             )
             .map_err(|_| TransportError::AeadDecryptionFailed)?;
 
+        // Flags are checked after AEAD authentication so any in-flight bitflip on header[6]
+        // surfaces as AeadDecryptionFailed, while an authenticated peer setting reserved flags still fails.
         if header[6] != 0 {
             return Err(TransportError::MalformedHandshake(format!(
                 "unsupported record flags 0x{:02x}",
@@ -1515,7 +1581,11 @@ where
     }
 
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
-    /// in-band `Rekey` and `KeepAlive` control frames.
+    /// up to `MAX_CONSECUTIVE_CONTROL_FRAMES` in-band `Rekey` and `KeepAlive` control frames.
+    ///
+    /// Aborts with `ConnectionClosed` on `CloseNotify` or peer revocation, and aborts with
+    /// `MalformedHandshake` if a peer floods more than `MAX_CONSECUTIVE_CONTROL_FRAMES`
+    /// consecutive control frames without delivering an `ApplicationData` payload.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.closed || *self.revocation_rx.borrow() {
             self.closed = true;
@@ -1523,9 +1593,13 @@ where
         }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
         let max_ciphertext = max_plaintext + AEAD_TAG_LEN;
+        let mut control_frame_count: usize = 0;
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
+            // Wait for the next record header without applying RECORD_IO_TIMEOUT: persistent
+            // sessions can legitimately remain idle longer than 10s, and callers wrap
+            // recv_message() in service-specific idle timeouts alongside revocation_rx.
             let read_hdr_res = tokio::select! {
                 res = self.stream.read_exact(&mut hdr) => res,
                 _ = self.revocation_rx.changed() => {
@@ -1559,6 +1633,7 @@ where
             }
 
             let mut ciphertext = vec![0u8; ct_len];
+            // Once a full header is parsed, the declared payload body must arrive within RECORD_IO_TIMEOUT.
             let body_fut = self.stream.read_exact(&mut ciphertext);
             let body_res = tokio::select! {
                 res = tokio::time::timeout(RECORD_IO_TIMEOUT, body_fut) => {
@@ -1585,6 +1660,13 @@ where
             match frame_type {
                 RecordFrameType::ApplicationData => return Ok(plaintext),
                 RecordFrameType::Rekey => {
+                    control_frame_count += 1;
+                    if control_frame_count > MAX_CONSECUTIVE_CONTROL_FRAMES {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "control frame flood: exceeded consecutive control frame limit".into(),
+                        ));
+                    }
                     if plaintext.as_slice() != REKEY_MAGIC_PAYLOAD {
                         self.closed = true;
                         return Err(TransportError::MalformedHandshake(
@@ -1596,7 +1678,16 @@ where
                         return Err(e);
                     }
                 }
-                RecordFrameType::KeepAlive => continue,
+                RecordFrameType::KeepAlive => {
+                    control_frame_count += 1;
+                    if control_frame_count > MAX_CONSECUTIVE_CONTROL_FRAMES {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "control frame flood: exceeded consecutive control frame limit".into(),
+                        ));
+                    }
+                    continue;
+                }
                 RecordFrameType::CloseNotify => {
                     self.closed = true;
                     return Err(TransportError::ConnectionClosed);
@@ -1606,7 +1697,15 @@ where
     }
 
     /// Sends a potentially multi-megabyte payload (e.g. a clipboard image or large JSON envelope)
-    /// segmented into `<= max_plaintext_frame_bytes()` AEAD records preceded by an 8-byte length record.
+    /// segmented into `<= max_plaintext_frame_bytes()` `ApplicationData` records.
+    ///
+    /// # Wire Format
+    /// 1. Leading 8-byte big-endian `u64` total byte length record (`payload.len() as u64`).
+    /// 2. One or more sequential `ApplicationData` records, each carrying at most `max_plaintext_frame_bytes()`.
+    ///
+    /// # Errors
+    /// Returns `OversizedFrame` if `payload.is_empty()` or `payload.len() > max_total_len`, or propagates
+    /// `ConnectionClosed` / `IoFailure` from `send_message()`.
     pub async fn send_chunked_payload(
         &mut self,
         payload: &[u8],
@@ -1628,7 +1727,14 @@ where
     }
 
     /// Receives a potentially multi-megabyte payload segmented into AEAD records, verifying
-    /// `total_len <= max_total_len` before allocating the output buffer.
+    /// `total_len <= max_total_len` before allocating the output buffer (capped initially at
+    /// `INITIAL_CHUNKED_BUFFER_CAPACITY_LIMIT` = 1 MiB to prevent single-frame OOM pre-allocation).
+    ///
+    /// # Wire Format & Errors
+    /// Expects an initial 8-byte big-endian `u64` length prefix record followed by non-empty data
+    /// chunks totaling `total_len` bytes. Returns `OversizedFrame` if the length frame is not 8 bytes,
+    /// `total_len == 0`, `total_len > max_total_len`, an empty chunk arrives, or cumulative chunk bytes
+    /// exceed `total_len`.
     pub async fn recv_chunked_payload(
         &mut self,
         max_total_len: usize,
@@ -2060,7 +2166,11 @@ pub struct TransportWriterV2<W> {
 impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
 
     /// Reads, verifies, and decrypts the next application data frame, transparently handling
-    /// in-band `Rekey` and `KeepAlive` control frames.
+    /// up to `MAX_CONSECUTIVE_CONTROL_FRAMES` in-band `Rekey` and `KeepAlive` control frames.
+    ///
+    /// Aborts with `ConnectionClosed` on `CloseNotify` or peer revocation, and aborts with
+    /// `MalformedHandshake` if a peer floods more than `MAX_CONSECUTIVE_CONTROL_FRAMES`
+    /// consecutive control frames without delivering an `ApplicationData` payload.
     pub async fn recv_message(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.closed || *self.revocation_rx.borrow() {
             self.closed = true;
@@ -2068,9 +2178,12 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
         }
         let max_plaintext = self.service_id.max_plaintext_frame_bytes();
         let max_ciphertext = max_plaintext + AEAD_TAG_LEN;
+        let mut control_frame_count: usize = 0;
 
         loop {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
+            // Wait for the next record header without applying RECORD_IO_TIMEOUT: persistent
+            // split sessions (e.g. KVM) remain idle between events and callers apply outer timeouts.
             let read_hdr_res = tokio::select! {
                 res = self.reader.read_exact(&mut hdr) => res,
                 _ = self.revocation_rx.changed() => {
@@ -2104,6 +2217,7 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
             }
 
             let mut ciphertext = vec![0u8; ct_len];
+            // Once a full header is parsed, the declared payload body must arrive within RECORD_IO_TIMEOUT.
             let body_fut = self.reader.read_exact(&mut ciphertext);
             let body_res = tokio::select! {
                 res = tokio::time::timeout(RECORD_IO_TIMEOUT, body_fut) => {
@@ -2130,6 +2244,13 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
             match frame_type {
                 RecordFrameType::ApplicationData => return Ok(plaintext),
                 RecordFrameType::Rekey => {
+                    control_frame_count += 1;
+                    if control_frame_count > MAX_CONSECUTIVE_CONTROL_FRAMES {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "control frame flood: exceeded consecutive control frame limit".into(),
+                        ));
+                    }
                     if plaintext.as_slice() != REKEY_MAGIC_PAYLOAD {
                         self.closed = true;
                         return Err(TransportError::MalformedHandshake(
@@ -2141,7 +2262,16 @@ impl<R: AsyncRead + Unpin> TransportReaderV2<R> {
                         return Err(e);
                     }
                 }
-                RecordFrameType::KeepAlive => continue,
+                RecordFrameType::KeepAlive => {
+                    control_frame_count += 1;
+                    if control_frame_count > MAX_CONSECUTIVE_CONTROL_FRAMES {
+                        self.closed = true;
+                        return Err(TransportError::MalformedHandshake(
+                            "control frame flood: exceeded consecutive control frame limit".into(),
+                        ));
+                    }
+                    continue;
+                }
                 RecordFrameType::CloseNotify => {
                     self.closed = true;
                     return Err(TransportError::ConnectionClosed);
@@ -2318,7 +2448,7 @@ where
 {
     /// Splits an arbitrary asynchronous full-duplex `TransportSessionV2` stream (such as `DuplexStream`)
     /// into reader and writer halves sharing session registration lifetime.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn into_split(
         mut self,
     ) -> (
@@ -2598,7 +2728,12 @@ fn derive_handshake_keys(
     (prk_hs, k_hs_s2c, k_hs_c2s)
 }
 
-/// Derives application-layer directional cipher states (`c2s` and `s2c`) and the 16-byte session ID.
+/// Derives application-layer directional cipher states (`c2s` and `s2c`) and the 16-byte `session_id`.
+///
+/// Extracts `derived_ikm` from `prk_hs`, re-extracts with `h4`, and expands 7 domain-separated outputs
+/// via HKDF-SHA256: `k_app_c2s` (32B), `k_app_s2c` (32B), `iv_c2s` (4B), `iv_s2c` (4B),
+/// `k_rekey_c2s` (32B), `k_rekey_s2c` (32B), and `session_id` (16B). All expansions are `<= 32` bytes
+/// and therefore infallible under HKDF-SHA256.
 fn derive_application_states(
     prk_hs: &[u8; 32],
     h4: &[u8; 32],
@@ -2687,9 +2822,14 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Test-only stream wrapper that fires `notify` whenever `poll_write` returns `Poll::Pending`
+    /// while `enabled` is set, enabling deterministic synchronization in blocked-write revocation tests.
     struct BlockNotifyStream<S> {
+        /// Wrapped asynchronous duplex stream.
         inner: S,
+        /// Notification signal woken when a write stalls (`Poll::Pending`).
         notify: Arc<tokio::sync::Notify>,
+        /// Atomic gate enabling `notify` signaling only once the test primes the buffer.
         enabled: Arc<AtomicBool>,
     }
 
@@ -2731,6 +2871,10 @@ mod tests {
         }
     }
 
+    /// Creates two mutually paired temporary `KeystoreV2` instances (`client` and `server`)
+    /// backed by distinct temp directories and a shared `[0x7A; 32]` root key for transport tests.
+    ///
+    /// Returns `(dir_c, ks_c, srv_creds_on_client, dir_s, ks_s, cli_creds_on_server)`.
     fn create_paired_keystores(
         label: &str,
     ) -> (

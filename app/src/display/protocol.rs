@@ -6,11 +6,22 @@
 //! `TransportSessionV2` sessions (`ServiceId::DisplayRpc`, TCP port [`crate::config::CONTROL_PORT`] = `58281`).
 //!
 //! The RPC protocol governs cross-device session coordination for both the **Display Subsystem**
-//! (Moonlight/Sunshine extended desktop) and the **Shared Camera Subsystem** (MacBook camera to Windows 11
-//! Virtual Webcam), along with auxiliary subsystems (Clipboard sharing, True Tone calibration,
-//! Network storage mounting, and UDP Audio streaming).
+//! (Moonlight/Sunshine extended desktop) and the **Shared Camera & Microphone Subsystem** (Mac
+//! camera and microphone to Windows 11 Virtual Webcam & Audio), along with auxiliary subsystems
+//! (Clipboard sharing, True Tone calibration, Network storage mounting, and UDP Audio streaming).
 //!
 //! ## 2. Cross-Platform Architectural Roles
+//!
+//! ### Upstream Callers
+//! - [`crate::core::IntegratorCore`]: Constructs outbound [`DisplayRpcRequest`] payloads for peer
+//!   RPC invocation and consumes [`DisplayRpcResponse`] snapshots.
+//! - [`super::server::DisplayServer`]: Deserializes inbound [`DisplayRpcRequest`] frames on TCP port
+//!   [`crate::config::CONTROL_PORT`] (`58281`), enforces [`required_feature_for_rpc`], and serializes
+//!   the resulting [`DisplayRpcResponse`].
+//!
+//! ### Downstream Callees
+//! - [`super::controller::DisplayController::handle_rpc`]: Executes validated requests against local
+//!   display, camera, microphone, audio, True Tone, clipboard, storage, and passkey/Touch ID services.
 //!
 //! ### Extended Display Streaming Pipeline
 //! - **Start / Stop Moonlight RPC**: The host device (Mac or Windows) configures its local virtual display
@@ -22,28 +33,34 @@
 //!   DXGI Desktop Duplication (Windows), encoding with Apple VideoToolbox or NVIDIA NVENC / AMD AMF /
 //!   Intel QuickSync. Moonlight decodes with low latency via VideoToolbox (Mac) or D3D11 / NVDEC (Windows).
 //!
-//! ### Shared Camera Control
-//! - **Camera RPC Commands**: Control methods [`DisplayRpcRequest::StartCamera`], [`DisplayRpcRequest::ToggleCamera`],
-//!   [`DisplayRpcRequest::StopCamera`], and [`DisplayRpcRequest::GetCameraStatus`] route state transitions
-//!   between UI view models and the core [`crate::camera::CameraService`].
+//! ### Shared Camera & Microphone Control
+//! - **Camera & Mic RPC Commands**: Control methods [`DisplayRpcRequest::StartCamera`], [`DisplayRpcRequest::ToggleCamera`],
+//!   [`DisplayRpcRequest::StopCamera`], [`DisplayRpcRequest::GetCameraStatus`], [`DisplayRpcRequest::ListCameras`],
+//!   [`DisplayRpcRequest::SelectCamera`], [`DisplayRpcRequest::ListMics`], [`DisplayRpcRequest::SelectMic`], and
+//!   [`DisplayRpcRequest::SetMicSettings`] route state transitions between UI view models and the core
+//!   [`crate::camera::CameraService`].
 //! - **Zero Third-Party Driver Architecture**: Signals the capture loop on Mac (AVFoundation 720p30 NV12)
 //!   and initiates the standalone Media Foundation FrameServer virtual webcam DLL (`integrator_vcam.dll` /
-//!   `Integrator MacBook Camera`) on Windows 11 without requiring physical camera wrapper attributes
+//!   `Integrator Mac Camera`) on Windows 11 without requiring physical camera wrapper attributes
 //!   (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
 //!
-//! ## 3. Serialization & Wire Framing
+//! ## 3. Threading & Serialization Wire Framing
+//! - **Thread Safety**: All wire types implement `Clone + Send + Sync` and are serialized/deserialized
+//!   on Tokio async worker tasks without blocking lock contention.
 //! - **Format**: Canonical UTF-8 JSON serialization (`serde_json`), bounded to a maximum payload size
-//!   of 64 KiB (`MAX_RPC_BYTES`) to prevent memory exhaustion attacks.
+//!   of 64 KiB (`MAX_RPC_BYTES`) on ingress and 1 MiB (`MAX_RPC_RESPONSE_BYTES`) on response to prevent
+//!   memory exhaustion attacks.
 //! - **Transport Security**: Transported inside encrypted `TransportSessionV2` frames utilizing
 //!   ChaCha20-Poly1305 AEAD and mutual Ed25519 identity verification.
 //! - **Redaction Invariants**: Sensitive credentials, including the 6-digit SPAKE2 pairing PIN
-//!   ([`DisplayRpcRequest::PairWithPeer::pin`]) and authentication tokens ([`DisplayRpcResponse::pairing_token`]),
+//!   ([`DisplayRpcRequest::PairWithPeer::pin`]), authentication tokens ([`DisplayRpcResponse::pairing_token`]),
+//!   and single-use camera lease bearer tokens ([`DisplayRpcResponse::camera_lease_token_hex`]),
 //!   are unconditionally redacted in `fmt::Debug` implementations (`"<REDACTED>"`).
 //!
 //! ## 4. Feature Gate Mapping
 //! The [`required_feature_for_rpc`] function maps each RPC request variant to its governing feature
-//! flag (`display`, `clipboard`, `truetone`, `storage`, `audio`). Requests referencing disabled
-//! features are rejected before dispatch.
+//! flag (`display`, `input_kvm`, `clipboard`, `truetone`, `storage`, `audio`, `camera`, `touchid`).
+//! Requests referencing disabled features are rejected before dispatch.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -197,6 +214,25 @@ pub enum DisplayRpcRequest {
         device_id: String,
     },
 
+    /// Enumerates audio input (microphone) devices available on the target Mac.
+    ListMics,
+
+    /// Switches the active microphone audio capture device on the target Mac.
+    SelectMic {
+        /// Target microphone device unique ID.
+        device_id: String,
+    },
+
+    /// Updates shared microphone capture enablement, mute state, and linear input gain (`0.0..=2.0`).
+    SetMicSettings {
+        /// Whether shared microphone capture is enabled.
+        enabled: bool,
+        /// Whether shared microphone output is muted.
+        muted: bool,
+        /// Linear microphone input gain multiplier (clamped to `0.0..=2.0`, where `1.0` = 100%).
+        gain: f32,
+    },
+
     /// Requests an interactive macOS Touch ID Secure Enclave biometric verification over `TransportSessionV2`,
     /// binding the peer's one-time 32-byte `challenge_nonce_hex` into an Ed25519 signed assertion.
     VerifyTouchId {
@@ -342,6 +378,21 @@ impl fmt::Debug for DisplayRpcRequest {
                 .debug_struct("SelectCamera")
                 .field("device_id", device_id)
                 .finish(),
+            Self::ListMics => f.write_str("ListMics"),
+            Self::SelectMic { device_id } => f
+                .debug_struct("SelectMic")
+                .field("device_id", device_id)
+                .finish(),
+            Self::SetMicSettings {
+                enabled,
+                muted,
+                gain,
+            } => f
+                .debug_struct("SetMicSettings")
+                .field("enabled", enabled)
+                .field("muted", muted)
+                .field("gain", gain)
+                .finish(),
             Self::VerifyTouchId {
                 challenge_nonce_hex,
                 requester_hostname,
@@ -415,6 +466,9 @@ pub struct DisplayRpcResponse {
     /// Available camera devices on the remote host returned by [`DisplayRpcRequest::ListCameras`].
     #[serde(default)]
     pub available_cameras: Option<Vec<crate::camera::CameraDeviceWire>>,
+    /// Available microphone audio input devices on the remote host returned by [`DisplayRpcRequest::ListMics`].
+    #[serde(default)]
+    pub available_mics: Option<Vec<crate::camera::MicDeviceWire>>,
     /// Local hardware profile returned by [`DisplayRpcRequest::GetHardwareProfile`].
     #[serde(default)]
     pub hardware_profile: Option<crate::system_info::LocalHardwareProfile>,
@@ -466,6 +520,10 @@ impl fmt::Debug for DisplayRpcResponse {
             .field("gpu_telemetry", &self.gpu_telemetry)
             .field("ambient_light", &self.ambient_light)
             .field("storage_status", &self.storage_status)
+            .field("bridge_status", &self.bridge_status)
+            .field("camera_status", &self.camera_status)
+            .field("available_cameras", &self.available_cameras)
+            .field("available_mics", &self.available_mics)
             .field("hardware_profile", &self.hardware_profile)
             .field(
                 "pairing_token",
@@ -475,6 +533,8 @@ impl fmt::Debug for DisplayRpcResponse {
                 "camera_lease_token_hex",
                 &self.camera_lease_token_hex.as_ref().map(|_| "<REDACTED>"),
             )
+            .field("camera_consent_status", &self.camera_consent_status)
+            .field("camera_lease_id", &self.camera_lease_id)
             .field("host_device_id", &self.host_device_id)
             .field("host_name", &self.host_name)
             .field("audio_session", &self.audio_session)
@@ -482,6 +542,7 @@ impl fmt::Debug for DisplayRpcResponse {
             .field("touchid_assertion", &self.touchid_assertion)
             .field("passkey_credential", &self.passkey_credential)
             .field("passkey_assertion", &self.passkey_assertion)
+            .field("media_state", &self.media_state)
             .finish()
     }
 }
@@ -513,7 +574,10 @@ pub(crate) fn required_feature_for_rpc(req: &DisplayRpcRequest) -> Option<&'stat
         | DisplayRpcRequest::StopCamera
         | DisplayRpcRequest::GetCameraStatus
         | DisplayRpcRequest::ListCameras
-        | DisplayRpcRequest::SelectCamera { .. } => Some("camera"),
+        | DisplayRpcRequest::SelectCamera { .. }
+        | DisplayRpcRequest::ListMics
+        | DisplayRpcRequest::SelectMic { .. }
+        | DisplayRpcRequest::SetMicSettings { .. } => Some("camera"),
         DisplayRpcRequest::VerifyTouchId { .. }
         | DisplayRpcRequest::NotifyTouchIdPrompt { .. }
         | DisplayRpcRequest::PasskeyMakeCredential(_)
@@ -548,11 +612,20 @@ mod tests {
         let resp = DisplayRpcResponse {
             success: true,
             pairing_token: Some("654321".to_string()),
+            camera_lease_token_hex: Some("deadbeef".repeat(8)),
             ..Default::default()
         };
         let resp_dbg = format!("{:?}", resp);
         assert!(resp_dbg.contains("<REDACTED>"));
         assert!(!resp_dbg.contains("654321"));
+        assert!(!resp_dbg.contains("deadbeef"));
+
+        // Legacy DisplayRpcResponse JSON without `available_mics` must deserialize cleanly.
+        let legacy_resp: DisplayRpcResponse = serde_json::from_str(
+            r#"{"success":true,"message":"ok","is_active":false,"active_mode":null,"gpu_telemetry":null,"ambient_light":null,"storage_status":null}"#,
+        )
+        .expect("legacy DisplayRpcResponse JSON must deserialize");
+        assert!(legacy_resp.available_mics.is_none());
     }
 
     #[test]
@@ -644,5 +717,42 @@ mod tests {
             }),
             None
         );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::ListCameras),
+            Some("camera")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SelectCamera {
+                device_id: "cam-0".into(),
+            }),
+            Some("camera")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::ListMics),
+            Some("camera")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SelectMic {
+                device_id: "mic-0".into(),
+            }),
+            Some("camera")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SetMicSettings {
+                enabled: true,
+                muted: false,
+                gain: 1.25,
+            }),
+            Some("camera")
+        );
+        let mic_req_dbg = format!(
+            "{:?}",
+            DisplayRpcRequest::SetMicSettings {
+                enabled: true,
+                muted: false,
+                gain: 1.5,
+            }
+        );
+        assert!(mic_req_dbg.contains("SetMicSettings"));
     }
 }

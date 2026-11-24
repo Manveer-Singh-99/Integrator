@@ -3,8 +3,8 @@
 //! ## 1. Module Purpose & Scope
 //! This module implements the Authenticated UDP Audio Sink (`IUA2` protocol) on UDP port
 //! `AUDIO_PORT = 58284`, Windows 11 WASAPI loopback audio capture (`win_capture.cpp`),
-//! macOS native C11 CoreAudio playback & lock-free SPSC (`audio_macos.c`), and local
-//! speaker test chime synthesis for the Integrator engine.
+//! macOS native C11 CoreAudio playback & lock-free SPSC (`audio_macos.c`), macOS HAL shared-memory
+//! capture (`IntegratorAudioDriver.c`), and local speaker test chime synthesis for the Integrator engine.
 //!
 //! ### Hardened Batch 1G.8-r2 Concurrency, Lifecycle & Security Invariants:
 //! - **Deadlock-Free Two-Phase Lifecycle (`NEW-01`, `AUD-1G7-07`)**: `AUDIO_LIFECYCLE_LOCK`
@@ -24,6 +24,54 @@
 //!   `integrator_win_audio_capture_start(gen)`, `integrator_win_audio_capture_stop_if_gen(gen)`,
 //!   and `integrator_on_win_audio_capture_ended(gen, reason)` bind native capture strictly to
 //!   its owning `ROUTING_GENERATION` so stale workers or drop threads can never disturb newer sessions.
+//!
+//! ## 2. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - `crate::core::IntegratorCore`: Starts the UDP sink server at daemon boot, updates mixer balance/mute
+//!     (`AudioManager::set_mixer`), exposes telemetry via `AudioManager::status()`, triggers spatial test
+//!     chimes (`play_spatial_test_chime`), and invokes `revoke_peer_audio_sessions()` on peer unpair/block.
+//!   - `crate::display::controller::DisplayController`: Handles authenticated `DisplayRpcRequest`
+//!     commands (`NegotiateAudioSession`, `StartAudioCapture`, `StopAudioCapture`, `StartAudioRouting`,
+//!     `StopAudioRouting`, `GetAudioStatus`).
+//!   - `crate::ffi`: Calls `AudioManager::shutdown_sync()` during host process teardown.
+//! - **Downstream Callees**:
+//!   - `crate::audio::jitter::JitterBuffer`: Bounded 64-slot ring jitter buffer with `session_order`
+//!     isolation and `min_seq_floor` rewind protection.
+//!   - `crate::security::audio_udp`: `AudioSessionRegistry` and `AudioSessionSender` providing
+//!     HKDF-SHA256 session keys, ChaCha20-Poly1305 AEAD framing, and 64-packet replay windows.
+//!   - `crate::security::transport`: `check_peer_trust_generation_fail_closed` for continuous revocation checks.
+//!   - Native FFI (`audio_macos.c`, `win_capture.cpp`, macOS POSIX `shm_open` for `IntegratorAudioDriver`).
+//! - **Cross-Platform / Cross-Device Flow**:
+//!   - Windows 11 WASAPI loopback (or macOS HAL shared-memory virtual device) captures 5 ms 48 kHz
+//!     stereo PCM16 frames, encrypts them as `IUA2` UDP datagrams over port `58284`, and streams to
+//!     the paired peer's UDP sink -> `JitterBuffer` -> 5 ms playout timer -> `apply_mixer_gain_pcm16` ->
+//!     CoreAudio C11 SPSC ring buffer.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - **Tokio Async Tasks**: `SINK_RECEIVER_TASK` (UDP 58284 decrypt/push loop), `PLAYOUT_WORKER_HANDLE`
+//!   (5 ms `tokio::time::interval` playout pump), `SENDER_TASK` (AEAD sealing + UDP `send_to`), and
+//!   `MAC_CAPTURE_TASK` (macOS SHM polling).
+//! - **Real-Time OS Threads**: Windows WASAPI MMCSS capture thread calls `integrator_on_win_audio_captured`
+//!   and uses `try_lock()` + bounded `try_send(16)` on `SENDER_CHANNEL` so real-time audio callbacks
+//!   never block on mutexes or network I/O.
+//! - **Lock Ordering Invariant**:
+//!   1. `AUDIO_LIFECYCLE_LOCK` (async mutex, NEVER held across remote network RPC `.await`)
+//!   2. `PLAYOUT_STATE_LOCK` (short sync mutex, NEVER held across `.await`)
+//!   3. Leaf locks: `ACTIVE_CAPTURE_TARGET`, `JITTER_BUFFER`, `AUDIO_SESSION_REGISTRY`,
+//!      `PLAYOUT_WORKER_HANDLE`, `SENDER_CHANNEL`, `SENDER_TASK`, `SINK_RECEIVER_TASK`, `MAC_CAPTURE_TASK`
+//!   Waiters always acquire outer locks before leaf locks and never acquire `PLAYOUT_STATE_LOCK` while
+//!   holding a leaf lock.
+//!
+//! ## 4. Security & Safety Invariants
+//! - **Zero Unauthenticated Playout**: Every UDP datagram must pass ChaCha20-Poly1305 AEAD tag verification,
+//!   anti-replay sliding window checks, and constant-time `ACTIVE_CAPTURE_TARGET.peer_device_id` matching.
+//! - **Fail-Closed Trust & Feature Gates**: Both sender and receiver paths check `AUDIO_SHUTDOWN`,
+//!   `AUDIO_ENABLED`, and `check_peer_trust_generation_fail_closed` before starting and continuously
+//!   during active streaming.
+//! - **Canonical Frame Enforcement**: Stage 1 accepts only 48,000 Hz, 2-channel, 16-bit PCM frames of
+//!   240 samples/channel (960 bytes) or 1-byte `AUDIO_FLAG_SILENCE` frames.
+//! - **Audio Mixer Safety**: `apply_mixer_gain_pcm16` guards against NaN/Inf balance inputs and clamps
+//!   scaled samples strictly within `[i16::MIN, i16::MAX]` to prevent wraparound distortion.
 
 pub mod jitter;
 
@@ -58,6 +106,7 @@ use crate::security::keystore::VerifiedPeerCredentials;
 use crate::security::transport::{check_peer_trust_generation_fail_closed, PeerTrustCheck};
 use crate::{config, security, system_info, trust};
 
+/// UDP port bound by the Authenticated UDP Audio Sink (`IUA2`) listener (`58284`).
 pub const AUDIO_PORT: u16 = config::AUDIO_PORT;
 
 /// Canonical PCM audio sample rate: 48,000 Hz.
@@ -71,28 +120,45 @@ pub const CANONICAL_FRAME_MS: u32 = AUDIO_FRAME_MS;
 /// Canonical 5ms stereo 16-bit PCM frame byte size: 960 bytes.
 pub const CANONICAL_FRAME_BYTES: usize = AUDIO_FRAME_BYTES;
 
+/// Minimum interval between repeated warning/error log emissions per category (30 seconds).
 const LOG_RATE_LIMIT: Duration = Duration::from_secs(30);
+/// Idle window (ms) after the last received packet before the playout worker auto-stops (5,000 ms).
 const RECENT_PACKET_WINDOW_MS: u64 = 5_000;
+/// Minimum interval between CoreAudio HAL restart attempts after a start failure (500 ms).
 const HAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum permitted lifetime in seconds for a negotiated `IUA2` audio session (900 s / 15 min).
 pub const MAX_NEGOTIATED_AUDIO_TTL_SECS: u64 = AUDIO_SESSION_TTL_SECS;
 
 /// Active audio capture/routing session metadata and cryptographic binding.
 #[derive(Debug, Clone)]
 pub struct ActiveCaptureTarget {
+    /// IP address string of the remote peer currently bound to active capture or playback.
     pub peer_ip: String,
+    /// 16-byte binary Ed25519-derived device ID of the active peer for constant-time packet checks.
     pub peer_device_id: [u8; 16],
+    /// Keystore/transport trust generation active when this audio session was authorized.
     pub trust_generation: u64,
+    /// Monotonic `ROUTING_GENERATION` token isolating this session from stale workers and RPCs.
     pub routing_generation: u64,
 }
 
+/// Latch set permanently during daemon shutdown to prevent post-shutdown task resurrection.
 static AUDIO_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Runtime feature gate mirroring `"audio"` in `FeatureManager` (`true` when enabled).
 static AUDIO_ENABLED: AtomicBool = AtomicBool::new(true);
+/// True while the UDP 58284 sink receiver task is bound and actively listening.
 static SINK_LISTENING: AtomicBool = AtomicBool::new(false);
+/// Monotonic generation counter for UDP sink listener lifecycles (`SinkListeningGuard`).
 static SINK_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// True while the 5 ms playout worker and native macOS CoreAudio unit are active.
 static PLAYOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// True while an end-to-end audio routing session (capture or playback) is active.
 static ROUTING_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Monotonic routing generation counter incremented on every start, stop, revocation, or shutdown.
 static ROUTING_GENERATION: AtomicU64 = AtomicU64::new(1);
+/// Unix epoch timestamp (milliseconds) of the most recent authenticated UDP audio packet received.
 static LAST_PACKET_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of authenticated UDP audio packets drained by the sink receiver.
 static PACKETS_DRAINED: AtomicU64 = AtomicU64::new(0);
 /// Cross-platform audio mixer balance encoded as fixed-point millis in `-1000..=1000` (`-1.0..=+1.0`).
 /// `-1.0` = boost Mac / mute Windows; `0.0` = balanced; `+1.0` = boost Windows / duck Mac.
@@ -106,67 +172,101 @@ static AUDIO_LIFECYCLE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 /// and generation-checked `PLAYOUT_WORKER_HANDLE` updates (never held across `.await`).
 static PLAYOUT_STATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Global registry holding active ChaCha20-Poly1305 `AudioSessionReceiver` instances keyed by `session_id`.
 static AUDIO_SESSION_REGISTRY: OnceLock<Mutex<AudioSessionRegistry>> = OnceLock::new();
+/// Serializes synthesis and playback of the local `spatial_test_chime.wav` file.
 static CHIME_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Global bounded 64-slot jitter buffer feeding the macOS CoreAudio playout worker.
 static JITTER_BUFFER: OnceLock<Mutex<jitter::JitterBuffer>> = OnceLock::new();
+/// Cooperative cancellation notifier waking the 5 ms playout worker immediately on stop/shutdown.
 static PLAYOUT_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
+/// Cooperative cancellation notifier waking the UDP sink `recv_from` loop immediately on stop/shutdown.
 static SINK_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 
+/// Currently authorized remote capture/playback target bound to `ROUTING_GENERATION`.
 static ACTIVE_CAPTURE_TARGET: Mutex<Option<ActiveCaptureTarget>> = Mutex::new(None);
+/// JoinHandle of the outbound UDP AEAD encryption and transmission task.
 static SENDER_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+/// JoinHandle of the inbound UDP port 58284 receiver task.
 static SINK_RECEIVER_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+/// JoinHandle of the 5 ms jitter-buffer-to-CoreAudio playout worker task.
 static PLAYOUT_WORKER_HANDLE: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+/// JoinHandle of the macOS HAL shared-memory capture polling task.
 #[cfg(target_os = "macos")]
 static MAC_CAPTURE_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 
+/// Single 5 ms PCM16 stereo capture frame transferred from OS capture callbacks to `SENDER_TASK`.
 #[derive(Clone)]
 struct CapturedFrameData {
+    /// Valid PCM payload byte count (`<= CANONICAL_FRAME_BYTES` = 960 bytes; `0` when `is_silent`).
     len: usize,
+    /// True when the capture backend detected digital silence (`AUDIO_FLAG_SILENCE` compact packet).
     is_silent: bool,
+    /// Fixed-size stack buffer holding raw 48 kHz 2ch 16-bit little-endian PCM bytes.
     data: [u8; CANONICAL_FRAME_BYTES],
 }
 
+/// Bounded 16-slot MPSC sender connecting real-time OS capture callbacks to `SENDER_TASK`.
 static SENDER_CHANNEL: Mutex<Option<tokio::sync::mpsc::Sender<CapturedFrameData>>> = Mutex::new(None);
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Prewarms CoreAudio AudioUnit state before starting playback. Returns `0` on success.
     fn integrator_mac_audio_prewarm() -> i32;
+    /// Starts the macOS CoreAudio output `AudioUnit`. Returns `0` on success or `-1` on HAL failure.
     fn integrator_mac_audio_start() -> i32;
+    /// Stops and disposes the active macOS CoreAudio output `AudioUnit`.
     fn integrator_mac_audio_stop();
+    /// Returns non-zero if the macOS CoreAudio output `AudioUnit` is actively rendering.
     fn integrator_mac_audio_is_active() -> i32;
+    /// Writes `len` bytes of 48 kHz 2ch 16-bit PCM into the lock-free C11 SPSC ring buffer.
     fn integrator_mac_audio_write_pcm(data: *const u8, len: u32) -> u32;
+    /// Returns the cumulative number of CoreAudio render-callback SPSC underruns.
     fn integrator_mac_audio_underruns() -> u64;
-    #[allow(dead_code)]
+    /// Flushes any buffered audio frames in the macOS C11 SPSC ring buffer (test-only).
+    #[cfg(test)]
     fn integrator_mac_audio_flush();
+    /// Applies local macOS audio ducking corresponding to mixer `balance` (`-1.0..=+1.0`).
     fn integrator_mac_audio_set_local_duck(balance: f32);
+    /// Returns the number of unread PCM bytes currently queued in the C11 SPSC ring buffer.
     #[cfg(test)]
     fn integrator_mac_audio_buffered_bytes() -> u32;
+    /// Simulates a CoreAudio render pull of `requested_bytes` into `out` for SPSC unit testing.
     #[cfg(test)]
     fn integrator_mac_audio_test_render_pull(out: *mut u8, requested_bytes: u32) -> u32;
+    /// Resets the C11 SPSC ring buffer and counters between unit tests.
     #[cfg(test)]
     fn integrator_mac_audio_test_reset();
 }
 
 #[cfg(target_os = "windows")]
 extern "C" {
+    /// Starts Windows WASAPI loopback capture bound to `capture_gen`. Returns `true` on success.
     fn integrator_win_audio_capture_start(capture_gen: u64) -> bool;
+    /// Stops the active Windows WASAPI loopback capture session and joins the worker thread.
     fn integrator_win_audio_capture_stop();
+    /// Stops Windows WASAPI loopback capture only if the active session matches `expected_gen`.
     fn integrator_win_audio_capture_stop_if_gen(expected_gen: u64);
+    /// Returns `true` while the Windows WASAPI loopback capture worker is actively capturing.
     fn integrator_win_audio_capture_is_active() -> bool;
+    /// Returns cumulative 5 ms frames read from the Windows WASAPI loopback endpoint.
     fn integrator_win_audio_capture_frames_read() -> u64;
-    #[allow(dead_code)]
-    fn integrator_win_audio_capture_silent_frames() -> u64;
+    /// Returns cumulative WASAPI buffer discontinuity flags observed during capture.
     fn integrator_win_audio_capture_discontinuities() -> u64;
+    /// Exercises the C1 `$C^1$`-smooth soft limiter DSP curve in unit tests.
     #[cfg(test)]
     fn integrator_win_audio_test_soft_limit(x: f32) -> f32;
+    /// Exercises UB-free 24-bit signed PCM little-endian decoding in unit tests.
     #[cfg(test)]
     fn integrator_win_audio_test_decode_pcm24(b0: u8, b1: u8, b2: u8) -> f32;
+    /// Exercises the `GetDevicePeriod`-calibrated silence-entry holdoff predicate in unit tests.
     #[cfg(test)]
     fn integrator_win_audio_test_should_emit_silence(
         elapsed_since_packet_us: f64,
         default_period_us: f64,
         already_in_silence: bool,
     ) -> bool;
+    /// Exercises exact dynamic surround peak normalization across speaker layouts in unit tests.
     #[cfg(test)]
     fn integrator_win_audio_test_downmix_unity_peak(
         channels: u16,
@@ -229,6 +329,10 @@ pub extern "C" fn integrator_on_win_audio_capture_ended(capture_gen: u64, reason
     }
 }
 
+/// Lock-free real-time capture trampoline enqueueing a 5 ms PCM frame onto `SENDER_CHANNEL`.
+///
+/// Uses `try_lock()` and `try_send()` so real-time audio capture threads (Windows WASAPI MMCSS)
+/// never block on contention or backpressure.
 fn send_captured_audio_frame(data: *const u8, len: usize, is_silent: bool) {
     if AUDIO_SHUTDOWN.load(Ordering::Acquire) {
         return;
@@ -251,30 +355,47 @@ fn send_captured_audio_frame(data: *const u8, len: usize, is_silent: bool) {
     }
 }
 
+/// POSIX shared-memory object name shared between `IntegratorAudioDriver.c` and the Rust capture task.
 #[cfg(target_os = "macos")]
 pub const INTEGRATOR_AUDIO_SHM_NAME: &str = "/com.manveersingh.integrator.audio.sink.shm";
+/// FourCC magic identifier (`'ITGS' = 0x4954_4753`) validating initialized HAL shared memory.
 #[cfg(target_os = "macos")]
 pub const INTEGRATOR_AUDIO_SHM_MAGIC: u32 = 0x4954_4753;
+/// Byte capacity of the lock-free SPSC ring buffer inside `IntegratorAudioShmHeader` (128 KiB).
 #[cfg(target_os = "macos")]
 pub const INTEGRATOR_AUDIO_RING_BUFFER_BYTES: usize = 128 * 1024;
 
+/// C-ABI shared-memory ring-buffer layout mapped between the macOS CoreAudio HAL plug-in and Rust.
 #[cfg(target_os = "macos")]
 #[repr(C, align(8))]
 pub struct IntegratorAudioShmHeader {
+    /// Magic sentinel (`INTEGRATOR_AUDIO_SHM_MAGIC`) indicating initialized header state.
     pub magic: u32,
+    /// Shared-memory ABI version number.
     pub version: u32,
+    /// Non-zero while CoreAudio IO is actively running inside the virtual HAL audio device.
     pub active: std::sync::atomic::AtomicU32,
+    /// Negotiated wire audio format code.
     pub format: std::sync::atomic::AtomicU32,
+    /// Active sample rate in Hz (canonical 48,000 Hz).
     pub sample_rate: std::sync::atomic::AtomicU32,
+    /// Active channel count (canonical 2 channels).
     pub channels: std::sync::atomic::AtomicU32,
+    /// Cumulative PCM frames written into `buffer` by the HAL producer.
     pub total_frames_written: std::sync::atomic::AtomicU64,
+    /// Cumulative PCM frames consumed from `buffer` by the Rust consumer.
     pub total_frames_read: std::sync::atomic::AtomicU64,
+    /// Producer write cursor byte offset within `buffer` (`0..INTEGRATOR_AUDIO_RING_BUFFER_BYTES`).
     pub write_pos: std::sync::atomic::AtomicU32,
+    /// Consumer read cursor byte offset within `buffer` (`0..INTEGRATOR_AUDIO_RING_BUFFER_BYTES`).
     pub read_pos: std::sync::atomic::AtomicU32,
+    /// Cumulative ring-buffer underrun count reported by the HAL driver.
     pub underruns: std::sync::atomic::AtomicU32,
+    /// Circular PCM16 stereo byte ring buffer (128 KiB).
     pub buffer: [u8; INTEGRATOR_AUDIO_RING_BUFFER_BYTES],
 }
 
+/// Send/Sync newtype wrapper around the mmap'd `IntegratorAudioShmHeader` pointer.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct ShmHeaderPtr(*mut IntegratorAudioShmHeader);
@@ -283,6 +404,11 @@ unsafe impl Send for ShmHeaderPtr {}
 #[cfg(target_os = "macos")]
 unsafe impl Sync for ShmHeaderPtr {}
 
+/// Spawns the generation-scoped macOS HAL shared-memory audio capture task.
+///
+/// Maps `INTEGRATOR_AUDIO_SHM_NAME` (`131,128` bytes), polls the SPSC ring buffer for 960-byte
+/// canonical 5 ms frames, detects digital silence, and forwards frames via `send_captured_audio_frame`.
+/// Automatically unmaps memory and closes the POSIX shm descriptor upon generation mismatch or shutdown.
 #[cfg(target_os = "macos")]
 pub(crate) fn start_mac_shm_audio_capture(gen: u64) -> Option<tokio::task::JoinHandle<()>> {
     Some(tokio::spawn(async move {
@@ -302,6 +428,10 @@ pub(crate) fn start_mac_shm_audio_capture(gen: u64) -> Option<tokio::task::JoinH
             };
             if ptr != libc::MAP_FAILED {
                 mapped_header = Some(ShmHeaderPtr(ptr as *mut IntegratorAudioShmHeader));
+            } else {
+                // Close leaked fd if initial mmap fails so retry loop can reopen cleanly.
+                unsafe { libc::close(fd) };
+                fd = -1;
             }
         }
 
@@ -345,8 +475,11 @@ pub(crate) fn start_mac_shm_audio_capture(gen: u64) -> Option<tokio::task::JoinH
             }
 
             let is_active = header.active.load(Ordering::Relaxed) != 0;
-            let write_pos = header.write_pos.load(Ordering::Acquire) as usize;
-            let read_pos = header.read_pos.load(Ordering::Relaxed) as usize;
+            // Acquire write_pos before reading ring buffer bytes written by the CoreAudio HAL producer.
+            let write_pos = (header.write_pos.load(Ordering::Acquire) as usize)
+                % INTEGRATOR_AUDIO_RING_BUFFER_BYTES;
+            let read_pos = (header.read_pos.load(Ordering::Relaxed) as usize)
+                % INTEGRATOR_AUDIO_RING_BUFFER_BYTES;
 
             let available = if write_pos >= read_pos {
                 write_pos - read_pos
@@ -365,6 +498,7 @@ pub(crate) fn start_mac_shm_audio_capture(gen: u64) -> Option<tokio::task::JoinH
                     frame_buf[i] = b;
                     curr = (curr + 1) % INTEGRATOR_AUDIO_RING_BUFFER_BYTES;
                 }
+                // Publish updated read_pos with Release ordering so the HAL producer observes freed space.
                 header.read_pos.store(curr as u32, Ordering::Release);
                 header.total_frames_read.fetch_add(AUDIO_FRAME_SAMPLES_PER_CH as u64, Ordering::Relaxed);
 
@@ -390,47 +524,64 @@ pub(crate) fn start_mac_shm_audio_capture(gen: u64) -> Option<tokio::task::JoinH
     }))
 }
 
+/// Returns the lazily initialized global async lifecycle mutex.
 fn lifecycle_lock() -> &'static tokio::sync::Mutex<()> {
     AUDIO_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Returns the lazily initialized global `IUA2` cryptographic session registry.
 fn global_audio_registry() -> &'static Mutex<AudioSessionRegistry> {
     AUDIO_SESSION_REGISTRY.get_or_init(|| Mutex::new(AudioSessionRegistry::new()))
 }
 
+/// Returns the lazily initialized global 64-slot audio jitter buffer.
 fn global_jitter_buffer() -> &'static Mutex<jitter::JitterBuffer> {
     JITTER_BUFFER.get_or_init(|| Mutex::new(jitter::JitterBuffer::new()))
 }
 
+/// Returns the lazily initialized mutex serializing test chime WAV generation and playback.
 fn chime_file_lock() -> &'static Mutex<()> {
     CHIME_FILE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Returns the cooperative cancellation notifier for the 5 ms playout worker.
 fn playout_cancel_notify() -> &'static Notify {
     PLAYOUT_CANCEL_NOTIFY.get_or_init(Notify::new)
 }
 
+/// Returns the cooperative cancellation notifier for the UDP port 58284 sink receiver task.
 fn sink_cancel_notify() -> &'static Notify {
     SINK_CANCEL_NOTIFY.get_or_init(Notify::new)
 }
 
+/// Serde default provider returning `AUDIO_PORT` (`58284`) when deserializing legacy status payloads.
 fn default_audio_port() -> u16 {
     AUDIO_PORT
 }
 
+/// Runtime status snapshot of the Dynamic Audio Routing subsystem serialized to UI & RPC callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioRoutingStatus {
+    /// Human-readable topology description reflecting active capture, playback, standby, or offline state.
     pub topology: String,
+    /// Estimated end-to-end audio pipeline latency in milliseconds (`25.0` ms when active, `0.0` ms idle).
     pub latency_ms: f32,
+    /// Canonical PCM sample rate in Hz (`48,000`).
     pub sample_rate: u32,
+    /// Canonical PCM bit depth in bits per sample (`16`).
     pub bit_depth: u8,
+    /// True if native audio capture (Windows) or CoreAudio playout (macOS) is currently streaming.
     pub is_active: bool,
+    /// UDP port bound by the `IUA2` sink (`58284`).
     #[serde(default = "default_audio_port")]
     pub port: u16,
+    /// Cumulative audio frames read by the local capture backend (Windows WASAPI).
     #[serde(default)]
     pub frames_captured: u64,
+    /// Cumulative authenticated `IUA2` packets processed by the local UDP sink (macOS).
     #[serde(default)]
     pub packets_drained: u64,
+    /// Cumulative audio buffer underruns or capture discontinuities reported by the native backend.
     #[serde(default)]
     pub underruns: u64,
     /// Cross-platform mixer balance (`-1.0` Mac boost ↔ `0.0` balanced ↔ `+1.0` Windows boost).
@@ -496,7 +647,9 @@ pub fn apply_mixer_gain_pcm16(buf: &mut [u8], balance: f32, muted: bool) {
     }
 }
 
+/// RAII guard clearing `SINK_LISTENING` only if `SINK_GENERATION` still matches `my_sink_gen`.
 struct SinkListeningGuard {
+    /// Generation token captured when this UDP sink receiver task was spawned.
     my_sink_gen: u64,
 }
 
@@ -513,6 +666,7 @@ impl Drop for SinkListeningGuard {
 /// Acquires `PLAYOUT_STATE_LOCK` and calls `integrator_mac_audio_stop()` **BEFORE** clearing
 /// `PLAYOUT_ACTIVE = false`, eliminating the idle-timeout silent-wedge window.
 struct PlayoutWorkerGuard {
+    /// Routing generation token owned by this playout worker instance.
     my_gen: u64,
 }
 
@@ -535,6 +689,7 @@ impl Drop for PlayoutWorkerGuard {
 /// Windows WASAPI capture (`integrator_win_audio_capture_stop_if_gen(my_gen)`) so a delayed exit
 /// thread can NEVER stop a newer session's WASAPI capture.
 struct SenderTaskGuard {
+    /// Routing generation token owned by this outbound sender task.
     my_gen: u64,
 }
 
@@ -565,6 +720,7 @@ impl Drop for SenderTaskGuard {
     }
 }
 
+/// Token-bucket-style 30-second rate limiter suppressing log storms on malformed UDP floods.
 fn rate_limit_allow(last_logged: &mut Option<Instant>) -> bool {
     let now = Instant::now();
     match *last_logged {
@@ -576,6 +732,7 @@ fn rate_limit_allow(last_logged: &mut Option<Instant>) -> bool {
     }
 }
 
+/// Returns the current wall-clock Unix epoch timestamp in milliseconds.
 fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -583,6 +740,7 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Reaps an exited or backgrounded child process without blocking the caller thread.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn reap_child(mut child: std::process::Child) {
     if let Ok(Some(_)) = child.try_wait() {
@@ -763,22 +921,33 @@ async fn spawn_playout_worker_for_gen_await(worker_routing_gen: u64) {
         }
     });
 
+    // Guard handle publication under PLAYOUT_STATE_LOCK against concurrent stop/shutdown (`NEW-04`)
     let mut guard = PLAYOUT_WORKER_HANDLE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    if ROUTING_GENERATION.load(Ordering::Acquire) != worker_routing_gen
+        || !PLAYOUT_ACTIVE.load(Ordering::Acquire)
+        || AUDIO_SHUTDOWN.load(Ordering::Acquire)
+    {
+        handle.abort();
+        return;
+    }
     if let Some(old_race) = guard.replace(handle) {
         old_race.abort();
     }
 }
 
+/// Top-level facade managing `IUA2` audio sessions, mixer gain, capture/playout lifecycles, and teardown.
 pub struct AudioManager;
 
 impl AudioManager {
     /// Synchronizes the atomic `"audio"` feature-enabled gate with `FeatureManager` (`AUD-1G7-07(2)`).
+    #[cfg(test)]
     pub fn set_audio_feature_enabled(enabled: bool) {
         AUDIO_ENABLED.store(enabled, Ordering::SeqCst);
     }
 
+    /// Resets `AUDIO_SHUTDOWN` and `AUDIO_ENABLED` latches between unit tests.
     #[cfg(test)]
     pub fn reset_shutdown_for_test() {
         AUDIO_SHUTDOWN.store(false, Ordering::SeqCst);
@@ -787,6 +956,7 @@ impl AudioManager {
 
     /// Atomically disables the audio feature, stops active routing/playback/capture, and closes
     /// UDP 58284 under a single `AUDIO_LIFECYCLE_LOCK` acquisition (zero lockless gap; `AUD-1G7-07(2)`).
+    #[cfg(test)]
     pub async fn disable_audio_feature_async() -> Result<String> {
         AUDIO_ENABLED.store(false, Ordering::SeqCst);
         let remote_ip = {
@@ -912,11 +1082,6 @@ impl AudioManager {
         (millis as f32 / 1000.0, muted)
     }
 
-    #[allow(dead_code)]
-    pub fn packets_drained() -> u64 {
-        PACKETS_DRAINED.load(Ordering::Relaxed)
-    }
-
     /// Resolves peer credentials strictly by authenticated `TransportSessionV2` `peer_device_id`
     /// and enforces canonical Stage 1 PCM parameters (`48 kHz / 2ch / 16-bit`; `AUD-1G7-10/15`).
     pub fn handle_negotiate_session_for_peer(
@@ -988,6 +1153,7 @@ impl AudioManager {
     /// (`NEW-07`, `AUD-1G7-02`): evicts & invalidates registry sessions, awaits playout worker drain,
     /// stops CoreAudio + `JitterBuffer` under `PLAYOUT_STATE_LOCK`, and offloads Windows WASAPI join
     /// via `spawn_blocking` — strictly scoped to when the revoked peer owns the active target.
+    #[cfg(test)]
     pub async fn revoke_peer_audio_sessions_async(peer_device_id_hex: &str) -> usize {
         let clean_id = peer_device_id_hex.trim().to_ascii_lowercase();
         let Some(peer_bytes) = security::hex_decode_array::<16>(&clean_id) else {
@@ -1104,6 +1270,8 @@ impl AudioManager {
         evicted
     }
 
+    /// Initiates a mutually authenticated `NegotiateAudioSession` RPC with `peer_ip`,
+    /// validates non-zero `receiver_nonce` and positive TTL, and derives `AudioSessionSender`.
     async fn negotiate_sender_session_for_peer(
         peer_ip: &str,
         peer_creds: &VerifiedPeerCredentials,
@@ -1303,11 +1471,18 @@ impl AudioManager {
                     break;
                 }
 
+                // Seal plaintext frame into authenticated IUA2 datagram, ignoring transient send errors
+                // on UDP, and tear down if session TTL expires or sequence cap is reached.
                 let now = security::unix_epoch_secs();
                 let (flags, payload): (u16, &[u8]) = if frame.is_silent {
                     (AUDIO_FLAG_SILENCE, &[0u8; 1])
                 } else {
-                    (AUDIO_FLAG_PCM_FRAME, &frame.data[..frame.len])
+                    // Clamp PCM slice to `CANONICAL_FRAME_BYTES` (960 B) and ignore malformed partial lengths.
+                    let slice_len = frame.len.min(CANONICAL_FRAME_BYTES);
+                    if slice_len != CANONICAL_FRAME_BYTES {
+                        continue;
+                    }
+                    (AUDIO_FLAG_PCM_FRAME, &frame.data[..slice_len])
                 };
                 frame_index = frame_index.wrapping_add(1);
                 let timestamp_us = frame_index.wrapping_mul(CANONICAL_FRAME_MS * 1000);
@@ -1392,7 +1567,8 @@ impl AudioManager {
         ))
     }
 
-    #[allow(dead_code)]
+    /// Resolves peer credentials by IP and delegates to `start_capture_and_stream_for_peer`.
+    #[cfg(not(target_os = "macos"))]
     pub async fn start_capture_and_stream(
         peer_ip: &str,
         sample_rate: u32,
@@ -1439,6 +1615,13 @@ impl AudioManager {
         {
             let mut guard = SENDER_CHANNEL.lock().unwrap_or_else(|e| e.into_inner());
             guard.take();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut task_guard = MAC_CAPTURE_TASK.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = task_guard.take() {
+                task.abort();
+            }
         }
         {
             let mut task_guard = SENDER_TASK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1552,13 +1735,24 @@ impl AudioManager {
                 (peer_creds, peer_hex, gen)
             };
 
-            // Phase 2 (UNLOCKED): invoke remote StartAudioCapture RPC
+            // Phase 2 (UNLOCKED): invoke remote StartAudioCapture RPC with bounded timeout
             let req = DisplayRpcRequest::StartAudioCapture {
                 sample_rate: CANONICAL_SAMPLE_RATE,
                 channels: CANONICAL_CHANNELS,
                 bit_depth: CANONICAL_BIT_DEPTH,
             };
-            let rpc_res = DisplayController::send_remote_rpc(peer_ip, &req).await;
+            let rpc_res = match tokio::time::timeout(
+                Duration::from_secs(10),
+                DisplayController::send_remote_rpc(peer_ip, &req),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "Timed out awaiting StartAudioCapture RPC response from {}",
+                    peer_ip
+                )),
+            };
 
             // Phase 3 (locked): validate state or roll back ONLY if still owning `my_gen`
             let mut need_remote_cleanup_stop = false;
@@ -1703,12 +1897,8 @@ impl AudioManager {
         Ok(format!("Dynamic Audio Routing stopped ({})", stop_detail))
     }
 
-    #[allow(dead_code)]
-    pub async fn stop_sink_server_async() {
-        let _lifecycle = lifecycle_lock().lock().await;
-        Self::stop_sink_server_inner().await;
-    }
-
+    /// Stops the UDP port 58284 sink receiver task while holding `AUDIO_LIFECYCLE_LOCK`.
+    #[cfg(test)]
     async fn stop_sink_server_inner() {
         SINK_GENERATION.fetch_add(1, Ordering::SeqCst);
         SINK_LISTENING.store(false, Ordering::Release);
@@ -1731,6 +1921,7 @@ impl AudioManager {
 
     /// Complete, awaited asynchronous teardown of Dynamic Audio Routing (`AUD-1G7-07`, `NEW-01`).
     /// Never blocked by remote RPCs because `AUDIO_LIFECYCLE_LOCK` is never held across network I/O.
+    #[cfg(test)]
     pub async fn shutdown_async() {
         AUDIO_SHUTDOWN.store(true, Ordering::SeqCst);
         {
@@ -1806,13 +1997,10 @@ impl AudioManager {
         tracing::info!("🛑 Dynamic Audio Routing subsystem shut down cleanly (sync)");
     }
 
-    #[allow(dead_code)]
-    pub async fn play_spatial_test_chime_async() -> Result<String> {
-        tokio::task::spawn_blocking(Self::play_spatial_test_chime)
-            .await
-            .map_err(|e| anyhow::anyhow!("Audio chime task panicked: {}", e))?
-    }
-
+    /// Generates and plays a stereo 24-bit 48 kHz spatial test chime through the local OS output device.
+    ///
+    /// Writes `spatial_test_chime.wav` under `app_data_dir()` with `0o600` permissions (Unix) and
+    /// spawns `afplay` (macOS) or `PowerShell Media.SoundPlayer` (Windows) via `reap_child`.
     pub fn play_spatial_test_chime() -> Result<String> {
         let _guard = chime_file_lock().lock().unwrap_or_else(|e| e.into_inner());
         let data_dir = system_info::app_data_dir();
@@ -1868,6 +2056,7 @@ impl AudioManager {
         }
     }
 
+    /// Synthesizes a 1.2-second C5/G5/C6 triad chime into a 24-bit 48 kHz stereo PCM WAV file at `path`.
     fn synthesize_chime_wav(path: &Path) -> Result<()> {
         let sample_rate = 48000usize;
         let duration_secs = 1.2f32;
@@ -1897,6 +2086,7 @@ impl AudioManager {
         file.write_all(b"data")?;
         file.write_all(&data_chunk_size.to_le_bytes())?;
 
+        // Triad frequencies in Hz: C5 (523.25), G5 (783.99), C6 (1046.50).
         let f1 = 523.25f32;
         let f2 = 783.99f32;
         let f3 = 1046.50f32;
@@ -1913,6 +2103,7 @@ impl AudioManager {
             let s3 = (two_pi * f3 * t).sin() * 0.15;
             let mono_sample = (s1 + s2 + s3) * env;
 
+            // Subtle 10% stereo spatial offset (L=1.05, R=0.95) for channel verification.
             let sample_l = (mono_sample * 1.05f32).clamp(-1.0, 1.0);
             let sample_r = (mono_sample * 0.95f32).clamp(-1.0, 1.0);
 
@@ -1930,11 +2121,13 @@ impl AudioManager {
         Ok(())
     }
 
+    /// Acquires `AUDIO_LIFECYCLE_LOCK` and starts the authenticated `IUA2` UDP sink server on port 58284.
     pub async fn start_sink_server() -> Result<()> {
         let _lifecycle = lifecycle_lock().lock().await;
         Self::start_sink_server_inner().await
     }
 
+    /// Binds `0.0.0.0:58284`, verifies shutdown/feature gates, and spawns the `IUA2` decrypt/playout loop.
     async fn start_sink_server_inner() -> Result<()> {
         if AUDIO_SHUTDOWN.load(Ordering::Acquire) {
             anyhow::bail!("Audio subsystem is shutting down");
@@ -2200,6 +2393,10 @@ impl AudioManager {
         });
 
         let mut recv_guard = SINK_RECEIVER_TASK.lock().unwrap_or_else(|e| e.into_inner());
+        if AUDIO_SHUTDOWN.load(Ordering::Acquire) || SINK_GENERATION.load(Ordering::Acquire) != my_sink_gen {
+            recv_handle.abort();
+            return Ok(());
+        }
         if let Some(old) = recv_guard.take() {
             old.abort();
         }

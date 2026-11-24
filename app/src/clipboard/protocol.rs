@@ -44,7 +44,7 @@
 //!                                      │
 //!                                      ▼
 //!  ┌───────────────────────────────────────────────────────────────────────────────┐
-//!  │ Binary Streaming Loop over TransportSessionV2 (Port 58285, 256 KiB AEAD)      │
+//!  │ Binary Streaming Loop over TransportSessionV2 (Port 58283, 256 KiB AEAD)      │
 //!  │   [0x01] FRAME_DIR       -> "Projects/App"                                    │
 //!  │   [0x02] FRAME_FILE      -> "Projects/App/main.rs" (size: 4096B)              │
 //!  │   [0x03] FRAME_FILE_DATA -> Chunk 1..N (256 KiB)                              │
@@ -144,6 +144,7 @@ pub(crate) fn validate_image_bounds(
     height: usize,
     byte_len: usize,
 ) -> Option<usize> {
+    // Reject zero dimensions or dimensions exceeding the 8,192 px single-axis cap.
     if width == 0
         || height == 0
         || width > MAX_IMAGE_DIMENSION
@@ -151,6 +152,7 @@ pub(crate) fn validate_image_bounds(
     {
         return None;
     }
+    // Checked multiplication prevents 32-bit/64-bit integer wraparound prior to allocation.
     let expected = width.checked_mul(height)?.checked_mul(4)?;
     if expected == 0 || expected > MAX_IMAGE_BYTES || expected != byte_len {
         return None;
@@ -236,23 +238,33 @@ pub struct ClipboardMessage {
 }
 
 /// Custom high-performance Base64 serialization module with strict canonical padding validation.
+///
+/// Standard relaxed Base64 decoders often ignore non-zero trailing bits in padded quartets
+/// (`==` or `=`), enabling representation malleability. This codec strictly enforces RFC 4648 §3.5
+/// canonical zero-padding invariants and pre-allocation quota checks against `MAX_IMAGE_BYTES`.
 mod rgba_base64 {
     use super::*;
     use serde::de::Error;
 
+    /// Standard RFC 4648 Base64 64-character lookup table.
     const B64_ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     /// Serializes raw byte slices into standard Base64 ASCII strings.
+    ///
+    /// Packs every 3-byte input triplet into a 24-bit integer (`triple`) and emits 4 6-bit
+    /// ASCII characters, appending `=` padding characters when the final chunk has 1 or 2 bytes.
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        // Pre-allocate exact output length: ceil(len / 3) * 4 characters.
         let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0] as u32;
             let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
             let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            // Combine 3 octets into a 24-bit big-endian register for 6-bit sextet extraction.
             let triple = (b0 << 16) | (b1 << 8) | b2;
             out.push(B64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
             out.push(B64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
@@ -270,7 +282,8 @@ mod rgba_base64 {
         serializer.serialize_str(&out)
     }
 
-    /// Decodes an individual Base64 ASCII character to its 6-bit value.
+    /// Decodes an individual Base64 ASCII character to its 6-bit value (`0..=63`),
+    /// returning `None` for padding (`=`), whitespace, or out-of-alphabet bytes.
     fn decode_char(b: u8) -> Option<u8> {
         match b {
             b'A'..=b'Z' => Some(b - b'A'),
@@ -282,13 +295,15 @@ mod rgba_base64 {
         }
     }
 
-    /// Deserializes a Base64 string into raw bytes, enforcing canonical padding bit verification.
+    /// Deserializes a Base64 string into raw bytes, enforcing canonical padding bit verification
+    /// and pre-allocation `MAX_IMAGE_BYTES` bounds checking.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         let raw = s.as_bytes();
+        // Valid Base64 strings must always be a multiple of 4 ASCII characters.
         if raw.len() % 4 != 0 {
             return Err(D::Error::custom("Invalid base64 image length"));
         }
@@ -302,6 +317,7 @@ mod rgba_base64 {
         } else {
             0
         };
+        // Reject oversized payloads before allocating the output vector.
         let estimated = (raw.len() / 4) * 3 - padding;
         if estimated > MAX_IMAGE_BYTES {
             return Err(D::Error::custom("Image base64 payload exceeds MAX_IMAGE_BYTES"));
@@ -317,11 +333,15 @@ mod rgba_base64 {
                 .ok_or_else(|| D::Error::custom("Invalid base64 character"))?;
 
             if quad[2] == b'=' {
+                // Double padding `==` is only legal in the final quartet, requires `quad[3] == '='`,
+                // and requires the low 4 bits of `v1` to be zero (RFC 4648 canonical encoding).
                 if !is_last || quad[3] != b'=' || (v1 & 0x0F) != 0 {
                     return Err(D::Error::custom("Malformed base64 padding"));
                 }
                 out.push((v0 << 2) | (v1 >> 4));
             } else if quad[3] == b'=' {
+                // Single padding `=` is only legal in the final quartet and requires the low 2 bits
+                // of `v2` to be zero.
                 if !is_last {
                     return Err(D::Error::custom("Malformed base64 padding"));
                 }
@@ -333,6 +353,7 @@ mod rgba_base64 {
                 out.push((v0 << 2) | (v1 >> 4));
                 out.push((v1 << 4) | (v2 >> 2));
             } else {
+                // Unpadded quartet: decode all 4 sextets into 3 output bytes.
                 let v2 = decode_char(quad[2])
                     .ok_or_else(|| D::Error::custom("Invalid base64 character"))?;
                 let v3 = decode_char(quad[3])

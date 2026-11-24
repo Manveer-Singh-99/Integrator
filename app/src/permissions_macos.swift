@@ -1,20 +1,26 @@
 //
 //  permissions_macos.swift
-//  Integrator Setup & Permissions Assistant - macOS Native TCC & Privacy FFI Bridge
+//  Integrator Setup & Permissions Assistant - macOS Native TCC, Touch ID & Privacy FFI Bridge
 //
 //  ========================================================================================
 //  1. MODULE PURPOSE & ARCHITECTURAL SCOPE
 //  ========================================================================================
 //  This module provides the native macOS C-ABI FFI bridge for querying and requesting
 //  operating system privacy permissions managed by macOS Transparency, Consent, and Control
-//  (TCC) across Accessibility, Input Monitoring, Screen Recording, and Camera capture.
+//  (TCC) across Accessibility, Input Monitoring, Screen Recording, and Camera capture,
+//  plus Apple Secure Enclave biometric authentication (Touch ID) and explicit session-scoped
+//  remote camera access consent prompts (`NSAlert` sheet / floating panel).
 //
 //  ========================================================================================
 //  2. ARCHITECTURAL LINKAGES & CALL FLOW
 //  ========================================================================================
 //  Upstream Callers:
-//  - `app/src/setup.rs`: Invokes `@_cdecl` entry points during launch health checks,
-//    on-demand permission audits, and user-initiated permission request flows.
+//  - `app/src/setup.rs`: Invokes permission preflight/request `@_cdecl` entry points during
+//    launch health checks, on-demand permission audits, and guided permission requests.
+//  - `app/src/trust.rs`: Invokes `integrator_mac_touchid_available` and
+//    `integrator_mac_touchid_authenticate` for cross-device Windows Hello / Passkey approval.
+//  - `app/src/camera/mod.rs`: Invokes `integrator_mac_prompt_camera_consent_scoped` and
+//    `integrator_mac_cancel_camera_consent_prompt` for explicit local camera consent leases.
 //
 //  Downstream Callees:
 //  - `ApplicationServices`: `AXIsProcessTrusted()`, `AXIsProcessTrustedWithOptions(_:)`.
@@ -22,18 +28,23 @@
 //    `CGPreflightScreenCaptureAccess()`, `CGRequestScreenCaptureAccess()`.
 //  - `AVFoundation`: `AVCaptureDevice.authorizationStatus(for:)`,
 //    `AVCaptureDevice.requestAccess(for:completionHandler:)`.
+//  - `LocalAuthentication`: `LAContext` Secure Enclave Touch ID evaluation.
+//  - `AppKit`: Non-blocking `NSAlert` (`beginSheetModal` or retained floating window).
 //
 //  ========================================================================================
 //  3. THREADING & CONCURRENCY MODEL
 //  ========================================================================================
-//  - Preflight status checks (`*_granted`, `*_status`) are thread-safe and non-blocking,
-//    suitable for synchronous invocation from Rust worker threads.
-//  - Interactive request triggers (`*_request`) may present native macOS system permission
-//    dialogs or dispatch asynchronous TCC prompts without blocking the main UI runloop.
+//  - Preflight status checks (`*_granted`, `*_status`, `touchid_available`) are thread-safe
+//    and non-blocking for direct synchronous invocation from Rust threads.
+//  - Blocking FFI prompts (`touchid_authenticate`, `prompt_camera_consent_scoped`,
+//    `perm_camera_request`) never block `Thread.isMainThread`: Touch ID and consent prompts
+//    guard against main-thread deadlock and present AppKit UI on `DispatchQueue.main`.
 //
 //  ========================================================================================
 //  4. SECURITY & SAFETY INVARIANTS
 //  ========================================================================================
+//  - Fail-Closed Main-Thread & Timeout Semantics: Touch ID and scoped camera consent prompts
+//    default to denial (`0`) on timeout, cancellation, preemption, or invalid calling thread.
 //  - OS Availability Guards: `CGPreflightListenEventAccess` and `CGPreflightScreenCaptureAccess`
 //    are gated with `if #available(macOS 10.15, *)` to guarantee symbol availability across
 //    deployment targets.
@@ -60,6 +71,35 @@ private let kTouchIdPromptTimeoutSec: Int = 45
 
 /// Fallback reason string displayed in the macOS Touch ID sheet when caller passes an empty reason.
 private let kTouchIdDefaultPromptReason: String = "authenticate a remote Touch ID challenge from your paired Windows PC"
+
+/// Default timeout in seconds when awaiting an explicit macOS camera consent dialog response.
+private let kCameraConsentDefaultTimeoutSec: Int = 30
+
+/// Thread-safe synchronization container bridging `LAContext.evaluatePolicy` callbacks across timeout boundaries.
+private final class TouchIdEvalBox: @unchecked Sendable {
+    /// Lock protecting `success` and `errorMessage`.
+    private let lock = NSLock()
+    /// Whether biometric authentication succeeded.
+    private var success = false
+    /// Localized diagnostic string supplied on biometric failure or cancellation.
+    private var errorMessage = ""
+
+    /// Stores the asynchronous LocalAuthentication outcome safely from any callback thread.
+    func set(success: Bool, errorMessage: String) {
+        lock.lock()
+        self.success = success
+        self.errorMessage = errorMessage
+        lock.unlock()
+    }
+
+    /// Reads the stored biometric authentication result and error diagnostic atomically.
+    func get() -> (Bool, String) {
+        lock.lock()
+        let res = (success, errorMessage)
+        lock.unlock()
+        return res
+    }
+}
 
 /// Queries whether the current process is trusted for macOS Accessibility (`AXIsProcessTrusted`).
 ///
@@ -158,6 +198,8 @@ public func integrator_mac_perm_camera_status() -> Int32 {
 
 /// Requests macOS video camera access via `AVCaptureDevice.requestAccess(for: .video)` if the
 /// bundle defines `NSCameraUsageDescription` and the status is `.notDetermined`.
+///
+/// Never blocks the main AppKit thread; dispatches asynchronously when invoked on `Thread.isMainThread`.
 @_cdecl("integrator_mac_perm_camera_request")
 public func integrator_mac_perm_camera_request() {
     guard AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined else {
@@ -166,6 +208,10 @@ public func integrator_mac_perm_camera_request() {
     guard let desc = Bundle.main.object(forInfoDictionaryKey: kCameraUsageDescriptionKey) as? String,
           !desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     else {
+        return
+    }
+    if Thread.isMainThread {
+        AVCaptureDevice.requestAccess(for: .video) { _ in }
         return
     }
     let sem = DispatchSemaphore(value: 0)
@@ -189,9 +235,18 @@ public func integrator_mac_touchid_available() -> Bool {
     return context.biometryType == .touchID
 }
 
-/// Copies a human-readable UTF-8 error message into a caller-allocated C character buffer.
+/// Copies a human-readable UTF-8 error message into a caller-allocated NUL-terminated C character buffer.
+///
+/// - Parameters:
+///   - text: Error string (truncated safely to `cap - 1` UTF-8 bytes without splitting multi-byte scalars).
+///   - buf: Destination C character buffer; no-op if `nil` or `cap <= 0`.
+///   - cap: Capacity of `buf` in bytes including trailing NUL byte.
 private func writeCStringBuffer(_ text: String, into buf: UnsafeMutablePointer<CChar>?, cap: Int) {
-    guard let buf = buf, cap > 1 else { return }
+    guard let buf = buf, cap > 0 else { return }
+    if cap == 1 {
+        buf[0] = 0
+        return
+    }
     let utf8 = Array(text.utf8)
     let copyLen = min(utf8.count, cap - 1)
     for i in 0..<copyLen {
@@ -202,13 +257,16 @@ private func writeCStringBuffer(_ text: String, into buf: UnsafeMutablePointer<C
 
 /// Presents the native macOS Touch ID fingerprint authentication sheet backed by the Apple Secure Enclave.
 ///
+/// Must be called from a background worker thread (returns `0` fail-closed if invoked synchronously on
+/// `Thread.isMainThread` so AppKit never deadlocks).
+///
 /// - Parameters:
 ///   - reasonPtr: NUL-terminated UTF-8 reason string displayed inside the macOS Touch ID sheet.
 ///   - outErrorBuf: Optional caller-allocated UTF-8 buffer receiving a failure explanation.
 ///   - outErrorCap: Capacity in bytes of `outErrorBuf`.
 /// - Returns:
 ///   - `1`: Biometric Touch ID match succeeded.
-///   - `0`: User cancelled or authentication failed.
+///   - `0`: User cancelled, authentication failed, or called on main thread.
 ///   - `-1`: Touch ID hardware unavailable or not enrolled on this Mac.
 @_cdecl("integrator_mac_touchid_authenticate")
 public func integrator_mac_touchid_authenticate(
@@ -216,6 +274,11 @@ public func integrator_mac_touchid_authenticate(
     outErrorBuf: UnsafeMutablePointer<CChar>?,
     outErrorCap: Int
 ) -> Int32 {
+    if Thread.isMainThread {
+        writeCStringBuffer("Touch ID verification cannot block the main AppKit UI thread.", into: outErrorBuf, cap: outErrorCap)
+        return 0
+    }
+
     let reason: String
     if let reasonPtr = reasonPtr {
         let parsed = String(cString: reasonPtr).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -239,14 +302,10 @@ public func integrator_mac_touchid_authenticate(
     }
 
     let sem = DispatchSemaphore(value: 0)
-    var authSuccess: Bool = false
-    var evalErrorMsg: String = ""
+    let evalBox = TouchIdEvalBox()
 
     context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, evalError in
-        authSuccess = success
-        if let evalError = evalError {
-            evalErrorMsg = evalError.localizedDescription
-        }
+        evalBox.set(success: success, errorMessage: evalError?.localizedDescription ?? "")
         sem.signal()
     }
 
@@ -257,6 +316,7 @@ public func integrator_mac_touchid_authenticate(
         return 0
     }
 
+    let (authSuccess, evalErrorMsg) = evalBox.get()
     if authSuccess {
         writeCStringBuffer("", into: outErrorBuf, cap: outErrorCap)
         return 1
@@ -267,45 +327,76 @@ public func integrator_mac_touchid_authenticate(
     }
 }
 
-/// Presents an explicit modal consent dialog asking the local user if they allow the remote peer
-/// to activate and stream the Mac camera, with a configurable timeout and granular scope options.
-///
-/// - Parameters:
-///   - peerNamePtr: UTF-8 C string of the remote peer hostname or device identifier.
-///   - timeoutSec: Maximum seconds before prompt automatically dismisses and denies.
-/// - Returns:
-///   - `1`: Allow Once (single stream)
-///   - `2`: Allow for this Session
-///   - `3`: Always Allow (persistent)
 // MARK: - Non-blocking Scoped Camera Consent Coordinator
 
-private final class MacPromptCoordinator: NSObject {
+/// Coordinates the lifecycle, timeout timer, sheet/window dismissal, and single-shot result delivery
+/// for the non-blocking AppKit remote camera authorization dialog.
+private final class MacPromptCoordinator: NSObject, @unchecked Sendable {
+    /// Mutex guarding `completed`, `resultValue`, `timer`, and `completion`.
     private let lock = NSLock()
+    /// Prevents double completion when button tap, sheet completion, timer, or cancel race.
     private var completed = false
+    /// Recorded user authorization scope decision (`0` = Denied until resolved).
+    private var resultValue: Int32 = 0
+    /// One-shot completion callback invoked at most once upon prompt resolution.
     private var completion: ((Int32) -> Void)?
+    /// Retained `NSAlert` instance kept alive for standalone floating alerts without an attached sheet.
+    var retainedAlert: NSAlert?
+    /// Weak reference to the alert window displayed onscreen.
     weak var window: NSWindow?
+    /// Weak reference to the parent `NSWindow` when presented via `beginSheetModal`.
+    weak var parentSheetWindow: NSWindow?
+    /// Main-queue expiration timer auto-denying the request if the user does not respond in time.
     private var timer: DispatchSourceTimer?
 
+    /// Creates a new coordinator with the given single-shot completion callback.
     init(completion: @escaping (Int32) -> Void) {
         self.completion = completion
         super.init()
     }
 
+    /// Attaches the expiration timeout source created on `DispatchQueue.main`.
     func attachTimer(timer: DispatchSourceTimer) {
+        lock.lock()
         self.timer = timer
+        lock.unlock()
     }
 
+    /// Returns the resolved authorization scope code safely from any thread.
+    func currentResult() -> Int32 {
+        lock.lock()
+        let v = resultValue
+        lock.unlock()
+        return v
+    }
+
+    /// Completes the prompt once with `result`, cancels the timeout timer, dismisses the UI cleanly
+    /// on the main thread, and invokes the caller completion callback.
     func finish(with result: Int32) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !completed else { return }
+        guard !completed else {
+            lock.unlock()
+            return
+        }
         completed = true
-        timer?.cancel()
-        timer = nil
+        resultValue = result
+        let activeTimer = self.timer
+        self.timer = nil
         let comp = self.completion
         self.completion = nil
-        DispatchQueue.main.async { [weak window] in
-            window?.orderOut(nil)
+        let win = self.window
+        let parent = self.parentSheetWindow
+        self.retainedAlert = nil
+        lock.unlock()
+
+        activeTimer?.cancel()
+
+        DispatchQueue.main.async {
+            if let parent = parent, let win = win, win.sheetParent === parent {
+                parent.endSheet(win, returnCode: .cancel)
+            } else {
+                win?.orderOut(nil)
+            }
         }
         g_macPromptLock.lock()
         if g_activeMacPromptCoordinator === self {
@@ -315,6 +406,7 @@ private final class MacPromptCoordinator: NSObject {
         comp?(result)
     }
 
+    /// Target-action handler attached to buttons when the alert runs as a standalone floating panel.
     @objc func buttonTapped(_ sender: NSButton) {
         let tag = sender.tag
         let decision: Int32
@@ -330,7 +422,10 @@ private final class MacPromptCoordinator: NSObject {
     }
 }
 
+/// Currently displayed camera consent prompt coordinator (used for remote cancellation or preemption).
 private var g_activeMacPromptCoordinator: MacPromptCoordinator?
+
+/// Lock protecting `g_activeMacPromptCoordinator`.
 private let g_macPromptLock = NSLock()
 
 /// Cancels any currently pending macOS camera consent dialog immediately.
@@ -345,7 +440,12 @@ public func integrator_mac_cancel_camera_consent_prompt() {
 /// Prompts the local Mac user for camera streaming consent using non-blocking AppKit presentation.
 /// Never invokes synchronous `runModal()`; main-thread event dispatch continues uninterrupted.
 ///
-/// Returns:
+/// Must be called from a background worker thread (returns `0` fail-closed if called on `Thread.isMainThread`).
+///
+/// - Parameters:
+///   - peerNamePtr: NUL-terminated UTF-8 C string of the remote peer display name.
+///   - timeoutSec: Maximum seconds before prompt automatically dismisses and denies (defaults to 30 when `<= 0`).
+/// - Returns:
 ///   - `1`: Allow Once (Single continuous stream)
 ///   - `2`: Allow for Active Session
 ///   - `3`: Always Allow (Remember persistently)
@@ -356,25 +456,31 @@ public func integrator_mac_prompt_camera_consent_scoped(
     peerNamePtr: UnsafePointer<CChar>?,
     timeoutSec: Int32
 ) -> Int32 {
+    if Thread.isMainThread {
+        return 0
+    }
+
     let peerName: String
     if let ptr = peerNamePtr {
-        peerName = String(cString: ptr)
+        let parsed = String(cString: ptr).trimmingCharacters(in: .whitespacesAndNewlines)
+        peerName = parsed.isEmpty ? "Paired Workstation" : parsed
     } else {
         peerName = "Paired Workstation"
     }
 
-    let effectiveTimeout = timeoutSec > 0 ? Int(timeoutSec) : 30
+    let effectiveTimeout = timeoutSec > 0 ? Int(timeoutSec) : kCameraConsentDefaultTimeoutSec
     let sem = DispatchSemaphore(value: 0)
-    var selectedOption: Int32 = 0
 
-    let coordinator = MacPromptCoordinator { result in
-        selectedOption = result
+    let coordinator = MacPromptCoordinator { _ in
         sem.signal()
     }
 
+    // Cancel any orphaned prior prompt before installing the new active coordinator.
     g_macPromptLock.lock()
+    let previous = g_activeMacPromptCoordinator
     g_activeMacPromptCoordinator = coordinator
     g_macPromptLock.unlock()
+    previous?.finish(with: 0)
 
     DispatchQueue.main.async {
         _ = NSApplication.shared
@@ -383,35 +489,16 @@ public func integrator_mac_prompt_camera_consent_scoped(
         alert.informativeText = "\(peerName) is requesting to access and stream your Mac camera.\n\nChoose an authorization scope:"
         alert.alertStyle = .warning
 
-        // Button 1: Allow for Session (tag: 1)
         let b1 = alert.addButton(withTitle: "Allow for Session")
         b1.tag = 1
-        b1.target = coordinator
-        b1.action = #selector(MacPromptCoordinator.buttonTapped(_:))
-
-        // Button 2: Allow Once (tag: 2)
         let b2 = alert.addButton(withTitle: "Allow Once")
         b2.tag = 2
-        b2.target = coordinator
-        b2.action = #selector(MacPromptCoordinator.buttonTapped(_:))
-
-        // Button 3: Always Allow (tag: 3)
         let b3 = alert.addButton(withTitle: "Always Allow")
         b3.tag = 3
-        b3.target = coordinator
-        b3.action = #selector(MacPromptCoordinator.buttonTapped(_:))
-
-        // Button 4: Deny (tag: 4)
         let b4 = alert.addButton(withTitle: "Deny")
         b4.tag = 4
-        b4.target = coordinator
-        b4.action = #selector(MacPromptCoordinator.buttonTapped(_:))
-
-        // Button 5: Deny & Block (tag: 5)
         let b5 = alert.addButton(withTitle: "Deny & Block")
         b5.tag = 5
-        b5.target = coordinator
-        b5.action = #selector(MacPromptCoordinator.buttonTapped(_:))
 
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
         timer.schedule(deadline: .now() + .seconds(effectiveTimeout))
@@ -423,8 +510,11 @@ public func integrator_mac_prompt_camera_consent_scoped(
 
         let window = alert.window
         coordinator.window = window
+        coordinator.retainedAlert = alert
 
         if let targetWindow = NSApp?.keyWindow ?? NSApp?.mainWindow {
+            // Preserve NSAlert's native sheet button handling so endSheet fires cleanly without stranding parent window.
+            coordinator.parentSheetWindow = targetWindow
             alert.beginSheetModal(for: targetWindow) { response in
                 let decision: Int32
                 switch response {
@@ -437,6 +527,11 @@ public func integrator_mac_prompt_camera_consent_scoped(
                 coordinator.finish(with: decision)
             }
         } else {
+            // Standalone floating alert: route button actions directly through coordinator.
+            for btn in [b1, b2, b3, b4, b5] {
+                btn.target = coordinator
+                btn.action = #selector(MacPromptCoordinator.buttonTapped(_:))
+            }
             window.level = .floating
             window.center()
             window.makeKeyAndOrderFront(nil)
@@ -449,7 +544,7 @@ public func integrator_mac_prompt_camera_consent_scoped(
         coordinator.finish(with: 0)
         return 0
     }
-    return selectedOption
+    return coordinator.currentResult()
 }
 
 /// Presents an explicit modal consent dialog asking the local user if they allow the remote peer
@@ -457,9 +552,12 @@ public func integrator_mac_prompt_camera_consent_scoped(
 ///
 /// - Parameters:
 ///   - peerNamePtr: UTF-8 C string of the remote peer hostname or device identifier.
-/// - Returns: `true` if the local user explicitly clicked "Allow", `false` if denied or cancelled.
+/// - Returns: `true` if the local user explicitly clicked an Allow option, `false` if denied or cancelled.
 @_cdecl("integrator_mac_prompt_camera_consent")
 public func integrator_mac_prompt_camera_consent(peerNamePtr: UnsafePointer<CChar>?) -> Bool {
-    let res = integrator_mac_prompt_camera_consent_scoped(peerNamePtr: peerNamePtr, timeoutSec: 30)
+    let res = integrator_mac_prompt_camera_consent_scoped(
+        peerNamePtr: peerNamePtr,
+        timeoutSec: Int32(kCameraConsentDefaultTimeoutSec)
+    )
     return res > 0
 }

@@ -45,6 +45,9 @@
 //    - Zero Use-After-Free / Clean COM Ownership: `WebAuthNEncode*` output buffers are allocated
 //      by Windows via `CoTaskMemAlloc` and transferred directly to COM out-parameters; unmanaged
 //      input allocations are freed strictly after all native calls using them return.
+//    - DLL Search-Order Hardening & Pipe Deadlock Prevention: All system P/Invokes specify
+//      `[DefaultDllImportSearchPaths(DllImportSearchPath.System32)]`, decoded native buffers are
+//      length-bounded, and `integrator_cli.exe` stdout/stderr pipes are drained concurrently.
 // ==============================================================================================
 
 using System;
@@ -56,6 +59,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace IntegratorPasskeyHost
 {
@@ -111,6 +115,10 @@ namespace IntegratorPasskeyHost
     // Protocol Constants & Named Win32 Values (Strictly Zero Inline Literals)
     // ==========================================================================================
 
+    /// <summary>
+    /// Centralized COM GUIDs, Win32 status codes, ABI struct versions, timeouts, and CBOR capability payloads
+    /// used by the packaged out-of-process passkey COM server.
+    /// </summary>
     internal static class Constants
     {
         /// <summary>COM CLSID string registered in AppxManifest.xml and WebAuthNPluginAddAuthenticator2.</summary>
@@ -239,6 +247,15 @@ namespace IntegratorPasskeyHost
         /// <summary>Idle timeout in milliseconds before exiting a COM-activated host if no call arrives (15 minutes).</summary>
         public const int IdleExitTimeoutMs = 15 * 60 * 1000;
 
+        /// <summary>Win32 <c>WM_QUIT</c> (<c>0x0012</c>) posted via <c>PostThreadMessageW</c> to stop the STA pump cleanly.</summary>
+        public const uint WmQuit = 0x0012u;
+
+        /// <summary>Maximum allowed byte length (4096 bytes) for decoded native WebAuthn fields.</summary>
+        public const uint MaxNativeFieldBytes = 4096u;
+
+        /// <summary>Maximum allowed number of credential descriptors (256) read from an allowList.</summary>
+        public const uint MaxAllowCredentialCount = 256u;
+
         /// <summary>Standard Base64-encoded Integrator Touch ID SVG logo (light theme).</summary>
         public const string LogoSvgBase64 =
             "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZlcnNpb249IjEuMSIgdmlld0JveD0iMCAwIDY0IDY0Ij4" +
@@ -291,12 +308,19 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_PLUGIN_OPERATION_REQUEST
     {
+        /// <summary>Calling browser window handle (<c>HWND</c>).</summary>
         public IntPtr hWnd;
+        /// <summary>Unique Windows WebAuthn transaction identifier.</summary>
         public Guid transactionId;
+        /// <summary>Byte count of Windows request signature payload.</summary>
         public uint cbRequestSignature;
+        /// <summary>Pointer to Windows request signature buffer.</summary>
         public IntPtr pbRequestSignature;
+        /// <summary>Request format type (<c>1</c> = CTAP2 CBOR).</summary>
         public int requestType;
+        /// <summary>Byte count of encoded CTAP2 CBOR request payload.</summary>
         public uint cbEncodedRequest;
+        /// <summary>Pointer to encoded CTAP2 CBOR request buffer.</summary>
         public IntPtr pbEncodedRequest;
     }
 
@@ -304,7 +328,9 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_PLUGIN_OPERATION_RESPONSE
     {
+        /// <summary>Byte count of encoded CTAP2 response payload.</summary>
         public uint cbEncodedResponse;
+        /// <summary>Pointer to <c>CoTaskMemAlloc</c>-allocated encoded response buffer owned by caller.</summary>
         public IntPtr pbEncodedResponse;
     }
 
@@ -312,8 +338,11 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_PLUGIN_CANCEL_OPERATION_REQUEST
     {
+        /// <summary>Transaction identifier of the operation to cancel.</summary>
         public Guid transactionId;
+        /// <summary>Byte count of request signature payload.</summary>
         public uint cbRequestSignature;
+        /// <summary>Pointer to request signature bytes.</summary>
         public IntPtr pbRequestSignature;
     }
 
@@ -321,15 +350,25 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_PLUGIN_ADD_AUTHENTICATOR_OPTIONS_2
     {
+        /// <summary>User-facing authenticator display name shown in Windows Settings.</summary>
         public string pwszAuthenticatorName;
+        /// <summary>Pointer to the 16-byte COM CLSID GUID.</summary>
         public IntPtr pClsid;
+        /// <summary>Plugin Relying Party identifier domain.</summary>
         public string pwszPluginRpId;
+        /// <summary>Optional Base64 SVG logo string for Windows light theme.</summary>
         public string? pwszLightThemeLogoSvg;
+        /// <summary>Optional Base64 SVG logo string for Windows dark theme.</summary>
         public string? pwszDarkThemeLogoSvg;
+        /// <summary>Byte count of CTAP2 <c>authenticatorGetInfo</c> CBOR bytes.</summary>
         public uint cbAuthenticatorInfo;
+        /// <summary>Pointer to CTAP2 <c>authenticatorGetInfo</c> CBOR buffer.</summary>
         public IntPtr pbAuthenticatorInfo;
+        /// <summary>Count of restricted Relying Party IDs (<c>0</c> allows all RPs).</summary>
         public uint cSupportedRpIds;
+        /// <summary>Pointer to array of supported Relying Party ID strings.</summary>
         public IntPtr ppwszSupportedRpIds;
+        /// <summary>Optional user verification key name override.</summary>
         public string? pwszUserVerificationKeyName;
     }
 
@@ -337,9 +376,13 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_RP_ENTITY_INFORMATION
     {
+        /// <summary>Structure version.</summary>
         public uint dwVersion;
+        /// <summary>Relying Party domain identifier.</summary>
         public string? pwszId;
+        /// <summary>Human-readable Relying Party display name.</summary>
         public string? pwszName;
+        /// <summary>Optional Relying Party icon URL.</summary>
         public string? pwszIcon;
     }
 
@@ -347,11 +390,17 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_USER_ENTITY_INFORMATION
     {
+        /// <summary>Structure version.</summary>
         public uint dwVersion;
+        /// <summary>Byte count of user identifier handle.</summary>
         public uint cbId;
+        /// <summary>Pointer to user identifier bytes.</summary>
         public IntPtr pbId;
+        /// <summary>Account username string.</summary>
         public string? pwszName;
+        /// <summary>Optional user avatar icon URL.</summary>
         public string? pwszIcon;
+        /// <summary>Human-readable user display name.</summary>
         public string? pwszDisplayName;
     }
 
@@ -359,7 +408,9 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_COSE_CREDENTIAL_PARAMETERS
     {
+        /// <summary>Number of COSE credential parameters in the array.</summary>
         public uint cCredentialParameters;
+        /// <summary>Pointer to unmanaged <c>WEBAUTHN_COSE_CREDENTIAL_PARAMETER</c> array.</summary>
         public IntPtr pCredentialParameters;
     }
 
@@ -367,9 +418,13 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_CREDENTIAL
     {
+        /// <summary>Structure version (1).</summary>
         public uint dwVersion;
+        /// <summary>Byte count of the credential identifier.</summary>
         public uint cbId;
+        /// <summary>Pointer to credential identifier bytes.</summary>
         public IntPtr pbId;
+        /// <summary>Canonical credential type string (<c>"public-key"</c>).</summary>
         public string? pwszCredentialType;
     }
 
@@ -377,10 +432,15 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_CREDENTIAL_EX
     {
+        /// <summary>Structure version (1).</summary>
         public uint dwVersion;
+        /// <summary>Byte count of the credential identifier.</summary>
         public uint cbId;
+        /// <summary>Pointer to credential identifier bytes.</summary>
         public IntPtr pbId;
+        /// <summary>Canonical credential type string (<c>"public-key"</c>).</summary>
         public string? pwszCredentialType;
+        /// <summary>Bitmask of supported CTAP transports.</summary>
         public uint dwTransports;
     }
 
@@ -388,7 +448,9 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_CREDENTIAL_LIST
     {
+        /// <summary>Number of credential pointers in <see cref="ppCredentials"/>.</summary>
         public uint cCredentials;
+        /// <summary>Pointer to array of unmanaged <see cref="WEBAUTHN_CREDENTIAL_EX"/> pointers.</summary>
         public IntPtr ppCredentials;
     }
 
@@ -396,7 +458,9 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_EXTENSIONS
     {
+        /// <summary>Number of extensions in the array.</summary>
         public uint cExtensions;
+        /// <summary>Pointer to unmanaged <c>WEBAUTHN_EXTENSION</c> array.</summary>
         public IntPtr pExtensions;
     }
 
@@ -404,14 +468,23 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_CTAPCBOR_MAKE_CREDENTIAL_REQUEST
     {
+        /// <summary>Structure version.</summary>
         public uint dwVersion;
+        /// <summary>Byte count of raw RP ID.</summary>
         public uint cbRpId;
+        /// <summary>Pointer to raw RP ID bytes.</summary>
         public IntPtr pbRpId;
+        /// <summary>Byte count of clientDataHash (32 bytes for SHA-256).</summary>
         public uint cbClientDataHash;
+        /// <summary>Pointer to clientDataHash bytes.</summary>
         public IntPtr pbClientDataHash;
+        /// <summary>Pointer to decoded <see cref="WEBAUTHN_RP_ENTITY_INFORMATION"/>.</summary>
         public IntPtr pRpInformation;
+        /// <summary>Pointer to decoded <see cref="WEBAUTHN_USER_ENTITY_INFORMATION"/>.</summary>
         public IntPtr pUserInformation;
+        /// <summary>Requested COSE signature algorithms.</summary>
         public WEBAUTHN_COSE_CREDENTIAL_PARAMETERS WebAuthNCredentialParameters;
+        /// <summary>Exclusion credential list.</summary>
         public WEBAUTHN_CREDENTIAL_LIST CredentialList;
     }
 
@@ -419,12 +492,19 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_CTAPCBOR_GET_ASSERTION_REQUEST
     {
+        /// <summary>Structure version.</summary>
         public uint dwVersion;
+        /// <summary>Relying Party domain string.</summary>
         public string? pwszRpId;
+        /// <summary>Byte count of raw RP ID.</summary>
         public uint cbRpId;
+        /// <summary>Pointer to raw RP ID bytes.</summary>
         public IntPtr pbRpId;
+        /// <summary>Byte count of clientDataHash (32 bytes for SHA-256).</summary>
         public uint cbClientDataHash;
+        /// <summary>Pointer to clientDataHash bytes.</summary>
         public IntPtr pbClientDataHash;
+        /// <summary>Allowed credential descriptor list.</summary>
         public WEBAUTHN_CREDENTIAL_LIST CredentialList;
     }
 
@@ -433,39 +513,66 @@ namespace IntegratorPasskeyHost
     internal struct WEBAUTHN_CREDENTIAL_ATTESTATION
     {
         // Version 1
+        /// <summary>Structure version (<see cref="Constants.WebAuthnCredentialAttestationVersion8"/> = 8).</summary>
         public uint dwVersion;
+        /// <summary>Attestation statement format string (<c>"none"</c>).</summary>
         public string? pwszFormatType;
+        /// <summary>Byte count of authenticatorData.</summary>
         public uint cbAuthenticatorData;
+        /// <summary>Pointer to authenticatorData buffer.</summary>
         public IntPtr pbAuthenticatorData;
+        /// <summary>Byte count of raw attestation statement.</summary>
         public uint cbAttestation;
+        /// <summary>Pointer to raw attestation statement buffer.</summary>
         public IntPtr pbAttestation;
+        /// <summary>Attestation decode type (<c>0</c> = none).</summary>
         public uint dwAttestationDecodeType;
+        /// <summary>Decoded attestation pointer (<see cref="IntPtr.Zero"/>).</summary>
         public IntPtr pvAttestationDecode;
+        /// <summary>Byte count of full CBOR attestation object.</summary>
         public uint cbAttestationObject;
+        /// <summary>Pointer to full CBOR attestation object.</summary>
         public IntPtr pbAttestationObject;
+        /// <summary>Byte count of credential ID.</summary>
         public uint cbCredentialId;
+        /// <summary>Pointer to credential ID bytes.</summary>
         public IntPtr pbCredentialId;
         // Version 2
+        /// <summary>Extension output descriptors.</summary>
         public WEBAUTHN_EXTENSIONS Extensions;
         // Version 3
+        /// <summary>Transport used to create the credential.</summary>
         public uint dwUsedTransport;
         // Version 4
+        /// <summary>Enterprise attestation boolean flag.</summary>
         public int bEpAtt;
+        /// <summary>Large blob storage support flag.</summary>
         public int bLargeBlobSupported;
+        /// <summary>Resident key (discoverable credential) flag.</summary>
         public int bResidentKey;
         // Version 5
+        /// <summary>PRF extension support flag.</summary>
         public int bPrfEnabled;
         // Version 6
+        /// <summary>Byte count of unsigned extension outputs.</summary>
         public uint cbUnsignedExtensionOutputs;
+        /// <summary>Pointer to unsigned extension outputs.</summary>
         public IntPtr pbUnsignedExtensionOutputs;
         // Version 7
+        /// <summary>Pointer to HMAC secret extension output.</summary>
         public IntPtr pHmacSecret;
+        /// <summary>Third-party payment extension flag.</summary>
         public int bThirdPartyPayment;
         // Version 8
+        /// <summary>Bitmask of supported transports.</summary>
         public uint dwTransports;
+        /// <summary>Byte count of UTF-8 clientDataJSON.</summary>
         public uint cbClientDataJSON;
+        /// <summary>Pointer to UTF-8 clientDataJSON.</summary>
         public IntPtr pbClientDataJSON;
+        /// <summary>Byte count of UTF-8 registrationResponseJSON.</summary>
         public uint cbRegistrationResponseJSON;
+        /// <summary>Pointer to UTF-8 registrationResponseJSON.</summary>
         public IntPtr pbRegistrationResponseJSON;
     }
 
@@ -474,30 +581,50 @@ namespace IntegratorPasskeyHost
     internal struct WEBAUTHN_ASSERTION
     {
         // Version 1
+        /// <summary>Structure version (<see cref="Constants.WebAuthnAssertionVersion6"/> = 6).</summary>
         public uint dwVersion;
+        /// <summary>Byte count of authenticatorData.</summary>
         public uint cbAuthenticatorData;
+        /// <summary>Pointer to authenticatorData buffer.</summary>
         public IntPtr pbAuthenticatorData;
+        /// <summary>Byte count of ASN.1 DER ECDSA signature.</summary>
         public uint cbSignature;
+        /// <summary>Pointer to ASN.1 DER ECDSA signature bytes.</summary>
         public IntPtr pbSignature;
+        /// <summary>Asserted credential descriptor.</summary>
         public WEBAUTHN_CREDENTIAL Credential;
+        /// <summary>Byte count of WebAuthn user handle.</summary>
         public uint cbUserId;
+        /// <summary>Pointer to WebAuthn user handle bytes.</summary>
         public IntPtr pbUserId;
         // Version 2
+        /// <summary>Extension output descriptors.</summary>
         public WEBAUTHN_EXTENSIONS Extensions;
+        /// <summary>Byte count of credLargeBlob payload.</summary>
         public uint cbCredLargeBlob;
+        /// <summary>Pointer to credLargeBlob payload.</summary>
         public IntPtr pbCredLargeBlob;
+        /// <summary>Large blob operation status code.</summary>
         public uint dwCredLargeBlobStatus;
         // Version 3
+        /// <summary>Pointer to HMAC secret extension output.</summary>
         public IntPtr pHmacSecret;
         // Version 4
+        /// <summary>Transport used during assertion.</summary>
         public uint dwUsedTransport;
         // Version 5
+        /// <summary>Byte count of unsigned extension outputs.</summary>
         public uint cbUnsignedExtensionOutputs;
+        /// <summary>Pointer to unsigned extension outputs.</summary>
         public IntPtr pbUnsignedExtensionOutputs;
         // Version 6
+        /// <summary>Byte count of UTF-8 clientDataJSON.</summary>
         public uint cbClientDataJSON;
+        /// <summary>Pointer to UTF-8 clientDataJSON.</summary>
         public IntPtr pbClientDataJSON;
+        /// <summary>Byte count of UTF-8 authenticationResponseJSON.</summary>
         public uint cbAuthenticationResponseJSON;
+        /// <summary>Pointer to UTF-8 authenticationResponseJSON.</summary>
         public IntPtr pbAuthenticationResponseJSON;
     }
 
@@ -505,13 +632,21 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct WEBAUTHN_CTAPCBOR_GET_ASSERTION_RESPONSE
     {
+        /// <summary>Core signed WebAuthn assertion payload.</summary>
         public WEBAUTHN_ASSERTION WebAuthNAssertion;
+        /// <summary>Pointer to user entity information structure.</summary>
         public IntPtr pUserInformation;
+        /// <summary>Total count of matching credentials.</summary>
         public uint dwNumberOfCredentials;
+        /// <summary>Index of the credential selected by the user.</summary>
         public int lUserSelected;
+        /// <summary>Byte count of large blob key.</summary>
         public uint cbLargeBlobKey;
+        /// <summary>Pointer to large blob key bytes.</summary>
         public IntPtr pbLargeBlobKey;
+        /// <summary>Byte count of unsigned extension outputs.</summary>
         public uint cbUnsignedExtensionOutputs;
+        /// <summary>Pointer to unsigned extension outputs.</summary>
         public IntPtr pbUnsignedExtensionOutputs;
     }
 
@@ -519,13 +654,21 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WEBAUTHN_PLUGIN_CREDENTIAL_DETAILS
     {
+        /// <summary>Byte count of the credential ID.</summary>
         public uint cbCredentialId;
+        /// <summary>Pointer to credential ID bytes.</summary>
         public IntPtr pbCredentialId;
+        /// <summary>Relying Party domain identifier string.</summary>
         public string pwszRpId;
+        /// <summary>Human-readable Relying Party display name.</summary>
         public string pwszRpName;
+        /// <summary>Byte count of the WebAuthn user handle.</summary>
         public uint cbUserId;
+        /// <summary>Pointer to WebAuthn user handle bytes.</summary>
         public IntPtr pbUserId;
+        /// <summary>Account username handle string.</summary>
         public string pwszUserName;
+        /// <summary>Account display name string.</summary>
         public string pwszUserDisplayName;
     }
 
@@ -533,12 +676,19 @@ namespace IntegratorPasskeyHost
     [StructLayout(LayoutKind.Sequential)]
     internal struct MSG
     {
+        /// <summary>Window handle receiving the message (null for thread messages such as <c>WM_QUIT</c>).</summary>
         public IntPtr hwnd;
+        /// <summary>Win32 message identifier.</summary>
         public uint message;
+        /// <summary>Additional message-specific word parameter.</summary>
         public UIntPtr wParam;
+        /// <summary>Additional message-specific long parameter.</summary>
         public IntPtr lParam;
+        /// <summary>Timestamp in milliseconds when the message was posted.</summary>
         public uint time;
+        /// <summary>Cursor horizontal screen coordinate in physical pixels.</summary>
         public int ptX;
+        /// <summary>Cursor vertical screen coordinate in physical pixels.</summary>
         public int ptY;
     }
 
@@ -546,55 +696,87 @@ namespace IntegratorPasskeyHost
     // JSON DTOs for integrator_cli.exe Bridge
     // ==========================================================================================
 
+    /// <summary>JSON-RPC input payload serialized and hex-encoded to <c>integrator_cli.exe passkey make-hex</c>.</summary>
     internal sealed class MakeCredRequestDto
     {
+        /// <summary>Hex-encoded 32-byte SHA-256 hash of WebAuthn clientDataJSON.</summary>
         [JsonPropertyName("client_data_hash_hex")] public string ClientDataHashHex { get; set; } = string.Empty;
+        /// <summary>Relying Party domain identifier.</summary>
         [JsonPropertyName("rp_id")] public string RpId { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn user entity identifier.</summary>
         [JsonPropertyName("user_id_hex")] public string UserIdHex { get; set; } = string.Empty;
+        /// <summary>Account username handle.</summary>
         [JsonPropertyName("user_name")] public string UserName { get; set; } = string.Empty;
+        /// <summary>Account human-readable display name.</summary>
         [JsonPropertyName("user_display_name")] public string UserDisplayName { get; set; } = string.Empty;
+        /// <summary>Local Windows hostname displayed in the paired Mac Touch ID prompt.</summary>
         [JsonPropertyName("requester_hostname")] public string RequesterHostname { get; set; } = Environment.MachineName;
     }
 
+    /// <summary>JSON response payload returned by <c>integrator_cli.exe passkey make-hex</c>.</summary>
     internal sealed class MakeCredResponseDto
     {
+        /// <summary>Hex-encoded credential identifier created on the Mac.</summary>
         [JsonPropertyName("credential_id_hex")] public string CredentialIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn authenticatorData bytes.</summary>
         [JsonPropertyName("auth_data_hex")] public string AuthDataHex { get; set; } = string.Empty;
+        /// <summary>Attestation statement format string (defaults to "none").</summary>
         [JsonPropertyName("attestation_format")] public string AttestationFormat { get; set; } = Constants.AttestationTypeNone;
+        /// <summary>Optional hex-encoded CBOR attestation object bytes.</summary>
         [JsonPropertyName("attestation_object_cbor_hex")] public string AttestationObjectCborHex { get; set; } = string.Empty;
     }
 
+    /// <summary>JSON-RPC input payload serialized and hex-encoded to <c>integrator_cli.exe passkey assert-hex</c>.</summary>
     internal sealed class GetAssertRequestDto
     {
+        /// <summary>Hex-encoded 32-byte SHA-256 hash of WebAuthn clientDataJSON.</summary>
         [JsonPropertyName("client_data_hash_hex")] public string ClientDataHashHex { get; set; } = string.Empty;
+        /// <summary>Relying Party domain identifier.</summary>
         [JsonPropertyName("rp_id")] public string RpId { get; set; } = string.Empty;
+        /// <summary>Hex-encoded allowList credential IDs (empty for discoverable resident passkeys).</summary>
         [JsonPropertyName("allow_credential_ids_hex")] public List<string> AllowCredentialIdsHex { get; set; } = new();
+        /// <summary>Local Windows hostname displayed in the paired Mac Touch ID prompt.</summary>
         [JsonPropertyName("requester_hostname")] public string RequesterHostname { get; set; } = Environment.MachineName;
     }
 
+    /// <summary>JSON response payload returned by <c>integrator_cli.exe passkey assert-hex</c>.</summary>
     internal sealed class GetAssertResponseDto
     {
+        /// <summary>Hex-encoded credential identifier that signed the challenge.</summary>
         [JsonPropertyName("credential_id_hex")] public string CredentialIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn user handle stored with the matched passkey.</summary>
         [JsonPropertyName("user_id_hex")] public string UserIdHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded WebAuthn authenticatorData bytes.</summary>
         [JsonPropertyName("auth_data_hex")] public string AuthDataHex { get; set; } = string.Empty;
+        /// <summary>Hex-encoded ASN.1 DER ECDSA P-256 assertion signature.</summary>
         [JsonPropertyName("signature_der_hex")] public string SignatureDerHex { get; set; } = string.Empty;
+        /// <summary>Monotonic authenticator signature counter value.</summary>
         [JsonPropertyName("sign_count")] public uint SignCount { get; set; }
     }
 
+    /// <summary>Standard JSON envelope emitted on stdout by <c>integrator_cli.exe passkey</c> subcommands.</summary>
+    /// <typeparam name="T">Deserialized response payload type.</typeparam>
     internal sealed class CliEnvelope<T>
     {
+        /// <summary>True if the remote Touch ID signing operation succeeded.</summary>
         [JsonPropertyName("ok")] public bool Ok { get; set; }
+        /// <summary>Deserialized payload when <see cref="Ok"/> is true.</summary>
         [JsonPropertyName("data")] public T? Data { get; set; }
+        /// <summary>Human-readable error diagnostic when <see cref="Ok"/> is false.</summary>
         [JsonPropertyName("error")] public string? Error { get; set; }
+        /// <summary>True if the paired Mac reported no matching resident credential (<c>NTE_NOT_FOUND</c>).</summary>
         [JsonPropertyName("not_found")] public bool NotFound { get; set; }
     }
 
     // ==========================================================================================
-    // Native Win32 Interop Declarations
+    // Native Win32 Interop Declarations (Pinned to System32)
     // ==========================================================================================
 
+    /// <summary>Direct P/Invoke declarations for COM, Win32 messaging, kernel32, and Windows 11 WebAuthn APIs.</summary>
     internal static class NativeMethods
     {
+        /// <summary>Configures process-wide COM security settings prior to class registration.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll")]
         public static extern int CoInitializeSecurity(
             IntPtr pSecDesc,
@@ -607,6 +789,8 @@ namespace IntegratorPasskeyHost
             uint dwCapabilities,
             IntPtr pReserved3);
 
+        /// <summary>Registers the out-of-process COM class factory with the local SCM.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll")]
         public static extern int CoRegisterClassObject(
             ref Guid rclsid,
@@ -615,81 +799,124 @@ namespace IntegratorPasskeyHost
             uint flags,
             out uint lpdwRegister);
 
+        /// <summary>Revokes a previously registered COM class factory cookie.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("ole32.dll")]
         public static extern int CoRevokeClassObject(uint dwRegister);
 
+        /// <summary>Queries the MSIX sparse package full name of the calling process.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetCurrentPackageFullName(
             ref uint packageFullNameLength,
             StringBuilder? packageFullName);
 
+        /// <summary>Returns the Win32 thread identifier of the calling thread for cross-thread <c>WM_QUIT</c> signaling.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+
+        /// <summary>Retrieves a message from the calling STA thread's message queue.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("user32.dll")]
         public static extern int GetMessageW(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
+        /// <summary>Translates virtual-key messages into character messages.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("user32.dll")]
         public static extern bool TranslateMessage(ref MSG lpMsg);
 
+        /// <summary>Dispatches a message to a window procedure or COM message window.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("user32.dll")]
         public static extern IntPtr DispatchMessageW(ref MSG lpMsg);
 
-        [DllImport("user32.dll")]
-        public static extern void PostQuitMessage(int nExitCode);
+        /// <summary>Posts a message (e.g., <c>WM_QUIT</c>) to the specified Win32 thread's message queue.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostThreadMessageW(uint idThread, uint Msg, UIntPtr wParam, IntPtr lParam);
 
+        /// <summary>Registers the plugin authenticator metadata, SVG logos, and CTAP2 capabilities with Windows.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         public static extern int WebAuthNPluginAddAuthenticator2(
             ref WEBAUTHN_PLUGIN_ADD_AUTHENTICATOR_OPTIONS_2 options,
             out IntPtr ppResponse);
 
+        /// <summary>Frees the response buffer allocated by <see cref="WebAuthNPluginAddAuthenticator2"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern void WebAuthNPluginFreeAddAuthenticatorResponse(IntPtr pResponse);
 
+        /// <summary>Removes the plugin authenticator registration from Windows WebAuthn.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern int WebAuthNPluginRemoveAuthenticator(ref Guid rclsid);
 
+        /// <summary>Queries the enabled/disabled state of the registered plugin authenticator.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern int WebAuthNPluginGetAuthenticatorState(ref Guid rclsid, out int state);
 
+        /// <summary>Adds resident credential metadata into the Windows Credential Manager autofill cache.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern int WebAuthNPluginAuthenticatorAddCredentials(
             ref Guid rclsid,
             uint cCredentialDetails,
             IntPtr pCredentialDetails);
 
+        /// <summary>Enumerates all cached credentials registered for this plugin authenticator.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern int WebAuthNPluginAuthenticatorGetAllCredentials(
             ref Guid rclsid,
             out uint pcCredentialDetails,
             out IntPtr ppCredentialDetailsArray);
 
+        /// <summary>Frees the credential details array allocated by <see cref="WebAuthNPluginAuthenticatorGetAllCredentials"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern void WebAuthNPluginAuthenticatorFreeCredentialDetailsArray(
             uint cCredentialDetails,
             IntPtr pCredentialDetailsArray);
 
-        [DllImport("webauthn.dll")]
+        /// <summary>Decodes an incoming CTAP2 CBOR MakeCredential request into a native structure.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         public static extern int WebAuthNDecodeMakeCredentialRequest(
             uint cbEncoded,
             IntPtr pbEncoded,
             out IntPtr ppMakeCredentialRequest);
 
+        /// <summary>Frees the decoded MakeCredential request allocated by <see cref="WebAuthNDecodeMakeCredentialRequest"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern void WebAuthNFreeDecodedMakeCredentialRequest(IntPtr pMakeCredentialRequest);
 
-        [DllImport("webauthn.dll")]
+        /// <summary>Encodes a WebAuthn attestation structure into a CTAP2 CBOR MakeCredential response buffer.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         public static extern int WebAuthNEncodeMakeCredentialResponse(
             ref WEBAUTHN_CREDENTIAL_ATTESTATION pCredentialAttestation,
             out uint pcbResp,
             out IntPtr ppbResp);
 
-        [DllImport("webauthn.dll")]
+        /// <summary>Decodes an incoming CTAP2 CBOR GetAssertion request into a native structure.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("webauthn.dll", CharSet = CharSet.Unicode)]
         public static extern int WebAuthNDecodeGetAssertionRequest(
             uint cbEncoded,
             IntPtr pbEncoded,
             out IntPtr ppGetAssertionRequest);
 
+        /// <summary>Frees the decoded GetAssertion request allocated by <see cref="WebAuthNDecodeGetAssertionRequest"/>.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern void WebAuthNFreeDecodedGetAssertionRequest(IntPtr pGetAssertionRequest);
 
+        /// <summary>Encodes a WebAuthn assertion response structure into a CTAP2 CBOR GetAssertion response buffer.</summary>
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("webauthn.dll")]
         public static extern int WebAuthNEncodeGetAssertionResponse(
             ref WEBAUTHN_CTAPCBOR_GET_ASSERTION_RESPONSE pGetAssertionResponse,
@@ -701,13 +928,21 @@ namespace IntegratorPasskeyHost
     // Logger Helper
     // ==========================================================================================
 
+    /// <summary>
+    /// Thread-safe diagnostic logger writing timestamped entries to <c>%USERPROFILE%\.integrator_passkey.log</c>
+    /// and standard output.
+    /// </summary>
     internal static class PasskeyLogger
     {
+        /// <summary>Lock serializing concurrent appends to <see cref="LogPath"/>.</summary>
         private static readonly object LogLock = new();
+        /// <summary>Resolved log file path under the current user's profile directory.</summary>
         private static readonly string LogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             Constants.PasskeyLogFileName);
 
+        /// <summary>Writes a timestamped diagnostic message with process ID to disk and stdout without throwing.</summary>
+        /// <param name="message">Diagnostic line content.</param>
         public static void Write(string message)
         {
             string line = $"[{DateTime.UtcNow:O}] [PasskeyHost pid={Environment.ProcessId}] {message}";
@@ -731,10 +966,16 @@ namespace IntegratorPasskeyHost
     // IPluginAuthenticator & IClassFactory COM Implementation
     // ==========================================================================================
 
+    /// <summary>
+    /// Out-of-process COM implementation of <see cref="IPluginAuthenticator"/> forwarding Windows WebAuthn
+    /// ceremonies to the paired macOS workstation via <see cref="CliBridge"/>.
+    /// </summary>
     internal sealed class IntegratorPluginAuthenticator : IPluginAuthenticator
     {
+        /// <summary>Synchronization lock serializing overlapping Touch ID ceremonies.</summary>
         private readonly object _operationLock = new();
 
+        /// <summary>Reports vault lock state (<see cref="Constants.PluginLockStatusUnlocked"/>).</summary>
         public int GetLockStatus(out int lockStatus)
         {
             PasskeyLogger.Write("GetLockStatus() called -> returning PluginUnlocked (1)");
@@ -742,12 +983,14 @@ namespace IntegratorPasskeyHost
             return Constants.S_OK;
         }
 
+        /// <summary>Handles Windows cancellation notifications for in-flight WebAuthn transactions.</summary>
         public int CancelOperation(in WEBAUTHN_PLUGIN_CANCEL_OPERATION_REQUEST request)
         {
             PasskeyLogger.Write($"CancelOperation(tx={request.transactionId}) called");
             return Constants.S_OK;
         }
 
+        /// <summary>Decodes CTAP2 MakeCredential requests, creates a credential on Mac via Touch ID, and encodes the response.</summary>
         public int MakeCredential(
             in WEBAUTHN_PLUGIN_OPERATION_REQUEST request,
             out WEBAUTHN_PLUGIN_OPERATION_RESPONSE response)
@@ -791,7 +1034,7 @@ namespace IntegratorPasskeyHost
                         rpId = rp.pwszId ?? string.Empty;
                         rpName = rp.pwszName ?? rpId;
                     }
-                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.pbRpId != IntPtr.Zero)
+                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.cbRpId <= Constants.MaxNativeFieldBytes && decoded.pbRpId != IntPtr.Zero)
                     {
                         byte[] rpBytes = new byte[decoded.cbRpId];
                         Marshal.Copy(decoded.pbRpId, rpBytes, 0, (int)decoded.cbRpId);
@@ -799,11 +1042,12 @@ namespace IntegratorPasskeyHost
                         if (string.IsNullOrEmpty(rpName)) rpName = rpId;
                     }
 
-                    // Extract 32-byte clientDataHash
-                    byte[] cdhBytes = new byte[decoded.cbClientDataHash];
-                    if (decoded.pbClientDataHash != IntPtr.Zero && decoded.cbClientDataHash > 0)
+                    // Extract 32-byte clientDataHash (bounded for safety)
+                    uint cdhLen = decoded.cbClientDataHash <= Constants.MaxNativeFieldBytes ? decoded.cbClientDataHash : 0u;
+                    byte[] cdhBytes = new byte[cdhLen];
+                    if (decoded.pbClientDataHash != IntPtr.Zero && cdhLen > 0)
                     {
-                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)decoded.cbClientDataHash);
+                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)cdhLen);
                     }
                     string clientDataHashHex = Convert.ToHexString(cdhBytes).ToLowerInvariant();
 
@@ -816,7 +1060,7 @@ namespace IntegratorPasskeyHost
                         var user = Marshal.PtrToStructure<WEBAUTHN_USER_ENTITY_INFORMATION>(decoded.pUserInformation);
                         userName = string.IsNullOrEmpty(user.pwszName) ? "user" : user.pwszName;
                         userDisplayName = string.IsNullOrEmpty(user.pwszDisplayName) ? userName : user.pwszDisplayName;
-                        if (user.cbId > 0 && user.pbId != IntPtr.Zero)
+                        if (user.cbId > 0 && user.cbId <= Constants.MaxNativeFieldBytes && user.pbId != IntPtr.Zero)
                         {
                             userIdBytes = new byte[user.cbId];
                             Marshal.Copy(user.pbId, userIdBytes, 0, (int)user.cbId);
@@ -837,7 +1081,9 @@ namespace IntegratorPasskeyHost
                     };
 
                     var rpcRes = CliBridge.Invoke<MakeCredResponseDto>("make-hex", rpcReq);
-                    if (rpcRes == null || !rpcRes.Ok || rpcRes.Data == null || string.IsNullOrEmpty(rpcRes.Data.AuthDataHex))
+                    if (rpcRes == null || !rpcRes.Ok || rpcRes.Data == null ||
+                        string.IsNullOrEmpty(rpcRes.Data.AuthDataHex) ||
+                        string.IsNullOrEmpty(rpcRes.Data.CredentialIdHex))
                     {
                         PasskeyLogger.Write($"Mac Touch ID MakeCredential failed/cancelled: {rpcRes?.Error ?? "null response"}");
                         return Constants.NTE_USER_CANCELLED;
@@ -845,6 +1091,11 @@ namespace IntegratorPasskeyHost
 
                     byte[] authDataBytes = Convert.FromHexString(rpcRes.Data.AuthDataHex);
                     byte[] credIdBytes = Convert.FromHexString(rpcRes.Data.CredentialIdHex);
+                    if (authDataBytes.Length == 0 || credIdBytes.Length == 0)
+                    {
+                        PasskeyLogger.Write("Mac Touch ID MakeCredential returned empty authData or credentialId");
+                        return Constants.NTE_USER_CANCELLED;
+                    }
 
                     pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
                     Marshal.Copy(authDataBytes, 0, pAuthData, authDataBytes.Length);
@@ -930,6 +1181,7 @@ namespace IntegratorPasskeyHost
             }
         }
 
+        /// <summary>Decodes CTAP2 GetAssertion requests, signs challenges on Mac via Touch ID, and encodes the assertion.</summary>
         public int GetAssertion(
             in WEBAUTHN_PLUGIN_OPERATION_REQUEST request,
             out WEBAUTHN_PLUGIN_OPERATION_RESPONSE response)
@@ -966,17 +1218,18 @@ namespace IntegratorPasskeyHost
                     var decoded = Marshal.PtrToStructure<WEBAUTHN_CTAPCBOR_GET_ASSERTION_REQUEST>(pDecoded);
 
                     string rpId = decoded.pwszRpId ?? string.Empty;
-                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.pbRpId != IntPtr.Zero)
+                    if (string.IsNullOrEmpty(rpId) && decoded.cbRpId > 0 && decoded.cbRpId <= Constants.MaxNativeFieldBytes && decoded.pbRpId != IntPtr.Zero)
                     {
                         byte[] rpBytes = new byte[decoded.cbRpId];
                         Marshal.Copy(decoded.pbRpId, rpBytes, 0, (int)decoded.cbRpId);
                         rpId = Encoding.UTF8.GetString(rpBytes);
                     }
 
-                    byte[] cdhBytes = new byte[decoded.cbClientDataHash];
-                    if (decoded.pbClientDataHash != IntPtr.Zero && decoded.cbClientDataHash > 0)
+                    uint cdhLen = decoded.cbClientDataHash <= Constants.MaxNativeFieldBytes ? decoded.cbClientDataHash : 0u;
+                    byte[] cdhBytes = new byte[cdhLen];
+                    if (decoded.pbClientDataHash != IntPtr.Zero && cdhLen > 0)
                     {
-                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)decoded.cbClientDataHash);
+                        Marshal.Copy(decoded.pbClientDataHash, cdhBytes, 0, (int)cdhLen);
                     }
                     string clientDataHashHex = Convert.ToHexString(cdhBytes).ToLowerInvariant();
 
@@ -984,13 +1237,14 @@ namespace IntegratorPasskeyHost
                     if (decoded.CredentialList.cCredentials > 0 && decoded.CredentialList.ppCredentials != IntPtr.Zero)
                     {
                         int ptrSize = IntPtr.Size;
-                        for (int i = 0; i < decoded.CredentialList.cCredentials; i++)
+                        uint allowCount = Math.Min(decoded.CredentialList.cCredentials, Constants.MaxAllowCredentialCount);
+                        for (int i = 0; i < allowCount; i++)
                         {
                             IntPtr credPtr = Marshal.ReadIntPtr(decoded.CredentialList.ppCredentials, i * ptrSize);
                             if (credPtr != IntPtr.Zero)
                             {
                                 var cred = Marshal.PtrToStructure<WEBAUTHN_CREDENTIAL_EX>(credPtr);
-                                if (cred.cbId > 0 && cred.pbId != IntPtr.Zero)
+                                if (cred.cbId > 0 && cred.cbId <= Constants.MaxNativeFieldBytes && cred.pbId != IntPtr.Zero)
                                 {
                                     byte[] idBytes = new byte[cred.cbId];
                                     Marshal.Copy(cred.pbId, idBytes, 0, (int)cred.cbId);
@@ -1011,7 +1265,10 @@ namespace IntegratorPasskeyHost
                     };
 
                     var rpcRes = CliBridge.Invoke<GetAssertResponseDto>("assert-hex", rpcReq);
-                    if (rpcRes == null || !rpcRes.Ok || rpcRes.Data == null || string.IsNullOrEmpty(rpcRes.Data.SignatureDerHex))
+                    if (rpcRes == null || !rpcRes.Ok || rpcRes.Data == null ||
+                        string.IsNullOrEmpty(rpcRes.Data.SignatureDerHex) ||
+                        string.IsNullOrEmpty(rpcRes.Data.AuthDataHex) ||
+                        string.IsNullOrEmpty(rpcRes.Data.CredentialIdHex))
                     {
                         PasskeyLogger.Write($"Mac Touch ID GetAssertion failed: notFound={rpcRes?.NotFound}, err={rpcRes?.Error ?? "null"}");
                         return (rpcRes != null && rpcRes.NotFound)
@@ -1025,6 +1282,11 @@ namespace IntegratorPasskeyHost
                     byte[] userIdBytes = string.IsNullOrEmpty(rpcRes.Data.UserIdHex)
                         ? Array.Empty<byte>()
                         : Convert.FromHexString(rpcRes.Data.UserIdHex);
+                    if (authDataBytes.Length == 0 || sigBytes.Length == 0 || credIdBytes.Length == 0)
+                    {
+                        PasskeyLogger.Write("Mac Touch ID GetAssertion returned empty authData, signature, or credentialId");
+                        return Constants.NTE_USER_CANCELLED;
+                    }
 
                     pAuthData = Marshal.AllocHGlobal(authDataBytes.Length);
                     Marshal.Copy(authDataBytes, 0, pAuthData, authDataBytes.Length);
@@ -1108,10 +1370,15 @@ namespace IntegratorPasskeyHost
         }
     }
 
+    /// <summary>
+    /// Out-of-process COM class factory instantiating <see cref="IntegratorPluginAuthenticator"/> for Windows COM SCM.
+    /// </summary>
     internal sealed class IntegratorPluginClassFactory : IClassFactory
     {
+        /// <summary>Singleton authenticator instance returned to COM callers.</summary>
         private readonly IntegratorPluginAuthenticator _authenticator = new();
 
+        /// <summary>Instantiates <see cref="IPluginAuthenticator"/> or <c>IUnknown</c> interfaces for COM activation.</summary>
         public int CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject)
         {
             ppvObject = IntPtr.Zero;
@@ -1137,6 +1404,7 @@ namespace IntegratorPasskeyHost
             return Constants.E_NOINTERFACE;
         }
 
+        /// <summary>Implements <c>IClassFactory::LockServer</c> and logs activation reference changes.</summary>
         public int LockServer(bool fLock)
         {
             PasskeyLogger.Write($"IClassFactory.LockServer(fLock={fLock})");
@@ -1148,8 +1416,20 @@ namespace IntegratorPasskeyHost
     // Companion Rust CLI Subprocess Bridge (Stateless TransportSessionV2 Client)
     // ==========================================================================================
 
+    /// <summary>
+    /// Stateless subprocess bridge invoking <c>integrator_cli.exe passkey</c> with hex-encoded JSON payloads
+    /// while concurrently draining stdout/stderr pipes to prevent OS buffer deadlocks.
+    /// </summary>
     internal static class CliBridge
     {
+        /// <summary>
+        /// Spawns <c>integrator_cli.exe passkey &lt;subcommand&gt; &lt;hex&gt;</c>, enforces a bounded 55s timeout,
+        /// and deserializes the trailing JSON envelope line from standard output.
+        /// </summary>
+        /// <typeparam name="T">Target response DTO type inside <see cref="CliEnvelope{T}"/>.</typeparam>
+        /// <param name="subcommand">Passkey CLI subcommand ("make-hex" or "assert-hex").</param>
+        /// <param name="payload">Request DTO serialized to JSON and hex-encoded on the command line.</param>
+        /// <returns>Deserialized response envelope, or an error envelope on timeout, launch failure, or corrupt JSON.</returns>
         public static CliEnvelope<T>? Invoke<T>(string subcommand, object payload)
         {
             string cliPath = Path.Combine(AppContext.BaseDirectory, Constants.CompanionCliExeName);
@@ -1179,13 +1459,18 @@ namespace IntegratorPasskeyHost
                 return new CliEnvelope<T> { Ok = false, Error = "Failed to spawn companion CLI" };
             }
 
-            string stdout = proc.StandardOutput.ReadToEnd();
-            string stderr = proc.StandardError.ReadToEnd();
+            // Drain stdout and stderr concurrently before WaitForExit to prevent pipe buffer deadlocks
+            // while ensuring the 55s timeout genuinely fires if the child hangs.
+            Task<string> stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            Task<string> stderrTask = proc.StandardError.ReadToEndAsync();
             if (!proc.WaitForExit(Constants.CliRpcTimeoutMs))
             {
                 try { proc.Kill(entireProcessTree: true); } catch { }
                 return new CliEnvelope<T> { Ok = false, Error = "Touch ID RPC timed out" };
             }
+
+            string stdout = stdoutTask.GetAwaiter().GetResult();
+            string stderr = stderrTask.GetAwaiter().GetResult();
 
             if (!string.IsNullOrWhiteSpace(stderr))
             {
@@ -1201,7 +1486,15 @@ namespace IntegratorPasskeyHost
             // Use the last JSON line in case tracing output preceded it
             string[] lines = trimmed.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             string lastLine = lines[^1];
-            return JsonSerializer.Deserialize<CliEnvelope<T>>(lastLine);
+            try
+            {
+                return JsonSerializer.Deserialize<CliEnvelope<T>>(lastLine);
+            }
+            catch (JsonException jex)
+            {
+                PasskeyLogger.Write($"CLI malformed JSON output: {jex.Message}");
+                return new CliEnvelope<T> { Ok = false, Error = $"Malformed CLI JSON: {jex.Message}" };
+            }
         }
     }
 
@@ -1209,8 +1502,12 @@ namespace IntegratorPasskeyHost
     // Entry Point & Lifecycle Modes
     // ==========================================================================================
 
+    /// <summary>
+    /// Entry point and CLI/COM server controller for <c>IntegratorPasskeyHost.exe</c>.
+    /// </summary>
     internal static class Program
     {
+        /// <summary>Queries the sparse MSIX package full name for diagnostics, or returns an unpackaged marker.</summary>
         private static string QueryPackageFullName()
         {
             uint len = 0;
@@ -1227,6 +1524,7 @@ namespace IntegratorPasskeyHost
             return $"(unpackaged, rc={rc})";
         }
 
+        /// <summary>Registers Integrator Touch ID with Windows 11 WebAuthn via <c>WebAuthNPluginAddAuthenticator2</c>.</summary>
         private static int RunRegister()
         {
             string pkg = QueryPackageFullName();
@@ -1279,6 +1577,7 @@ namespace IntegratorPasskeyHost
             }
         }
 
+        /// <summary>Unregisters Integrator Touch ID from Windows 11 WebAuthn via <c>WebAuthNPluginRemoveAuthenticator</c>.</summary>
         private static int RunUnregister()
         {
             Guid clsid = Constants.ClsidIntegratorPasskey;
@@ -1287,6 +1586,7 @@ namespace IntegratorPasskeyHost
             return (hr == Constants.S_OK || hr == Constants.NTE_NOT_FOUND) ? 0 : 1;
         }
 
+        /// <summary>Logs package identity, plugin registration state, and cached resident credential count.</summary>
         private static int RunStatus()
         {
             string pkg = QueryPackageFullName();
@@ -1302,6 +1602,7 @@ namespace IntegratorPasskeyHost
             return 0;
         }
 
+        /// <summary>Runs a live ABI marshaling self-test against <c>webauthn.dll</c> encode functions.</summary>
         private static int RunSelfTest()
         {
             // Verify WebAuthNEncodeMakeCredentialResponse & WebAuthNEncodeGetAssertionResponse ABI alignment live
@@ -1379,6 +1680,11 @@ namespace IntegratorPasskeyHost
             }
         }
 
+        /// <summary>
+        /// Runs the out-of-process COM LocalServer STA message loop until idle timeout or <c>WM_QUIT</c>.
+        /// Captures the STA Win32 thread ID so the ThreadPool idle timer posts <c>WM_QUIT</c> to the correct queue.
+        /// </summary>
+        /// <returns>0 on clean COM revocation and exit; 1 if <c>CoRegisterClassObject</c> fails.</returns>
         private static int RunComServer()
         {
             string pkg = QueryPackageFullName();
@@ -1411,10 +1717,11 @@ namespace IntegratorPasskeyHost
                 return 1;
             }
 
+            uint staThreadId = NativeMethods.GetCurrentThreadId();
             using var idleTimer = new System.Threading.Timer(_ =>
             {
-                PasskeyLogger.Write("Idle timeout elapsed without active COM calls; posting WM_QUIT.");
-                NativeMethods.PostQuitMessage(0);
+                PasskeyLogger.Write("Idle timeout elapsed without active COM calls; posting WM_QUIT to STA thread.");
+                NativeMethods.PostThreadMessageW(staThreadId, Constants.WmQuit, UIntPtr.Zero, IntPtr.Zero);
             }, null, Constants.IdleExitTimeoutMs, System.Threading.Timeout.Infinite);
 
             try
@@ -1436,6 +1743,12 @@ namespace IntegratorPasskeyHost
             return 0;
         }
 
+        /// <summary>
+        /// Main STA entry point dispatching administrative subcommands (<c>--register</c>, <c>--unregister</c>,
+        /// <c>--status</c>, <c>--self-test</c>) or running the COM LocalServer pump.
+        /// </summary>
+        /// <param name="args">Command-line arguments passed by Windows COM SCM or administrative tooling.</param>
+        /// <returns>Process exit code (0 on success, non-zero on error).</returns>
         [STAThread]
         public static int Main(string[] args)
         {

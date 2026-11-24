@@ -13,6 +13,17 @@
 //!
 //! ## 2. Cross-Subsystem Architectural Flow
 //!
+//! ### Upstream Callers
+//! - [`crate::core::IntegratorCore`]: Instantiates and starts [`DisplayServer`] on the Tokio async
+//!   runtime during daemon initialization.
+//!
+//! ### Downstream Callees
+//! - [`crate::trust::handle_incoming_pairing_stream_v2`]: Executes SPAKE2 mutual pairing handshakes (`"IPR2"`).
+//! - [`crate::trust::accept_transport_from_stream`]: Establishes authenticated `TransportSessionV2`
+//!   sessions (`"ITR2"`, [`ServiceId::DisplayRpc`]).
+//! - [`super::controller::DisplayController::handle_rpc`]: Dispatches authenticated and feature-checked
+//!   [`DisplayRpcRequest`] commands.
+//!
 //! ### Extended Display Streaming Pipeline
 //! When a display session is initiated (Mac -> PC or PC -> Mac), the initiator transmits
 //! [`DisplayRpcRequest::StartMoonlight`] over this server's connection. The server validates
@@ -20,11 +31,16 @@
 //! peer's authenticated IP address to prevent redirect attacks, and invokes [`DisplayController::handle_rpc`],
 //! which launches Moonlight with hardware-accelerated decoding (D3D11 on Windows, VideoToolbox on Mac).
 //!
-//! ### Shared Camera Control Routing
-//! Incoming camera control requests ([`DisplayRpcRequest::StartCamera`], [`DisplayRpcRequest::ToggleCamera`],
-//! [`DisplayRpcRequest::StopCamera`], [`DisplayRpcRequest::GetCameraStatus`]) are demultiplexed through this
-//! server and handed to [`DisplayController`]. These trigger local activation of the Shared Camera pipeline:
-//! - On Mac: Starts AVFoundation 720p30 NV12 capture (`camera_macos.swift`) and opens streaming port 58287.
+//! ### Shared Camera & Microphone Control Routing
+//! Incoming camera and microphone control requests ([`DisplayRpcRequest::StartCamera`],
+//! [`DisplayRpcRequest::ToggleCamera`], [`DisplayRpcRequest::StopCamera`],
+//! [`DisplayRpcRequest::GetCameraStatus`], [`DisplayRpcRequest::ListCameras`],
+//! [`DisplayRpcRequest::SelectCamera`], [`DisplayRpcRequest::ListMics`],
+//! [`DisplayRpcRequest::SelectMic`], [`DisplayRpcRequest::SetMicSettings`]) are demultiplexed through
+//! this server and handed to [`DisplayController`]. These trigger local activation of the Shared Camera
+//! and Microphone pipeline:
+//! - On Mac: Starts AVFoundation 720p30 NV12 capture (`camera_macos.swift`), enumerates/selects
+//!   AVFoundation audio input devices, and opens streaming port 58287.
 //! - On Windows: Registers and starts the standalone Media Foundation Virtual Camera COM DLL (`integrator_vcam.dll`),
 //!   mapping shared memory (`Global\IntegratorVCamShm_v1`) to receive remote frames without requiring physical
 //!   webcam hardware or wrapper attributes (`MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`).
@@ -219,7 +235,8 @@ impl DisplayServer {
         .with_context(|| format!("Timed out during TransportV2 handshake from {}", peer_ip))?
         .map_err(|e| anyhow::anyhow!(e))?;
 
-        // 4. Acquire post-auth permit and release pre-auth slot
+        // 4. Acquire post-auth permit and immediately drop pre-auth slot so authenticated
+        // RPC execution does not starve unrelated incoming connections at the ingress gate.
         let post_auth_permit = post_auth_limiter.try_acquire_owned().map_err(|_| {
             anyhow::anyhow!(
                 "Dropped Display RPC connection from {}: authenticated concurrency limit ({}) reached",
@@ -263,7 +280,8 @@ impl DisplayServer {
             }
         };
 
-        // 7. Check feature flag requirements
+        // 7. Check feature flag requirements early for remote callers; loopback requests proceed to
+        // `DisplayController::handle_rpc`, which restricts disabled-feature execution to StopAll/StopMoonlight.
         let resp = if let Some(feature) = required_feature_for_rpc(&req) {
             if !features.is_enabled(feature) && !peer_ip.is_loopback() {
                 warn!(

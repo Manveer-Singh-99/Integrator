@@ -15,13 +15,16 @@
 //! ### Core Responsibilities:
 //! 1. **Signed Beacon Broadcast**: Periodically broadcasts Ed25519-signed discovery beacons over local interface
 //!    broadcast addresses (`bcast_str`), global broadcast (`255.255.255.255`), and unicast addresses.
-//! 2. **Multi-Stage Beacon Verification**: Validates protocol versions, timestamp freshness (±60s),
+//! 2. **Bonjour / mDNS & BLE Proximity Ingestion**: Integrates `_integrator._tcp.local.` mDNS hints
+//!    (`bonjour_discovery`) and privacy-masked BLE magic packets (`ble_discovery`), unconditionally verifying
+//!    every hinted endpoint via mutual `TransportSessionV2` authentication before route admission.
+//! 3. **Multi-Stage Beacon Verification**: Validates protocol versions, timestamp freshness (±60s),
 //!    cryptographic Ed25519 signatures, port safety bounds, and Unicode character safety.
-//! 3. **Anti-Replay Protection (`BeaconReplayCache`)**: Rejects duplicate or replayed discovery frames
+//! 4. **Anti-Replay Protection (`BeaconReplayCache`)**: Rejects duplicate or replayed discovery frames
 //!    across single or multiple network interfaces while allowing valid multi-interface bursts.
-//! 4. **Route Characterization & Metric Ranking**: Probes candidate link latency (TCP RTT) and evaluates
-//!    transport hierarchy (Thunderbolt > Direct USB > Ethernet > Wi-Fi) to elect the lowest-latency,
-//!    highest-bandwidth communication route.
+//! 5. **Route Characterization & Metric Ranking**: Probes candidate link latency (`bridge::LinkMonitor`) and
+//!    evaluates transport hierarchy (Thunderbolt > Direct USB > Ethernet > Wi-Fi > Hotspot) to elect the
+//!    lowest-latency, highest-bandwidth communication route.
 //!
 //! ## 2. Architectural Linkages & Dependencies
 //! ### Upstream Callers:
@@ -31,10 +34,13 @@
 //!   `remove_manual_peer_ip()` to display live discovery candidate lists and manage manual IP overrides.
 //!
 //! ### Downstream Callees:
+//! - `bridge::LinkMonitor`: Measures TCP three-way handshake RTT across discovered peer routes.
+//! - `bonjour_discovery` / `ble_discovery`: Additive mDNS and Bluetooth LE proximity transports.
 //! - `system_info`: Queries host profile (`collect_local_profile`), enumerates physical interface endpoints
 //!   (`discovery_interface_endpoints`), and resolves OS routing tables (`describe_route_to_peer`).
-//! - `trust`: Cryptographically signs outgoing beacons (`sign_discovery_beacon_v2_full`) and verifies
-//!   incoming beacon authenticity and authorization states (`verify_discovery_beacon_v2_full`, `observe_discovered_peer`).
+//! - `trust`: Cryptographically signs outgoing beacons (`sign_discovery_beacon_v2_full`), verifies
+//!   incoming beacon authenticity and authorization states (`verify_discovery_beacon_v2_full`, `observe_discovered_peer`),
+//!   and executes `TransportSessionV2` verification (`connect_transport_to_hinted_ip`).
 //! - `config`: Reads well-known port definitions (`DISCOVERY_PORT`, `CONTROL_PORT`, `CLIPBOARD_PORT`).
 //! - Native OS Sockets: Utilizes `tokio::net::UdpSocket` and native C sockets (`setsockopt` with `IP_BOUND_IF`
 //!   on macOS) to bind outgoing broadcast packets to specific physical network adapters.
@@ -69,7 +75,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::config::{
@@ -886,16 +892,17 @@ impl DiscoveryManager {
 
                             upsert_peer_candidate(&mut list, candidate, now);
 
-                            // Re-evaluate best candidate route
-                            let best = select_best_peer(&list).map(|c| c.addr.ip().to_string());
+                            // Re-evaluate best candidate route and log the elected route's actual transport
+                            let best_cand = select_best_peer(&list);
+                            let best_ip_opt = best_cand.as_ref().map(|c| c.addr.ip().to_string());
                             let mut active = active_peer_ip.write().await;
-                            if *active != best {
-                                *active = best.clone();
-                                if let Some(ref b) = best {
+                            if *active != best_ip_opt {
+                                *active = best_ip_opt.clone();
+                                if let Some(ref b_cand) = best_cand {
                                     tracing::info!(
                                         "📡 Selected active peer route: {} ({})",
-                                        b,
-                                        transport.label()
+                                        b_cand.addr.ip(),
+                                        b_cand.transport.label()
                                     );
                                 }
                             }
@@ -1014,6 +1021,10 @@ impl DiscoveryManager {
 
                     let bytes = serde_json::to_vec(&beacon).unwrap_or_default();
                     let endpoints = system_info::discovery_interface_endpoints();
+                    let own_local_ips: HashSet<String> = system_info::list_local_ipv4_interfaces()
+                        .into_iter()
+                        .map(|iface| iface.ip)
+                        .collect();
                     let mut unicast_targets: Vec<String> = Vec::new();
                     let mut seen: HashSet<String> = HashSet::new();
                     let hist = load_peer_history();
@@ -1026,7 +1037,7 @@ impl DiscoveryManager {
                         .chain(active_candidate_ips.iter())
                         .chain(hist.recent_ips.iter())
                     {
-                        if !is_own_local_ip(ip) && seen.insert(ip.clone()) {
+                        if !own_local_ips.contains(ip) && seen.insert(ip.clone()) {
                             unicast_targets.push(ip.clone());
                         }
                     }
@@ -1161,7 +1172,8 @@ impl DiscoveryManager {
     }
 }
 
-/// Rate-limits repeated Bonjour/BLE authentication probes to the same IPv4 address (at most once every 3s).
+/// Rate-limits repeated Bonjour/BLE authentication probes to the same IPv4 address (at most once every 3s),
+/// capping cache entries at [`MAX_RTT_CACHE_ENTRIES`] with oldest eviction to prevent spoofed-IP DoS growth.
 fn allow_hint_probe(
     probe_times: &Mutex<HashMap<(Ipv4Addr, &'static str), Instant>>,
     ip: Ipv4Addr,
@@ -1174,6 +1186,15 @@ fn allow_hint_probe(
     if let Some(prev) = guard.get(&(ip, source)) {
         if now.saturating_duration_since(*prev) < HINT_PROBE_COOLDOWN {
             return false;
+        }
+    }
+    if !guard.contains_key(&(ip, source)) && guard.len() >= MAX_RTT_CACHE_ENTRIES {
+        if let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, ts)| *ts)
+            .map(|(k, _)| *k)
+        {
+            guard.remove(&oldest_key);
         }
     }
     guard.insert((ip, source), now);
@@ -1386,17 +1407,18 @@ async fn ingest_authenticated_hint(
     let mut list = candidates.write().await;
     let now = Instant::now();
     upsert_peer_candidate(&mut list, candidate, now);
-    let best = select_best_peer(&list).map(|c| c.addr.ip().to_string());
+    let best_cand = select_best_peer(&list);
+    let best_ip_opt = best_cand.as_ref().map(|c| c.addr.ip().to_string());
     let mut active = active_peer_ip.write().await;
-    if *active != best {
-        *active = best.clone();
-        if let Some(ref b) = best {
+    if *active != best_ip_opt {
+        *active = best_ip_opt;
+        if let Some(ref b_cand) = best_cand {
             tracing::info!(
                 "📡 Selected active peer route via {}: {} ({}, {:.2} ms)",
                 source,
-                b,
-                transport.label(),
-                tcp_rtt_ms.unwrap_or(0.0)
+                b_cand.addr.ip(),
+                b_cand.transport.label(),
+                b_cand.rtt_ms.unwrap_or(0.0)
             );
         }
     }
@@ -1404,6 +1426,13 @@ async fn ingest_authenticated_hint(
 
 /// Executes an isolated, end-to-end **BLE-only** discovery + cryptographic `TransportSessionV2`
 /// authentication verification (zero UDP `:58280`, zero Bonjour mDNS, zero cached IPs).
+///
+/// # Arguments
+/// * `timeout` - Maximum wait time for the one-shot BLE radio scan.
+///
+/// # Errors
+/// Returns an error if BLE scanning fails/times out, `TransportSessionV2` authentication fails,
+/// or the authenticated peer's `device_id` does not match the BLE packet prefix.
 pub async fn authenticate_peer_via_ble(timeout: Duration) -> Result<AuthDiscoveryProof> {
     let own_id = trust::local_device_id_hex();
     let hint = crate::ble_discovery::scan_once_for_ble_hint(&own_id, timeout).await?;
@@ -1427,7 +1456,11 @@ pub async fn authenticate_peer_via_ble(timeout: Duration) -> Result<AuthDiscover
     }
 
     let (peer_hostname, peer_os, peer_form_factor) = match prof_opt {
-        Some(p) => (p.hostname, p.os, p.form_factor.as_str().to_string()),
+        Some(p) => (
+            sanitize_display_text(&p.hostname, 128),
+            sanitize_display_text(&p.os, 64),
+            p.form_factor.as_str().to_string(),
+        ),
         None => ("Unknown".to_string(), "unknown".to_string(), "unknown".to_string()),
     };
 
@@ -1450,6 +1483,13 @@ pub async fn authenticate_peer_via_ble(timeout: Duration) -> Result<AuthDiscover
 
 /// Executes an isolated, end-to-end **Bonjour-only** (`_integrator._tcp.local.`) discovery +
 /// cryptographic `TransportSessionV2` authentication verification (zero UDP `:58280`, zero BLE, zero cached IPs).
+///
+/// # Arguments
+/// * `timeout` - Maximum wait time for the one-shot Bonjour browse resolution.
+///
+/// # Errors
+/// Returns an error if mDNS browsing fails/times out, `TransportSessionV2` authentication fails,
+/// or the authenticated peer's `device_id` disagrees with the mDNS TXT `"id"` claim.
 pub async fn authenticate_peer_via_bonjour(timeout: Duration) -> Result<AuthDiscoveryProof> {
     let own_id = trust::local_device_id_hex();
     let hint = crate::bonjour_discovery::browse_once_for_bonjour_hint(&own_id, timeout).await?;
@@ -1475,11 +1515,21 @@ pub async fn authenticate_peer_via_bonjour(timeout: Duration) -> Result<AuthDisc
     }
 
     let (peer_hostname, peer_os, peer_form_factor) = match prof_opt {
-        Some(p) => (p.hostname, p.os, p.form_factor.as_str().to_string()),
+        Some(p) => (
+            sanitize_display_text(&p.hostname, 128),
+            sanitize_display_text(&p.os, 64),
+            p.form_factor.as_str().to_string(),
+        ),
         None => (
-            hint.hostname,
-            hint.os.unwrap_or_else(|| "unknown".to_string()),
-            hint.form_factor.unwrap_or_else(|| "unknown".to_string()),
+            sanitize_display_text(&hint.hostname, 128),
+            hint.os
+                .map(|s| sanitize_display_text(&s, 64))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string()),
+            hint.form_factor
+                .map(|s| sanitize_display_text(&s, 32))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string()),
         ),
     };
 
@@ -1671,23 +1721,10 @@ fn is_own_local_ip(ip: &str) -> bool {
         .any(|iface| iface.ip == ip)
 }
 
-/// Measures TCP connection round-trip latency to `ip:port` with a bounded probe timeout.
-///
-/// Drops the TCP stream immediately upon completing the 3-way handshake.
+/// Measures TCP connection round-trip latency to `ip:port` with a bounded probe timeout
+/// by delegating to [`crate::bridge::LinkMonitor::measure_peer_rtt_ms`].
 async fn measure_tcp_connect_rtt(ip: &str, port: u16) -> Option<f64> {
-    let Ok(parsed) = ip.parse::<IpAddr>() else {
-        return None;
-    };
-    let target = SocketAddr::new(parsed, port);
-    let start = Instant::now();
-    if let Ok(Ok(stream)) =
-        tokio::time::timeout(TCP_RTT_PROBE_TIMEOUT, TcpStream::connect(target)).await
-    {
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        drop(stream);
-        return Some((ms * 100.0).round() / 100.0);
-    }
-    None
+    crate::bridge::LinkMonitor::measure_peer_rtt_ms(ip, port, TCP_RTT_PROBE_TIMEOUT).await
 }
 
 /// Resolves the filesystem path to `peer_history.json` in the user's application data directory.

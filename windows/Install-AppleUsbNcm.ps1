@@ -1,9 +1,118 @@
 #Requires -RunAsAdministrator
 <#
+==============================================================================================
+Integrator USB-C CDC-NCM WinUSB Driver & Bridge Service Installer (windows/Install-AppleUsbNcm.ps1)
+==============================================================================================
+
+1. MODULE PURPOSE & ARCHITECTURAL SCOPE
+----------------------------------------------------------------------------------------------
+Automates the zero-reboot installation of the signed WinUSB kernel driver for Apple Silicon
+Mac USB-C CDC-NCM gadget Ethernet interfaces (USB\VID_05AC&PID_1902) on Windows 10/11 with
+Secure Boot ENABLED. Generates a Windows 11 v2 Authenticode-signed security catalog (.cat)
+in-memory via WinTrust Crypto APIs, registers the catalog and driver via PnPUtil, downloads
+and verifies the official WHQL-signed WinTun userspace tunnel driver, compiles the high-
+performance AppleUsbNcmBridge.cs service using the inbox .NET Framework 4.x csc.exe compiler,
+and registers a high-availability background scheduled task running as NT AUTHORITY\SYSTEM.
+
+2. ARCHITECTURAL LINKAGES & DEPENDENCIES
+----------------------------------------------------------------------------------------------
+- Upstream Callers:
+  - Invoked by the user or elevated setup wizard (app/src/setup.rs: `Install-AppleUsbNcm.ps1`)
+    during initial workstation deployment or USB-C link troubleshooting.
+  - Referenced in README.md as the primary Windows automated setup script.
+- Downstream Callees:
+  - `pnputil.exe`: Installs `AppleWinUsb.inf` and signed `AppleWinUsb.cat` into the Windows
+    Driver Store without reboot.
+  - `wintrust.dll` & `CatGenWinUsb`: Programmatically computes dual SHA-256 and SHA-1 file
+    hashes and generates the Authenticode security catalog.
+  - `csc.exe`: .NET Framework 4.x C# compiler producing `AppleUsbNcmBridge.exe`.
+  - Windows Task Scheduler (`schtasks.exe` / `ScheduledTasks` module): Registers
+    the `AppleUsbNcmBridge` background service running as `NT AUTHORITY\SYSTEM`.
+  - Windows Defender Firewall (`NetSecurity` module): Configures scoped inbound allow rules
+    for point-to-point direct link (`10.99.99.0/24`) and macOS Internet Sharing (`192.168.2.0/24`).
+- Cross-Platform / Cross-Device Flow:
+  - Prepares the Windows PC to peer with macOS `macos/install-macos.sh` over a physical USB-C
+    cable without requiring third-party drivers or test-signing mode.
+
+3. THREADING & CONCURRENCY MODEL
+----------------------------------------------------------------------------------------------
+- Runs synchronously as Administrator in PowerShell (Console or Windows Terminal).
+- Safely stops any running `AppleUsbNcmBridge` background scheduled task and process instances
+  with timeouts before compiling and replacing binaries in `%ProgramData%\AppleUsbNcm`.
+
+4. SECURITY & SAFETY INVARIANTS
+----------------------------------------------------------------------------------------------
+- Least Privilege & Anti-LPE: The installation target directory (`%ProgramData%\AppleUsbNcm`)
+  has its access control list (ACL) explicitly stripped of inherited permissions and locked to
+  `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` (FullControl) before any binaries, DLLs,
+  or configuration files are staged. This mitigates DLL planting and unprivileged binary tampering.
+- WHQL & Cryptographic Integrity: Downloaded `wintun.zip` is strictly verified against an
+  immutable SHA-256 hash (`07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51`)
+  and the extracted `wintun.dll` must have a valid Microsoft WHQL Authenticode signature.
+- Strict Input Validation: All IPv4 parameters (`WinDirectIp`, `DirectNetmask`, `WinSharingIp`,
+  `SharingNetmask`, `SharingGwIp`, `SecondaryDns`), CIDR blocks, and port numbers are strictly
+  validated before writing `bridge.conf` or executing `New-NetFirewallRule`.
+- Secure Boot Compatibility: The self-signed Code Signing certificate is installed into
+  `Cert:\LocalMachine\Root` and `Cert:\LocalMachine\TrustedPublisher`, allowing Windows 11
+  kernel PnP driver installation with Secure Boot ON and Driver Signature Enforcement active.
+==============================================================================================
+
 .SYNOPSIS
     Installs the signed WinUSB driver for Apple Silicon Mac USB-C CDC-NCM (VID_05AC&PID_1902)
-    and deploys the zero-polling AppleUsbNcmBridge WinTun service.
-    Works with Windows 10/11 Secure Boot ON and requires zero reboots.
+    and deploys the zero-polling AppleUsbNcmBridge WinTun service on Windows 10/11.
+
+.DESCRIPTION
+    Generates a Windows 11 v2 security catalog, signs it with a local trusted code-signing
+    certificate, registers the driver via pnputil, acquires WHQL-signed wintun.dll, compiles
+    AppleUsbNcmBridge.cs with csc.exe, and registers a SYSTEM background service.
+
+.PARAMETER InstallDir
+    Target directory for bridge binaries, configuration, and logs (default: %ProgramData%\AppleUsbNcm).
+
+.PARAMETER WinDirectIp
+    Windows static IPv4 address for the direct point-to-point USB-C link (default: 10.99.99.1).
+
+.PARAMETER DirectNetmask
+    IPv4 subnet mask for the direct point-to-point USB-C link (default: 255.255.255.0).
+
+.PARAMETER DirectCidr
+    CIDR network prefix for the direct USB-C link firewall rule (default: 10.99.99.0/24).
+
+.PARAMETER WinSharingIp
+    Windows static IPv4 address for the macOS Internet Sharing subnet (default: 192.168.2.2).
+
+.PARAMETER SharingNetmask
+    IPv4 subnet mask for the macOS Internet Sharing subnet (default: 255.255.255.0).
+
+.PARAMETER SharingGwIp
+    macOS Internet Sharing gateway IPv4 address (default: 192.168.2.1).
+
+.PARAMETER SharingCidr
+    CIDR network prefix for the macOS Internet Sharing firewall rule (default: 192.168.2.0/24).
+
+.PARAMETER HintPort
+    UDP port for receiving ON/OFF sharing state hints from macOS (default: 47901).
+
+.PARAMETER SecondaryDns
+    Optional secondary DNS server IPv4 address (empty string disables secondary DNS injection).
+
+.PARAMETER WintunUrl
+    HTTPS download URL for the official WinTun driver distribution zip.
+
+.PARAMETER WintunSha256
+    Expected SHA-256 hex digest of the downloaded WinTun distribution zip.
+
+.PARAMETER TaskName
+    Scheduled task name under NT AUTHORITY\SYSTEM (default: AppleUsbNcmBridge).
+
+.PARAMETER FirewallRuleName
+    Display name for the inbound allow rule in Windows Defender Firewall (default: Apple USB-C Direct Link).
+
+.EXAMPLE
+    .\Install-AppleUsbNcm.ps1
+
+.EXAMPLE
+    .\Install-AppleUsbNcm.ps1 -WinDirectIp "10.99.99.1" -DirectNetmask "255.255.255.0" -DirectCidr "10.99.99.0/24"
 #>
 param(
     [string]$InstallDir = (Join-Path $env:ProgramData "AppleUsbNcm"),
@@ -11,6 +120,7 @@ param(
     [string]$DirectNetmask = "255.255.255.0",
     [string]$DirectCidr = "10.99.99.0/24",
     [string]$WinSharingIp = "192.168.2.2",
+    [string]$SharingNetmask = "255.255.255.0",
     [string]$SharingGwIp = "192.168.2.1",
     [string]$SharingCidr = "192.168.2.0/24",
     [int]$HintPort = 47901,
@@ -34,10 +144,29 @@ function Test-StrictIpv4 {
     }
 }
 
+function Test-StrictCidr {
+    param([string]$Name, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw "CIDR -$Name cannot be empty."
+    }
+    $parts = $Value.Trim().Split('/')
+    if ($parts.Count -ne 2) {
+        throw "Invalid CIDR format for -$Name : '$Value' (expected IP/prefix, e.g. 10.99.99.0/24)"
+    }
+    Test-StrictIpv4 -Name "$Name-IP" -Value $parts[0]
+    $prefix = 0
+    if (-not [int]::TryParse($parts[1], [ref]$prefix) -or $prefix -lt 0 -or $prefix -gt 32) {
+        throw "Invalid CIDR prefix length for -$Name : '$($parts[1])' (expected 0..32)"
+    }
+}
+
 Test-StrictIpv4 -Name "WinDirectIp" -Value $WinDirectIp
 Test-StrictIpv4 -Name "DirectNetmask" -Value $DirectNetmask
+Test-StrictCidr -Name "DirectCidr" -Value $DirectCidr
 Test-StrictIpv4 -Name "WinSharingIp" -Value $WinSharingIp
+Test-StrictIpv4 -Name "SharingNetmask" -Value $SharingNetmask
 Test-StrictIpv4 -Name "SharingGwIp" -Value $SharingGwIp
+Test-StrictCidr -Name "SharingCidr" -Value $SharingCidr
 if (-not [string]::IsNullOrWhiteSpace($SecondaryDns)) {
     Test-StrictIpv4 -Name "SecondaryDns" -Value $SecondaryDns
 }
@@ -118,64 +247,101 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 
+/// <summary>
+/// Programmatic Windows Security Catalog (.cat) generator using Microsoft WinTrust APIs.
+/// Generates compliant dual-hash (SHA-256 + SHA-1) Windows 10/11 v2 driver security catalogs
+/// without requiring external Windows SDK tools (makecat.exe / inf2cat).
+/// </summary>
 public class CatGenWinUsb {
+    /// <summary>
+    /// Win32 CryptoAPI byte array container structure.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct CRYPTOAPI_BLOB {
+        /// <summary>Count of bytes in pbData.</summary>
         public uint cbData;
+        /// <summary>Pointer to unmanaged byte array.</summary>
         public IntPtr pbData;
     }
 
+    /// <summary>
+    /// WinTrust catalog member descriptor structure.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct CRYPTCATMEMBER {
+        /// <summary>Size of structure in bytes.</summary>
         public uint cbStruct;
+        /// <summary>Catalog member reference tag (hex hash string).</summary>
         public string pwszReferenceTag;
+        /// <summary>Source filename corresponding to catalog member.</summary>
         public string pwszFileName;
+        /// <summary>Subject type GUID identifying SIP.</summary>
         public Guid gSubjectType;
+        /// <summary>Member flags.</summary>
         public uint fdwMemberFlags;
+        /// <summary>Pointer to indirect data.</summary>
         public IntPtr pIndirectData;
+        /// <summary>Certificate version.</summary>
         public uint dwCertVersion;
+        /// <summary>Reserved word.</summary>
         public uint dwReserved;
+        /// <summary>Reserved handle.</summary>
         public IntPtr hReserved;
+        /// <summary>Encoded indirect data blob.</summary>
         public CRYPTOAPI_BLOB sEncodedIndirectData;
+        /// <summary>Encoded member info blob.</summary>
         public CRYPTOAPI_BLOB sEncodedMemberInfo;
     }
 
+    /// <summary>WinTrust P/Invoke: opens a security catalog for writing.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CryptCATOpen(string pwszFileName, uint fdwOpenFlags, IntPtr hProv, uint dwPublicVersion, uint dwEncodingType);
 
+    /// <summary>WinTrust P/Invoke: closes a security catalog handle.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", SetLastError = true)]
     public static extern bool CryptCATClose(IntPtr hCatalog);
 
+    /// <summary>WinTrust P/Invoke: adds a catalog-level attribute (such as OS or OSAttr).</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CryptCATPutCatAttrInfo(IntPtr hCatalog, string pwszReferenceTag, uint dwAttrTypeAndAction, uint cbData, byte[] pbData);
 
+    /// <summary>WinTrust P/Invoke: adds a file member descriptor into the security catalog.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CryptCATPutMemberInfo(IntPtr hCatalog, string pwszFileName, string pwszReferenceTag, ref Guid pgSubjectType, uint dwCertVersion, uint cbSIPIndirectData, IntPtr pbSIPIndirectData);
 
+    /// <summary>WinTrust P/Invoke: adds a member-level attribute (such as File name) into the catalog.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CryptCATPutAttrInfo(IntPtr hCatalog, IntPtr pCatMember, string pwszReferenceTag, uint dwAttrTypeAndAction, uint cbData, byte[] pbData);
 
+    /// <summary>WinTrust P/Invoke: writes the in-memory catalog store to disk.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", SetLastError = true)]
     public static extern bool CryptCATPersistStore(IntPtr hCatalog);
 
+    /// <summary>WinTrust P/Invoke: acquires a catalog administrator context for calculating driver file hashes.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool CryptCATAdminAcquireContext2(out IntPtr phCatAdmin, IntPtr pgSubsystem, string pwszHashAlgorithm, IntPtr pStrongHashPolicy, uint dwFlags);
 
+    /// <summary>WinTrust P/Invoke: releases a catalog administrator context.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", SetLastError = true)]
     public static extern bool CryptCATAdminReleaseContext(IntPtr hCatAdmin, uint dwFlags);
 
+    /// <summary>WinTrust P/Invoke: computes the Authenticode file hash of a driver INF file using the specified algorithm.</summary>
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("wintrust.dll", SetLastError = true)]
     public static extern bool CryptCATAdminCalcHashFromFileHandle2(IntPtr hCatAdmin, IntPtr hFile, ref uint pcbHash, byte[] pbHash, uint dwFlags);
 
+    /// <summary>
+    /// Generates a signed Windows 11 v2 security catalog (<paramref name="catPath"/>) covering <paramref name="infPath"/>
+    /// with both SHA-256 and SHA-1 hashes and architecture-specific OS attributes.
+    /// </summary>
     public static void BuildCat(string infPath, string catPath, bool isArm64) {
         if (File.Exists(catPath)) File.Delete(catPath);
         Guid drvVerify = new Guid("F750E6C3-38EE-11D1-85E5-00C04FC295EE");
@@ -380,7 +546,7 @@ $confLines = @(
     "DirectNetmask=$DirectNetmask",
     "DirectCidr=$DirectCidr",
     "WinSharingIp=$WinSharingIp",
-    "SharingNetmask=$DirectNetmask",
+    "SharingNetmask=$SharingNetmask",
     "SharingGwIp=$SharingGwIp",
     "SharingCidr=$SharingCidr",
     "HintPort=$HintPort",

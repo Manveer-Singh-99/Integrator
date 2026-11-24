@@ -1,22 +1,29 @@
 //! # Native Build Script (`build.rs`)
 //!
 //! ## 1. Module Purpose & Scope
-//! Compiles and links platform-native Swift, Objective-C, and C++ static libraries and helper
-//! binaries required by `integrator_core` on macOS and Windows 11.
+//! Compiles and links platform-native Swift, Objective-C, C11, and C++ static libraries,
+//! standalone COM DLLs, and helper binaries required by `integrator_core` on macOS and Windows 11.
 //!
 //! ## 2. Architectural Linkages & Dependencies
-//! - **Upstream Callers**: Cargo build pipeline (`cargo build`, `cargo test`).
-//! - **Downstream Callees**: `swiftc`, `xcrun`, `clang`, `ar` on macOS; MSVC (`cc` crate) on Windows.
-//! - **Cross-Platform Flow**: Emits platform-gated static archives (`libtouchbar.a`,
-//!   `libvirtualdisplay.a`, `kvm_windows`) and standalone helpers (`macos_clip_files`,
-//!   `integrator_vcam.dll`).
+//! - **Upstream Callers**: Cargo build pipeline (`cargo build`, `cargo test`, `build-universal-app.sh`).
+//! - **Downstream Callees**:
+//!   - **macOS**: `swiftc`, `xcrun`, `clang`, `ar` compiling `src/*.swift`, `ui-macos/IntegratorApp.swift`,
+//!     `macos_clip_files.swift`, `src/audio_macos.c` (`libaudiomacos.a`), and `src/virtual_display.m`
+//!     (`libvirtualdisplay.a`).
+//!   - **Windows**: MSVC / `cc` crate compiling `src/kvm_windows.cpp`, `src/camera_windows.cpp`, and
+//!     `src/win_capture.cpp` into `kvm_windows`, plus standalone `src/vcam_windows.cpp` into
+//!     `integrator_vcam.dll` (linked against `/MT` static CRT).
+//! - **Cross-Platform / Cross-Arch Flow**: Maps Cargo's `CARGO_CFG_TARGET_ARCH` (`aarch64` / `x86_64`)
+//!   and `MACOSX_DEPLOYMENT_TARGET` to explicit `-target` / `-arch` flags on macOS (supporting universal
+//!   cross-compilation) and uses `cc::Build` target-triple discovery on Windows (`x86_64` / `aarch64`).
 //!
 //! ## 3. Threading & Concurrency Model
-//! Single-threaded synchronous build script executed by Cargo before crate compilation.
+//! Single-threaded synchronous build script executed sequentially by Cargo prior to Rust crate compilation.
 //!
 //! ## 4. Security & Safety Invariants
-//! All build artifacts are emitted strictly under Cargo's `OUT_DIR` or profile target directory;
-//! Swift rpath resolution queries `xcrun --show-sdk-path` dynamically with a safe system fallback.
+//! All build artifacts are emitted strictly under Cargo's `OUT_DIR` or copied into the active Cargo
+//! `<target>/<triple?>/<profile>/` output directory (never mutating the repository root). Swift runtime
+//! rpath resolution queries `xcrun --show-sdk-path` dynamically with `/usr/lib/swift` fallback.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -47,14 +54,29 @@ fn resolve_macos_swift_rpath() -> String {
     FALLBACK_MACOS_SWIFT_RPATH.to_string()
 }
 
+/// Resolves the Cargo `<target>/<triple?>/<profile>/` directory containing `OUT_DIR`
+/// regardless of whether Cargo uses `build/<pkg>/<hash>/out` or `build/<pkg>-<hash>/out`.
+fn resolve_profile_dir(out_dir: &str) -> Option<PathBuf> {
+    PathBuf::from(out_dir)
+        .ancestors()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
+        .and_then(|b| b.parent())
+        .map(PathBuf::from)
+}
+
+/// Cargo build script entry point: compiles platform-native Swift/C/ObjC/C++ libraries and
+/// standalone helpers, emitting `cargo:rustc-link-*` and `cargo:rerun-if-*` directives.
 fn main() {
     for env_key in [
         "CARGO_CFG_TARGET_OS",
         "CARGO_CFG_TARGET_ARCH",
+        "TARGET",
         "MACOSX_DEPLOYMENT_TARGET",
         "SDKROOT",
         "CC",
         "CFLAGS",
+        "CXX",
+        "CXXFLAGS",
         "PROFILE",
     ] {
         println!("cargo:rerun-if-env-changed={}", env_key);
@@ -63,11 +85,13 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
     if target_os == "macos" {
-        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set by Cargo");
         let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let deploy_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
             .unwrap_or_else(|_| DEFAULT_MACOS_DEPLOYMENT_TARGET.to_string());
 
+        // Map Cargo target architecture to Apple toolchain triple / clang `-arch` names so
+        // cross-arch universal builds (`arm64` <-> `x86_64`) compile the right slice.
         let (swift_arch, clang_arch) = match target_arch.as_str() {
             "aarch64" => ("arm64", "arm64"),
             "x86_64" => ("x86_64", "x86_64"),
@@ -79,6 +103,7 @@ fn main() {
             None
         };
 
+        // 1. Compile Swift AppKit/Foundation/AVFoundation/IOKit integration into `libtouchbar.a`.
         let lib_path = format!("{}/libtouchbar.a", out_dir);
         let mut swift_cmd = Command::new("swiftc");
         swift_cmd.args([
@@ -108,7 +133,8 @@ fn main() {
             panic!("swiftc failed to compile swift sources into static library");
         }
 
-        // Also compile macos_clip_files.swift into target/<profile>/macos_clip_files (not repo root)
+        // 2. Compile standalone `macos_clip_files` helper into `OUT_DIR`, then stage a copy into
+        // `target/<triple?>/<profile>/` for runtime execution and universal `.app` bundling.
         let clip_helper_out = PathBuf::from(&out_dir).join("macos_clip_files");
         let mut clip_cmd = Command::new("swiftc");
         if is_release {
@@ -122,19 +148,23 @@ fn main() {
         if let Some(ref target) = swift_target {
             clip_cmd.args(["-target", target]);
         }
-        if let Ok(s) = clip_cmd.status() {
-            if s.success() {
-                // Copy helper binary into <target>/<profile>/ regardless of Cargo's build/<pkg>/<hash>/out vs build/<pkg>-<hash>/out layout
-                if let Some(profile_dir) = PathBuf::from(&out_dir)
-                    .ancestors()
-                    .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
-                    .and_then(|b| b.parent())
-                {
-                    let _ = std::fs::copy(&clip_helper_out, profile_dir.join("macos_clip_files"));
-                }
+        let clip_status = clip_cmd
+            .status()
+            .expect("Failed to execute swiftc to build macos_clip_files helper");
+        if !clip_status.success() {
+            panic!("swiftc failed to compile macos_clip_files.swift");
+        }
+        if let Some(profile_dir) = resolve_profile_dir(&out_dir) {
+            if let Err(e) = std::fs::copy(&clip_helper_out, profile_dir.join("macos_clip_files")) {
+                println!(
+                    "cargo:warning=Failed to copy macos_clip_files into {}: {}",
+                    profile_dir.display(),
+                    e
+                );
             }
         }
 
+        // 3. Locate toolchain Swift compatibility libraries and configure dyld rpaths.
         if let Ok(output) = Command::new("xcrun").args(["--find", "swiftc"]).output() {
             if output.status.success() {
                 let swiftc_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -167,6 +197,7 @@ fn main() {
         println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
+        // 4. Compile pure C11 CoreAudio real-time audio driver bridge (`libaudiomacos.a`).
         let audio_obj_path = format!("{}/audio_macos.o", out_dir);
         let audio_lib_path = format!("{}/libaudiomacos.a", out_dir);
         let min_ver_flag = format!("-mmacosx-version-min={}", deploy_target);
@@ -202,6 +233,7 @@ fn main() {
         println!("cargo:rustc-link-lib=static=audiomacos");
         println!("cargo:rerun-if-changed=src/audio_macos.c");
 
+        // 5. Compile Objective-C ARC virtual display driver bridge (`libvirtualdisplay.a`).
         let obj_path = format!("{}/virtual_display.o", out_dir);
         let vd_lib_path = format!("{}/libvirtualdisplay.a", out_dir);
 
@@ -248,10 +280,11 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
         println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rerun-if-changed=src/virtual_display.m");
-    }
+    } else if target_os == "windows" {
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set by Cargo");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let out_dir = std::env::var("OUT_DIR").unwrap();
+        // 1. Compile Win32 C++ static library (`kvm_windows`) containing KVM hooks, camera helper,
+        // and DXGI/MediaFoundation screen capture backends.
         cc::Build::new()
             .cpp(true)
             .flag_if_supported("/EHsc")
@@ -272,7 +305,8 @@ fn main() {
         println!("cargo:rerun-if-changed=src/win_capture.cpp");
         println!("cargo:rerun-if-changed=src/vcam_windows.cpp");
 
-        // Compile standalone FrameServer COM DLL (`integrator_vcam.dll`) with zero external runtime deps (/MT).
+        // 2. Compile standalone FrameServer COM DLL (`integrator_vcam.dll`) with `/MT` static CRT
+        // via `cc::Build` so target-arch (`x86_64` vs `aarch64`) MSVC toolchains are selected automatically.
         let vcam_dll_out = PathBuf::from(&out_dir).join("integrator_vcam.dll");
         let vcam_obj_out = PathBuf::from(&out_dir).join("vcam_windows.obj");
         let vcam_lib_out = PathBuf::from(&out_dir).join("integrator_vcam.lib");
@@ -309,12 +343,14 @@ fn main() {
         if !vcam_status.success() {
             panic!("MSVC failed compiling src/vcam_windows.cpp into integrator_vcam.dll");
         }
-        if let Some(profile_dir) = PathBuf::from(&out_dir)
-            .ancestors()
-            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
-            .and_then(|b| b.parent())
-        {
-            let _ = std::fs::copy(&vcam_dll_out, profile_dir.join("integrator_vcam.dll"));
+        if let Some(profile_dir) = resolve_profile_dir(&out_dir) {
+            if let Err(e) = std::fs::copy(&vcam_dll_out, profile_dir.join("integrator_vcam.dll")) {
+                println!(
+                    "cargo:warning=Failed to copy integrator_vcam.dll into {}: {}",
+                    profile_dir.display(),
+                    e
+                );
+            }
         }
     }
 }

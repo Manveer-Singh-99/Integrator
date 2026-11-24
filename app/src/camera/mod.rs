@@ -1,15 +1,17 @@
-//! # Camera Subsystem: Mac -> Windows 11 Shared Virtual Camera
+//! # Camera & Shared Microphone Subsystem: Mac -> Windows 11 Virtual Camera & Mic
 //!
 //! ## 1. Module Purpose & Scope
-//! This module owns the end-to-end orchestration of the **Mac -> Windows 11 Shared Camera** pipeline
-//! (`camera` feature flag). It captures the FaceTime HD camera stream on macOS, transmits it over
-//! an encrypted, mutually authenticated transport session, and injects it directly into the
-//! Windows 11 Media Foundation FrameServer pipeline as a native standalone virtual webcam.
+//! This module owns the end-to-end orchestration of the **Mac -> Windows 11 Shared Camera & Microphone**
+//! pipeline (`camera` feature flag). It captures the Mac camera stream (and tracks shared microphone
+//! device selection, mute, TCC permission, and input gain settings), transmits video over an encrypted,
+//! mutually authenticated transport session, and injects it directly into the Windows 11 Media
+//! Foundation FrameServer pipeline as a native standalone virtual webcam.
 //!
 //! ### Core Subsystem Responsibilities
 //! - **Capture Ingestion (macOS)**: Interfaces via C-ABI FFI with `camera_macos.swift`, capturing
 //!   uncompressed 720p30 `NV12` bi-planar frames (`kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`)
-//!   directly from the built-in FaceTime HD camera via AVFoundation.
+//!   directly from built-in, USB, or Continuity Camera devices via AVFoundation, and discovering/selecting
+//!   macOS AVFoundation microphone sources alongside TCC audio permission checks.
 //! - **Wire Serialization**: Packages raw frame buffers into length-delimited, magic-tagged `ICAM`
 //!   datagrams with microsecond-precision presentation timestamps and geometry validation.
 //! - **Secure Streaming**: Transmits frames across `TransportSessionV2` (`ServiceId::CameraStream`,
@@ -22,12 +24,27 @@
 //!   under the friendly name **"Integrator Mac Camera"**.
 //!
 //! ## 2. Architectural Linkages & Cross-Platform Flow
+//! - **Upstream Callers**:
+//!   - [`crate::core::IntegratorCore`]: Owns [`CameraService`], drives camera/mic RPC actions, privacy
+//!     shutter toggles, and teardown on peer revocation (`terminate_peer_connections*`).
+//!   - [`crate::display::controller::DisplayController`]: Dispatches authenticated remote camera and
+//!     microphone RPCs (`StartCamera`, `CheckCameraConsent`, `ToggleCamera`, `StopCamera`,
+//!     `GetCameraStatus`, `ListMics`, `SelectMic`, `SetMicSettings`).
+//!   - [`integrator_on_mac_camera_frame`]: C-ABI callback invoked directly by `camera_macos.swift`.
+//! - **Downstream Callees**:
+//!   - `camera_macos.swift` & `permissions_macos.swift` (macOS FFI): AVFoundation camera/mic capture,
+//!     device enumeration, selection, and scoped consent dialogs.
+//!   - `camera_windows.cpp` / `vcam_windows.cpp` (`integrator_vcam.dll`, Windows FFI): Media Foundation
+//!     virtual webcam registration, SHM ingestion, and scoped consent prompts.
+//!   - [`authorization::CameraConsentManager`] & [`distribution::CameraFrameHub`]: Per-peer consent
+//!     state machine, single-use lease redemption, and multi-subscriber fan-out mailboxes.
+//!   - [`crate::security::keystore`], [`crate::security::transport`], [`crate::trust`].
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────────────┐
 //! │                           macOS (Sender)                               │
 //! │                                                                        │
-//! │  AVCaptureSession (FaceTime HD Camera, 720p30 NV12)                    │
+//! │  AVCaptureSession (FaceTime HD Camera, 720p30 NV12) + Audio Inputs     │
 //! │         │                                                              │
 //! │         ▼                                                              │
 //! │  MacCameraCaptureController (`camera_macos.swift`)                     │
@@ -35,8 +52,8 @@
 //! │         ▼ (C-ABI: integrator_on_mac_camera_frame)                      │
 //! │  Rust Camera FFI Handler (`camera/mod.rs`)                             │
 //! │         │                                                              │
-//! │         ▼ (LatestFrameSlot::publish / notify)                          │
-//! │  run_mac_sender_loop (`camera/mod.rs`)                                 │
+//! │         ▼ (CameraFrameHub::publish_frame)                              │
+//! │  run_mac_sender_for_peer (`camera/mod.rs`)                             │
 //! │         │                                                              │
 //! │         ▼ (TransportSessionV2::send_message - ChaCha20-Poly1305)       │
 //! └─────────┼──────────────────────────────────────────────────────────────┘
@@ -84,23 +101,27 @@
 //!
 //! ## 3. Threading & Concurrency Model
 //! - **Tokio Multi-Threaded Async Runtime**: Manages the TCP listener on Windows (`start_server`)
-//!   and the async sender loop on macOS (`run_mac_sender_loop`).
-//! - **Single-Slot Buffer Swapping (`LatestFrameSlot`)**: Bridges high-frequency AVFoundation camera
-//!   delegate callbacks to the Tokio async sender. Uses a `std::sync::Mutex` protecting an
-//!   `Option<Vec<u8>>` paired with a `tokio::sync::Notify`. New frames replace older unread frames,
-//!   preventing buffer bloat and ensuring sub-millisecond transmission latency.
-//! - **Blocking OS Dispatches**: In-process camera start/stop calls (`integrator_mac_camera_start`,
-//!   `integrator_win_vcam_start`) are dispatched to `tokio::task::spawn_blocking` to avoid
-//!   blocking the async worker threads during COM or AVFoundation session initialization.
+//!   and the async per-peer sender loops on macOS (`run_mac_sender_for_peer`).
+//! - **Single-Copy Fan-Out (`CameraFrameHub` / `SubscriberMailbox`)**: Bridges high-frequency
+//!   AVFoundation camera callbacks to multiple Tokio async senders using reference-counted `Arc<Vec<u8>>`
+//!   mailboxes paired with `Notify`. Stale unread frames are replaced in place per subscriber,
+//!   preventing buffer bloat and head-of-line blocking across peers.
+//! - **Strict Lifecycle Lock Hierarchy**: [`CameraLifecycleCoordinator`] enforces exact-once hardware
+//!   teardown under `hardware_io_lock -> active_peer_streams -> peer_consent -> lingering_tasks -> hardware_state`.
+//! - **Blocking OS Dispatches**: In-process camera/mic start, stop, enumeration, and consent calls are
+//!   dispatched to `tokio::task::spawn_blocking` to avoid blocking async workers.
 //!
 //! ## 4. Security & Safety Invariants
 //! - **Mutual Ed25519 Authentication**: Unauthenticated TCP connections are dropped immediately.
-//!   Every stream must complete an encrypted `TransportSessionV2` handshake tied to paired device keys.
+//!   Every stream must complete an encrypted `TransportSessionV2` handshake tied to paired device keys
+//!   and redeem a single-use 256-bit authorization lease (`FLAG_AUTH_LEASE_REDEMPTION`).
 //! - **Pre-Auth Connection Throttling**: Windows incoming connections are bounded by a semaphore
 //!   ([`MAX_PRE_AUTH_CAMERA_CONNS`] = 8) to mitigate connection-flooding denial of service.
-//! - **Memory Safety & Buffer Bounds**: All frame packets are bound to exactly [`NV12_FRAME_BYTES`]
+//! - **Memory Safety & Buffer Bounds**: All live frame packets are bound to exactly [`NV12_FRAME_BYTES`]
 //!   (1,382,400 bytes for 1280x720 NV12). Packets exceeding this size or bearing invalid magic
 //!   headers (`ICAM`) are rejected before slice memory is accessed.
+//! - **Input Sanitization & Clamping**: Microphone gain is validated finite and clamped to `[0.0, 2.0]`,
+//!   and device names/identifiers are sanitized against control characters and Unicode bidi overrides.
 //! - **FFI Pointer Invariants**: Raw pointer inputs from native platform libraries are checked
 //!   for nullity, valid buffer length, and expected dimensions prior to constructing Rust slices.
 
@@ -118,7 +139,7 @@ use distribution::{CameraFrameHub, SharedCameraFrame, SubscriberMailbox};
 #[cfg(target_os = "windows")]
 use std::ffi::CStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -196,6 +217,22 @@ const CAMERA_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const MAX_PRE_AUTH_CAMERA_CONNS: usize = 8;
 
+/// Minimum allowed linear shared microphone gain multiplier (`0.0` = 0% silence).
+const MIN_MIC_GAIN: f32 = 0.0;
+
+/// Maximum allowed linear shared microphone gain multiplier (`2.0` = 200% boost).
+const MAX_MIC_GAIN: f32 = 2.0;
+
+/// Default linear shared microphone gain multiplier (`1.0` = 100% unity gain).
+const DEFAULT_MIC_GAIN: f32 = 1.0;
+
+/// Maximum UTF-8 character count retained when sanitizing external microphone device names or IDs.
+#[cfg(target_os = "macos")]
+const MAX_MIC_LABEL_CHARS: usize = 128;
+
+/// Maximum UTF-8 byte length accepted for an incoming microphone unique device identifier.
+const MAX_MIC_DEVICE_ID_BYTES: usize = 256;
+
 /// Serde default helper providing the canonical virtual camera TCP streaming port.
 fn default_camera_port() -> u16 {
     CAMERA_PORT
@@ -211,7 +248,43 @@ fn default_camera_available() -> bool {
     true
 }
 
-/// Diagnostic telemetry and status report for the Camera subsystem.
+/// Serde default helper providing unity (`1.0`) microphone gain when deserializing legacy status payloads.
+fn default_mic_gain() -> f32 {
+    DEFAULT_MIC_GAIN
+}
+
+/// Strips ASCII/Unicode control characters and Unicode bidirectional formatting overrides from
+/// external audio/video device strings and truncates cleanly to `max_chars`.
+#[cfg(any(target_os = "macos", test))]
+fn sanitize_mic_label(raw: &str, max_chars: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                )
+        })
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Wire descriptor for an available microphone audio input device on the macOS host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MicDeviceWire {
+    /// Platform unique device identifier (`AVCaptureDevice.uniqueID` on macOS).
+    pub id: String,
+    /// Human-readable localized device display name (sanitized against control/bidi chars).
+    pub name: String,
+    /// `true` if this device is currently the macOS system default audio input source.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// Diagnostic telemetry and status report for the Camera & Shared Microphone subsystem.
 ///
 /// Returned over local RPC to the UI and CLI to display the live state of the camera pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +321,21 @@ pub struct CameraStatus {
     /// Whether the Hardware Camera Privacy Killswitch shutter is actively muting outgoing frames.
     #[serde(default)]
     pub privacy_muted: bool,
+    /// Whether macOS-to-PC shared microphone capture/forwarding is enabled.
+    #[serde(default)]
+    pub mic_enabled: bool,
+    /// Whether shared microphone output is currently muted.
+    #[serde(default)]
+    pub mic_muted: bool,
+    /// Friendly display name of the currently selected macOS microphone source (empty if unselected).
+    #[serde(default)]
+    pub mic_device_name: String,
+    /// Whether operating system microphone privacy permissions (`AVMediaType.audio` on macOS) are granted.
+    #[serde(default)]
+    pub mic_permission_granted: bool,
+    /// Linear microphone input gain multiplier clamped to `0.0..=2.0` (`1.0` = 100% unity gain).
+    #[serde(default = "default_mic_gain")]
+    pub mic_gain: f32,
 }
 
 /// Parsed, zero-copy camera frame received over the network transport.
@@ -382,55 +470,6 @@ pub fn decode_camera_frame(raw: &[u8]) -> Result<DecodedCameraFrame<'_>, String>
     })
 }
 
-/// Single-slot concurrent buffer bridging synchronous video callbacks to async network dispatch.
-///
-/// Ensures zero-latency frame delivery by replacing stale unread frames with newly arrived frames.
-struct LatestFrameSlot {
-    /// Mutex-guarded storage holding the latest serialized camera frame datagram.
-    latest: Mutex<Option<Vec<u8>>>,
-    /// Async notification trigger woken when a new frame is published.
-    notify: Notify,
-}
-
-impl LatestFrameSlot {
-    /// Creates an empty frame slot with an initialized async notification handle.
-    fn new() -> Self {
-        Self {
-            latest: Mutex::new(None),
-            notify: Notify::new(),
-        }
-    }
-
-    /// Stores the newly encoded frame datagram, discarding any prior unread frame, and signals waiters.
-    fn publish(&self, encoded: Vec<u8>) {
-        if let Ok(mut guard) = self.latest.lock() {
-            *guard = Some(encoded);
-        }
-        self.notify.notify_one();
-    }
-
-    /// Takes the currently pending frame datagram out of the slot, leaving it empty.
-    #[allow(dead_code)]
-    fn take(&self) -> Option<Vec<u8>> {
-        self.latest.lock().ok()?.take()
-    }
-
-    /// Clears any pending frame data from the slot.
-    fn clear(&self) {
-        if let Ok(mut guard) = self.latest.lock() {
-            *guard = None;
-        }
-    }
-}
-
-/// Global lazy-initialized singleton instance of [`LatestFrameSlot`].
-static GLOBAL_FRAME_SLOT: OnceLock<Arc<LatestFrameSlot>> = OnceLock::new();
-
-/// Returns the static reference to the shared [`LatestFrameSlot`].
-fn global_frame_slot() -> &'static Arc<LatestFrameSlot> {
-    GLOBAL_FRAME_SLOT.get_or_init(|| Arc::new(LatestFrameSlot::new()))
-}
-
 /// Global lazy-initialized singleton instance of [`CameraFrameHub`].
 static GLOBAL_FRAME_HUB: OnceLock<Arc<CameraFrameHub>> = OnceLock::new();
 
@@ -441,26 +480,48 @@ pub fn global_frame_hub() -> &'static Arc<CameraFrameHub> {
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Returns current macOS TCC camera permission state (`2`: Authorized, `1`: Denied/Restricted, `0`: Not Determined).
     fn integrator_mac_camera_permission_state() -> i32;
+    /// Returns `1` if the running bundle `Info.plist` includes `NSCameraUsageDescription`, else `0`.
     fn integrator_mac_camera_has_usage_desc() -> i32;
+    /// Returns `1` if at least one active macOS video capture device is detected, else `0`.
     fn integrator_mac_camera_has_hardware() -> i32;
+    /// Starts 720p30 NV12 AVFoundation camera capture; returns `0` on success or negative error code on failure.
     fn integrator_mac_camera_start() -> i32;
+    /// Stops AVFoundation camera capture synchronously on the capture queue.
     fn integrator_mac_camera_stop();
+    /// Returns `1` if AVFoundation capture is currently active and running, else `0`.
     fn integrator_mac_camera_is_running() -> i32;
+    /// Serializes discovered camera devices into `out_buf` as UTF-8 JSON; returns byte length or `-1` on error.
     fn integrator_mac_camera_list_json(out_buf: *mut std::os::raw::c_char, cap: i32) -> i32;
+    /// Selects active macOS video capture device by NUL-terminated UTF-8 `uniqueID`; returns `1` on success.
     fn integrator_mac_camera_select(device_id_utf8: *const std::os::raw::c_char) -> i32;
+    /// Legacy consent prompt FFI symbol retained for ABI compatibility with `permissions_macos.swift` (OBS-1E-01).
     #[allow(dead_code)]
     fn integrator_mac_prompt_camera_consent(peer_name: *const std::os::raw::c_char) -> bool;
+    /// Displays scoped macOS camera consent dialog (`1`: Once, `2`: Session, `3`: Always, `-1`: Block, `0`: Deny).
     fn integrator_mac_prompt_camera_consent_scoped(peer_name: *const std::os::raw::c_char, timeout_sec: i32) -> i32;
+    /// Consent prompt cancellation FFI symbol retained for ABI compatibility with `permissions_macos.swift` (OBS-1E-01).
     #[allow(dead_code)]
     fn integrator_mac_cancel_camera_consent_prompt();
+    /// Returns `true` if macOS TCC microphone authorization (`AVMediaType.audio`) is `.authorized`.
+    fn integrator_mac_mic_permission_granted() -> bool;
+    /// Serializes available macOS microphone inputs into `out_buf` as UTF-8 JSON; returns byte count written or `0`.
+    fn integrator_mac_list_mics(out_buf: *mut u8, cap: usize) -> usize;
+    /// Selects active macOS microphone device by NUL-terminated UTF-8 `uniqueID`; returns `true` if found/selected.
+    fn integrator_mac_select_mic(device_id: *const std::ffi::c_char) -> bool;
+    /// Requests macOS TCC microphone access if undetermined (bounded by 30s timeout off main thread); returns `true` if authorized.
+    fn integrator_mac_request_mic_permission() -> bool;
 }
 
 /// Serializable descriptor for a discovered camera hardware/continuity device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CameraDeviceWire {
+    /// Platform-assigned unique camera identifier (`AVCaptureDevice.uniqueID`).
     pub id: String,
+    /// Human-readable localized camera display name.
     pub name: String,
+    /// `true` if this camera is currently selected or the active default capture source.
     pub is_active: bool,
 }
 
@@ -469,12 +530,16 @@ pub fn list_available_cameras() -> Vec<CameraDeviceWire> {
     #[cfg(target_os = "macos")]
     {
         let mut buf = vec![0u8; 8192];
+        // SAFETY: `buf` is a mutable 8 KiB heap allocation and `cap` matches `buf.len()`.
         let n = unsafe {
             integrator_mac_camera_list_json(buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len() as i32)
         };
-        if n > 0 {
+        if n > 0 && (n as usize) <= buf.len() {
             if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
-                if let Ok(list) = serde_json::from_str::<Vec<CameraDeviceWire>>(s) {
+                if let Ok(mut list) = serde_json::from_str::<Vec<CameraDeviceWire>>(s) {
+                    for cam in &mut list {
+                        cam.name = sanitize_mic_label(&cam.name, MAX_MIC_LABEL_CHARS);
+                    }
                     return list;
                 }
             }
@@ -489,9 +554,17 @@ pub fn list_available_cameras() -> Vec<CameraDeviceWire> {
 
 /// Selects a specific video capture device by unique device identifier.
 pub fn select_camera_device(device_id: &str) -> bool {
+    let trimmed = device_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_MIC_DEVICE_ID_BYTES
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(c_str) = std::ffi::CString::new(device_id) {
+        if let Ok(c_str) = std::ffi::CString::new(trimmed) {
+            // SAFETY: `c_str` points to a valid NUL-terminated UTF-8 string for the duration of the call.
             let res = unsafe { integrator_mac_camera_select(c_str.as_ptr()) };
             return res == 1;
         }
@@ -499,7 +572,7 @@ pub fn select_camera_device(device_id: &str) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = device_id;
+        let _ = trimmed;
         false
     }
 }
@@ -589,18 +662,24 @@ pub extern "C" fn integrator_on_mac_camera_frame(
         timestamp_us,
         slice,
     ) {
-        global_frame_slot().publish(encoded.clone());
         global_frame_hub().publish_frame(encoded, false);
     }
 }
 
 #[cfg(target_os = "windows")]
 extern "C" {
+    /// Initializes Windows FrameServer virtual camera (`integrator_vcam.dll`) and ACL-hardened shared memory;
+    /// returns `0` on success or writes a diagnostic message into `err_buf` on failure.
     fn integrator_win_vcam_start(err_buf: *mut std::os::raw::c_char, err_cap: i32) -> i32;
+    /// Lock-free ingestion pushing one contiguous 720p NV12 frame into Windows shared memory ping-pong slots.
     fn integrator_win_vcam_push_nv12(data: *const u8, len: u32, timestamp_us: u64);
+    /// Tears down the Windows virtual camera COM activation and unmaps shared memory safely.
     fn integrator_win_vcam_stop();
+    /// Returns `1` if the Windows virtual camera receiver SHM/COM session is active, else `0`.
     fn integrator_win_vcam_is_active() -> i32;
+    /// Displays scoped Windows receiver camera consent prompt (`1`: Once, `2`: Session, `3`: Always, `-1`: Block, `0`: Deny).
     fn integrator_win_prompt_camera_consent_scoped(peer_name: *const std::os::raw::c_char, timeout_sec: u32) -> i32;
+    /// Consent prompt cancellation FFI symbol retained for ABI compatibility with `camera_windows.cpp` (OBS-1E-01).
     #[allow(dead_code)]
     fn integrator_win_cancel_camera_consent_prompt();
 }
@@ -711,9 +790,13 @@ impl CameraHardwareBackend for NativeCameraBackend {
 
 /// Represents an active peer camera stream with its stream ID, cancellation sender, optional task handle, and generation.
 pub struct ActivePeerStreamEntry {
+    /// Monotonically assigned unique identifier for this stream instance (prevents same-generation clobbering).
     pub stream_id: u64,
+    /// Watch channel sender signaling cooperative stream shutdown (`true`).
     pub cancel_tx: tokio::sync::watch::Sender<bool>,
+    /// Spawned Tokio task handle retained for bounded timeout + `.abort()` escalation on teardown.
     pub task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cryptographic peer trust generation bound when this stream was registered.
     #[allow(dead_code)]
     pub generation: u64,
 }
@@ -721,10 +804,15 @@ pub struct ActivePeerStreamEntry {
 /// Completion and reaping observability statistics for supervised lingering camera tasks and native operations.
 #[derive(Debug, Clone, Default)]
 pub struct CameraReapStats {
+    /// Number of supervised lingering tasks or native ops that finished with `Ok(())`.
     pub reaped_ok: u64,
+    /// Number of supervised lingering tasks observed cancelled via `.abort()`.
     pub reaped_cancelled: u64,
+    /// Number of supervised lingering tasks or native ops caught panicking on unwind.
     pub reaped_panicked: u64,
+    /// Number of supervised lingering tasks terminating with any other JoinError.
     pub reaped_other_err: u64,
+    /// Diagnostic failure strings captured from unexpected panics or join errors.
     pub unexpected_failures: Vec<String>,
 }
 
@@ -736,23 +824,31 @@ impl CameraReapStats {
     }
 }
 
+/// Bookkeeping entry for an outer stream `JoinHandle` that exceeded bounded teardown timeout.
 struct LingeringTaskEntry {
+    /// Lowercased normalized hex device ID of the owning peer.
     peer_id: String,
+    /// Diagnostic task origin label retained for observability and post-mortem debugging.
     #[allow(dead_code)]
     label: String,
     /// Populated only when supervision was registered outside any Tokio runtime context.
     fallback_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Bookkeeping entry tracking an active `spawn_blocking` native FFI call guarded by [`CameraNativeOpGuard`].
 struct ActiveNativeOpRecord {
+    /// Optional lowercased peer hex ID owning this blocking native call.
     peer_id: Option<String>,
+    /// Optional unique `stream_id` associating this native op with a single stream instance.
     stream_id: Option<u64>,
+    /// Diagnostic operation label (e.g. `"win_vcam_push_nv12"`).
     #[allow(dead_code)]
     label: String,
     /// Set to true if peer teardown timed out while this native resource operation remained active.
     lingering: bool,
 }
 
+/// Level-3 coordinator registry tracking lingering async handles, blocking native ops, and teardown drains.
 #[derive(Default)]
 struct LingeringRegistry {
     /// Supervised lingering JoinHandles awaiting asynchronous completion.
@@ -772,6 +868,7 @@ struct LingeringRegistry {
 }
 
 impl LingeringRegistry {
+    /// Returns total number of lingering outer task handles plus native ops marked lingering.
     fn lingering_count(&self) -> usize {
         self.tasks.len()
             + self
@@ -781,12 +878,14 @@ impl LingeringRegistry {
                 .count()
     }
 
+    /// Returns `true` if any lingering task, active blocking native op, or in-flight teardown still depends on hardware.
     fn has_any_hardware_dependents(&self) -> bool {
         !self.tasks.is_empty()
             || !self.active_native_ops.is_empty()
             || self.in_flight_teardowns > 0
     }
 
+    /// Returns `true` if `clean_peer_id` owns any lingering task, active native op, or active teardown drain.
     fn peer_has_lingering_or_active_native(&self, clean_peer_id: &str) -> bool {
         self.tasks.values().any(|t| t.peer_id == clean_peer_id)
             || self
@@ -801,6 +900,7 @@ impl LingeringRegistry {
                 > 0
     }
 
+    /// Returns `true` if `stream_id` (or unscoped peer ops) still has an executing [`CameraNativeOpGuard`].
     fn stream_has_active_native_ops(&self, clean_peer_id: &str, stream_id: u64) -> bool {
         self.active_native_ops.values().any(|op| {
             op.peer_id.as_deref() == Some(clean_peer_id)
@@ -808,6 +908,7 @@ impl LingeringRegistry {
         })
     }
 
+    /// Marks active native operations belonging to `stream_id` as lingering and returns count marked.
     fn mark_stream_native_ops_lingering(&mut self, clean_peer_id: &str, stream_id: u64) -> usize {
         let mut marked = 0usize;
         for op in self.active_native_ops.values_mut() {
@@ -821,6 +922,7 @@ impl LingeringRegistry {
         marked
     }
 
+    /// Decrements global and per-peer in-flight teardown counters once teardown hands off or finishes.
     fn dec_in_flight_teardown(&mut self, clean_peer_id: &str) {
         self.in_flight_teardowns = self.in_flight_teardowns.saturating_sub(1);
         if let Some(cnt) = self.in_flight_teardown_peers.get_mut(clean_peer_id) {
@@ -832,8 +934,10 @@ impl LingeringRegistry {
     }
 }
 
+/// Level-4 protected hardware run flag preventing duplicate start or double stop of native camera hardware.
 #[derive(Default)]
 struct HardwareState {
+    /// `true` after `backend.start_capture()` succeeds until exact-once `backend.stop_capture()`.
     running: bool,
 }
 
@@ -847,31 +951,52 @@ struct HardwareState {
 /// 3. `lingering_tasks`
 /// 4. `hardware_state`
 struct CameraLifecycleCoordinator {
+    /// Hardware capture / virtual webcam backend implementation (production or deterministic test mock).
     backend: Arc<dyn CameraHardwareBackend>,
+    /// Shared active flag exposed to [`CameraService::is_active`] and status snapshots.
     active: Arc<AtomicBool>,
+    /// Session-scoped local camera user consent flag cleared upon idle hardware shutdown.
     local_consent: Arc<AtomicBool>,
+    /// Indicates whether local preview currently pins capture hardware active.
     local_preview_active: Arc<AtomicBool>,
+    /// Counter of in-progress stream or preview starts guarding against premature idle shutdown.
     starting_streams: Arc<AtomicUsize>,
+    /// Total count of `backend.stop_capture()` executions (exact-once verification counter).
     shutdown_executions: Arc<AtomicU64>,
+    /// Total count of idle hardware shutdown evaluations completed.
     shutdown_eval_count: Arc<AtomicU64>,
+    /// Level-0 serialization mutex protecting `backend.start_capture()` / `backend.stop_capture()` I/O.
     hardware_io_lock: Mutex<()>,
+    /// Level-1 map of active remote peer stream entries keyed by normalized peer device ID hex.
     active_peer_streams: Arc<Mutex<HashMap<String, ActivePeerStreamEntry>>>,
+    /// Level-3 supervision registry tracking lingering tasks, active native ops, and teardown drains.
     lingering_tasks: Arc<Mutex<LingeringRegistry>>,
+    /// Level-4 running state flag governing exact-once backend stop transitions.
     hardware_state: Mutex<HardwareState>,
+    /// Shared operational status label (`"Standby"`, `"Streaming 720p30"`, etc.).
     state_label: Arc<Mutex<String>>,
+    /// Shared most recent diagnostic error message.
     last_error: Arc<Mutex<Option<String>>>,
+    /// Captured Tokio runtime handle used for completion-driven reaping from Drop threads.
     runtime_handle: Mutex<Option<tokio::runtime::Handle>>,
+    /// Broadcast signal emitted whenever a native op, in-flight teardown, or lingering task completes.
     op_finished_notify: Arc<Notify>,
+    /// Broadcast signal emitted after hardware idle evaluation or lingering count changes.
     lifecycle_notify: Arc<Notify>,
+    /// Monotonic identifier generator shared across streams, native ops, and lingering tasks.
     next_id: AtomicU64,
+    /// Bounded grace window awaiting cooperative stream cancellation before `.abort()`.
     teardown_timeout: Duration,
+    /// Bounded drain window awaiting native blocking operations after outer task `.abort()`.
     abort_drain_timeout: Duration,
 }
 
 /// RAII guard protecting an in-progress stream/hardware startup against premature shutdown
 /// triggered by a concurrently completing lingering task.
 struct StreamStartGuard {
+    /// Owning lifecycle coordinator.
     coord: Arc<CameraLifecycleCoordinator>,
+    /// When `true` on drop, schedules idle hardware shutdown evaluation (failed/aborted startup).
     trigger_shutdown_on_drop: bool,
 }
 
@@ -909,11 +1034,17 @@ impl Drop for StreamStartGuard {
 /// `lingering_tasks` atomically before decrementing `in_flight_teardowns`, and dispatches deferred
 /// hardware shutdown evaluation.
 struct TeardownInFlightGuard {
+    /// Owning lifecycle coordinator.
     coord: Arc<CameraLifecycleCoordinator>,
+    /// Normalized peer hex identifier being torn down.
     peer_id: String,
+    /// Unique stream identifier targeted by this teardown.
     stream_id: u64,
+    /// Diagnostic label attached to supervised lingering entries.
     label: String,
+    /// Extracted Tokio task handle owned until awaited, handed off, or dropped on cancellation.
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Set to `true` after [`Self::handoff_to_lingering`] transfers ownership cleanly.
     disarmed: bool,
 }
 
@@ -1043,9 +1174,13 @@ impl Drop for TeardownInFlightGuard {
 /// native resource completion, retains hardware while active, records panics on unwind, and
 /// automatically triggers hardware shutdown once the final resource-using operation completes.
 pub struct CameraNativeOpGuard {
+    /// Owning lifecycle coordinator.
     coord: Arc<CameraLifecycleCoordinator>,
+    /// Unique operation ID registered under `LingeringRegistry::active_native_ops`.
     op_id: u64,
+    /// Optional peer hex identifier associated with this native operation.
     peer_id: Option<String>,
+    /// Diagnostic label describing the native FFI call.
     label: String,
 }
 
@@ -1120,10 +1255,12 @@ impl Drop for CameraNativeOpGuard {
 }
 
 impl CameraLifecycleCoordinator {
+    /// Allocates a monotonically increasing unique identifier for streams, tasks, or native ops.
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Captures the active Tokio runtime handle if invoked inside a Tokio runtime context.
     fn capture_runtime_handle(&self) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if let Ok(mut slot) = self.runtime_handle.lock() {
@@ -1132,6 +1269,7 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Resolves the current or previously captured Tokio runtime handle.
     fn resolve_runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             return Some(handle);
@@ -1139,10 +1277,12 @@ impl CameraLifecycleCoordinator {
         self.runtime_handle.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Returns `true` if a Tokio runtime handle is available for spawning completion watchers.
     fn has_runtime_handle(&self) -> bool {
         self.resolve_runtime_handle().is_some()
     }
 
+    /// Increments `starting_streams` and returns a guard protecting startup from premature reaping.
     fn begin_stream_start(self: &Arc<Self>) -> StreamStartGuard {
         self.starting_streams.fetch_add(1, Ordering::SeqCst);
         StreamStartGuard {
@@ -1278,6 +1418,8 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Handles completion of a supervised lingering stream `JoinHandle`, recording stats/panics
+    /// and dispatching an idle hardware shutdown check outside all locks.
     async fn on_lingering_handle_completed(
         self: Arc<Self>,
         task_id: u64,
@@ -1349,6 +1491,7 @@ impl CameraLifecycleCoordinator {
         self.lifecycle_notify.notify_waiters();
     }
 
+    /// Records failure statistics and `last_error` when an awaited stream handle panics or errors.
     fn record_completed_task_error(
         &self,
         peer_id: &str,
@@ -1458,6 +1601,7 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Returns supervised lingering task/native-op count (never `< 1` if any lifecycle mutex is poisoned).
     fn lingering_count(&self) -> usize {
         let base = match self.lingering_tasks.lock() {
             Ok(reg) => reg.lingering_count(),
@@ -1473,6 +1617,7 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Returns whether `stream_id` (or unscoped peer native ops) still has an executing native op guard.
     fn stream_has_active_native_ops(&self, clean_peer_id: &str, stream_id: u64) -> bool {
         match self.lingering_tasks.lock() {
             Ok(reg) => reg.stream_has_active_native_ops(clean_peer_id, stream_id),
@@ -1482,6 +1627,7 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Returns whether `clean_peer_id` has any remaining lingering tasks, active native ops, or teardown drains.
     fn peer_has_lingering_or_active_native(&self, clean_peer_id: &str) -> bool {
         match self.lingering_tasks.lock() {
             Ok(reg) => reg.peer_has_lingering_or_active_native(clean_peer_id),
@@ -1491,6 +1637,7 @@ impl CameraLifecycleCoordinator {
         }
     }
 
+    /// Clones accumulated lingering reap statistics for deterministic test assertions.
     #[cfg(test)]
     fn reap_stats(&self) -> CameraReapStats {
         match self.lingering_tasks.lock() {
@@ -1513,6 +1660,7 @@ impl CameraLifecycleCoordinator {
         stopped
     }
 
+    /// Inner idle-hardware evaluation routine executed while incrementing `shutdown_eval_count` cleanly.
     fn try_shutdown_hardware_if_idle_inner(&self) -> bool {
         let _io_guard = match self.hardware_io_lock.lock() {
             Ok(g) => g,
@@ -1592,11 +1740,10 @@ impl CameraLifecycleCoordinator {
             return false;
         }
 
-        global_frame_slot().clear();
-        global_frame_slot().notify.notify_waiters();
+        self.shutdown_executions.fetch_add(1, Ordering::SeqCst);
+        global_frame_hub().clear_all();
 
         self.backend.stop_capture();
-        self.shutdown_executions.fetch_add(1, Ordering::SeqCst);
 
         if let Ok(mut s) = self.state_label.lock() {
             *s = "Standby".to_string();
@@ -1605,6 +1752,7 @@ impl CameraLifecycleCoordinator {
         true
     }
 
+    /// Runs [`Self::try_shutdown_hardware_if_idle`] on `spawn_blocking` and wakes lifecycle waiters.
     async fn try_shutdown_hardware_if_idle_async(self: &Arc<Self>) -> bool {
         let coord = Arc::clone(self);
         let stopped = tokio::task::spawn_blocking(move || coord.try_shutdown_hardware_if_idle())
@@ -1615,14 +1763,11 @@ impl CameraLifecycleCoordinator {
     }
 }
 
-/// Central controller service for the Camera subsystem.
+/// Central controller service for the Camera & Shared Microphone subsystem.
 ///
-/// Manages the activation lifecycle, network transport session, and status reporting on both
-/// macOS (capture sender) and Windows 11 (virtual camera receiver).
+/// Manages activation lifecycles, network transport sessions, per-peer authorization,
+/// shared microphone source/gain/mute state, and status reporting on both macOS and Windows 11.
 pub struct CameraService {
-    /// Peer discovery manager for resolving counterpart device IP addresses.
-    #[allow(dead_code)]
-    discovery: DiscoveryManager,
     /// Dynamic feature flags manager governing subsystem activation.
     features: Arc<FeatureManager>,
     /// Atomic flag indicating whether camera capture or virtual camera service is active.
@@ -1643,15 +1788,20 @@ pub struct CameraService {
     active_peer_streams: Arc<Mutex<HashMap<String, ActivePeerStreamEntry>>>,
     /// Serializes concurrent user consent prompt dialogs across threads/requests.
     prompt_mutex: Arc<tokio::sync::Mutex<()>>,
-    /// Tracks the timestamp of the last displayed consent prompt per peer device ID to enforce rate limiting.
-    #[allow(dead_code)]
-    last_prompt_times: Arc<Mutex<HashMap<String, Instant>>>,
     /// Human-readable operational status label.
     state_label: Arc<Mutex<String>>,
     /// Most recent error message, if any.
     last_error: Arc<Mutex<Option<String>>>,
     /// Unified lifecycle supervisor managing lingering tasks, native operation guards, and exact-once hardware shutdown.
     lifecycle: Arc<CameraLifecycleCoordinator>,
+    /// Atomic flag tracking whether shared Mac-to-PC microphone forwarding is enabled.
+    mic_enabled: Arc<AtomicBool>,
+    /// Atomic flag tracking whether shared Mac-to-PC microphone output is muted.
+    mic_muted: Arc<AtomicBool>,
+    /// IEEE-754 bit representation of linear microphone gain clamped to `0.0..=2.0` (`1.0` default).
+    mic_gain_bits: Arc<AtomicU32>,
+    /// Sanitized friendly name of the currently selected macOS microphone device (empty if unselected).
+    selected_mic_name: Arc<Mutex<String>>,
 }
 
 impl CameraService {
@@ -1674,6 +1824,8 @@ impl CameraService {
         teardown_timeout: Duration,
         abort_drain_timeout: Duration,
     ) -> Arc<Self> {
+        // Peer endpoint resolution uses authenticated keystore records rather than raw discovery beacons.
+        let _ = discovery;
         let active = Arc::new(AtomicBool::new(false));
         let local_consent = Arc::new(AtomicBool::new(false));
         let peer_consent = Arc::new(Mutex::new(HashMap::new()));
@@ -1725,7 +1877,6 @@ impl CameraService {
         });
 
         Arc::new(Self {
-            discovery,
             features,
             active,
             frames_transferred: Arc::new(AtomicU64::new(0)),
@@ -1736,10 +1887,13 @@ impl CameraService {
             local_preview_active,
             active_peer_streams,
             prompt_mutex: Arc::new(tokio::sync::Mutex::new(())),
-            last_prompt_times: Arc::new(Mutex::new(HashMap::new())),
             state_label,
             last_error,
             lifecycle,
+            mic_enabled: Arc::new(AtomicBool::new(false)),
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            mic_gain_bits: Arc::new(AtomicU32::new(DEFAULT_MIC_GAIN.to_bits())),
+            selected_mic_name: Arc::new(Mutex::new(String::new())),
         })
     }
 
@@ -2521,7 +2675,6 @@ impl CameraService {
             if let Some(tx) = cancel_tx {
                 let _ = tx.send(true);
             }
-            global_frame_slot().notify.notify_waiters();
 
             if let Some(ref mut handle) = guard.handle {
                 match tokio::time::timeout(self.lifecycle.teardown_timeout, handle).await {
@@ -2693,7 +2846,6 @@ impl CameraService {
             self.frame_hub.unsubscribe(&clean_id);
             if let Some(mut entry) = streams.remove(&clean_id) {
                 let _ = entry.cancel_tx.send(true);
-                global_frame_slot().notify.notify_waiters();
                 {
                     let mut reg = match self.lifecycle.lingering_tasks.lock() {
                         Ok(g) => g,
@@ -2838,123 +2990,128 @@ impl CameraService {
                 let re_eval = self.authorization.evaluate_sender_consent(&target_device_id_hex, target_generation);
 
                 if re_eval != ConsentEvaluation::Granted {
-                    let _req_id = self.authorization.try_begin_prompt(
-                        direction,
-                        &target_device_id_hex,
-                    )?;
-
-                    #[cfg(target_os = "windows")]
-                    {
-                        let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
-                        let choice = tokio::task::spawn_blocking(move || {
-                            unsafe { integrator_win_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        match choice {
-                            1 => {
-                                self.grant_receiver_consent(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::AllowOnce,
-                                );
-                            }
-                            2 => {
-                                self.grant_receiver_consent(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::ActiveSession,
-                                );
-                            }
-                            3 => {
-                                self.grant_receiver_consent(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::AlwaysAllow,
-                                );
-                            }
-                            -1 => {
-                                self.record_peer_denial(
-                                    direction,
-                                    &target_device_id_hex,
-                                    CameraDenialAction::DenyAndBlock,
-                                );
-                                return Err("Rejected: User denied and blocked camera access".into());
-                            }
-                            _ => {
-                                self.record_peer_denial(
-                                    direction,
-                                    &target_device_id_hex,
-                                    CameraDenialAction::Temporary,
-                                );
-                                return Err("Rejected: User denied camera access".into());
-                            }
-                        }
-                    }
-
-                    #[cfg(target_os = "macos")]
-                    {
-                        let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
-                        let choice = tokio::task::spawn_blocking(move || {
-                            unsafe { integrator_mac_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        match choice {
-                            1 => {
-                                // Allow Once (Single continuous stream)
-                                self.grant_peer_consent_scoped(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::AllowOnce,
-                                    _req_id,
-                                );
-                            }
-                            2 => {
-                                // Allow for this Session
-                                self.grant_peer_consent_scoped(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::ActiveSession,
-                                    0,
-                                );
-                            }
-                            3 => {
-                                // Always Allow
-                                self.grant_peer_consent_scoped(
-                                    &target_device_id_hex,
-                                    target_generation,
-                                    CameraConsentScope::AlwaysAllow,
-                                    0,
-                                );
-                            }
-                            -1 => {
-                                // Deny and Block persistently
-                                self.record_peer_denial(
-                                    direction,
-                                    &target_device_id_hex,
-                                    CameraDenialAction::DenyAndBlock,
-                                );
-                                return Err("Rejected: Local user denied and blocked remote camera access".into());
-                            }
-                            _ => {
-                                // Deny / Timeout
-                                self.record_peer_denial(
-                                    direction,
-                                    &target_device_id_hex,
-                                    CameraDenialAction::Temporary,
-                                );
-                                return Err("Rejected: Local user denied remote camera access".into());
-                            }
-                        }
-                    }
-
                     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     {
                         let _ = &target_display_name;
                         return Err("Rejected: Local camera consent required on camera host".into());
+                    }
+
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    {
+                        let _req_id = self.authorization.try_begin_prompt(
+                            direction,
+                            &target_device_id_hex,
+                        )?;
+
+                        #[cfg(target_os = "windows")]
+                        {
+                            let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
+                            // Treat JoinError as denied (0) so a panicked prompt task never leaks a pending prompt slot.
+                            let choice = tokio::task::spawn_blocking(move || {
+                                unsafe { integrator_win_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
+                            })
+                            .await
+                            .unwrap_or(0);
+
+                            match choice {
+                                1 => {
+                                    self.grant_receiver_consent(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::AllowOnce,
+                                    );
+                                }
+                                2 => {
+                                    self.grant_receiver_consent(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::ActiveSession,
+                                    );
+                                }
+                                3 => {
+                                    self.grant_receiver_consent(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::AlwaysAllow,
+                                    );
+                                }
+                                -1 => {
+                                    self.record_peer_denial(
+                                        direction,
+                                        &target_device_id_hex,
+                                        CameraDenialAction::DenyAndBlock,
+                                    );
+                                    return Err("Rejected: User denied and blocked camera access".into());
+                                }
+                                _ => {
+                                    self.record_peer_denial(
+                                        direction,
+                                        &target_device_id_hex,
+                                        CameraDenialAction::Temporary,
+                                    );
+                                    return Err("Rejected: User denied camera access".into());
+                                }
+                            }
+                        }
+
+                        #[cfg(target_os = "macos")]
+                        {
+                            let display_c = std::ffi::CString::new(target_display_name.clone()).unwrap_or_default();
+                            // Treat JoinError as denied (0) so a panicked prompt task never leaks a pending prompt slot.
+                            let choice = tokio::task::spawn_blocking(move || {
+                                unsafe { integrator_mac_prompt_camera_consent_scoped(display_c.as_ptr(), 30) }
+                            })
+                            .await
+                            .unwrap_or(0);
+
+                            match choice {
+                                1 => {
+                                    // Allow Once (Single continuous stream)
+                                    self.grant_peer_consent_scoped(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::AllowOnce,
+                                        _req_id,
+                                    );
+                                }
+                                2 => {
+                                    // Allow for this Session
+                                    self.grant_peer_consent_scoped(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::ActiveSession,
+                                        0,
+                                    );
+                                }
+                                3 => {
+                                    // Always Allow
+                                    self.grant_peer_consent_scoped(
+                                        &target_device_id_hex,
+                                        target_generation,
+                                        CameraConsentScope::AlwaysAllow,
+                                        0,
+                                    );
+                                }
+                                -1 => {
+                                    // Deny and Block persistently
+                                    self.record_peer_denial(
+                                        direction,
+                                        &target_device_id_hex,
+                                        CameraDenialAction::DenyAndBlock,
+                                    );
+                                    return Err("Rejected: Local user denied and blocked remote camera access".into());
+                                }
+                                _ => {
+                                    // Deny / Timeout
+                                    self.record_peer_denial(
+                                        direction,
+                                        &target_device_id_hex,
+                                        CameraDenialAction::Temporary,
+                                    );
+                                    return Err("Rejected: Local user denied remote camera access".into());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3175,7 +3332,6 @@ impl CameraService {
             }
 
             frames_transferred.store(0, Ordering::Relaxed);
-            global_frame_slot().clear();
 
             if let Err(err) = coord.backend.start_capture() {
                 coord.active.store(false, Ordering::SeqCst);
@@ -3469,8 +3625,7 @@ impl CameraService {
             let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
             consent.clear();
         }
-        global_frame_slot().clear();
-        global_frame_slot().notify.notify_waiters();
+        global_frame_hub().clear_all();
 
         let stopped = self.lifecycle.try_shutdown_hardware_if_idle_async().await;
         if stopped {
@@ -3504,8 +3659,7 @@ impl CameraService {
             let mut consent = self.peer_consent.lock().unwrap_or_else(|e| e.into_inner());
             consent.clear();
         }
-        global_frame_slot().clear();
-        global_frame_slot().notify.notify_waiters();
+        global_frame_hub().clear_all();
 
         // Bounded drain for short-lived in-flight native FFI writes (e.g. Windows NV12 SHM memcpy)
         let drain_deadline = Instant::now() + Duration::from_millis(200);
@@ -3573,22 +3727,23 @@ impl CameraService {
         }
     }
 
-    /// Queries the current operational snapshot of the Camera subsystem.
+    /// Queries the current operational snapshot of the Camera & Shared Microphone subsystem.
     pub fn status(&self) -> CameraStatus {
-        let active = self.active.load(Ordering::Relaxed);
+        let active = self.active.load(Ordering::Acquire);
         let enabled = self.features.is_enabled("camera");
         #[cfg(target_os = "macos")]
-        let (permission_granted, camera_available) = unsafe {
+        let (permission_granted, camera_available, mic_permission_granted) = unsafe {
             (
                 integrator_mac_camera_permission_state() == 2
                     && integrator_mac_camera_has_usage_desc() == 1,
                 integrator_mac_camera_has_hardware() != 0,
+                integrator_mac_mic_permission_granted(),
             )
         };
         #[cfg(target_os = "windows")]
-        let (permission_granted, camera_available) = (true, true);
+        let (permission_granted, camera_available, mic_permission_granted) = (true, true, true);
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let (permission_granted, camera_available) = (false, false);
+        let (permission_granted, camera_available, mic_permission_granted) = (false, false, false);
 
         let role = if cfg!(target_os = "macos") {
             "Mac Camera Sender"
@@ -3609,6 +3764,18 @@ impl CameraService {
                 .unwrap_or_else(|_| if active { "Active".into() } else { "Standby".into() })
         };
 
+        let raw_gain = f32::from_bits(self.mic_gain_bits.load(Ordering::Acquire));
+        let mic_gain = if raw_gain.is_finite() {
+            raw_gain.clamp(MIN_MIC_GAIN, MAX_MIC_GAIN)
+        } else {
+            DEFAULT_MIC_GAIN
+        };
+        let mic_device_name = self
+            .selected_mic_name
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+
         CameraStatus {
             supported: cfg!(any(target_os = "macos", target_os = "windows")),
             camera_available,
@@ -3624,6 +3791,124 @@ impl CameraService {
             port: CAMERA_PORT,
             device_name: DEFAULT_CAMERA_FRIENDLY_NAME.to_string(),
             privacy_muted: is_camera_privacy_muted(),
+            mic_enabled: self.mic_enabled.load(Ordering::Acquire),
+            mic_muted: self.mic_muted.load(Ordering::Acquire),
+            mic_device_name,
+            mic_permission_granted,
+            mic_gain,
+        }
+    }
+
+    /// Enumerates available microphone audio input devices on the macOS host (or empty outside macOS).
+    ///
+    /// Device display labels are stripped of control/bidi formatting characters and bounded by
+    /// [`MAX_MIC_LABEL_CHARS`]; entries with invalid or control-laden IDs are filtered out.
+    pub fn list_mics(&self) -> Vec<MicDeviceWire> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut buf = vec![0u8; 8192];
+            // SAFETY: `buf` provides `buf.len()` writable bytes for the UTF-8 JSON output.
+            let n = unsafe { integrator_mac_list_mics(buf.as_mut_ptr(), buf.len()) };
+            if n > 0 && n <= buf.len() {
+                if let Ok(json_str) = std::str::from_utf8(&buf[..n]) {
+                    if let Ok(parsed) = serde_json::from_str::<Vec<MicDeviceWire>>(json_str) {
+                        return parsed
+                            .into_iter()
+                            .filter(|m| {
+                                let id_t = m.id.trim();
+                                !id_t.is_empty()
+                                    && id_t.len() <= MAX_MIC_DEVICE_ID_BYTES
+                                    && !id_t.chars().any(|c| c.is_control())
+                            })
+                            .map(|mut m| {
+                                m.name = sanitize_mic_label(&m.name, MAX_MIC_LABEL_CHARS);
+                                m
+                            })
+                            .collect();
+                    }
+                }
+            }
+            Vec::new()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Selects the active macOS microphone source by unique identifier (`AVCaptureDevice.uniqueID`),
+    /// returning the sanitized localized device name on success.
+    pub fn select_mic(&self, device_id: &str) -> Result<String, String> {
+        let trimmed = device_id.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_MIC_DEVICE_ID_BYTES
+            || trimmed.chars().any(|c| c.is_control())
+        {
+            return Err("Rejected select_mic: invalid or overlong microphone device_id".into());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let c_id = std::ffi::CString::new(trimmed)
+                .map_err(|_| "Microphone device_id contains embedded NUL byte".to_string())?;
+            // SAFETY: `c_id` is a valid NUL-terminated UTF-8 C string for the duration of the call.
+            let ok = unsafe { integrator_mac_select_mic(c_id.as_ptr()) };
+            if !ok {
+                return Err(format!(
+                    "Microphone '{}' was not found or is unavailable",
+                    sanitize_mic_label(trimmed, 64)
+                ));
+            }
+            let friendly = self
+                .list_mics()
+                .into_iter()
+                .find(|m| m.id == trimmed)
+                .map(|m| m.name)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| sanitize_mic_label(trimmed, MAX_MIC_LABEL_CHARS));
+            if let Ok(mut guard) = self.selected_mic_name.lock() {
+                *guard = friendly.clone();
+            }
+            info!("🎤 Selected shared microphone device: '{}'", friendly);
+            Ok(friendly)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("Microphone selection is only supported on the macOS host".into())
+        }
+    }
+
+    /// Updates shared microphone capture enablement, mute state, and linear gain (`0.0..=2.0`),
+    /// returning the refreshed [`CameraStatus`] snapshot.
+    pub fn set_mic_settings(&self, enabled: bool, muted: bool, gain: f32) -> CameraStatus {
+        let safe_gain = if gain.is_finite() {
+            gain.clamp(MIN_MIC_GAIN, MAX_MIC_GAIN)
+        } else {
+            DEFAULT_MIC_GAIN
+        };
+        self.mic_enabled.store(enabled, Ordering::SeqCst);
+        self.mic_muted.store(muted, Ordering::SeqCst);
+        self.mic_gain_bits
+            .store(safe_gain.to_bits(), Ordering::SeqCst);
+        info!(
+            "🎤 Shared microphone settings updated: enabled={}, muted={}, gain={:.0}%",
+            enabled,
+            muted,
+            safe_gain * 100.0
+        );
+        self.status()
+    }
+
+    /// Prompts macOS TCC for microphone capture permission (`AVMediaType.audio`) if not yet granted.
+    pub fn request_mic_permission(&self) -> Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `integrator_mac_request_mic_permission` takes no pointer arguments and handles threading internally.
+            Ok(unsafe { integrator_mac_request_mic_permission() })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("Microphone permission requests are only applicable on macOS".into())
         }
     }
 
@@ -3724,6 +4009,11 @@ mod tests {
         assert_eq!(parsed.port, CAMERA_PORT);
         assert_eq!(parsed.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
         assert_eq!(parsed.device_name, "Integrator Mac Camera");
+        assert!(!parsed.mic_enabled);
+        assert!(!parsed.mic_muted);
+        assert_eq!(parsed.mic_device_name, "");
+        assert!(!parsed.mic_permission_granted);
+        assert!((parsed.mic_gain - 1.0).abs() < f32::EPSILON);
 
         let serialized = serde_json::to_string(&parsed).expect("CameraStatus should serialize");
         let roundtrip: CameraStatus =
@@ -3731,6 +4021,56 @@ mod tests {
         assert!(roundtrip.camera_available);
         assert_eq!(roundtrip.port, CAMERA_PORT);
         assert_eq!(roundtrip.device_name, DEFAULT_CAMERA_FRIENDLY_NAME);
+        assert!((roundtrip.mic_gain - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_mic_settings_clamping_sanitization_and_wire_roundtrip() {
+        let svc = CameraService::new(
+            DiscoveryManager::new("cam_mic_settings_test"),
+            Arc::new(FeatureManager::new()),
+        );
+
+        let initial = svc.status();
+        assert!(!initial.mic_enabled);
+        assert!(!initial.mic_muted);
+        assert!((initial.mic_gain - 1.0).abs() < f32::EPSILON);
+
+        // Gain clamps cleanly below 0.0 and above 2.0, and handles non-finite inputs safely.
+        let low = svc.set_mic_settings(true, false, -0.75);
+        assert!(low.mic_enabled);
+        assert!(!low.mic_muted);
+        assert_eq!(low.mic_gain, 0.0);
+
+        let high = svc.set_mic_settings(true, true, 5.25);
+        assert!(high.mic_enabled);
+        assert!(high.mic_muted);
+        assert_eq!(high.mic_gain, 2.0);
+
+        let nan_status = svc.set_mic_settings(false, false, f32::NAN);
+        assert!(!nan_status.mic_enabled);
+        assert_eq!(nan_status.mic_gain, 1.0);
+
+        let exact = svc.set_mic_settings(true, false, 1.35);
+        assert!((exact.mic_gain - 1.35).abs() < 1e-6);
+
+        // Input validation rejects empty, control-char, or overlong mic device IDs before FFI.
+        assert!(svc.select_mic("").is_err());
+        assert!(svc.select_mic("  \t\n ").is_err());
+        assert!(svc.select_mic("mic\x00bad").is_err());
+        assert!(svc.select_mic(&"a".repeat(300)).is_err());
+
+        // Sanitization strips Unicode bidi overrides and ASCII control characters.
+        assert_eq!(
+            sanitize_mic_label("  MacBook \u{202E}Mic\x07 Pro  ", 64),
+            "MacBook Mic Pro"
+        );
+
+        let mic_wire: MicDeviceWire =
+            serde_json::from_str(r#"{"id":"mic-builtin","name":"MacBook Pro Microphone"}"#)
+                .expect("MicDeviceWire without is_default must deserialize");
+        assert!(!mic_wire.is_default);
+        assert_eq!(mic_wire.id, "mic-builtin");
     }
 
     #[tokio::test]

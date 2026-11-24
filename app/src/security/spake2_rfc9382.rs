@@ -46,7 +46,21 @@
 //!   - Ephemeral scalar $x$ or $y$, password scalar $w$, and my public share are wiped on `Drop` via [`zeroize::Zeroize`].
 //!   - Output keys $K_e$, $K_a$, $K_{cA}$, $K_{cB}$, $K_{\text{root}}$, and $K_{\text{ack}}$ are wrapped in [`zeroize::Zeroizing`].
 //!
-//! ## 3. Architectural Linkages & Protocol State Machine
+//! ## 3. Architectural Linkages & Dependencies
+//! - **Upstream Callers**:
+//!   - `app/src/security/pairing.rs`: [`PairingCoordinatorV2`], [`ClientPairingHandshakeV2`], and [`ClientAwaitingServerComplete`] invoke [`compute_password_salt`], [`Spake2State::start_a`], [`Spake2State::start_b`], [`Spake2State::finish`], [`Spake2TranscriptOutput::verify_peer_confirm_mac`], and [`Spake2TranscriptOutput::derive_application_secrets`] during the 4-message `IPR2` pairing handshake.
+//!   - `app/src/security/mod.rs`: Cryptographic unit and vector test suite validating RFC 9382 point constants, torsion rejection, and symmetric key agreement.
+//! - **Downstream Callees**:
+//!   - `curve25519_dalek`: Constant-time `EdwardsPoint`, `CompressedEdwardsY`, and `Scalar` arithmetic over `edwards25519`.
+//!   - `hkdf::Hkdf<Sha256>`, `hmac::Hmac<Sha256>`, `sha2::{Sha256, Sha512}`: RFC 5869 HKDF key expansion, RFC 2104 HMAC tag generation, and SHA-2 transcript digests.
+//!   - `subtle::ConstantTimeEq`: Timing-safe comparisons for scalars, curve points, and confirmation MACs.
+//!   - `zeroize::{Zeroize, Zeroizing}`: Deterministic memory wiping of sensitive scalars, transcripts, and derived keys on drop.
+//!   - `super::{try_csprng_fill, derive_key_id, format_sas_6}`: OS kernel CSPRNG entropy filling, 128-bit key ID derivation, and 6-character human-readable SAS formatting.
+//! - **Cross-Platform / Cross-Device Flow (Mac ↔ Windows 11)**:
+//!   - Ensures byte-for-byte identical PAKE computations across macOS (ARM64/x86_64) and Windows 11 (x86_64/ARM64) endpoints over TCP port 58281 (`IPR2` framing).
+//!   - All curve points are exchanged as canonical 32-byte compressed Edwards Y coordinates, and all transcript length prefixes use canonical 8-byte little-endian (`u64::to_le_bytes`) encoding to eliminate endianness or architecture divergence.
+//!
+//! ### Protocol State Machine
 //! ```text
 //!    Initiator (Client A)                                 Responder (Server B)
 //!    ====================                                 ====================
@@ -82,6 +96,11 @@
 //! All structures and functions in this module are purely computational, synchronous, and non-blocking.
 //! They contain no mutexes, channel endpoints, or file handles, making them safe to execute within any
 //! Tokio async task or worker thread.
+//!
+//! ## 5. Security & Safety Invariants
+//! - **Zero `unsafe` Blocks**: All curve arithmetic, hashing, and memory zeroization rely strictly on safe Rust abstractions.
+//! - **Input Clamping**: Transcript identity (`id_a`, `id_b`) and associated data (`aad`) inputs are bounded to [`MAX_SPAKE2_TRANSCRIPT_INPUT_BYTES`] (4,096 bytes) to prevent memory exhaustion.
+//! - **Strict Key Separation**: Shared group point $K$, encryption secret $K_e$, confirmation master key $K_a$, directional MAC keys $K_{cA}/K_{cB}$, root key $K_{\text{root}}$, and acknowledgment key $K_{\text{ack}}$ are domain-separated via SHA-512 splitting and HKDF-SHA256 labels.
 
 use curve25519_dalek::{
     constants::ED25519_BASEPOINT_POINT,
@@ -95,6 +114,7 @@ use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Type alias for HMAC-SHA256 message authentication code instance (32-byte tag output).
 type HmacSha256 = Hmac<Sha256>;
 
 /// RFC 9382 Section 4 `edwards25519` point constant `M` (compressed Edwards Y, 32 bytes):
@@ -335,30 +355,51 @@ pub enum Spake2Role {
 
 /// Single-use ephemeral state machine for an RFC 9382 SPAKE2 handshake party.
 ///
-/// Securely zeroizes internal scalars $x/y$ and $w$ upon drop.
+/// Consumed by value in [`Spake2State::finish`] to enforce single-use execution and prevent
+/// ephemeral scalar reuse across multiple peer shares. Securely zeroizes internal scalars
+/// $x/y$ and $w$, transcript identities, and the local blinded share upon drop.
 pub struct Spake2State {
+    /// Protocol role of the local party ([`Spake2Role::InitiatorA`] or [`Spake2Role::ResponderB`]).
     role: Spake2Role,
+    /// Ephemeral secret scalar $x \in [1, \ell - 1]$ (for Initiator A) or $y \in [1, \ell - 1]$ (for Responder B).
     xy_scalar: Scalar,
+    /// Password-derived scalar $w \in [1, \ell - 1]$ computed from the 6-digit PIN and session salt.
     w_scalar: Scalar,
+    /// Canonical initiator identity byte sequence `A` bound into the RFC 9382 transcript `TT` (max 4,096 bytes).
     id_a: Vec<u8>,
+    /// Canonical responder identity byte sequence `B` bound into the RFC 9382 transcript `TT` (max 4,096 bytes).
     id_b: Vec<u8>,
+    /// Local party's 32-byte compressed Edwards25519 blinded public share ($pA$ for Initiator A, $pB$ for Responder B).
     my_share: [u8; 32],
 }
 
 impl Drop for Spake2State {
+    /// Zeroizes all secret scalars, transcript identity buffers, and public share bytes when the state leaves scope.
     fn drop(&mut self) {
         self.xy_scalar.zeroize();
         self.w_scalar.zeroize();
+        self.id_a.zeroize();
+        self.id_b.zeroize();
         self.my_share.zeroize();
     }
 }
 
-/// Samples a non-zero private scalar from the OS CSPRNG modulo $\ell$ via rejection sampling.
+/// Samples a uniform non-zero private scalar $s \in [1, \ell - 1]$ from the OS kernel CSPRNG via rejection sampling.
+///
+/// # Mathematical Details
+/// Samples 64 random bytes (512 bits) per iteration and performs wide modular reduction modulo the 253-bit
+/// prime subgroup order $\ell$ (`Scalar::from_bytes_mod_order_wide`), ensuring statistical distance from a
+/// uniform distribution over $\mathbb{Z}/\ell\mathbb{Z}$ is $< 2^{-256}$ per RFC 9382 §3.2.
+///
+/// # Errors
+/// Returns [`Spake2Error::ZeroEphemeralScalar`] if the OS kernel CSPRNG fails to provide entropy.
 fn sample_nonzero_scalar() -> Result<Scalar, Spake2Error> {
     let mut scalar_wide = Zeroizing::new([0u8; 64]);
     loop {
+        // Fill 512-bit buffer from OS CSPRNG; abort immediately if kernel entropy source fails.
         super::try_csprng_fill(&mut *scalar_wide).map_err(|_| Spake2Error::ZeroEphemeralScalar)?;
         let s = Scalar::from_bytes_mod_order_wide(&scalar_wide);
+        // Reject zero modulo l in constant time (probability ~ 2^-252).
         if !bool::from(s.ct_eq(&Scalar::ZERO)) {
             return Ok(s);
         }
@@ -632,9 +673,12 @@ impl Spake2TranscriptOutput {
         salt_hasher.update(self.tt_sha256);
         salt_hasher.update(sig_a);
         salt_hasher.update(sig_b);
-        let salt = salt_hasher.finalize();
+        let salt_digest = salt_hasher.finalize();
+        let mut salt = Zeroizing::new([0u8; 32]);
+        salt.copy_from_slice(&salt_digest);
 
-        let hk = Hkdf::<Sha256>::new(Some(&salt), &*self.k_e);
+        // HKDF-Extract with transcript-bound salt and SPAKE2 shared encryption secret Ke as IKM.
+        let hk = Hkdf::<Sha256>::new(Some(&*salt), &*self.k_e);
 
         let mut root_key = Zeroizing::new([0u8; 32]);
         hk.expand(b"integrator-v2-root-key", &mut *root_key)
@@ -644,14 +688,15 @@ impl Spake2TranscriptOutput {
         hk.expand(b"integrator-v2-pair-ack", &mut *ack_key)
             .expect("32-byte HKDF expand cannot fail");
 
-        let mut sas_bytes = [0u8; 4];
-        hk.expand(b"integrator-v2-sas", &mut sas_bytes)
+        let mut sas_bytes = Zeroizing::new([0u8; 4]);
+        hk.expand(b"integrator-v2-sas", &mut *sas_bytes)
             .expect("4-byte HKDF expand cannot fail");
 
         let key_id = super::derive_key_id(&root_key);
         let sas_code = super::format_sas_6(&sas_bytes);
 
-        let mut ack_input = Vec::with_capacity(32 + 32 + 32 + 64);
+        // Assemble 155-byte acknowledgment payload: 27B domain label || 32B tt_sha256 || 32B confirm_mac_a || 64B sig_a.
+        let mut ack_input = Zeroizing::new(Vec::with_capacity(27 + 32 + 32 + 64));
         ack_input.extend_from_slice(b"integrator-pair-complete-v2");
         ack_input.extend_from_slice(&self.tt_sha256);
         ack_input.extend_from_slice(&self.confirm_mac_a);

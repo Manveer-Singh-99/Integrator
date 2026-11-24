@@ -4,15 +4,48 @@
 //! Provides native Windows Global System Media Transport Controls (GSMTC) metadata polling and
 //! sub-millisecond media transport command execution (`PlayPause`, `Next`, `Previous`, `Seek`)
 //! using WinRT `Windows.Media.Control` directly in-process (zero subprocess spawning), so a
-//! paired MacBook Pro Touch Bar can display and control Spotify, YouTube, VLC, and other
-//! Windows media players while the user works on macOS.
+//! paired MacBook Pro Touch Bar can display and control Spotify, YouTube, Apple Music, VLC, and
+//! other Windows media players while the user works on macOS.
 //!
-//! ## 2. Security & Safety Invariants
+//! ## 2. Architectural Linkages & Dependencies
+//! ### Upstream Callers:
+//! - `core::IntegratorCore`: Handles `"get_windows_media_state"` and `"send_windows_media_cmd"` UI
+//!   JSON-RPC actions via `tokio::task::spawn_blocking`.
+//! - `display::controller::DisplayController`: Dispatches incoming peer RPC requests
+//!   (`DisplayRpcRequest::GetMediaState`, `DisplayRpcRequest::SendMediaCommand`).
+//!
+//! ### Downstream Callees:
+//! - WinRT `Windows.Media.Control` (`GlobalSystemMediaTransportControlsSessionManager`):
+//!   Enumerates active media sessions, track metadata, playback status, and timeline properties.
+//! - Windows UI Automation (`IUIAutomation`, `CUIAutomation`, `IUIAutomationRangeValuePattern`):
+//!   Fallback scrub control via `LCDScrubber` (Apple Music) or duration-matched `Slider` controls
+//!   when GSMTC reports `IsPlaybackPositionEnabled = false`.
+//! - Win32 Toolhelp (`CreateToolhelp32Snapshot`, `Process32FirstW`/`NextW`) & `SendInput`:
+//!   Resolves player PIDs for UIA scrubbing and synthesizes `VK_MEDIA_*` keys if GSMTC declines.
+//!
+//! ### Cross-Platform / Cross-Device Flow:
+//! 1. macOS Touch Bar UI polls `get_windows_media_state`, forwarding `DisplayRpcRequest::GetMediaState`
+//!    over the encrypted TCP RPC channel to Windows.
+//! 2. Windows queries GSMTC in-process (500 ms cache), sanitizes metadata, and returns [`MediaPlaybackState`].
+//! 3. Touch Bar playback controls and scrub gestures dispatch [`MediaControlAction`] back to Windows
+//!    for immediate GSMTC execution or UIA `LCDScrubber` timeline seeking, invalidating the cache.
+//!
+//! ## 3. Threading & Concurrency Model
+//! - All Windows COM/WinRT/UIA calls are synchronous blocking calls dispatched by upstream callers
+//!   on `tokio::task::spawn_blocking` worker threads.
+//! - Each entry initializes COM Multi-Threaded Apartment (`COINIT_MULTITHREADED`), treating
+//!   `RPC_E_CHANGED_MODE` gracefully if the thread was previously initialized as STA.
+//! - `MEDIA_CACHE` serializes 500 ms state caching under a `OnceLock<Mutex<...>>`.
+//!
+//! ## 4. Security & Safety Invariants
 //! - **Least Privilege**: Operates strictly at user session privilege (`asInvoker`).
 //! - **Zero Subprocess Overhead**: Native WinRT COM queries complete in ~1–2 ms with a 500 ms
 //!   in-memory cache, eliminating PowerShell fork latency and window flashes.
-//! - **Input Sanitization**: Track titles, artist names, and app IDs are stripped of control
-//!   and bidirectional override characters and clamped to bounded lengths.
+//! - **Input Sanitization & Bounds**: Track titles, artist names, and app IDs are stripped of control
+//!   and bidirectional override characters and clamped to bounded lengths; seek targets and timeline
+//!   durations are verified finite and clamped to `[0.0, MAX_MEDIA_DURATION_SECS]`.
+//! - **COM/Handle Hygiene**: Toolhelp snapshot handles are unconditionally closed with `CloseHandle`,
+//!   and `SendInput` `ManuallyDrop` union fields match Win32 `INPUT` layout.
 
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
@@ -21,13 +54,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Maximum permitted string length for sanitized media metadata fields.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const MAX_MEDIA_TEXT_LEN: usize = 96;
 
 /// Maximum finite track duration accepted (24 hours in seconds).
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const MAX_MEDIA_DURATION_SECS: f64 = 86_400.0;
 
+/// In-memory TTL (500 ms) for GSMTC playback state queries to coalesce rapid UI polling.
 #[cfg(target_os = "windows")]
 const MEDIA_CACHE_TTL: Duration = Duration::from_millis(500);
 
@@ -92,7 +126,7 @@ pub fn sanitize_media_text(raw: &str, max_chars: usize) -> String {
 }
 
 /// Normalizes a `MediaPlaybackState` enforcing finite bounded timeline values and safe display strings.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn sanitize_media_state(mut st: MediaPlaybackState) -> MediaPlaybackState {
     st.title = sanitize_media_text(&st.title, MAX_MEDIA_TEXT_LEN);
     st.artist = sanitize_media_text(&st.artist, MAX_MEDIA_TEXT_LEN);
@@ -159,8 +193,10 @@ mod windows_media {
         UIA_ProcessIdPropertyId, UIA_RangeValuePatternId, UIA_SliderControlTypeId,
     };
 
+    /// Global cached GSMTC state snapshot and its monotonic capture timestamp.
     static MEDIA_CACHE: OnceLock<Mutex<(Instant, MediaPlaybackState)>> = OnceLock::new();
 
+    /// Returns the mutex protecting [`MEDIA_CACHE`], initialized to an expired timestamp.
     fn cache_lock() -> &'static Mutex<(Instant, MediaPlaybackState)> {
         MEDIA_CACHE.get_or_init(|| {
             Mutex::new((
@@ -170,13 +206,18 @@ mod windows_media {
         })
     }
 
+    /// Initializes the calling worker thread into the Windows COM Multi-Threaded Apartment (MTA).
+    /// Ignores `RPC_E_CHANGED_MODE` when a thread was already initialized as STA by the host.
     fn ensure_com_mta() {
+        // SAFETY: `CoInitializeEx(None, COINIT_MULTITHREADED)` is safe to invoke on any OS thread;
         // S_OK (0), S_FALSE (1), or RPC_E_CHANGED_MODE (0x80010106) are all safe to proceed with.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
     }
 
+    /// Selects the highest-priority active GSMTC session: prefers any session currently `Playing`,
+    /// otherwise falls back to `GetCurrentSession()`, then the first enumerated registered session.
     fn pick_best_session(
         mgr: &GlobalSystemMediaTransportControlsSessionManager,
     ) -> Option<GlobalSystemMediaTransportControlsSession> {
@@ -210,6 +251,8 @@ mod windows_media {
         mgr.GetCurrentSession().ok()
     }
 
+    /// Queries Windows GSMTC synchronously for track metadata and 100ns-tick timeline state,
+    /// returning sanitized [`MediaPlaybackState`] or `None` if no active session exists.
     fn query_gsmtc_uncached() -> Option<MediaPlaybackState> {
         ensure_com_mta();
         let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
@@ -240,6 +283,7 @@ mod windows_media {
             None => (String::new(), String::new()),
         };
 
+        // WinRT TimeSpan::Duration uses 100-nanosecond ticks (10_000_000 ticks per second).
         let (position_secs, duration_secs) = match sess.GetTimelineProperties() {
             Ok(tl) => {
                 let start_ticks = tl.StartTime().map(|ts| ts.Duration).unwrap_or(0);
@@ -263,6 +307,7 @@ mod windows_media {
         }))
     }
 
+    /// Returns cached GSMTC playback state if younger than [`MEDIA_CACHE_TTL`], otherwise queries live.
     pub fn query_gsmtc_cached() -> MediaPlaybackState {
         let cache = cache_lock();
         if let Ok(guard) = cache.lock() {
@@ -277,12 +322,15 @@ mod windows_media {
         fresh
     }
 
+    /// Forces the next [`query_gsmtc_cached`] call to re-query GSMTC by backdating cache age.
     fn invalidate_cache() {
         if let Ok(mut guard) = cache_lock().lock() {
             guard.0 = Instant::now() - Duration::from_secs(60);
         }
     }
 
+    /// Maps a GSMTC `SourceAppUserModelId` to lowercase candidate Windows executable filenames
+    /// used to locate top-level player windows for UI Automation fallback seeking.
     fn candidate_exe_names(source_app_id: &str) -> Vec<String> {
         let lower = source_app_id.to_ascii_lowercase();
         let mut out = Vec::new();
@@ -312,21 +360,33 @@ mod windows_media {
         out
     }
 
+    /// Enumerates running process IDs matching any lowercase filename in `targets` via Toolhelp32.
     fn find_pids_by_exe_names(targets: &[String]) -> Vec<u32> {
         if targets.is_empty() {
             return Vec::new();
         }
+        /// Win32 `PROCESSENTRY32W` layout used with `Process32FirstW`/`Process32NextW`.
         #[repr(C)]
         struct ProcessEntry32W {
+            /// Structure size in bytes (must be initialized before `Process32FirstW`).
             dw_size: u32,
+            /// Deprecated reference count (unused).
             cnt_usage: u32,
+            /// Windows process identifier (PID).
             th32_process_id: u32,
+            /// Identifier of default heap (unused).
             th32_default_heap_id: usize,
+            /// Module identifier (unused).
             th32_module_id: u32,
+            /// Count of execution threads started by the process.
             cnt_threads: u32,
+            /// Parent process identifier.
             th32_parent_process_id: u32,
+            /// Base priority of threads created by this process.
             pc_pri_class_base: i32,
+            /// Flags (unused).
             dw_flags: u32,
+            /// Null-terminated UTF-16 executable filename (`MAX_PATH` = 260 WCHARs).
             sz_exe_file: [u16; 260],
         }
         const TH32CS_SNAPPROCESS: u32 = 0x00000002;
@@ -337,6 +397,7 @@ mod windows_media {
             fn Process32NextW(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
             fn CloseHandle(handle: *mut c_void) -> i32;
         }
+        // SAFETY: `CreateToolhelp32Snapshot` takes value flags and returns a valid handle or `INVALID_HANDLE`.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap.is_null() || snap == INVALID_HANDLE {
             return Vec::new();
@@ -354,6 +415,7 @@ mod windows_media {
             sz_exe_file: [0u16; 260],
         };
         let mut pids = Vec::new();
+        // SAFETY: `snap` is a valid non-null Toolhelp snapshot handle and `entry.dw_size` matches `sizeof(ProcessEntry32W)`.
         if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
             loop {
                 let nul_pos = entry
@@ -366,11 +428,13 @@ mod windows_media {
                 if targets.iter().any(|t| t == &name) {
                     pids.push(entry.th32_process_id);
                 }
+                // SAFETY: Continues iteration over valid Toolhelp snapshot using properly sized `entry`.
                 if unsafe { Process32NextW(snap, &mut entry) } == 0 {
                     break;
                 }
             }
         }
+        // SAFETY: Releases the valid Toolhelp snapshot handle unconditionally before returning.
         unsafe {
             CloseHandle(snap);
         }
@@ -381,12 +445,20 @@ mod windows_media {
     /// for media players (such as Apple Music for Windows) that report `IsPlaybackPositionEnabled = false`
     /// over GSMTC while exposing a writable WinUI progress `Slider` (`LCDScrubber`).
     fn try_uia_seek(source_app_id: &str, target_secs: f64, duration_secs: f64) -> bool {
+        let safe_target = if target_secs.is_finite() {
+            target_secs.max(0.0)
+        } else {
+            return false;
+        };
         let targets = candidate_exe_names(source_app_id);
         let pids = find_pids_by_exe_names(&targets);
         if pids.is_empty() {
             return false;
         }
         ensure_com_mta();
+        // SAFETY: COM is initialized on this thread via `ensure_com_mta()`, and all Win32 UIA COM
+        // interface pointers returned by `CoCreateInstance`/`GetRootElement`/`FindFirst`/`FindAll`
+        // are managed via `windows` smart COM wrappers with checked `Result` returns.
         unsafe {
             let Ok(uia) =
                 CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
@@ -411,8 +483,11 @@ mod windows_media {
                 .ok();
 
             for pid in pids {
-                let Ok(pid_cond) = uia
-                    .CreatePropertyCondition(UIA_ProcessIdPropertyId, &VARIANT::from(pid as i32))
+                let Ok(pid_i32) = i32::try_from(pid) else {
+                    continue;
+                };
+                let Ok(pid_cond) =
+                    uia.CreatePropertyCondition(UIA_ProcessIdPropertyId, &VARIANT::from(pid_i32))
                 else {
                     continue;
                 };
@@ -432,8 +507,8 @@ mod windows_media {
                             if !ro {
                                 let min = rv.CurrentMinimum().unwrap_or(0.0);
                                 let max = rv.CurrentMaximum().unwrap_or(duration_secs);
-                                if max > min {
-                                    let clamped = target_secs.clamp(min, max);
+                                if min.is_finite() && max.is_finite() && max > min {
+                                    let clamped = safe_target.clamp(min, max);
                                     if rv.SetValue(clamped).is_ok() {
                                         tracing::debug!(
                                             "🎵 Seeked '{}' via UIA LCDScrubber to {:.1}s",
@@ -449,7 +524,8 @@ mod windows_media {
                 }
 
                 // Generic fallback: any writable Slider whose range matches the active track duration
-                if duration_secs > 1.0 {
+                // (3.5s tolerance accommodates rounded track durations in player UI sliders).
+                if duration_secs.is_finite() && duration_secs > 1.0 {
                     if let Some(ref cond) = slider_type_cond {
                         if let Ok(arr) = win.FindAll(TreeScope_Descendants, cond) {
                             let len = arr.Length().unwrap_or(0);
@@ -470,8 +546,13 @@ mod windows_media {
                                 }
                                 let min = rv.CurrentMinimum().unwrap_or(0.0);
                                 let max = rv.CurrentMaximum().unwrap_or(0.0);
-                                if min <= 0.5 && (max - duration_secs).abs() <= 3.5 && max > min {
-                                    let clamped = target_secs.clamp(min, max);
+                                if min.is_finite()
+                                    && max.is_finite()
+                                    && min <= 0.5
+                                    && (max - duration_secs).abs() <= 3.5
+                                    && max > min
+                                {
+                                    let clamped = safe_target.clamp(min, max);
                                     if rv.SetValue(clamped).is_ok() {
                                         tracing::debug!(
                                             "🎵 Seeked '{}' via UIA Slider to {:.1}s",
@@ -490,23 +571,35 @@ mod windows_media {
         false
     }
 
+    /// Synthesizes a Win32 hardware media virtual-key press+release event pair (`VK_MEDIA_*`)
+    /// when a player has no active GSMTC session or declines `TryTogglePlayPauseAsync`/skip calls.
     fn send_win32_media_vk(vk: u16) -> Result<(), String> {
+        /// Win32 `KEYBDINPUT` structure describing a single virtual keyboard event.
         #[repr(C)]
         struct KeybdInput {
+            /// Virtual-key code (`VK_MEDIA_PLAY_PAUSE`, `VK_MEDIA_NEXT_TRACK`, `VK_MEDIA_PREV_TRACK`).
             w_vk: u16,
+            /// Hardware scan code (0 when synthesizing virtual keys).
             w_scan: u16,
+            /// Keystroke flags (`0` for key down, `KEYEVENTF_KEYUP` for release).
             dw_flags: u32,
+            /// Event timestamp in ms (0 lets system supply timestamp).
             time: u32,
+            /// Application-defined extra info.
             dw_extra_info: usize,
         }
+        /// Win32 `INPUT` union sized to the largest Win32 union variant (`MOUSEINPUT` / 32 bytes).
         #[repr(C)]
         union InputUnion {
             ki: std::mem::ManuallyDrop<KeybdInput>,
             _pad: [u8; 32],
         }
+        /// Win32 `INPUT` event descriptor passed to `SendInput`.
         #[repr(C)]
         struct Input {
+            /// Event type discriminant (`INPUT_KEYBOARD = 1`).
             r#type: u32,
+            /// Event payload union.
             u: InputUnion,
         }
         const INPUT_KEYBOARD: u32 = 1;
@@ -541,6 +634,7 @@ mod windows_media {
                 },
             },
         ];
+        // SAFETY: `inputs` is a stack-allocated 2-element array matching Win32 `INPUT` layout and size.
         let sent = unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<Input>() as i32) };
         if sent == 2 {
             Ok(())
@@ -549,6 +643,9 @@ mod windows_media {
         }
     }
 
+    /// Executes a [`MediaControlAction`] on Windows via GSMTC first, falling back to Win32
+    /// `SendInput` (`VK_MEDIA_*`) for transport keys and UI Automation `LCDScrubber`/`Slider`
+    /// scrubbing for timeline seeks, then invalidates [`MEDIA_CACHE`].
     pub fn execute_command(action: &MediaControlAction) -> Result<String, String> {
         const VK_MEDIA_NEXT_TRACK: u16 = 0xB0;
         const VK_MEDIA_PREV_TRACK: u16 = 0xB1;

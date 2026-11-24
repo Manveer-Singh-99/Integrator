@@ -72,6 +72,27 @@ pub fn is_bonjour_active() -> bool {
     BONJOUR_ACTIVE.load(Ordering::Acquire)
 }
 
+/// Returns `true` if `c` is a Unicode bidirectional formatting override character.
+#[inline]
+fn is_bidi_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Strips control characters and Unicode BiDi overrides from untrusted mDNS metadata, trims
+/// outer whitespace, and caps output length to `max_chars` Unicode scalar values.
+fn sanitize_bonjour_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() && !is_bidi_format_char(c))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 /// Decoded reachability hint extracted from a resolved `_integrator._tcp.local.` mDNS service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BonjourDiscoveryHint {
@@ -92,6 +113,13 @@ pub struct BonjourDiscoveryHint {
 }
 
 /// Sanitizes an arbitrary hostname into a valid RFC 1035 DNS label (`[a-zA-Z0-9-]`, max 48 chars).
+///
+/// # Arguments
+/// * `raw` - Unsanitized local or remote hostname string.
+/// * `fallback` - Default label returned if `raw` contains no ASCII alphanumeric characters.
+///
+/// # Returns
+/// A bounded, hyphen-trimmed ASCII DNS label safe for `<label>.local.` mDNS advertisements.
 pub fn sanitize_dns_label(raw: &str, fallback: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -116,6 +144,9 @@ pub fn sanitize_dns_label(raw: &str, fallback: &str) -> String {
 }
 
 /// Collects active, non-virtual local IPv4 addresses sorted by transport priority for mDNS registration.
+///
+/// Filters out loopback, unspecified (`0.0.0.0`), and multicast addresses and deduplicates entries
+/// while preserving `LinkTransport::route_priority()` order (Thunderbolt > USB-C > Ethernet > Wi-Fi > Hotspot).
 fn collect_bonjour_local_ipv4s() -> Vec<Ipv4Addr> {
     let mut ifaces = system_info::list_local_ipv4_interfaces();
     ifaces.sort_by(|a, b| a.transport.route_priority().cmp(&b.transport.route_priority()));
@@ -132,6 +163,16 @@ fn collect_bonjour_local_ipv4s() -> Vec<Ipv4Addr> {
 }
 
 /// Builds an `mdns_sd::ServiceInfo` record exclusively for `_integrator._tcp.local.`.
+///
+/// # Arguments
+/// * `device_id` - Full hexadecimal device identity string.
+/// * `hostname_raw` - Local machine hostname (sanitized to an RFC 1035 label).
+/// * `os_name` - Platform identifier (`"macos"`, `"windows"`).
+/// * `form_factor` - Hardware chassis form factor (`"laptop"`, `"desktop"`, `"unknown"`).
+/// * `ips` - Ordered list of local IPv4 addresses to publish in mDNS A records.
+///
+/// # Errors
+/// Returns an error if `mdns_sd::ServiceInfo::new` rejects the constructed instance or host FQDN.
 fn build_service_info(
     device_id: &str,
     hostname_raw: &str,
@@ -143,11 +184,18 @@ fn build_service_info(
         .trim()
         .to_ascii_lowercase()
         .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
+    // Ensure DNS label never terminates with a stray '-' if `device_id` was unexpectedly empty.
+    let label_suffix = if dev_prefix.is_empty() {
+        "node"
+    } else {
+        dev_prefix.as_str()
+    };
     let host_label = sanitize_dns_label(hostname_raw, "integrator");
-    let instance_name = format!("{}-{}", host_label, dev_prefix);
-    let host_fqdn = format!("{}-{}.local.", host_label.to_ascii_lowercase(), dev_prefix);
+    let instance_name = format!("{}-{}", host_label, label_suffix);
+    let host_fqdn = format!("{}-{}.local.", host_label.to_ascii_lowercase(), label_suffix);
 
     let mut props = HashMap::new();
     props.insert(
@@ -177,19 +225,31 @@ fn build_service_info(
     Ok(info)
 }
 
-/// Converts an `mdns_sd::ServiceInfo` resolution event into zero or more [`BonjourDiscoveryHint`]s.
+/// Converts an `mdns_sd::ServiceInfo` resolution event into zero or more sanitized [`BonjourDiscoveryHint`]s.
+///
+/// # Security & Sanitization
+/// - Drops self-advertisements matching `own_device_id`.
+/// - Rejects privileged ports (`< 1024`), malformed non-hex `device_id` TXT values, and non-unicast IPv4s
+///   (loopback, unspecified, broadcast, multicast).
+/// - Strips control characters and Unicode BiDi formatting markers from hostname, fullname, OS, and form factor.
 fn extract_hints_from_resolved(
     info: &ServiceInfo,
     own_device_id: &str,
 ) -> Vec<BonjourDiscoveryHint> {
     let own_lower = own_device_id.trim().to_ascii_lowercase();
-    let dev_id = info
+    let raw_dev_id = info
         .get_property_val_str(BONJOUR_TXT_KEY_DEVICE_ID)
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty());
 
+    if let Some(ref id) = raw_dev_id {
+        if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Vec::new();
+        }
+    }
+
     // Skip our own advertisements
-    if dev_id.as_deref() == Some(own_lower.as_str()) {
+    if raw_dev_id.as_deref() == Some(own_lower.as_str()) {
         return Vec::new();
     }
 
@@ -200,18 +260,23 @@ fn extract_hints_from_resolved(
 
     let os = info
         .get_property_val_str(BONJOUR_TXT_KEY_OS)
-        .map(|s| s.trim().to_string())
+        .map(|s| sanitize_bonjour_text(s, 64))
         .filter(|s| !s.is_empty());
     let form_factor = info
         .get_property_val_str(BONJOUR_TXT_KEY_FORM_FACTOR)
-        .map(|s| s.trim().to_string())
+        .map(|s| sanitize_bonjour_text(s, 32))
         .filter(|s| !s.is_empty());
-    let hostname = info
-        .get_hostname()
-        .trim_end_matches('.')
-        .trim_end_matches(".local")
-        .to_string();
-    let fullname = info.get_fullname().to_string();
+
+    let raw_host = info.get_hostname().trim_end_matches('.');
+    let stripped_host = if raw_host.len() >= 6
+        && raw_host[raw_host.len() - 6..].eq_ignore_ascii_case(".local")
+    {
+        &raw_host[..raw_host.len() - 6]
+    } else {
+        raw_host
+    };
+    let hostname = sanitize_bonjour_text(stripped_host, 128);
+    let fullname = sanitize_bonjour_text(info.get_fullname(), 256);
 
     let mut hints = Vec::new();
     for addr in info.get_addresses_v4() {
@@ -221,7 +286,7 @@ fn extract_hints_from_resolved(
         }
         hints.push(BonjourDiscoveryHint {
             fullname: fullname.clone(),
-            device_id: dev_id.clone(),
+            device_id: raw_dev_id.clone(),
             hostname: hostname.clone(),
             ip,
             port,
@@ -233,6 +298,15 @@ fn extract_hints_from_resolved(
 }
 
 /// Starts continuous Bonjour / mDNS registration and browsing on `_integrator._tcp.local.`.
+///
+/// # Arguments
+/// * `local_device_id` - Local Ed25519 device ID hex string included in TXT records and self-filtering.
+/// * `enable_browse` - When `true`, spawns a browser thread emitting remote [`BonjourDiscoveryHint`]s.
+/// * `enable_register` - When `true`, periodically refreshes `_integrator._tcp.local.` registrations
+///   whenever the host's active IPv4 address set changes.
+///
+/// # Returns
+/// Returns `Some(rx)` receiving decoded remote hints, or `None` if `mdns_sd::ServiceDaemon` failed to start.
 pub fn start_bonjour_discovery(
     local_device_id: String,
     enable_browse: bool,
@@ -285,7 +359,7 @@ pub fn start_bonjour_discovery(
 
     if enable_register {
         tokio::spawn(async move {
-            // Keep `daemon` alive for the lifetime of the registration loop
+            // Keep `daemon` alive for the lifetime of the registration loop and shut down cleanly if receiver closes.
             let daemon = daemon;
             let mut last_ips: Vec<Ipv4Addr> = Vec::new();
             loop {
@@ -321,12 +395,23 @@ pub fn start_bonjour_discovery(
                         last_ips = ips;
                     }
                 }
-                tokio::time::sleep(BONJOUR_IP_REFRESH_INTERVAL).await;
+                tokio::select! {
+                    _ = tx.closed() => {
+                        BONJOUR_ACTIVE.store(false, Ordering::Release);
+                        let _ = daemon.shutdown();
+                        return;
+                    }
+                    _ = tokio::time::sleep(BONJOUR_IP_REFRESH_INTERVAL) => {}
+                }
             }
         });
     } else {
-        // Keep daemon alive for browser-only mode
-        std::mem::forget(daemon);
+        // Keep daemon alive for browser-only mode without leaking via `mem::forget`; shut down if receiver drops.
+        tokio::spawn(async move {
+            tx.closed().await;
+            BONJOUR_ACTIVE.store(false, Ordering::Release);
+            let _ = daemon.shutdown();
+        });
     }
 
     Some(rx)
@@ -334,6 +419,13 @@ pub fn start_bonjour_discovery(
 
 /// Performs an isolated one-shot Bonjour `_integrator._tcp.local.` browse (zero UDP `:58280`, zero BLE)
 /// waiting up to `timeout` for a non-self Integrator peer service resolution.
+///
+/// # Arguments
+/// * `own_device_id` - Local device ID hex string filtered out so self-announcements are ignored.
+/// * `timeout` - Maximum wait window before returning a timeout error.
+///
+/// # Errors
+/// Returns an error if `ServiceDaemon` fails to initialize/browse, the browser channel closes, or `timeout` elapses.
 pub async fn browse_once_for_bonjour_hint(
     own_device_id: &str,
     timeout: Duration,
@@ -421,6 +513,16 @@ mod tests {
         // Must never publish Apple AirPlay / AirDrop service types
         assert!(!info.get_type().contains("airplay"));
         assert!(!info.get_type().contains("raop"));
+
+        // Empty device ID must not produce trailing hyphen DNS labels
+        let empty_id_info = build_service_info("", "HP-OMEN", "windows", "laptop", &ips)
+            .expect("ServiceInfo with empty device_id should still construct safely");
+        assert!(empty_id_info.get_fullname().contains("HP-OMEN-node._integrator._tcp.local."));
+    }
+
+    #[test]
+    fn sanitize_bonjour_text_strips_control_and_bidi_chars() {
+        assert_eq!(sanitize_bonjour_text("  PC\u{202E}Host\x07  ", 64), "PCHost");
     }
 
     #[test]

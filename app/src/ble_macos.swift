@@ -49,7 +49,8 @@
 //  - All CoreBluetooth delegate callbacks and state mutations execute strictly on a private
 //    serial GCD queue (`com.integrator.ble`), preventing race conditions between peripheral
 //    advertisement updates, central scan callbacks, and Rust lifecycle calls.
-//  - Atomic/lock-protected snapshots expose powered-on state without deadlocking the GCD queue.
+//  - Bluetooth hardware authorization state (`CBManager.authorization`) is queried directly
+//    via CoreBluetooth without blocking caller threads.
 //
 //  ========================================================================================
 //  4. SECURITY & SAFETY INVARIANTS
@@ -73,8 +74,10 @@ private let kIntegratorBleServiceUuid = CBUUID(string: "7A4E9C10-5B2F-4D81-9E3A-
 /// Read-only GATT characteristic UUID mirroring the 17-byte binary magic packet.
 private let kIntegratorBleCharUuid = CBUUID(string: "7A4E9C11-5B2F-4D81-9E3A-1C6F8B2D4E90")
 
-/// Bluetooth SIG internal/custom Manufacturer Company ID (`0xFFFF`, little-endian `[0xFF, 0xFF]`).
+/// Bluetooth SIG internal/custom Manufacturer Company ID low byte (`0xFFFF` little-endian `[0xFF, 0xFF]`).
 private let kIntegratorBleCompanyIdLow: UInt8 = 0xFF
+
+/// Bluetooth SIG internal/custom Manufacturer Company ID high byte (`0xFFFF` little-endian `[0xFF, 0xFF]`).
 private let kIntegratorBleCompanyIdHigh: UInt8 = 0xFF
 
 /// ASCII prefix identifying Integrator v2 BLE LocalName magic packets.
@@ -86,6 +89,9 @@ private let kIntegratorBleQueueLabel: String = "com.integrator.ble"
 /// Info.plist key required by macOS TCC for CoreBluetooth access.
 private let kBluetoothUsageDescKey: String = "NSBluetoothAlwaysUsageDescription"
 
+/// Maximum BLE binary magic packet payload accepted over C FFI (`1024` bytes, bounding allocations).
+private let kMaxBleBinaryPayloadBytes: Int = 1024
+
 /// C callback signature delivering raw 17-byte binary magic packets (without 2-byte company ID).
 public typealias IntegratorBleBinaryCallback = @convention(c) (UnsafePointer<UInt8>?, Int, Int16) -> Void
 
@@ -94,34 +100,39 @@ public typealias IntegratorBleNameCallback = @convention(c) (UnsafePointer<CChar
 
 /// Singleton coordinator driving macOS CoreBluetooth peripheral advertising and central scanning.
 final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDelegate {
+    /// Process-wide singleton instance backing the C FFI entry points.
     static let shared = IntegratorBleController()
 
+    /// Private serial GCD queue serializing all CoreBluetooth delegate events and state transitions.
     private let bleQueue = DispatchQueue(label: kIntegratorBleQueueLabel, qos: .utility)
-    private let stateLock = NSLock()
 
+    /// CoreBluetooth central scanner receiving peer Windows/macOS beacons.
     private var centralManager: CBCentralManager?
+    /// CoreBluetooth peripheral advertiser broadcasting service UUID, LocalName, and GATT mirror.
     private var peripheralManager: CBPeripheralManager?
+    /// Tracks whether `kIntegratorBleServiceUuid` has already been registered on `peripheralManager`.
     private var gattServiceAdded: Bool = false
+    /// Cached read-only GATT characteristic mirroring the latest binary magic packet.
     private var gattCharacteristic: CBMutableCharacteristic?
 
+    /// Registered Rust callback invoked on discovered `ManufacturerData` binary magic packets.
     private var onBinaryCb: IntegratorBleBinaryCallback?
+    /// Registered Rust callback invoked on discovered Service UUID or `LocalName` hints.
     private var onNameCb: IntegratorBleNameCallback?
 
+    /// Pending 128-bit dynamic Service UUID string queued for peripheral advertisement.
     private var pendingServiceUuid: String?
+    /// Pending `IG2...` LocalName string queued for scan-response advertisement.
     private var pendingLocalName: String?
+    /// Pending 17-byte binary magic packet served over GATT read requests.
     private var pendingBinaryPayload: Data?
+    /// Desired central scanning state across Bluetooth power-state transitions.
     private var wantsScan: Bool = false
+    /// Desired peripheral advertising state across Bluetooth power-state transitions.
     private var wantsAdvertise: Bool = false
 
-    private var _centralPoweredOn: Bool = false
-    private var _peripheralPoweredOn: Bool = false
-
-    var isPoweredOn: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _centralPoweredOn || _peripheralPoweredOn
-    }
-
+    /// Verifies that `.app` bundles declare `NSBluetoothAlwaysUsageDescription` in `Info.plist` before
+    /// initializing CoreBluetooth objects (preventing fatal macOS TCC termination).
     private static func hasBluetoothUsageDescription() -> Bool {
         // Unbundled CLI binaries launched from Terminal inherit Terminal's TCC context, while
         // `.app` bundles must declare `NSBluetoothAlwaysUsageDescription` in `Info.plist`.
@@ -135,6 +146,14 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         return !desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Initializes CoreBluetooth central/peripheral managers on `bleQueue` and applies scan/advertise flags.
+    ///
+    /// - Parameters:
+    ///   - enableScan: Enables central scanning with duplicate reporting (`withServices: nil`).
+    ///   - enableAdvertise: Enables peripheral advertising for macOS discovery hints.
+    ///   - binaryCb: Optional callback receiving binary `ManufacturerData` magic packets.
+    ///   - nameCb: Optional callback receiving Service UUID or `LocalName` string hints.
+    /// - Returns: `true` if TCC plist check passes and startup was queued; `false` if missing usage description.
     func start(
         enableScan: Bool,
         enableAdvertise: Bool,
@@ -168,7 +187,7 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
                     self.peripheralManager = CBPeripheralManager(
                         delegate: self,
                         queue: self.bleQueue,
-                        options: [CBPeripheralManagerOptionShowPowerAlertKey: false]
+                        options: [CBCentralManagerOptionShowPowerAlertKey: false]
                     )
                 } else if self.peripheralManager?.state == .poweredOn {
                     self.applyAdvertisementLocked()
@@ -178,6 +197,7 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         return true
     }
 
+    /// Updates the pending advertisement payload on `bleQueue` and refreshes active CoreBluetooth advertising.
     func updateAdvertisement(serviceUuid: String, localName: String, binaryPayload: Data) {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
@@ -190,6 +210,7 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         }
     }
 
+    /// Halts scanning and advertising on `bleQueue` and clears pending payloads and callbacks.
     func stop() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
@@ -199,11 +220,15 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
             if self.peripheralManager?.isAdvertising == true {
                 self.peripheralManager?.stopAdvertising()
             }
+            self.pendingServiceUuid = nil
+            self.pendingLocalName = nil
+            self.pendingBinaryPayload = nil
             self.onBinaryCb = nil
             self.onNameCb = nil
         }
     }
 
+    /// Begins duplicate-enabled passive BLE scanning when radio is powered on (`bleQueue` only).
     private func startScanningLocked() {
         guard wantsScan, let cm = centralManager, cm.state == .poweredOn else { return }
         // Pass `withServices: nil` so macOS also receives Windows ManufacturerData-only beacons.
@@ -213,6 +238,7 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         )
     }
 
+    /// Registers the mirrored read-only GATT service once and starts advertising Service UUID + LocalName (`bleQueue` only).
     private func applyAdvertisementLocked() {
         guard wantsAdvertise, let pm = peripheralManager, pm.state == .poweredOn else { return }
         guard let localName = pendingLocalName, !localName.isEmpty else { return }
@@ -234,8 +260,12 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
         if pm.isAdvertising {
             pm.stopAdvertising()
         }
+        // Validate dynamic UUID before calling CBUUID(string:), which throws NSInvalidArgumentException on invalid strings.
         let advUuid: CBUUID
-        if let dyn = pendingServiceUuid, !dyn.isEmpty {
+        if let dyn = pendingServiceUuid?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !dyn.isEmpty,
+           UUID(uuidString: dyn) != nil
+        {
             advUuid = CBUUID(string: dyn)
         } else {
             advUuid = kIntegratorBleServiceUuid
@@ -249,17 +279,14 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
 
     // MARK: - CBCentralManagerDelegate
 
+    /// Starts scanning automatically when CoreBluetooth reports `.poweredOn`.
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        let on = (central.state == .poweredOn)
-        stateLock.lock()
-        _centralPoweredOn = on
-        stateLock.unlock()
-
-        if on && wantsScan {
+        if central.state == .poweredOn && wantsScan {
             startScanningLocked()
         }
     }
 
+    /// Parses Integrator magic packets from discovered peripherals' ManufacturerData, ServiceUUIDs, and LocalName.
     func centralManager(
         _ central: CBCentralManager,
         didDiscover peripheral: CBPeripheral,
@@ -268,24 +295,20 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
     ) {
         let rssiVal = Int16(clamping: RSSI.intValue)
 
-        // 1. Check ManufacturerData (Company ID 0xFFFF + 17-byte IG2 magic packet from Windows)
+        // 1. Check ManufacturerData (Company ID 0xFFFF + >=17-byte IG2 magic packet from Windows) without heap copies.
         if let mfg = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
            mfg.count >= 19,
            mfg[0] == kIntegratorBleCompanyIdLow,
-           mfg[1] == kIntegratorBleCompanyIdHigh
+           mfg[1] == kIntegratorBleCompanyIdHigh,
+           mfg[2] == 0x49, // 'I'
+           mfg[3] == 0x47, // 'G'
+           mfg[4] == 0x32, // '2'
+           let cb = onBinaryCb
         {
-            let payload = mfg.subdata(in: 2..<mfg.count)
-            if payload.count >= 17,
-               payload[0] == 0x49, // 'I'
-               payload[1] == 0x47, // 'G'
-               payload[2] == 0x32  // '2'
-            {
-                if let cb = onBinaryCb {
-                    payload.withUnsafeBytes { rawBuf in
-                        if let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                            cb(ptr, payload.count, rssiVal)
-                        }
-                    }
+            let payloadLen = mfg.count - 2
+            mfg.withUnsafeBytes { rawBuf in
+                if let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    cb(ptr.advanced(by: 2), payloadLen, rssiVal)
                 }
             }
         }
@@ -317,34 +340,40 @@ final class IntegratorBleController: NSObject, CBCentralManagerDelegate, CBPerip
 
     // MARK: - CBPeripheralManagerDelegate
 
+    /// Starts peripheral advertising automatically when CoreBluetooth reports `.poweredOn`.
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        let on = (peripheral.state == .poweredOn)
-        stateLock.lock()
-        _peripheralPoweredOn = on
-        stateLock.unlock()
-
-        if on && wantsAdvertise {
+        if peripheral.state == .poweredOn && wantsAdvertise {
             applyAdvertisementLocked()
         }
     }
 
+    /// Serves offset-checked GATT reads for the mirrored binary magic characteristic.
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
-        if request.characteristic.uuid == kIntegratorBleCharUuid,
-           let payload = pendingBinaryPayload
-        {
-            if request.offset <= payload.count {
-                request.value = payload.subdata(in: request.offset..<payload.count)
-                peripheral.respond(to: request, withResult: .success)
-                return
-            }
+        guard request.characteristic.uuid == kIntegratorBleCharUuid,
+              let payload = pendingBinaryPayload
+        else {
+            peripheral.respond(to: request, withResult: .attributeNotFound)
+            return
         }
-        peripheral.respond(to: request, withResult: .attributeNotFound)
+        guard request.offset >= 0 && request.offset <= payload.count else {
+            peripheral.respond(to: request, withResult: .invalidOffset)
+            return
+        }
+        request.value = payload.subdata(in: request.offset..<payload.count)
+        peripheral.respond(to: request, withResult: .success)
     }
 }
 
 // MARK: - C FFI Exports
 
 /// Starts macOS CoreBluetooth BLE scanning and/or advertising with the given C hint callbacks.
+///
+/// - Parameters:
+///   - enableScan: Enable central scan mode (`CBCentralManager`).
+///   - enableAdvertise: Enable peripheral advertisement mode (`CBPeripheralManager`).
+///   - binaryCb: Optional callback receiving raw `IG2` ManufacturerData bytes and RSSI.
+///   - nameCb: Optional callback receiving UTF-8 `IG2` LocalName or `7A4E...` UUID strings and RSSI.
+/// - Returns: `true` if startup was scheduled; `false` if bundle lacks `NSBluetoothAlwaysUsageDescription`.
 @_cdecl("integrator_mac_ble_start")
 public func integrator_mac_ble_start(
     enableScan: Bool,
@@ -361,6 +390,12 @@ public func integrator_mac_ble_start(
 }
 
 /// Updates the advertised macOS BLE 128-bit Service UUID magic packet, LocalName, and mirrored GATT payload.
+///
+/// - Parameters:
+///   - serviceUuidPtr: NUL-terminated UTF-8 128-bit Service UUID string.
+///   - localNamePtr: NUL-terminated UTF-8 `IG2...` LocalName string.
+///   - binPtr: Raw pointer to binary magic payload bytes.
+///   - binLen: Length of `binPtr` in bytes (`1..kMaxBleBinaryPayloadBytes`).
 @_cdecl("integrator_mac_ble_update_advertisement")
 public func integrator_mac_ble_update_advertisement(
     serviceUuidPtr: UnsafePointer<CChar>?,
@@ -371,7 +406,8 @@ public func integrator_mac_ble_update_advertisement(
     guard let serviceUuidPtr = serviceUuidPtr,
           let localNamePtr = localNamePtr,
           let binPtr = binPtr,
-          binLen > 0
+          binLen > 0,
+          binLen <= kMaxBleBinaryPayloadBytes
     else { return }
     let serviceUuid = String(cString: serviceUuidPtr)
     let localName = String(cString: localNamePtr)
@@ -406,10 +442,4 @@ public func integrator_mac_ble_auth_status() -> Int32 {
         }
     }
     return 2
-}
-
-/// Returns `true` if either the CoreBluetooth central or peripheral radio is powered on.
-@_cdecl("integrator_mac_ble_is_powered_on")
-public func integrator_mac_ble_is_powered_on() -> Bool {
-    return IntegratorBleController.shared.isPoweredOn
 }

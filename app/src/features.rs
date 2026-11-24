@@ -23,14 +23,17 @@
 //! - `discovery::Beacon`: Advertises enabled capability bitmasks to local network peers.
 //!
 //! ### Downstream Callees:
-//! - `system_info::app_data_dir`: Resolves OS-specific persistent configuration directory
-//!   (`~/Library/Application Support/Integrator` on macOS, `%APPDATA%\Integrator` on Windows).
+//! - `system_info::app_data_dir`: Resolves the OS-specific persistent configuration directory
+//!   (`~/.usbc_clipboard_cache` by default via `config::APP_DATA_DIR_NAME`).
 //! - Local Filesystem (`std::fs`): Writes and renames JSON files atomically.
 //!
 //! ### Cross-Platform / Cross-Device Flow:
 //! When two Integrator nodes connect (macOS ↔ Windows 11), each node advertises its active `FeatureFlags`.
 //! Subsystems only establish data streams if BOTH local and remote nodes have enabled the corresponding feature.
-//! Toggling a feature locally immediately halts the active stream and notifies the peer.
+//! Toggling a feature locally immediately halts the active stream and notifies the peer. Note that at the
+//! `IntegratorCore` orchestration layer (`core.rs`), enabling Extended Screen (`display`) and Universal
+//! Input/KVM (`input_kvm`) are mutually exclusive at runtime because Moonlight/Sunshine cursor capture
+//! conflicts with KVM low-level mouse/keyboard event hooks.
 //!
 //! ## 3. Threading & Concurrency Model
 //! - `Arc<RwLock<FeatureFlags>>`: Provides lock-free read concurrency for high-frequency queries
@@ -91,8 +94,10 @@ pub struct FeatureFlags {
 impl Default for FeatureFlags {
     /// Returns default feature configuration for first-time installation.
     ///
-    /// Core continuity features (display, clipboard, input, audio, truetone) are enabled by default.
-    /// Camera and Touch ID are disabled by default until explicitly enabled by the user.
+    /// Core continuity features (`display`, `clipboard`, `input_kvm`, `storage`, `touchid`,
+    /// `truetone`, `audio`, `touchbar`, `benchmark`) are enabled by default.
+    /// Camera (`camera`) is disabled by default (`false`) for privacy until explicitly enabled
+    /// by the user, and `dragdrop` is permanently disabled (`false`).
     fn default() -> Self {
         Self {
             display: true,

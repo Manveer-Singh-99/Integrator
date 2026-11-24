@@ -84,13 +84,24 @@ use tracing::warn;
 
 #[cfg(target_os = "macos")]
 extern "C" {
+    /// Swift AppKit FFI: copies `\0`-delimited UTF-8 file paths from `NSPasteboard.generalPasteboard`
+    /// into `out_buf` (up to `cap` bytes). Returns byte count (`> 0`), `0` if no files are present,
+    /// or `< 0` if `cap` was insufficient.
     fn read_pasteboard_files_in_app(out_buf: *mut u8, cap: usize) -> isize;
+    /// Swift AppKit FFI: writes `\0`-delimited UTF-8 file paths (`paths_ptr`, `len` bytes) as
+    /// `NSURL` file objects onto `NSPasteboard.generalPasteboard`.
     fn write_pasteboard_files_in_app(paths_ptr: *const u8, len: usize) -> bool;
 }
 
+/// Minimum interval between automatic background disk cache pruning passes (300 seconds / 5 minutes).
 const PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+/// Maximum directory recursion depth when computing cached item byte sizes (64 levels).
 const MAX_CACHE_WALK_DEPTH: usize = 64;
+/// Initial stack/heap buffer capacity in bytes for in-process macOS `NSPasteboard` file path reads (64 KiB).
+#[cfg(target_os = "macos")]
 const MACOS_INITIAL_READ_CAP: usize = 64 * 1024;
+/// Retry buffer capacity in bytes when a multi-file macOS `NSPasteboard` selection exceeds 64 KiB (2 MiB).
+#[cfg(target_os = "macos")]
 const MACOS_RETRY_READ_CAP: usize = 2 * 1024 * 1024;
 /// Default maximum retention age in days for cached clipboard files (3 days).
 const DEFAULT_CACHE_MAX_AGE_DAYS: u64 = 3;
@@ -102,6 +113,7 @@ const MACOS_CLIP_HELPER_BIN: &str = "macos_clip_files";
 /// Fallback Windows file-clipboard helper binary name.
 #[cfg(target_os = "windows")]
 const WIN_CLIP_HELPER_BIN: &str = "win_clip_files.exe";
+/// Win32 process creation flag suppressing console window creation (`0x08000000`).
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -236,12 +248,15 @@ pub(crate) fn serialize_nul_paths(files: &[PathBuf]) -> Result<Vec<u8>> {
 }
 
 impl FileClipboardHelper {
+    /// Initializes the file clipboard helper using the default private `clipboard_cache` directory
+    /// under `app_data_dir()` and performs an initial cache prune pass.
     pub fn new() -> Result<Self> {
         let base_dir = crate::system_info::app_data_dir();
         let cache_dir = ensure_private_cache_dir(&base_dir)?;
         Self::new_in_dir(cache_dir)
     }
 
+    /// Initializes a `FileClipboardHelper` rooted at a specific `cache_dir` (used by `new()` and tests).
     pub(crate) fn new_in_dir(cache_dir: PathBuf) -> Result<Self> {
         let helper = Self {
             cache_dir,
@@ -251,10 +266,13 @@ impl FileClipboardHelper {
         Ok(helper)
     }
 
+    /// Returns the filesystem path to the isolated clipboard cache directory.
     pub fn get_cache_dir(&self) -> &Path {
         &self.cache_dir
     }
 
+    /// Triggers a cache pruning sweep if at least `PRUNE_INTERVAL` (5 minutes) has elapsed
+    /// since the previous sweep.
     pub(crate) fn maybe_prune_cache(&self) {
         let should_prune = {
             if let Ok(mut guard) = self.last_prune.lock() {
@@ -374,6 +392,8 @@ impl FileClipboardHelper {
         }
     }
 
+    /// Recursively computes the cumulative byte size of a directory tree up to `MAX_CACHE_WALK_DEPTH`,
+    /// ignoring symlinks to prevent directory cycle loops.
     fn calculate_dir_size_depth(path: &Path, depth: usize) -> u64 {
         if depth >= MAX_CACHE_WALK_DEPTH {
             return 0;
@@ -397,6 +417,7 @@ impl FileClipboardHelper {
         total
     }
 
+    /// Resolves an application helper binary by name via `system_info::find_app_helper`.
     fn find_helper(name: &str) -> Option<PathBuf> {
         crate::system_info::find_app_helper(name)
     }
@@ -510,9 +531,11 @@ impl FileClipboardHelper {
                 .spawn()
                 .context("Failed to execute macos_clip_files")?;
             if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(&nul_bytes)
-                    .context("Failed to write paths to macos_clip_files stdin")?;
+                if let Err(e) = stdin.write_all(&nul_bytes) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("Failed to write paths to macos_clip_files stdin");
+                }
             }
             let output = child
                 .wait_with_output()
@@ -545,9 +568,11 @@ impl FileClipboardHelper {
                     .spawn()
                     .context("Failed to execute win_clip_files.exe")?;
                 if let Some(mut stdin) = child.stdin.take() {
-                    stdin
-                        .write_all(&nul_bytes)
-                        .context("Failed to write paths to win_clip_files.exe stdin")?;
+                    if let Err(e) = stdin.write_all(&nul_bytes) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(e).context("Failed to write paths to win_clip_files.exe stdin");
+                    }
                 }
                 let output = child
                     .wait_with_output()
@@ -580,23 +605,35 @@ mod win32 {
 
     use crate::clipboard::protocol::MAX_TRANSFER_FILES;
 
+    /// Standard Win32 clipboard format identifier for file drop lists (`CF_HDROP = 15`).
     const CF_HDROP: u32 = 15;
+    /// `GlobalAlloc` flag allocating movable memory handle required by `SetClipboardData` (`0x0002`).
     const GMEM_MOVEABLE: u32 = 0x0002;
+    /// `GlobalAlloc` flag zero-initializing allocated memory (`0x0040`).
     const GMEM_ZEROINIT: u32 = 0x0040;
+    /// Win32 pseudo-parent handle for creating message-only windows (`HWND_MESSAGE = -3`).
     const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
+    /// Upper bound on `DragQueryFileW` index inspection to prevent unbounded loops on malformed handles.
     const MAX_DROP_ITEMS_INSPECT: usize = MAX_TRANSFER_FILES * 4;
+    /// Maximum UTF-16 code units allowed per Win32 extended file path (`32,768` chars).
     const MAX_EXTENDED_PATH_CHARS: u32 = 32_768;
     /// Maximum retry attempts when acquiring the Win32 clipboard lock via `OpenClipboard`.
     const OPEN_CLIPBOARD_RETRIES: usize = 8;
     /// Backoff sleep between consecutive failed `OpenClipboard` attempts (20 ms).
     const OPEN_CLIPBOARD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+    /// Win32 `DROPFILES` header structure preceding the double-NUL-terminated file path list in `CF_HDROP`.
     #[repr(C)]
     struct DropFiles {
+        /// Byte offset from the start of this structure to the beginning of the file path array (`20` bytes).
         p_files: u32,
+        /// Drop-point X coordinate in client/screen coordinates (`0` for clipboard operations).
         pt_x: i32,
+        /// Drop-point Y coordinate in client/screen coordinates (`0` for clipboard operations).
         pt_y: i32,
+        /// Non-client area flag (`0` for clipboard operations).
         f_nc: i32,
+        /// Wide-character encoding flag (`1` / `TRUE` for UTF-16LE paths, `0` for ANSI).
         f_wide: i32,
     }
 
@@ -643,9 +680,11 @@ mod win32 {
         fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
+    /// RAII wrapper for a temporary Win32 `HWND_MESSAGE` owner window used during `EmptyClipboard()`.
     struct OwnerWindow(*mut c_void);
 
     impl OwnerWindow {
+        /// Creates a lightweight message-only window (`HWND_MESSAGE`) using the built-in `"Static"` class.
         fn create_message_only() -> Result<Self> {
             // System predefined "Static" class needs no RegisterClassW.
             let static_class: [u16; 7] = [b'S' as u16, b't' as u16, b'a' as u16, b't' as u16, b'i' as u16, b'c' as u16, 0];
@@ -672,6 +711,7 @@ mod win32 {
             Ok(Self(hwnd))
         }
 
+        /// Returns the raw `HWND` pointer.
         fn as_ptr(&self) -> *mut c_void {
             self.0
         }
@@ -687,6 +727,7 @@ mod win32 {
         }
     }
 
+    /// RAII guard ensuring `CloseClipboard()` is called when the guard leaves scope.
     struct ClipboardGuard;
 
     impl Drop for ClipboardGuard {
@@ -697,6 +738,7 @@ mod win32 {
         }
     }
 
+    /// Acquires the Win32 clipboard lock via `OpenClipboard`, retrying up to `OPEN_CLIPBOARD_RETRIES` times.
     fn open_clipboard_with_retry(hwnd: *mut c_void) -> Result<ClipboardGuard> {
         for _ in 0..OPEN_CLIPBOARD_RETRIES {
             if unsafe { OpenClipboard(hwnd) } != 0 {
@@ -707,6 +749,7 @@ mod win32 {
         Err(std::io::Error::last_os_error()).context("OpenClipboard failed after retries")
     }
 
+    /// Reads the list of file paths from the Win32 `CF_HDROP` clipboard format via `DragQueryFileW`.
     pub fn read_cf_hdrop_files() -> Result<Option<Vec<PathBuf>>> {
         unsafe {
             if IsClipboardFormatAvailable(CF_HDROP) == 0 {
@@ -720,6 +763,7 @@ mod win32 {
             if h_drop.is_null() {
                 return Ok(None);
             }
+            // Passing 0xFFFF_FFFF queries the total number of files in the HDROP structure.
             let raw_count = DragQueryFileW(h_drop, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
             if raw_count == 0 {
                 return Ok(None);
@@ -727,6 +771,9 @@ mod win32 {
             let count = (raw_count as usize).min(MAX_DROP_ITEMS_INSPECT);
             let mut paths = Vec::with_capacity(count.min(MAX_TRANSFER_FILES));
             for i in 0..count {
+                if paths.len() >= MAX_TRANSFER_FILES {
+                    break;
+                }
                 let len = DragQueryFileW(h_drop, i as u32, std::ptr::null_mut(), 0);
                 if len == 0 || len > MAX_EXTENDED_PATH_CHARS {
                     continue;
@@ -743,6 +790,7 @@ mod win32 {
         }
     }
 
+    /// Writes a slice of local file paths into the Win32 clipboard as a UTF-16 `CF_HDROP` (`DROPFILES`) block.
     pub fn write_cf_hdrop_files(files: &[PathBuf]) -> Result<()> {
         if files.is_empty() {
             bail!("No files provided");
