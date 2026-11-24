@@ -1511,37 +1511,70 @@ impl DisplayController {
                 lux,
                 cct,
                 gamma_comp,
+                raw_als,
+                als_ch0,
+                als_ch1,
+                als_ch2,
+                cie_x,
+                cie_y,
+                cie_z,
             } => {
+                let valid_opt = |v: Option<f32>| -> bool {
+                    v.map_or(true, |x| x.is_finite() && (0.0..=1_000_000.0).contains(&x))
+                };
                 if !lux.is_finite()
                     || !(0.0..=TRUETONE_MAX_LUX).contains(&lux)
-                    || !(TRUETONE_MIN_WIRE_CCT..=TRUETONE_MAX_WIRE_CCT).contains(&cct)
                     || !gamma_comp.is_finite()
                     || !(TRUETONE_MIN_WIRE_GAMMA..=TRUETONE_MAX_WIRE_GAMMA).contains(&gamma_comp)
+                    || (!raw_als && !(TRUETONE_MIN_WIRE_CCT..=TRUETONE_MAX_WIRE_CCT).contains(&cct))
+                    || !valid_opt(als_ch0)
+                    || !valid_opt(als_ch1)
+                    || !valid_opt(als_ch2)
+                    || !valid_opt(cie_x)
+                    || !valid_opt(cie_y)
+                    || !valid_opt(cie_z)
                 {
                     return self
                         .base_response(false, "Rejected SyncTrueTone: out-of-range calibration values")
                         .await;
                 }
-                let res = tokio::task::spawn_blocking(move || {
-                    crate::truetone::apply_hardware_gamma_ramp(cct, gamma_comp)?;
-                    crate::truetone::record_synced_ambient(lux, cct);
-                    Ok(())
+                let res: Result<(f32, u32), anyhow::Error> = tokio::task::spawn_blocking(move || {
+                    if raw_als {
+                        let (eff_lux, eff_cct) = crate::truetone::apply_raw_als_sync(
+                            lux, als_ch0, als_ch1, als_ch2, cie_x, cie_y, cie_z, gamma_comp,
+                        )?;
+                        crate::truetone::record_synced_ambient(eff_lux, eff_cct);
+                        Ok((eff_lux, eff_cct))
+                    } else {
+                        let clamped_cct = cct.clamp(config::MIN_CCT_KELVIN, config::MAX_CCT_KELVIN);
+                        crate::truetone::apply_hardware_gamma_ramp(clamped_cct, gamma_comp)?;
+                        crate::truetone::record_synced_ambient(lux, clamped_cct);
+                        Ok((lux, clamped_cct))
+                    }
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("TrueTone task panicked: {}", e)));
                 let success = res.is_ok();
-                let message = match res {
-                    Ok(_) => format!(
-                        "Applied True Tone LUT: CCT={}K, Lux={:.1}, Gamma={:.2}x",
-                        cct, lux, gamma_comp
+                let (out_lux, out_cct, message) = match res {
+                    Ok((eff_lux, eff_cct)) => (
+                        eff_lux,
+                        eff_cct,
+                        format!(
+                            "Applied True Tone LUT: CCT={}K, Lux={:.1}, Gamma={:.2}x",
+                            eff_cct, eff_lux, gamma_comp
+                        ),
                     ),
-                    Err(e) => format!("Failed to apply True Tone LUT: {}", e),
+                    Err(e) => (
+                        lux,
+                        cct,
+                        format!("Failed to apply True Tone LUT: {}", e),
+                    ),
                 };
                 let mut resp = self.base_response(success, message).await;
                 resp.ambient_light = Some(crate::truetone::AmbientLightData {
-                    lux,
-                    cct_kelvin: cct,
-                    supported: success && lux >= 0.0,
+                    lux: out_lux,
+                    cct_kelvin: out_cct,
+                    supported: success && out_lux >= 0.0,
                     updated_at_secs: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -2895,6 +2928,13 @@ mod tests {
                     lux: f32::NAN,
                     cct: 6500,
                     gamma_comp: 1.0,
+                    raw_als: false,
+                    als_ch0: None,
+                    als_ch1: None,
+                    als_ch2: None,
+                    cie_x: None,
+                    cie_y: None,
+                    cie_z: None,
                 },
                 Some(peer_ip),
                 None,
@@ -2909,6 +2949,13 @@ mod tests {
                     lux: 245.5,
                     cct: 5200,
                     gamma_comp: 1.0,
+                    raw_als: false,
+                    als_ch0: None,
+                    als_ch1: None,
+                    als_ch2: None,
+                    cie_x: None,
+                    cie_y: None,
+                    cie_z: None,
                 },
                 Some(peer_ip),
                 None,

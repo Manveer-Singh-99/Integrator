@@ -123,14 +123,35 @@ pub enum DisplayRpcRequest {
     /// Requests that the application's graphical window be brought to the foreground and focused.
     ShowWindow,
 
-    /// Applies ambient light sensor True Tone calibration to the local display hardware LUT.
+    /// Applies ambient light sensor True Tone calibration or raw ALS telemetry on the local display.
     SyncTrueTone {
         /// Ambient illuminance in Lux (units: lx, valid range: 0.0 to 200,000.0).
         lux: f32,
-        /// Correlated Color Temperature in Kelvin (units: K, valid range: 1000 to 15,000).
+        /// Correlated Color Temperature in Kelvin (`1000..=15000`, or `0` when `raw_als` is `true` for PC-side calculation).
         cct: u32,
         /// Hardware gamma compensation factor (typically 1.0; valid range: 0.2 to 3.0).
         gamma_comp: f32,
+        /// When true, `SyncTrueTone` carries raw Mac ALS sensor channels and the receiving PC performs all color math.
+        #[serde(default)]
+        raw_als: bool,
+        /// Optional raw ALS warm/red sensor channel count (`ch0`).
+        #[serde(default)]
+        als_ch0: Option<f32>,
+        /// Optional raw ALS green sensor channel count (`ch1`).
+        #[serde(default)]
+        als_ch1: Option<f32>,
+        /// Optional raw ALS cool/blue sensor channel count (`ch2`).
+        #[serde(default)]
+        als_ch2: Option<f32>,
+        /// Optional calibrated CIE 1931 X tristimulus reading from Apple HID ALS.
+        #[serde(default)]
+        cie_x: Option<f32>,
+        /// Optional calibrated CIE 1931 Y tristimulus reading from Apple HID ALS.
+        #[serde(default)]
+        cie_y: Option<f32>,
+        /// Optional calibrated CIE 1931 Z tristimulus reading from Apple HID ALS.
+        #[serde(default)]
+        cie_z: Option<f32>,
     },
 
     /// Mounts the peer's shared storage filesystem over SMB/WebDAV.
@@ -324,11 +345,14 @@ impl fmt::Debug for DisplayRpcRequest {
                 lux,
                 cct,
                 gamma_comp,
+                raw_als,
+                ..
             } => f
                 .debug_struct("SyncTrueTone")
                 .field("lux", lux)
                 .field("cct", cct)
                 .field("gamma_comp", gamma_comp)
+                .field("raw_als", raw_als)
                 .finish(),
             Self::MountStorage => f.write_str("MountStorage"),
             Self::UnmountStorage => f.write_str("UnmountStorage"),
@@ -647,6 +671,13 @@ mod tests {
                 lux: 100.0,
                 cct: 5000,
                 gamma_comp: 1.0,
+                raw_als: false,
+                als_ch0: None,
+                als_ch1: None,
+                als_ch2: None,
+                cie_x: None,
+                cie_y: None,
+                cie_z: None,
             }),
             Some("truetone")
         );

@@ -17,20 +17,18 @@
 //    `PrimaryUsagePage = 0xff00` (Apple Vendor Specific) and `PrimaryUsage = 4` (Ambient Light Sensor),
 //    and falls back cleanly to IOKit `AppleLMUController` for pre-T2 Intel Macs.
 //  - Photometric Extraction: Interrogates HID event type 12 (`kIOHIDEventTypeAmbientLightSensor`)
-//    to extract:
-//    - Raw Illuminance in Lux (`luxField = 12 << 16`)
-//    - Red / Warm channel value (`ch0Field = (12 << 16) | 1`)
-//    - Blue / Cool channel value (`ch2Field = (12 << 16) | 3`)
-//  - Correlated Color Temperature (CCT) Estimation: Solves the channel ratio `ch2 / ch0` to compute
-//    ambient color temperature in Kelvin `[2500K, 9000K]` relative to standard D65 (6500K).
+//    to extract raw hardware sensor channels only (zero CCT/color calculation on Mac):
+//    - Illuminance in Lux (`field[11]` float lux with fallback to `field[0]` level)
+//    - Raw ADC channels (`ch0`, `ch1`, `ch2`, `ch3`)
+//    - Calibrated CIE XYZ chromaticity (`field[7..9]` when `field[6]` color space is active)
 //
 //  ========================================================================================
 //  2. ARCHITECTURAL LINKAGES & CALL FLOW
 //  ========================================================================================
 //  Upstream Caller:
-//  - `src/truetone/mod.rs`: Rust TrueTone engine invokes the C-ABI function:
-//    `read_mac_ambient_sensor(outLux, outCct)`
-//    during periodic display calibration cycles.
+//  - `src/truetone/mod.rs`: Rust TrueTone daemon invokes the C-ABI function:
+//    `read_mac_raw_ambient_sensor(...)` every 2 seconds and forwards raw telemetry to Windows,
+//    where the PC performs all CCT estimation, chromatic adaptation, and 4s smooth LUT transitions.
 //
 //  Downstream Callees:
 //  - `/System/Library/Frameworks/IOKit.framework/IOKit`: Dynamic symbol invocation and `AppleLMUController` fallback.
@@ -126,26 +124,14 @@ private let iohidEventGetFloatValue: FnIOHIDEventGetFloatValue? = {
 
 // MARK: - Photometric Physical Constants
 
-/// Standard CIE D65 daylight neutral Correlated Color Temperature in Kelvin.
-private let kD65NeutralKelvin: Double = 6500.0
-
-/// Warm baseline Correlated Color Temperature in Kelvin for blue/red channel ratio estimation.
-private let kCctBaseKelvin: Double = 3000.0
-
-/// Linear Kelvin scaling factor applied to the blue-to-red ambient light channel ratio.
-private let kCctScaleKelvin: Double = 3500.0
-
-/// Minimum valid Correlated Color Temperature clamp bound in Kelvin.
-private let kCctMinKelvin: Double = 2500.0
-
-/// Maximum valid Correlated Color Temperature clamp bound in Kelvin.
-private let kCctMaxKelvin: Double = 9000.0
-
 /// Empirical scale divisor converting pre-T2 `AppleLMUController` 26-bit integer sensor readings to lux.
 private let kPreT2LmuRawToLuxDivisor: Double = 2000.0
 
 /// IOKit user-client scalar selector (`kGetSensorReadingID`) on legacy `AppleLMUController`.
 private let kLmuGetSensorReadingSelector: UInt32 = 0
+
+/// Expected Apple IOKit HID ambient sensor color space tag (`1.0` = CIE XYZ tristimulus).
+private let kAlsColorSpaceCieXyz: Double = 1.0
 
 /// Fallback reader for pre-T2 Intel Macs exposing the monochrome `AppleLMUController` IOKit service
 /// when no HID Event System ALS service is registered.
@@ -194,33 +180,36 @@ private func readPreT2LmuLux() -> Float? {
     return lux
 }
 
-// MARK: - Ambient Light Sensor Reader FFI
+// MARK: - Raw Ambient Light Sensor Reader FFI (Zero Colour Calculation on Mac)
 
-/// Reads the macOS hardware Ambient Light Sensor via IOKit HID (with `AppleLMUController` fallback).
+/// Reads the macOS hardware Ambient Light Sensor raw channels via IOKit HID (with `AppleLMUController` fallback).
 ///
 /// FFI Return Contract (consumed by `src/truetone/mod.rs`):
-/// - Returns `true` when an ambient light sensor is present and yields a valid
-///   reading, writing `outLux >= 0.0` (finite lux) and `outCct` (2500..9000 K;
-///   defaults to 6500 K D65 neutral when RGB color channels are absent).
-/// - Returns `false` when no IOKit HID / AppleLMU ambient sensor exists
-///   (e.g., Mac Studio, Mac mini, desktop Mac, or unavailable sensor) or when the
-///   sensor reading is non-finite/negative, explicitly writing sentinel
-///   `outLux = -1.0` and `outCct = 0` instead of fabricating positive lux.
-///
-/// - Parameters:
-///   - outLux: Pointer receiving the ambient illumination in Lux.
-///   - outCct: Pointer receiving the estimated Correlated Color Temperature in Kelvin.
-/// - Returns: `true` if a hardware sensor was read successfully, `false` otherwise.
-@_cdecl("read_mac_ambient_sensor")
-public func read_mac_ambient_sensor(
+/// - Performs **no** color temperature, chromaticity, or white-point adaptation math on macOS;
+///   only extracts finite raw sensor values (`lux`, raw ADC channels `ch0..ch2`, and calibrated
+///   CIE XYZ tristimulus values when `ColorSpace == 1`) so the receiving Windows PC computes all color math.
+/// - Returns `true` when an ambient light sensor is present and yields a valid non-negative finite `outLux`.
+/// - Returns `false` with `-1.0` sentinels when no ambient sensor exists (e.g., Mac mini/Studio/Pro or closed lid).
+@_cdecl("read_mac_raw_ambient_sensor")
+public func read_mac_raw_ambient_sensor(
     outLux: UnsafeMutablePointer<Float>?,
-    outCct: UnsafeMutablePointer<UInt32>?
+    outCh0: UnsafeMutablePointer<Float>?,
+    outCh1: UnsafeMutablePointer<Float>?,
+    outCh2: UnsafeMutablePointer<Float>?,
+    outCieX: UnsafeMutablePointer<Float>?,
+    outCieY: UnsafeMutablePointer<Float>?,
+    outCieZ: UnsafeMutablePointer<Float>?
 ) -> Bool {
-    let setUnsupported: () -> Bool = {
+    let resetOutputs: () -> Void = {
         outLux?.pointee = -1.0
-        outCct?.pointee = 0
-        return false
+        outCh0?.pointee = -1.0
+        outCh1?.pointee = -1.0
+        outCh2?.pointee = -1.0
+        outCieX?.pointee = -1.0
+        outCieY?.pointee = -1.0
+        outCieZ?.pointee = -1.0
     }
+    resetOutputs()
 
     if let createClient = iohidClientCreateWithType,
        let setMatching = iohidClientSetMatching,
@@ -258,7 +247,13 @@ public func read_mac_ambient_sensor(
                 let alsEventType: Int64 = 12
                 let luxField: Int32 = Int32(alsEventType << 16)
                 let ch0Field: Int32 = Int32((alsEventType << 16) | 1)
+                let ch1Field: Int32 = Int32((alsEventType << 16) | 2)
                 let ch2Field: Int32 = Int32((alsEventType << 16) | 3)
+                let colorSpaceField: Int32 = Int32((alsEventType << 16) | 6)
+                let cieXField: Int32 = Int32((alsEventType << 16) | 7)
+                let cieYField: Int32 = Int32((alsEventType << 16) | 8)
+                let cieZField: Int32 = Int32((alsEventType << 16) | 9)
+                let preciseLuxField: Int32 = Int32((alsEventType << 16) | 11)
 
                 for idx in 0..<count {
                     guard let serviceRaw = CFArrayGetValueAtIndex(services, idx) else {
@@ -268,38 +263,44 @@ public func read_mac_ambient_sensor(
                         continue
                     }
                     let eventObj = Unmanaged<CFTypeRef>.fromOpaque(eventRaw).takeRetainedValue()
-                    let parsed: (Float, UInt32)? = withExtendedLifetime(eventObj) {
-                        let luxRaw = getFloatValue(UnsafeRawPointer(eventRaw), luxField)
-                        guard luxRaw.isFinite, luxRaw >= 0.0 else {
-                            return nil
+                    let ok = withExtendedLifetime(eventObj) { () -> Bool in
+                        let evPtr = UnsafeRawPointer(eventRaw)
+                        let fineLux = getFloatValue(evPtr, preciseLuxField)
+                        let coarseLux = getFloatValue(evPtr, luxField)
+                        let luxDouble = (fineLux.isFinite && fineLux >= 0.0) ? fineLux : coarseLux
+                        guard luxDouble.isFinite, luxDouble >= 0.0 else {
+                            return false
                         }
-
-                        let lux = Float(luxRaw)
+                        let lux = Float(luxDouble)
                         guard lux.isFinite, lux >= 0.0 else {
-                            return nil
+                            return false
                         }
 
-                        let ch0 = getFloatValue(UnsafeRawPointer(eventRaw), ch0Field) // Red / Warm channel
-                        let ch2 = getFloatValue(UnsafeRawPointer(eventRaw), ch2Field) // Blue / Cool channel
+                        let ch0 = Float(getFloatValue(evPtr, ch0Field))
+                        let ch1 = Float(getFloatValue(evPtr, ch1Field))
+                        let ch2 = Float(getFloatValue(evPtr, ch2Field))
+                        let colorSpace = getFloatValue(evPtr, colorSpaceField)
+                        let xRaw = Float(getFloatValue(evPtr, cieXField))
+                        let yRaw = Float(getFloatValue(evPtr, cieYField))
+                        let zRaw = Float(getFloatValue(evPtr, cieZField))
 
-                        // Calculate Correlated Color Temperature (Kelvin) relative to D65 neutral.
-                        var cctKelvin: Double = kD65NeutralKelvin
-                        if ch0.isFinite, ch2.isFinite, ch0 > 0.0, ch2 > 0.0 {
-                            let ratio = ch2 / ch0
-                            if ratio.isFinite {
-                                cctKelvin = kCctBaseKelvin + (ratio * kCctScaleKelvin)
-                                cctKelvin = min(max(cctKelvin, kCctMinKelvin), kCctMaxKelvin)
-                            }
+                        outLux?.pointee = lux
+                        outCh0?.pointee = (ch0.isFinite && ch0 > 0.0) ? ch0 : -1.0
+                        outCh1?.pointee = (ch1.isFinite && ch1 > 0.0) ? ch1 : -1.0
+                        outCh2?.pointee = (ch2.isFinite && ch2 > 0.0) ? ch2 : -1.0
+
+                        if colorSpace == kAlsColorSpaceCieXyz,
+                           xRaw.isFinite, yRaw.isFinite, zRaw.isFinite,
+                           xRaw > 0.0, yRaw > 0.0, zRaw >= 0.0
+                        {
+                            outCieX?.pointee = xRaw
+                            outCieY?.pointee = yRaw
+                            outCieZ?.pointee = zRaw
                         }
-                        guard cctKelvin.isFinite else {
-                            return nil
-                        }
-                        return (lux, UInt32(cctKelvin.rounded()))
+                        return true
                     }
 
-                    if let (lux, cct) = parsed {
-                        outLux?.pointee = lux
-                        outCct?.pointee = cct
+                    if ok {
                         return true
                     }
                 }
@@ -312,12 +313,11 @@ public func read_mac_ambient_sensor(
         }
     }
 
-    // Fallback for pre-T2 Intel Macs exposing the legacy AppleLMUController (monochrome ALS -> D65).
+    // Fallback for pre-T2 Intel Macs exposing the legacy monochrome AppleLMUController (lux only).
     if let lmuLux = readPreT2LmuLux() {
         outLux?.pointee = lmuLux
-        outCct?.pointee = UInt32(kD65NeutralKelvin)
         return true
     }
 
-    return setUnsupported()
+    return false
 }

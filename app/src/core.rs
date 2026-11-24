@@ -2831,6 +2831,13 @@ impl IntegratorCore {
                             lux,
                             cct: args.cct,
                             gamma_comp: args.comp_factor,
+                            raw_als: false,
+                            als_ch0: None,
+                            als_ch1: None,
+                            als_ch2: None,
+                            cie_x: None,
+                            cie_y: None,
+                            cie_z: None,
                         };
                         let resp = DisplayController::send_remote_rpc(&peer_ip, &rpc)
                             .await
