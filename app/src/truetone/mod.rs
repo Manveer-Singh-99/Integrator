@@ -74,8 +74,150 @@
 use crate::config::{
     D65_CCT_KELVIN, MAX_CCT_KELVIN, MAX_GAMMA_COMP_FACTOR, MIN_CCT_KELVIN, MIN_GAMMA_COMP_FACTOR,
 };
+use crate::discovery::DiscoveryManager;
+use crate::display::controller::DisplayController;
+use crate::display::protocol::DisplayRpcRequest;
+use crate::features::FeatureManager;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Scaled integer (value * 100) storing user-selected gamma compensation factor (default: 1.00x).
+static USER_GAMMA_COMP_X100: AtomicU32 = AtomicU32::new(100);
+
+/// Reentrancy guard preventing overlapping asynchronous True Tone RPC sync dispatches.
+static SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Updates the user's preferred gamma compensation factor for True Tone sync.
+pub fn set_user_gamma_comp(comp: f32) {
+    if comp.is_finite() && comp > 0.0 {
+        let val = (comp.clamp(MIN_GAMMA_COMP_FACTOR, MAX_GAMMA_COMP_FACTOR) * 100.0).round() as u32;
+        USER_GAMMA_COMP_X100.store(val, Ordering::Release);
+    }
+}
+
+/// Retrieves the user's preferred gamma compensation factor.
+pub fn get_user_gamma_comp() -> f32 {
+    let val = USER_GAMMA_COMP_X100.load(Ordering::Acquire);
+    (val as f32) / 100.0
+}
+
+/// Continuously monitors the ambient light sensor on macOS and synchronizes
+/// chromatic calibration to the paired Windows PC whenever ambient light changes.
+pub async fn run_continuous_truetone_sync(
+    discovery: DiscoveryManager,
+    features: Arc<FeatureManager>,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut last_synced_cct: Option<u32> = None;
+        let mut last_synced_lux: Option<f32> = None;
+        let mut last_sync_instant = Instant::now() - Duration::from_secs(60);
+
+        tracing::info!("🎨 Continuous True Tone ambient sync daemon started on macOS");
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            if !features.is_enabled("truetone") {
+                continue;
+            }
+
+            let peer_ip = match discovery.get_peer_ip().await {
+                Some(ip) => ip,
+                None => match discovery.get_best_peer().await {
+                    Some(p) => p.addr.ip().to_string(),
+                    None => {
+                        last_synced_cct = None;
+                        continue;
+                    }
+                },
+            };
+
+            let als = tokio::task::spawn_blocking(read_ambient_light)
+                .await
+                .unwrap_or(AmbientLightData {
+                    lux: 0.0,
+                    cct_kelvin: D65_CCT_KELVIN,
+                    supported: false,
+                    updated_at_secs: 0,
+                });
+
+            if !als.supported || !als.lux.is_finite() || als.lux < 0.0 {
+                continue;
+            }
+
+            let cct = als.cct_kelvin;
+            let lux = als.lux;
+
+            let cct_delta = match last_synced_cct {
+                Some(prev) => (cct as i64 - prev as i64).abs(),
+                None => i64::MAX,
+            };
+            let lux_delta = match last_synced_lux {
+                Some(prev) => (lux - prev).abs(),
+                None => f32::MAX,
+            };
+            let time_elapsed = last_sync_instant.elapsed() >= Duration::from_secs(45);
+
+            // Deadband filter: trigger when color temperature changes by >= 40K,
+            // or illuminance changes by >= 15 Lux, or on periodic keepalive.
+            if cct_delta >= 40 || lux_delta >= 15.0 || time_elapsed {
+                if SYNC_IN_FLIGHT
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let gamma_comp = get_user_gamma_comp();
+                    let rpc = DisplayRpcRequest::SyncTrueTone {
+                        lux,
+                        cct,
+                        gamma_comp,
+                    };
+                    let target_ip = peer_ip.clone();
+                    tokio::spawn(async move {
+                        let res = DisplayController::send_remote_rpc(&target_ip, &rpc).await;
+                        SYNC_IN_FLIGHT.store(false, Ordering::Release);
+                        match res {
+                            Ok(resp) if resp.success => {
+                                tracing::debug!(
+                                    "🎨 Auto-synced True Tone to {}: {}K ({:.1} lux)",
+                                    target_ip,
+                                    cct,
+                                    lux
+                                );
+                            }
+                            Ok(resp) => {
+                                tracing::debug!(
+                                    "True Tone sync to {} rejected: {}",
+                                    target_ip,
+                                    resp.message
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "True Tone sync transport error to {}: {}",
+                                    target_ip,
+                                    e
+                                );
+                            }
+                        }
+                    });
+
+                    last_synced_cct = Some(cct);
+                    last_synced_lux = Some(lux);
+                    last_sync_instant = Instant::now();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (discovery, features);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbientLightData {
@@ -329,5 +471,20 @@ mod tests {
         }
         let (r65, g65, b65) = calculate_bradford_multipliers(D65_CCT_KELVIN, 1.0);
         assert!((r65 - 1.0).abs() < 0.05 && (g65 - 1.0).abs() < 0.05 && (b65 - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_user_gamma_comp_get_set_clamping() {
+        set_user_gamma_comp(1.15);
+        assert!((get_user_gamma_comp() - 1.15).abs() < 0.01);
+
+        set_user_gamma_comp(0.1); // below min 0.70
+        assert!((get_user_gamma_comp() - MIN_GAMMA_COMP_FACTOR).abs() < 0.01);
+
+        set_user_gamma_comp(5.0); // above max 1.30
+        assert!((get_user_gamma_comp() - MAX_GAMMA_COMP_FACTOR).abs() < 0.01);
+
+        set_user_gamma_comp(1.0); // reset
+        assert!((get_user_gamma_comp() - 1.0).abs() < 0.01);
     }
 }

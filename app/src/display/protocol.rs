@@ -77,6 +77,9 @@ pub enum DisplayRpcRequest {
         bitrate_kbps: u32,
         /// Whether audio should remain on host rather than being streamed to client.
         audio_on_host: bool,
+        /// Whether HDR video streaming should be enabled in Moonlight.
+        #[serde(default)]
+        hdr: bool,
     },
 
     /// Gracefully terminates the running Moonlight client process on the target machine.
@@ -131,6 +134,31 @@ pub enum DisplayRpcRequest {
         bit_depth: u8,
     },
 
+    /// Starts local audio capture and streaming to the requesting peer over authenticated IUA2 UDP.
+    StartAudioCapture {
+        /// Audio sample rate in Hertz (e.g. 48000).
+        sample_rate: u32,
+        /// Audio channel count (e.g. 2 for stereo).
+        channels: u8,
+        /// Audio bit depth per sample (e.g. 16 for 16-bit PCM).
+        bit_depth: u8,
+    },
+
+    /// Stops local audio capture and streaming to the peer.
+    StopAudioCapture,
+
+    /// Requests the local engine to route audio from the remote peer to local speakers.
+    RouteRemoteAudio {
+        /// Remote peer IPv4/IPv6 address.
+        peer_ip: String,
+    },
+
+    /// Requests the local engine to stop all active audio routing.
+    StopAudioRouting,
+
+    /// Requests the audio status snapshot from the local engine.
+    GetAudioStatus,
+
     /// Generates or queries the active 6-digit SPAKE2 mutual pairing PIN.
     GetPairingPin,
 
@@ -160,6 +188,15 @@ pub enum DisplayRpcRequest {
     /// Queries the current operational snapshot of the Shared Camera pipeline.
     GetCameraStatus,
 
+    /// Enumerates video capture devices available on the target Mac.
+    ListCameras,
+
+    /// Switches the active camera device on the target Mac.
+    SelectCamera {
+        /// Target camera device unique ID.
+        device_id: String,
+    },
+
     /// Requests an interactive macOS Touch ID Secure Enclave biometric verification over `TransportSessionV2`,
     /// binding the peer's one-time 32-byte `challenge_nonce_hex` into an Ed25519 signed assertion.
     VerifyTouchId {
@@ -174,6 +211,42 @@ pub enum DisplayRpcRequest {
 
     /// Requests WebAuthn passkey assertion signing on the remote peer, verified by Touch ID.
     PasskeyGetAssertion(crate::security::passkey::PasskeyGetAssertionRequest),
+
+    /// Illuminates or dismisses the visual Touch ID passkey/UAC guidance strip on the Mac Touch Bar.
+    NotifyTouchIdPrompt {
+        /// Prompt headline displayed on the Mac Touch Bar pointing toward the Touch ID sensor.
+        label: String,
+        /// `true` to illuminate the animated Touch ID pulse, `false` to dismiss it.
+        active: bool,
+    },
+
+    /// Dynamically reconfigures extended display resolution, refresh rate (Hz), and HDR state.
+    SetDisplayMode {
+        /// Desired width in pixels (`0` keeps current/native width).
+        width: u32,
+        /// Desired height in pixels (`0` keeps current/native height).
+        height: u32,
+        /// Desired refresh rate in Hertz (`60`, `120`, `165`, etc.).
+        fps: u32,
+        /// Whether HDR mode should be enabled.
+        #[serde(default)]
+        hdr: bool,
+    },
+
+    /// Synchronizes KVM Gaming Boundary Lock state so the cursor stays locked to the target PC/Mac screen.
+    SetKvmBoundaryLock {
+        /// `true` to lock the cursor boundary and freeze edge-hopping.
+        locked: bool,
+    },
+
+    /// Queries the currently playing Windows media session (Spotify, YouTube, VLC, etc.) via GSMTC.
+    GetMediaState,
+
+    /// Dispatches a media playback transport command (`PlayPause`, `Next`, `Previous`, `Seek`) to Windows.
+    SendMediaCommand {
+        /// Requested media transport action.
+        action: crate::media::MediaControlAction,
+    },
 }
 
 impl fmt::Debug for DisplayRpcRequest {
@@ -190,6 +263,7 @@ impl fmt::Debug for DisplayRpcRequest {
                 fps,
                 bitrate_kbps,
                 audio_on_host,
+                hdr,
             } => f
                 .debug_struct("StartMoonlight")
                 .field("host_ip", host_ip)
@@ -200,6 +274,7 @@ impl fmt::Debug for DisplayRpcRequest {
                 .field("fps", fps)
                 .field("bitrate_kbps", bitrate_kbps)
                 .field("audio_on_host", audio_on_host)
+                .field("hdr", hdr)
                 .finish(),
             Self::StopMoonlight => f.write_str("StopMoonlight"),
             Self::ToggleMacToPc => f.write_str("ToggleMacToPc"),
@@ -233,6 +308,23 @@ impl fmt::Debug for DisplayRpcRequest {
                 .field("channels", channels)
                 .field("bit_depth", bit_depth)
                 .finish(),
+            Self::StartAudioCapture {
+                sample_rate,
+                channels,
+                bit_depth,
+            } => f
+                .debug_struct("StartAudioCapture")
+                .field("sample_rate", sample_rate)
+                .field("channels", channels)
+                .field("bit_depth", bit_depth)
+                .finish(),
+            Self::StopAudioCapture => f.write_str("StopAudioCapture"),
+            Self::RouteRemoteAudio { peer_ip } => f
+                .debug_struct("RouteRemoteAudio")
+                .field("peer_ip", peer_ip)
+                .finish(),
+            Self::StopAudioRouting => f.write_str("StopAudioRouting"),
+            Self::GetAudioStatus => f.write_str("GetAudioStatus"),
             Self::GetPairingPin => f.write_str("GetPairingPin"),
             Self::PairWithPeer { ip, pin: _ } => f
                 .debug_struct("PairWithPeer")
@@ -245,6 +337,11 @@ impl fmt::Debug for DisplayRpcRequest {
             Self::ToggleCamera => f.write_str("ToggleCamera"),
             Self::StopCamera => f.write_str("StopCamera"),
             Self::GetCameraStatus => f.write_str("GetCameraStatus"),
+            Self::ListCameras => f.write_str("ListCameras"),
+            Self::SelectCamera { device_id } => f
+                .debug_struct("SelectCamera")
+                .field("device_id", device_id)
+                .finish(),
             Self::VerifyTouchId {
                 challenge_nonce_hex,
                 requester_hostname,
@@ -261,6 +358,32 @@ impl fmt::Debug for DisplayRpcRequest {
             Self::PasskeyGetAssertion(req) => f
                 .debug_struct("PasskeyGetAssertion")
                 .field("rp_id", &req.rp_id)
+                .finish(),
+            Self::NotifyTouchIdPrompt { label, active } => f
+                .debug_struct("NotifyTouchIdPrompt")
+                .field("label", label)
+                .field("active", active)
+                .finish(),
+            Self::SetDisplayMode {
+                width,
+                height,
+                fps,
+                hdr,
+            } => f
+                .debug_struct("SetDisplayMode")
+                .field("width", width)
+                .field("height", height)
+                .field("fps", fps)
+                .field("hdr", hdr)
+                .finish(),
+            Self::SetKvmBoundaryLock { locked } => f
+                .debug_struct("SetKvmBoundaryLock")
+                .field("locked", locked)
+                .finish(),
+            Self::GetMediaState => f.write_str("GetMediaState"),
+            Self::SendMediaCommand { action } => f
+                .debug_struct("SendMediaCommand")
+                .field("action", action)
                 .finish(),
         }
     }
@@ -289,6 +412,9 @@ pub struct DisplayRpcResponse {
     /// Camera subsystem diagnostic snapshot returned by camera-related RPC requests.
     #[serde(default)]
     pub camera_status: Option<crate::camera::CameraStatus>,
+    /// Available camera devices on the remote host returned by [`DisplayRpcRequest::ListCameras`].
+    #[serde(default)]
+    pub available_cameras: Option<Vec<crate::camera::CameraDeviceWire>>,
     /// Local hardware profile returned by [`DisplayRpcRequest::GetHardwareProfile`].
     #[serde(default)]
     pub hardware_profile: Option<crate::system_info::LocalHardwareProfile>,
@@ -304,6 +430,9 @@ pub struct DisplayRpcResponse {
     /// Negotiated UDP audio session metadata returned by [`DisplayRpcRequest::NegotiateAudioSession`].
     #[serde(default)]
     pub audio_session: Option<crate::security::audio_udp::NegotiatedAudioSessionWire>,
+    /// Audio routing subsystem status snapshot returned by audio-related RPC requests.
+    #[serde(default)]
+    pub audio_status: Option<crate::audio::AudioRoutingStatus>,
     /// Signed Touch ID Secure Enclave biometric assertion returned by [`DisplayRpcRequest::VerifyTouchId`].
     #[serde(default)]
     pub touchid_assertion: Option<crate::trust::TouchIdSignedAssertion>,
@@ -322,6 +451,9 @@ pub struct DisplayRpcResponse {
     /// Passkey assertion signature response returned by [`DisplayRpcRequest::PasskeyGetAssertion`].
     #[serde(default)]
     pub passkey_assertion: Option<crate::security::passkey::PasskeyGetAssertionResponse>,
+    /// Active Windows GSMTC media playback state returned by [`DisplayRpcRequest::GetMediaState`].
+    #[serde(default)]
+    pub media_state: Option<crate::media::MediaPlaybackState>,
 }
 
 impl fmt::Debug for DisplayRpcResponse {
@@ -346,6 +478,7 @@ impl fmt::Debug for DisplayRpcResponse {
             .field("host_device_id", &self.host_device_id)
             .field("host_name", &self.host_name)
             .field("audio_session", &self.audio_session)
+            .field("audio_status", &self.audio_status)
             .field("touchid_assertion", &self.touchid_assertion)
             .field("passkey_credential", &self.passkey_credential)
             .field("passkey_assertion", &self.passkey_assertion)
@@ -363,23 +496,34 @@ pub(crate) fn required_feature_for_rpc(req: &DisplayRpcRequest) -> Option<&'stat
         | DisplayRpcRequest::StopMoonlight
         | DisplayRpcRequest::ToggleMacToPc
         | DisplayRpcRequest::TogglePcToMac
+        | DisplayRpcRequest::SetDisplayMode { .. }
         | DisplayRpcRequest::StopAll => Some("display"),
+        DisplayRpcRequest::SetKvmBoundaryLock { .. } => Some("input_kvm"),
         DisplayRpcRequest::PasteRemote => Some("clipboard"),
         DisplayRpcRequest::SyncTrueTone { .. } => Some("truetone"),
         DisplayRpcRequest::MountStorage | DisplayRpcRequest::UnmountStorage => Some("storage"),
-        DisplayRpcRequest::NegotiateAudioSession { .. } => Some("audio"),
+        DisplayRpcRequest::NegotiateAudioSession { .. }
+        | DisplayRpcRequest::StartAudioCapture { .. }
+        | DisplayRpcRequest::RouteRemoteAudio { .. }
+        | DisplayRpcRequest::GetAudioStatus => Some("audio"),
+        DisplayRpcRequest::StopAudioCapture | DisplayRpcRequest::StopAudioRouting => None,
         DisplayRpcRequest::StartCamera
         | DisplayRpcRequest::CheckCameraConsent
         | DisplayRpcRequest::ToggleCamera
         | DisplayRpcRequest::StopCamera
-        | DisplayRpcRequest::GetCameraStatus => Some("camera"),
+        | DisplayRpcRequest::GetCameraStatus
+        | DisplayRpcRequest::ListCameras
+        | DisplayRpcRequest::SelectCamera { .. } => Some("camera"),
         DisplayRpcRequest::VerifyTouchId { .. }
+        | DisplayRpcRequest::NotifyTouchIdPrompt { .. }
         | DisplayRpcRequest::PasskeyMakeCredential(_)
         | DisplayRpcRequest::PasskeyGetAssertion(_) => Some("touchid"),
         DisplayRpcRequest::Ping
         | DisplayRpcRequest::GetHardwareProfile
         | DisplayRpcRequest::GetStatus
         | DisplayRpcRequest::GetGpuTelemetry
+        | DisplayRpcRequest::GetMediaState
+        | DisplayRpcRequest::SendMediaCommand { .. }
         | DisplayRpcRequest::ShowWindow
         | DisplayRpcRequest::GetPairingPin
         | DisplayRpcRequest::PairWithPeer { .. }
@@ -442,9 +586,62 @@ mod tests {
             }),
             Some("audio")
         );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::StartAudioCapture {
+                sample_rate: 48000,
+                channels: 2,
+                bit_depth: 16,
+            }),
+            Some("audio")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::StopAudioCapture),
+            None
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::RouteRemoteAudio {
+                peer_ip: "127.0.0.1".into(),
+            }),
+            Some("audio")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::StopAudioRouting),
+            None
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::GetAudioStatus),
+            Some("audio")
+        );
         assert_eq!(required_feature_for_rpc(&DisplayRpcRequest::Ping), None);
         assert_eq!(
             required_feature_for_rpc(&DisplayRpcRequest::GetGpuTelemetry),
+            None
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::NotifyTouchIdPrompt {
+                label: "Approve Windows Hello Login".into(),
+                active: true,
+            }),
+            Some("touchid")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SetDisplayMode {
+                width: 2560,
+                height: 1440,
+                fps: 165,
+                hdr: true,
+            }),
+            Some("display")
+        );
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SetKvmBoundaryLock { locked: true }),
+            Some("input_kvm")
+        );
+        assert_eq!(required_feature_for_rpc(&DisplayRpcRequest::GetMediaState), None);
+        assert_eq!(
+            required_feature_for_rpc(&DisplayRpcRequest::SendMediaCommand {
+                action: crate::media::MediaControlAction::PlayPause,
+            }),
             None
         );
     }

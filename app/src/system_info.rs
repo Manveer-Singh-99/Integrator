@@ -572,16 +572,15 @@ impl LinkTransport {
 
     /// Route preference rank used for interface ordering and peer route election (lower is better).
     ///
-    /// Thunderbolt / USB4 (10–40 Gbps) outranks USB-C NCM, which outranks wired Ethernet, Wi-Fi LAN,
-    /// mobile hotspots, and finally unclassified routes.
+    /// USB-C CDC-NCM, Thunderbolt/USB4, and wired Ethernet share TOP priority (#1, rank 0).
+    /// Wireless Wi-Fi LAN takes priority #2 (rank 1), followed by mobile hotspots (rank 2),
+    /// and unclassified/routed fallback routes (rank 3).
     pub fn route_priority(self) -> u8 {
         match self {
-            LinkTransport::Thunderbolt => 0,
-            LinkTransport::DirectUsb => 1,
-            LinkTransport::Ethernet => 2,
-            LinkTransport::Wifi => 3,
-            LinkTransport::Hotspot => 4,
-            LinkTransport::Unknown => 5,
+            LinkTransport::Thunderbolt | LinkTransport::DirectUsb | LinkTransport::Ethernet => 0,
+            LinkTransport::Wifi => 1,
+            LinkTransport::Hotspot => 2,
+            LinkTransport::Unknown => 3,
         }
     }
 }
@@ -672,6 +671,9 @@ pub struct AppPathPreferences {
     /// User preference suppressing the automatic Setup & Permissions Assistant prompt on app launch.
     #[serde(default)]
     pub suppress_launch_setup_prompt: bool,
+    /// Whether to automatically mount the peer's shared folder on peer detection.
+    #[serde(default)]
+    pub auto_mount_on_peer_detect: bool,
 }
 
 impl fmt::Debug for AppPathPreferences {
@@ -680,6 +682,7 @@ impl fmt::Debug for AppPathPreferences {
             .field("smb_share_name", &self.smb_share_name)
             .field("peer_smb_share_name", &self.peer_smb_share_name)
             .field("local_shared_folder", &self.local_shared_folder)
+            .field("auto_mount_on_peer_detect", &self.auto_mount_on_peer_detect)
             .field("sunshine_conf_path", &self.sunshine_conf_path)
             .field("moonlight_path", &self.moonlight_path)
             .field("sunshine_api_user", &self.sunshine_api_user)
@@ -1713,6 +1716,76 @@ fn enumerate_gpus_uncached() -> Vec<GpuDeviceInfo> {
                 }
             }
         }
+
+        // Query Win32 EnumDisplayDevicesW to ensure all physical adapters (Intel, AMD, NVIDIA) are captured
+        {
+            #[repr(C)]
+            struct DisplayDeviceW {
+                cb: u32,
+                device_name: [u16; 32],
+                device_string: [u16; 128],
+                state_flags: u32,
+                device_id: [u16; 128],
+                device_key: [u16; 128],
+            }
+            #[link(name = "user32")]
+            extern "system" {
+                fn EnumDisplayDevicesW(
+                    lp_device: *const u16,
+                    i_dev_num: u32,
+                    lp_display_device: *mut DisplayDeviceW,
+                    dw_flags: u32,
+                ) -> i32;
+            }
+            let mut dev_idx = 0;
+            let mut seen: HashSet<String> =
+                out.iter().map(|g| g.name.to_ascii_lowercase()).collect();
+            loop {
+                let mut dd = DisplayDeviceW {
+                    cb: std::mem::size_of::<DisplayDeviceW>() as u32,
+                    device_name: [0; 32],
+                    device_string: [0; 128],
+                    state_flags: 0,
+                    device_id: [0; 128],
+                    device_key: [0; 128],
+                };
+                let ret = unsafe {
+                    EnumDisplayDevicesW(std::ptr::null(), dev_idx, &mut dd, 0)
+                };
+                if ret == 0 {
+                    break;
+                }
+                dev_idx += 1;
+                let len = dd.device_string.iter().position(|&c| c == 0).unwrap_or(128);
+                let name = String::from_utf16_lossy(&dd.device_string[..len]).trim().to_string();
+                let lower = name.to_ascii_lowercase();
+                if name.is_empty()
+                    || lower.contains("virtual")
+                    || lower.contains("microsoft basic")
+                    || lower.contains("idd")
+                    || lower.contains("parsec")
+                    || lower.contains("rdp")
+                    || seen.contains(&lower)
+                {
+                    continue;
+                }
+                seen.insert(lower.clone());
+                let vendor = infer_vendor(&name).to_string();
+                let is_discrete = (vendor == "NVIDIA" && !lower.contains("integrated"))
+                    || lower.contains("radeon rx")
+                    || lower.contains("radeon pro")
+                    || lower.contains("arc a")
+                    || lower.contains("arc b")
+                    || lower.contains("geforce");
+                out.push(GpuDeviceInfo {
+                    index: out.len() as u32,
+                    name,
+                    vendor,
+                    is_discrete,
+                    vram_mb: None,
+                });
+            }
+        }
     }
 
     if out.is_empty() {
@@ -2636,13 +2709,30 @@ pub fn is_known_hotspot_subnet(ip: Ipv4Addr, mask: Ipv4Addr) -> bool {
     false
 }
 
+/// Returns `true` if `(ip, mask)` belongs to a well-known point-to-point USB-C direct link subnet:
+/// - Integrator Apple USB-C NCM link default (`10.99.99.0/24`)
+/// - Alternative point-to-point direct USB link (`192.168.2.0/24`)
+pub fn is_known_direct_usb_subnet(ip: Ipv4Addr, mask: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let prefix = mask_to_prefix(mask);
+    if octets[0] == 10 && octets[1] == 99 && octets[2] == 99 && prefix >= 24 {
+        return true;
+    }
+    if octets[0] == 192 && octets[1] == 168 && octets[2] == 2 && prefix >= 24 {
+        return true;
+    }
+    false
+}
+
 /// Refines a hardware-classified `LinkTransport` using on-link subnet characteristics while
 /// strictly preserving the security invariant that hardware classification takes precedence:
-/// - Never promotes `Wifi`, `Hotspot`, `Ethernet`, or `Unknown` to `DirectUsb` or `Thunderbolt`
-///   regardless of IP prefix (`10.99.99.x`, `192.168.2.x`, `169.254.x.x` on a Wi-Fi/Ethernet router
-///   remains `Wifi` / `Ethernet` with `is_direct_cable() == false`).
+/// - Never promotes `Wifi` or `Hotspot` to `DirectUsb` or `Thunderbolt`
+///   regardless of IP prefix (`10.99.99.x`, `192.168.2.x`, `169.254.x.x` on a Wi-Fi router
+///   remains `Wifi` / `Hotspot` with `is_direct_cable() == false`).
 /// - Refines a `Wifi` client interface connected to a known hotspot subnet (`172.20.10.x/28`,
 ///   `192.168.137.x/24`, `192.168.43.x/24`) to `LinkTransport::Hotspot`.
+/// - Refines unclassified (`Unknown`) or generic `Ethernet` interfaces on direct USB subnets
+///   (`10.99.99.0/24` or `192.168.2.0/24`) to `LinkTransport::DirectUsb`.
 pub fn refine_transport_with_subnet(
     transport: LinkTransport,
     ip: Ipv4Addr,
@@ -2650,6 +2740,10 @@ pub fn refine_transport_with_subnet(
 ) -> LinkTransport {
     if transport == LinkTransport::Wifi && is_known_hotspot_subnet(ip, mask) {
         LinkTransport::Hotspot
+    } else if (transport == LinkTransport::Unknown || transport == LinkTransport::Ethernet)
+        && is_known_direct_usb_subnet(ip, mask)
+    {
+        LinkTransport::DirectUsb
     } else {
         transport
     }
@@ -3694,6 +3788,26 @@ mod tests {
             assert_eq!(eth_t, LinkTransport::Ethernet);
             assert!(!eth_t.is_direct_cable());
         }
+
+        // Route priority ordering: DirectUsb, Thunderbolt, Ethernet share top priority (0),
+        // Wifi takes #2 (1), Hotspot takes #3 (2), Unknown takes #4 (3).
+        assert_eq!(LinkTransport::DirectUsb.route_priority(), 0);
+        assert_eq!(LinkTransport::Thunderbolt.route_priority(), 0);
+        assert_eq!(LinkTransport::Ethernet.route_priority(), 0);
+        assert_eq!(LinkTransport::Wifi.route_priority(), 1);
+        assert_eq!(LinkTransport::Hotspot.route_priority(), 2);
+        assert_eq!(LinkTransport::Unknown.route_priority(), 3);
+
+        // Subnet detection for direct USB link
+        assert!(super::is_known_direct_usb_subnet(Ipv4Addr::new(10, 99, 99, 2), mask_24));
+        assert!(super::is_known_direct_usb_subnet(Ipv4Addr::new(192, 168, 2, 1), mask_24));
+        assert!(!super::is_known_direct_usb_subnet(Ipv4Addr::new(10, 99, 99, 2), mask_16));
+        assert!(!super::is_known_direct_usb_subnet(Ipv4Addr::new(10, 145, 4, 203), mask_24));
+
+        // Unknown interface on 10.99.99.x/24 refines to DirectUsb
+        let unk_usb = refine_transport_with_subnet(LinkTransport::Unknown, Ipv4Addr::new(10, 99, 99, 2), mask_24);
+        assert_eq!(unk_usb, LinkTransport::DirectUsb);
+        assert!(unk_usb.is_direct_cable());
 
         // Wi-Fi client connected to iPhone /28 Hotspot, PC Hotspot 192.168.137.x/24, or Android Hotspot 192.168.43.x/24 refines to Hotspot
         assert_eq!(

@@ -252,6 +252,9 @@ pub struct KvmStatusSnapshot {
     pub peer_height: u32,
     /// User-visible label of an active file drag-and-drop session in transit.
     pub active_drag_label: Option<String>,
+    /// Whether KVM Gaming Boundary Lock is active (freezes edge-hopping during full-screen games).
+    #[serde(default)]
+    pub boundary_locked: bool,
     /// Current desk layout arrangement and edge configuration.
     pub layout: KvmLayoutConfig,
 }
@@ -338,6 +341,7 @@ pub struct KvmService {
     staging_task: Mutex<Option<AbortHandle>>,
     drag_stage_dirs: Mutex<HashMap<String, PathBuf>>,
     last_controlled_entry_ms: AtomicU64,
+    boundary_locked: AtomicBool,
 }
 
 impl KvmService {
@@ -387,6 +391,7 @@ impl KvmService {
             staging_task: Mutex::new(None),
             drag_stage_dirs: Mutex::new(HashMap::new()),
             last_controlled_entry_ms: AtomicU64::new(0),
+            boundary_locked: AtomicBool::new(false),
         });
         svc.refresh_local_rect();
         svc
@@ -822,8 +827,40 @@ impl KvmService {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            boundary_locked: self.boundary_locked.load(Ordering::Acquire),
             layout: self.get_layout(),
         }
+    }
+
+    /// Returns whether the KVM Gaming Boundary Lock is currently engaged.
+    pub fn is_boundary_locked(&self) -> bool {
+        self.boundary_locked.load(Ordering::Acquire)
+    }
+
+    /// Engages or disengages KVM Gaming Boundary Lock (freezes cursor edge-hopping).
+    ///
+    /// When `sync_peer` is `true`, propagates `KvmWireMessage::SetBoundaryLock` over the
+    /// live KVM transport session so both Mac and PC honor the boundary lock synchronously.
+    pub fn set_boundary_locked(&self, locked: bool, sync_peer: bool) -> bool {
+        self.boundary_locked.store(locked, Ordering::SeqCst);
+        if locked {
+            *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if sync_peer {
+            self.try_send_wire(KvmWireMessage::SetBoundaryLock { locked });
+        }
+        crate::core::notify_touchbar_kvm_lock_state(locked);
+        info!(
+            "🖱️ KVM Gaming Boundary Lock {}",
+            if locked { "LOCKED (edge-hopping frozen)" } else { "UNLOCKED (edge-hopping active)" }
+        );
+        locked
+    }
+
+    /// Toggles KVM Gaming Boundary Lock and synchronizes state with the peer.
+    pub fn toggle_boundary_locked(&self) -> bool {
+        let next = !self.is_boundary_locked();
+        self.set_boundary_locked(next, true)
     }
 
     /// Immediately tears down any active KVM session associated with the specified peer device ID hex.
@@ -1421,6 +1458,10 @@ impl KvmService {
                 if !norm_pos.is_finite() {
                     return;
                 }
+                // Gaming Boundary Lock: keep cursor locked on the remote gaming PC until explicitly unlocked
+                if self.boundary_locked.load(Ordering::Acquire) {
+                    return;
+                }
                 let local_rect = *self.local_rect.read().unwrap_or_else(|e| e.into_inner());
                 let layout_cfg = self.get_layout();
                 let (rx, ry) = resolve_entry_point(local_rect, layout_cfg.peer_edge, norm_pos, RETURN_ENTRY_INSET_PX);
@@ -1497,7 +1538,8 @@ impl KvmService {
                         .elapsed()
                         >= EDGE_TRANSITION_COOLDOWN;
 
-                    if crossed && active_drag_session.is_none() && cooldown_elapsed {
+                    let boundary_locked = self.boundary_locked.load(Ordering::Acquire);
+                    if crossed && !boundary_locked && active_drag_session.is_none() && cooldown_elapsed {
                         let dead = cfg.dead_corners
                             && is_in_dead_corner(local_rect, entry_edge, next_x, next_y);
                         if !dead {
@@ -1693,6 +1735,9 @@ impl KvmService {
             }
             KvmWireMessage::ReleaseAll => {
                 self.force_release_all(false);
+            }
+            KvmWireMessage::SetBoundaryLock { locked } => {
+                self.set_boundary_locked(locked, false);
             }
             KvmWireMessage::Ping => {}
         }
@@ -1897,6 +1942,11 @@ impl KvmService {
             }
         };
         if !is_idle {
+            return HookDecision::PassThrough;
+        }
+        // KVM Gaming Boundary Lock: freeze all outgoing edge hops while locked
+        if self.boundary_locked.load(Ordering::Acquire) {
+            *self.edge_dwell.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return HookDecision::PassThrough;
         }
 

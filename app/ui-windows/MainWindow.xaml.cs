@@ -169,6 +169,16 @@ namespace IntegratorUI
         private bool _didShowLaunchSetupPrompt;
         /// <summary>Reentrancy guard preventing overlapping Setup Assistant ContentDialog instances.</summary>
         private bool _isSetupDialogOpen;
+        /// <summary>Reentrancy guard preventing overlapping quit confirmation or shutdown progress flows.</summary>
+        private bool _isQuitFlowRunning;
+        /// <summary>Guard suppressing SwitchConfirmQuit.Toggled during programmatic state initialization.</summary>
+        private bool _syncingConfirmQuitSwitch;
+        /// <summary>Guard flag preventing camera selection event during programmatic ComboBox population.</summary>
+        private bool _populatingCameras;
+        /// <summary>Atomic guard preventing overlapping background camera enumeration calls.</summary>
+        private int _cameraRefreshInFlight;
+        /// <summary>Timestamp of last camera enumeration query to throttle polling.</summary>
+        private DateTime _lastCameraRefresh = DateTime.MinValue;
 
         /// <summary>
         /// Resolves the platform default public shared directory label dynamically from OS environment
@@ -224,6 +234,7 @@ namespace IntegratorUI
             ConfigureWindowChrome();
             UpdateNavStyles();
             RebuildCardsGrid(force: true);
+            SyncConfirmQuitSwitch();
 
             RootGrid.ActualThemeChanged += (_, _) =>
             {
@@ -302,6 +313,7 @@ namespace IntegratorUI
             AppWindow.Closing += (_, args) =>
             {
                 args.Cancel = true;
+                if (_isQuitFlowRunning || _disposedForExit) return;
                 HideToTray();
             };
 
@@ -491,12 +503,18 @@ namespace IntegratorUI
                     : Color.FromArgb(255, 136, 136, 136));
                 PopulateGpuCombos(s);
 
-                if (s.DisplayActive && !s.IsWindowsMaster)
+                string mode = s.ActiveMode ?? "";
+                bool isMacToPcActive = s.DisplayActive && mode.IndexOf("Mac -> PC", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isPcToMacActive = s.DisplayActive && mode.IndexOf("PC -> Mac", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                BtnExtendMacToPc.Content = isMacToPcActive ? "Stop Extending" : "Extend Mac -> PC";
+                if (isMacToPcActive)
                     BtnExtendMacToPc.Style = (Style)Application.Current.Resources["AccentButtonStyle"];
                 else
                     BtnExtendMacToPc.ClearValue(FrameworkElement.StyleProperty);
 
-                if (s.DisplayActive && s.IsWindowsMaster)
+                BtnExtendPcToMac.Content = isPcToMacActive ? "Stop Extending" : "Extend PC -> Mac";
+                if (isPcToMacActive)
                     BtnExtendPcToMac.Style = (Style)Application.Current.Resources["AccentButtonStyle"];
                 else
                     BtnExtendPcToMac.ClearValue(FrameworkElement.StyleProperty);
@@ -626,6 +644,7 @@ namespace IntegratorUI
                 LocalSharedFolderInput.Text = !string.IsNullOrWhiteSpace(s.LocalSharedFolder)
                     ? s.LocalSharedFolder
                     : GetDefaultSharedFolderLabel();
+                CheckAutoMountStorage.IsChecked = s.AutoMountStorage;
                 BtnOpenInExplorer.Visibility = s.StorageMounted ? Visibility.Visible : Visibility.Collapsed;
 
                 if (!_preferredShareDirty && PreferredShareInput.FocusState == FocusState.Unfocused)
@@ -642,9 +661,23 @@ namespace IntegratorUI
 
                 // Card 8: True Tone
                 SwitchTrueTone.IsOn = f.Truetone;
-                TrueTonePillText.Text = s.AmbientSupported
-                    ? string.Format(CultureInfo.InvariantCulture, "{0:0} lux • {1}K", s.AmbientLux ?? 0f, s.AmbientCct ?? DefaultAmbientCctKelvin)
-                    : "Manual";
+                if (s.AmbientSupported && s.AmbientCct.HasValue && s.AmbientCct.Value >= 2500 && s.AmbientCct.Value <= 9000)
+                {
+                    TrueTonePillText.Text = string.Format(CultureInfo.InvariantCulture, "Auto • {0:0} lux • {1}K", s.AmbientLux ?? 0f, s.AmbientCct.Value);
+                    if (CctSlider != null && CctValueText != null && !_applyingStatus)
+                    {
+                        double targetVal = Math.Clamp((double)s.AmbientCct.Value, CctSlider.Minimum, CctSlider.Maximum);
+                        if (Math.Abs(CctSlider.Value - targetVal) >= 50)
+                        {
+                            CctSlider.Value = targetVal;
+                            CctValueText.Text = $"{(int)targetVal}K";
+                        }
+                    }
+                }
+                else
+                {
+                    TrueTonePillText.Text = "Manual";
+                }
                 SetPillStyle(TrueTonePill, TrueTonePillDot, f.Truetone
                     ? Color.FromArgb(255, 232, 192, 27)
                     : Color.FromArgb(255, 136, 136, 136));
@@ -704,6 +737,15 @@ namespace IntegratorUI
                 }
                 BtnToggleCamera.Content = cam.Active ? "Stop Virtual Camera" : "Enable Virtual Camera";
 
+                if (f.Camera)
+                {
+                    _ = RefreshCameraDevicesAsync();
+                }
+                else
+                {
+                    CameraSelectionPanel.Visibility = Visibility.Collapsed;
+                }
+
                 // Card 11: Autostart
                 SwitchAutostart.IsOn = s.AutostartEnabled;
                 AutostartPillText.Text = s.AutostartEnabled ? "Launch at Login" : "Manual Launch";
@@ -730,9 +772,18 @@ namespace IntegratorUI
                 if (!_didShowLaunchSetupPrompt)
                 {
                     _didShowLaunchSetupPrompt = true;
-                    if (s.SetupStatus?.NeedsAttention == true && !s.SetupStatus.SuppressLaunchPrompt && !_isHiddenToTray)
+                    if (!UiPreferences.HasCompletedInitialSetup)
                     {
-                        DispatcherQueue.TryEnqueue(() => _ = ShowSetupAssistantDialogAsync());
+                        bool allAlreadyConfigured = UpdateSetupAssistantCardStatuses();
+                        if (allAlreadyConfigured)
+                        {
+                            // All setup components are already installed (e.g. user updating the app)
+                            UiPreferences.HasCompletedInitialSetup = true;
+                        }
+                        else if (!_isHiddenToTray)
+                        {
+                            SetupAssistantOverlay.Visibility = Visibility.Visible;
+                        }
                     }
                 }
 
@@ -1438,6 +1489,47 @@ namespace IntegratorUI
         private void HideWindowBtn_Click(object sender, RoutedEventArgs e) => HideToTray();
 
         /// <summary>
+        /// Triggers the quit confirmation dialog and visual shutdown sequence from the top toolbar.
+        /// </summary>
+        private void QuitBtn_Click(object sender, RoutedEventArgs e) => _ = RequestQuitAsync();
+
+        /// <summary>
+        /// Handles Ctrl+Q keyboard shortcut to initiate the quit confirmation and shutdown flow.
+        /// </summary>
+        private void QuitAccelerator_Invoked(
+            Microsoft.UI.Xaml.Input.KeyboardAccelerator sender,
+            Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
+        {
+            args.Handled = true;
+            _ = RequestQuitAsync();
+        }
+
+        /// <summary>
+        /// Persists user preference for showing the quit confirmation dialog before exiting.
+        /// </summary>
+        private void ConfirmQuitSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (_syncingConfirmQuitSwitch) return;
+            UiPreferences.SkipQuitConfirmation = !SwitchConfirmQuit.IsOn;
+        }
+
+        /// <summary>
+        /// Synchronizes the "Ask for Confirmation Before Quitting" switch with persisted UI preferences.
+        /// </summary>
+        private void SyncConfirmQuitSwitch()
+        {
+            _syncingConfirmQuitSwitch = true;
+            try
+            {
+                SwitchConfirmQuit.IsOn = !UiPreferences.SkipQuitConfirmation;
+            }
+            finally
+            {
+                _syncingConfirmQuitSwitch = false;
+            }
+        }
+
+        /// <summary>
         /// Handles toggle switches for subsystem feature flags and dispatches set_feature_flag RPCs.
         /// </summary>
         private void FeatureSwitch_Toggled(object sender, RoutedEventArgs e)
@@ -1518,25 +1610,45 @@ namespace IntegratorUI
         }
 
         /// <summary>
-        /// Queries real-time discrete GPU metrics (temperature, VRAM, clock, load) from the peer.
+        /// Queries real-time discrete GPU metrics (temperature, VRAM, clock, load) from the peer
+        /// and enumerates all physical GPUs installed in the local system.
         /// </summary>
         private async void QueryGpu_Click(object sender, RoutedEventArgs e)
         {
             var res = await Task.Run(() => CoreBridge.Invoke<GpuTelemetryModel>("get_gpu_telemetry"));
             if (_disposedForExit) return;
+
+            var gpus = _status?.LocalGpus ?? new List<GpuDeviceInfo>();
+            var lines = new List<string>();
+
             if (res.Ok && res.Data != null)
             {
                 var t = res.Data;
-                GpuTelemetryText.Text = string.Format(
+                lines.Add(string.Format(
                     CultureInfo.InvariantCulture,
-                    "{0}  •  {1}°C  •  GPU {2}%  •  VRAM {3}/{4} MB",
-                    t.GpuName, t.TemperatureC, t.GpuUtilizationPercent, t.MemoryUsedMb, t.MemoryTotalMb);
-                GpuTelemetryBox.Visibility = Visibility.Visible;
+                    "Active Telemetry: {0} • {1}°C • GPU {2}% • VRAM {3}/{4} MB",
+                    t.GpuName, t.TemperatureC, t.GpuUtilizationPercent, t.MemoryUsedMb, t.MemoryTotalMb));
+
+                var allGpus = t.AllGpus != null && t.AllGpus.Count > 0
+                    ? t.AllGpus
+                    : gpus.Select(g => g.Name).Distinct().ToList();
+                if (allGpus.Count > 0)
+                {
+                    lines.Add("Detected GPUs: " + string.Join(" | ", allGpus));
+                }
             }
-            else
+            else if (gpus.Count > 0)
             {
-                ShowToast(res.Error ?? "GPU telemetry unavailable", "error");
+                var names = gpus.Select(g => g.Name).Distinct();
+                lines.Add("Detected GPUs: " + string.Join(" | ", names));
             }
+            else if (!res.Ok || res.Data == null)
+            {
+                lines.Add("No discrete GPU telemetry available");
+            }
+
+            GpuTelemetryText.Text = string.Join("\n", lines);
+            GpuTelemetryBox.Visibility = Visibility.Visible;
         }
 
         /// <summary>
@@ -1870,6 +1982,15 @@ namespace IntegratorUI
         }
 
         /// <summary>
+        /// Updates the auto-mount preference for shared storage when peer is detected.
+        /// </summary>
+        private void CheckAutoMountStorage_Click(object sender, RoutedEventArgs e)
+        {
+            bool enabled = CheckAutoMountStorage.IsChecked ?? false;
+            RunInvoke("set_auto_mount_storage", new { enabled });
+        }
+
+        /// <summary>
         /// Updates preview labels for True Tone CCT (Kelvin) and gamma compensation factor sliders.
         /// </summary>
         private void TrueToneSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
@@ -1904,7 +2025,99 @@ namespace IntegratorUI
         /// <summary>
         /// Toggles the Mac -> PC shared virtual camera streaming session.
         /// </summary>
-        private void ToggleCamera_Click(object sender, RoutedEventArgs e) => RunInvoke("toggle_camera");
+        private void ToggleCamera_Click(object sender, RoutedEventArgs e)
+        {
+            RunInvoke("toggle_camera", null, true, false, ok =>
+            {
+                _ = RefreshCameraDevicesAsync(true);
+            });
+        }
+
+        /// <summary>
+        /// Queries the paired Mac for connected camera devices.
+        /// Shows the camera selection dropdown strictly when 2 or more cameras are connected.
+        /// </summary>
+        private async Task RefreshCameraDevicesAsync(bool force = false)
+        {
+            if (!force && (DateTime.UtcNow - _lastCameraRefresh).TotalSeconds < 10)
+            {
+                return;
+            }
+            if (System.Threading.Interlocked.CompareExchange(ref _cameraRefreshInFlight, 1, 0) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                _lastCameraRefresh = DateTime.UtcNow;
+                var res = await Task.Run(() => CoreBridge.Invoke<List<CameraDeviceModel>>("list_cameras"));
+                if (_disposedForExit) return;
+
+                var cameras = res.Data;
+                if (!res.Ok || cameras == null || cameras.Count < 2)
+                {
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        if (CameraSelectionPanel != null)
+                        {
+                            CameraSelectionPanel.Visibility = Visibility.Collapsed;
+                        }
+                    });
+                    return;
+                }
+
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    if (CameraSelectionCombo == null || CameraSelectionPanel == null) return;
+                    _populatingCameras = true;
+                    try
+                    {
+                        CameraSelectionCombo.Items.Clear();
+                        int selectedIndex = 0;
+                        for (int i = 0; i < cameras.Count; i++)
+                        {
+                            var item = new ComboBoxItem
+                            {
+                                Content = cameras[i].Name,
+                                Tag = cameras[i].Id
+                            };
+                            CameraSelectionCombo.Items.Add(item);
+                            if (cameras[i].IsActive)
+                            {
+                                selectedIndex = i;
+                            }
+                        }
+                        CameraSelectionCombo.SelectedIndex = selectedIndex;
+                        CameraSelectionPanel.Visibility = Visibility.Visible;
+                    }
+                    finally
+                    {
+                        _populatingCameras = false;
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Integrator] Failed to refresh cameras: {ex.Message}");
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref _cameraRefreshInFlight, 0);
+            }
+        }
+
+        /// <summary>
+        /// Handles camera selection change from the dropdown, dispatching RPC to the paired Mac.
+        /// </summary>
+        private void CameraSelectionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_populatingCameras) return;
+            if (CameraSelectionCombo?.SelectedItem is ComboBoxItem item && item.Tag is string devId)
+            {
+                RunInvoke("select_camera", new { device_id = devId });
+            }
+        }
 
         /// <summary>
         /// Initiates a live Touch ID Secure Enclave biometric challenge to the paired Mac over TransportSessionV2.
@@ -1977,6 +2190,168 @@ namespace IntegratorUI
                     card.BorderBrush = cardBorder;
                 }
             }
+        }
+
+        // MARK: - Setup Assistant First-Launch Wizard Event Handlers
+
+        private void NavSetupBtn_Click(object sender, RoutedEventArgs e)
+        {
+            SetupAssistantOverlay.Visibility = Visibility.Visible;
+            UpdateSetupAssistantCardStatuses();
+        }
+
+        private void SetupAssistantClose_Click(object sender, RoutedEventArgs e)
+        {
+            SetupAssistantOverlay.Visibility = Visibility.Collapsed;
+        }
+
+        private void SetupAssistantDone_Click(object sender, RoutedEventArgs e)
+        {
+            if (SetupDontShowAgainCheck.IsChecked == true)
+            {
+                UiPreferences.HasCompletedInitialSetup = true;
+            }
+            SetupAssistantOverlay.Visibility = Visibility.Collapsed;
+            ShowToast("Setup Assistant completed! Welcome to Integrator.", "success");
+        }
+
+        private async void SetupInstallStreamingBtn_Click(object sender, RoutedEventArgs e)
+        {
+            SetupInstallStreamingBtn.IsEnabled = false;
+            SetupDisplayStatusText.Text = "Status: Installing Sunshine & Moonlight via WinGet…";
+            var r1 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "sunshine" }));
+            var r2 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "moonlight" }));
+            SetupDisplayStatusText.Text = "Status: WinGet installer launched in background. Approve prompts if shown.";
+            ShowToast("Started Sunshine & Moonlight automated installation.", "info");
+            SetupInstallStreamingBtn.IsEnabled = true;
+        }
+
+        private async void SetupEnablePasskeyBtn_Click(object sender, RoutedEventArgs e)
+        {
+            SetupEnablePasskeyBtn.IsEnabled = false;
+            SetupPasskeyStatusText.Text = "Status: Registering Integrator Touch ID Passkey Host…";
+            bool ok = false;
+            await Task.Run(() =>
+            {
+                try
+                {
+                    PasskeyAuthenticatorPlugin.Initialize();
+                    ok = true;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[SetupPasskey] Failed: {ex}");
+                }
+            });
+            if (ok)
+            {
+                SetupPasskeyStatusText.Text = "Status: Active! Ready to authenticate in Chrome & Edge.";
+                ShowToast("Passkeys ready: choose 'Integrator (Mac Touch ID)' on websites.", "success");
+            }
+            else
+            {
+                SetupPasskeyStatusText.Text = "Status: Registration failed. Check system logs.";
+                ShowToast("Failed to register Passkey host.", "error");
+            }
+            SetupEnablePasskeyBtn.IsEnabled = true;
+        }
+
+        private async void SetupEnableUsbNcmBtn_Click(object sender, RoutedEventArgs e)
+        {
+            SetupEnableUsbNcmBtn.IsEnabled = false;
+            SetupUsbNcmStatusText.Text = "Status: Setting up USB-C NCM & SMB server…";
+            var r1 = await Task.Run(() => CoreBridge.Invoke<string>("install_dependency", new { id = "usb_ncm" }));
+            var r2 = await Task.Run(() => CoreBridge.Invoke<string>("request_permission", new { id = "smb_server" }));
+            SetupUsbNcmStatusText.Text = "Status: USB-C NCM bridge configured. SMB server ready.";
+            ShowToast("USB-C NCM & SMB sharing configured.", "success");
+            SetupEnableUsbNcmBtn.IsEnabled = true;
+        }
+
+        private bool UpdateSetupAssistantCardStatuses()
+        {
+            bool allConfigured = true;
+
+            if (_status?.SetupStatus != null)
+            {
+                var s = _status.SetupStatus;
+
+                // 1. Display Extension (Sunshine & Moonlight)
+                var sun = s.Dependencies.FirstOrDefault(d => d.Id == "sunshine");
+                var moon = s.Dependencies.FirstOrDefault(d => d.Id == "moonlight");
+                bool sunOk = sun?.Installed == true;
+                bool moonOk = moon?.Installed == true;
+
+                if (sunOk && moonOk)
+                {
+                    SetupDisplayStatusText.Text = "Status: Installed and configured (Ready)";
+                    SetupDisplayStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90));
+                    SetupInstallStreamingBtn.Content = "Configured ✓";
+                    SetupInstallStreamingBtn.IsEnabled = false;
+                }
+                else
+                {
+                    allConfigured = false;
+                    string missing = (!sunOk && !moonOk) ? "Sunshine & Moonlight missing" : (!sunOk ? "Sunshine missing" : "Moonlight missing");
+                    SetupDisplayStatusText.Text = $"Status: {missing}. 1-click install via WinGet.";
+                    SetupDisplayStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 232, 158, 27));
+                    SetupInstallStreamingBtn.Content = "Install Display Tools";
+                    SetupInstallStreamingBtn.IsEnabled = true;
+                }
+
+                // 2. Passkey Touch ID
+                bool passkeyOk = PasskeyAuthenticatorPlugin.IsRegistered || PasskeyAuthenticatorPlugin.IsActive;
+                if (passkeyOk)
+                {
+                    SetupPasskeyStatusText.Text = "Status: Registered with Windows 11 WebAuthn (Active)";
+                    SetupPasskeyStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90));
+                    SetupEnablePasskeyBtn.Content = "Registered ✓";
+                    SetupEnablePasskeyBtn.IsEnabled = false;
+                }
+                else
+                {
+                    allConfigured = false;
+                    SetupPasskeyStatusText.Text = "Status: Not registered yet. 1-click registration.";
+                    SetupPasskeyStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 232, 158, 27));
+                    SetupEnablePasskeyBtn.Content = "Enable Touch ID";
+                    SetupEnablePasskeyBtn.IsEnabled = true;
+                }
+
+                // 3. USB-C NCM & SMB Sharing
+                var ncm = s.Dependencies.FirstOrDefault(d => d.Id == "usb_ncm" || d.Id == "usbncm");
+                var smb = s.Permissions.FirstOrDefault(p => p.Id == "smb_server");
+                bool ncmOk = ncm?.Installed == true;
+                bool smbOk = smb?.Granted == true;
+
+                if (ncmOk && smbOk)
+                {
+                    SetupUsbNcmStatusText.Text = "Status: USB-C link & SMB sharing configured (Ready)";
+                    SetupUsbNcmStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90));
+                    SetupEnableUsbNcmBtn.Content = "Configured ✓";
+                    SetupEnableUsbNcmBtn.IsEnabled = false;
+                }
+                else
+                {
+                    allConfigured = false;
+                    string missing = (!ncmOk && !smbOk) ? "USB-C driver & SMB share not ready" : (!ncmOk ? "USB-C driver not ready" : "SMB share not started");
+                    SetupUsbNcmStatusText.Text = $"Status: {missing}. 1-click setup.";
+                    SetupUsbNcmStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 232, 158, 27));
+                    SetupEnableUsbNcmBtn.Content = "Setup USB-C & SMB";
+                    SetupEnableUsbNcmBtn.IsEnabled = true;
+                }
+            }
+
+            if (allConfigured)
+            {
+                SetupHeaderSubtitleText.Text = "All features are already installed and configured. Your workstation continuity is fully ready!";
+                SetupHeaderSubtitleText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90));
+            }
+            else
+            {
+                SetupHeaderSubtitleText.Text = "Set up seamless cross-device features between your Windows PC and Mac in one click. No terminal scripts required.";
+                SetupHeaderSubtitleText.Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+            }
+
+            return allConfigured;
         }
 
         // MARK: - Permissions & Setup Assistant Dialog
@@ -2319,6 +2694,384 @@ namespace IntegratorUI
             finally
             {
                 _isSetupDialogOpen = false;
+            }
+        }
+
+        // MARK: - Quit Confirmation & Live Process Shutdown Progress
+
+        /// <summary>
+        /// Displays a quit confirmation dialog (with "Don't ask again") warning that all Integrator
+        /// features and background processes will stop working, then runs the visible step-by-step
+        /// process shutdown dialog before terminating the application.
+        /// </summary>
+        internal async Task RequestQuitAsync()
+        {
+            if (_isQuitFlowRunning || _disposedForExit) return;
+            _isQuitFlowRunning = true;
+            bool wasHidden = _isHiddenToTray || !AppWindow.IsVisible;
+
+            try
+            {
+                // Bring the window visible so WinUI 3 ContentDialog has a valid XamlRoot and is front-and-center.
+                if (wasHidden)
+                {
+                    RestoreAndActivate();
+                }
+                else
+                {
+                    Activate();
+                }
+
+                // Wait briefly for initial XamlRoot layout if launched directly via --minimized.
+                for (int i = 0; i < 20 && RootGrid?.XamlRoot == null; i++)
+                {
+                    await Task.Delay(50);
+                }
+
+                if (RootGrid?.XamlRoot == null)
+                {
+                    _app.ExitApplication();
+                    return;
+                }
+
+                if (!UiPreferences.SkipQuitConfirmation)
+                {
+                    var warnHeader = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 10
+                    };
+                    warnHeader.Children.Add(new FontIcon
+                    {
+                        Glyph = "\uE7BA",
+                        FontSize = 20,
+                        Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 232, 163, 23)),
+                        VerticalAlignment = VerticalAlignment.Center
+                    });
+                    warnHeader.Children.Add(new TextBlock
+                    {
+                        Text = "All Integrator features will stop working.",
+                        FontSize = 14,
+                        FontWeight = FontWeights.SemiBold,
+                        VerticalAlignment = VerticalAlignment.Center,
+                        TextWrapping = TextWrapping.Wrap
+                    });
+
+                    var bodyText = new TextBlock
+                    {
+                        Text = "Are you sure you want to quit Integrator?\n\n" +
+                               "Quitting will shut down all Integrator background processes — including KVM mouse & keyboard sharing, Universal Clipboard & Drag-and-Drop, Extended Screen, Shared Camera, Dynamic Audio Routing, Shared Storage, and Passkey bridging.",
+                        FontSize = 13,
+                        TextWrapping = TextWrapping.Wrap,
+                        Opacity = 0.88
+                    };
+
+                    var dontAskCheck = new CheckBox
+                    {
+                        Content = "Don't ask again",
+                        FontSize = 12,
+                        Margin = new Thickness(0, 6, 0, 0)
+                    };
+
+                    var confirmStack = new StackPanel { Spacing = 10, MaxWidth = 420 };
+                    confirmStack.Children.Add(warnHeader);
+                    confirmStack.Children.Add(bodyText);
+                    confirmStack.Children.Add(dontAskCheck);
+
+                    var confirmDlg = new ContentDialog
+                    {
+                        Title = "Quit Integrator?",
+                        Content = confirmStack,
+                        PrimaryButtonText = "Quit Integrator",
+                        CloseButtonText = "Cancel",
+                        DefaultButton = ContentDialogButton.Close,
+                        XamlRoot = RootGrid.XamlRoot
+                    };
+
+                    var result = await confirmDlg.ShowAsync();
+                    if (result != ContentDialogResult.Primary)
+                    {
+                        if (wasHidden)
+                        {
+                            HideToTray();
+                        }
+                        return;
+                    }
+
+                    if (dontAskCheck.IsChecked == true)
+                    {
+                        UiPreferences.SkipQuitConfirmation = true;
+                        SyncConfirmQuitSwitch();
+                    }
+                }
+
+                await RunVisualShutdownAndExitAsync();
+            }
+            catch
+            {
+                _app.ExitApplication();
+            }
+            finally
+            {
+                _isQuitFlowRunning = false;
+            }
+        }
+
+        /// <summary>
+        /// Displays a non-dismissible shutdown progress dialog while stopping every Integrator
+        /// subsystem and background process sequentially, then terminates the app cleanly.
+        /// </summary>
+        private async Task RunVisualShutdownAndExitAsync()
+        {
+            CleanupForExit();
+
+            var steps = new (string Id, string Title, string Detail)[]
+            {
+                ("audio",   "Dynamic Audio Routing",            "Stopping WASAPI capture & UDP sink…"),
+                ("camera",  "Shared Camera",                    "Stopping virtual camera streams…"),
+                ("display", "Extended Display & GPU",           "Stopping Moonlight, virtual display & gamma…"),
+                ("storage", "Clipboard, Storage & Passkey Host","Clearing cache, unmounting & stopping PasskeyHost…"),
+                ("kvm",     "KVM Hooks & Core Services",        "Releasing input hooks & closing sockets…")
+            };
+
+            var headerRing = new ProgressRing { Width = 22, Height = 22, IsActive = true };
+            var headerCheck = new FontIcon
+            {
+                Glyph = "\uE73E",
+                FontSize = 18,
+                Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90)),
+                Visibility = Visibility.Collapsed
+            };
+            var headerText = new TextBlock
+            {
+                Text = "Stopping all Integrator processes and background services…",
+                FontSize = 13,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            var headerRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            headerRow.Children.Add(headerRing);
+            headerRow.Children.Add(headerCheck);
+            headerRow.Children.Add(headerText);
+
+            var rowsPanel = new StackPanel { Spacing = 8, Margin = new Thickness(0, 6, 0, 0) };
+            var rowWidgets = new Dictionary<string, (FontIcon Pending, ProgressRing Spinner, FontIcon Done, TextBlock Status)>();
+
+            foreach (var step in steps)
+            {
+                var row = new Grid { ColumnSpacing = 10 };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(20) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                var pending = new FontIcon
+                {
+                    Glyph = "\uEA3A",
+                    FontSize = 12,
+                    Opacity = 0.45,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                var spinner = new ProgressRing
+                {
+                    Width = 14,
+                    Height = 14,
+                    IsActive = false,
+                    Visibility = Visibility.Collapsed
+                };
+                var done = new FontIcon
+                {
+                    Glyph = "\uE73E",
+                    FontSize = 13,
+                    Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90)),
+                    Visibility = Visibility.Collapsed,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+
+                var iconHost = new Grid { Width = 20, Height = 20 };
+                iconHost.Children.Add(pending);
+                iconHost.Children.Add(spinner);
+                iconHost.Children.Add(done);
+                Grid.SetColumn(iconHost, 0);
+
+                var labelStack = new StackPanel { Spacing = 1 };
+                labelStack.Children.Add(new TextBlock
+                {
+                    Text = step.Title,
+                    FontSize = 13,
+                    FontWeight = FontWeights.SemiBold
+                });
+                var statusLbl = new TextBlock
+                {
+                    Text = "Waiting…",
+                    FontSize = 11,
+                    Opacity = 0.7
+                };
+                labelStack.Children.Add(statusLbl);
+                Grid.SetColumn(labelStack, 1);
+
+                row.Children.Add(iconHost);
+                row.Children.Add(labelStack);
+                rowsPanel.Children.Add(row);
+
+                rowWidgets[step.Id] = (pending, spinner, done, statusLbl);
+            }
+
+            var contentStack = new StackPanel { Spacing = 10, MinWidth = 380 };
+            contentStack.Children.Add(headerRow);
+            contentStack.Children.Add(new Border
+            {
+                Height = 1,
+                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(40, 128, 128, 128))
+            });
+            contentStack.Children.Add(rowsPanel);
+
+            bool allowClose = false;
+            var shutdownDlg = new ContentDialog
+            {
+                Title = "Shutting Down Integrator…",
+                Content = contentStack,
+                XamlRoot = RootGrid.XamlRoot
+            };
+            shutdownDlg.Closing += (_, e) =>
+            {
+                if (!allowClose) e.Cancel = true;
+            };
+
+            // Show dialog asynchronously so we can drive live step transitions while it stays open.
+            var showTask = shutdownDlg.ShowAsync().AsTask();
+
+            foreach (var step in steps)
+            {
+                var w = rowWidgets[step.Id];
+                w.Pending.Visibility = Visibility.Collapsed;
+                w.Spinner.Visibility = Visibility.Visible;
+                w.Spinner.IsActive = true;
+                w.Status.Text = step.Detail;
+
+                await Task.Run(() =>
+                {
+                    try
+                    {
+                        CoreBridge.Invoke<string>("shutdown_subsystem", new { step = step.Id });
+                    }
+                    catch { }
+
+                    if (step.Id == "storage")
+                    {
+                        try
+                        {
+                            PasskeyAuthenticatorPlugin.Shutdown();
+                            App.TerminateSessionPasskeyHosts();
+                        }
+                        catch { }
+                    }
+                    else if (step.Id == "kvm")
+                    {
+                        try
+                        {
+                            CoreBridge.Shutdown();
+                        }
+                        catch { }
+                    }
+                });
+
+                await Task.Delay(140);
+
+                w.Spinner.IsActive = false;
+                w.Spinner.Visibility = Visibility.Collapsed;
+                w.Done.Visibility = Visibility.Visible;
+                w.Status.Text = "Stopped";
+                w.Status.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 32, 184, 90));
+                w.Status.Opacity = 1.0;
+            }
+
+            _app.DisposeTrayIcon();
+            headerRing.IsActive = false;
+            headerRing.Visibility = Visibility.Collapsed;
+            headerCheck.Visibility = Visibility.Visible;
+            headerText.Text = "All Integrator processes stopped. Quitting…";
+            shutdownDlg.Title = "Integrator Stopped";
+
+            await Task.Delay(450);
+
+            allowClose = true;
+            shutdownDlg.Hide();
+            try { await showTask; } catch { }
+
+            _app.FinishExitAfterVisualShutdown();
+        }
+    }
+
+    /// <summary>
+    /// Persists lightweight Windows UI preferences (such as "Don't ask again" on quit,
+    /// and initial setup completion state) under %LOCALAPPDATA%\Integrator\ui_prefs.json.
+    /// </summary>
+    internal static class UiPreferences
+    {
+        private sealed class PrefsModel
+        {
+            [System.Text.Json.Serialization.JsonPropertyName("skip_quit_confirmation")]
+            public bool SkipQuitConfirmation { get; set; }
+
+            [System.Text.Json.Serialization.JsonPropertyName("has_completed_initial_setup")]
+            public bool HasCompletedInitialSetup { get; set; }
+        }
+
+        private static string PrefsPath => System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Integrator",
+            "ui_prefs.json");
+
+        private static PrefsModel LoadModel()
+        {
+            try
+            {
+                if (System.IO.File.Exists(PrefsPath))
+                {
+                    string json = System.IO.File.ReadAllText(PrefsPath);
+                    return JsonSerializer.Deserialize<PrefsModel>(json) ?? new PrefsModel();
+                }
+            }
+            catch { }
+            return new PrefsModel();
+        }
+
+        private static void SaveModel(PrefsModel model)
+        {
+            try
+            {
+                string? dir = System.IO.Path.GetDirectoryName(PrefsPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    System.IO.Directory.CreateDirectory(dir);
+                }
+                string json = JsonSerializer.Serialize(model);
+                System.IO.File.WriteAllText(PrefsPath, json);
+            }
+            catch { }
+        }
+
+        public static bool SkipQuitConfirmation
+        {
+            get => LoadModel().SkipQuitConfirmation;
+            set
+            {
+                var m = LoadModel();
+                m.SkipQuitConfirmation = value;
+                SaveModel(m);
+            }
+        }
+
+        public static bool HasCompletedInitialSetup
+        {
+            get => LoadModel().HasCompletedInitialSetup;
+            set
+            {
+                var m = LoadModel();
+                m.HasCompletedInitialSetup = value;
+                SaveModel(m);
             }
         }
     }

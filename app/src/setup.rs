@@ -260,6 +260,8 @@ pub enum DependencyId {
     UsbNcm,
     /// Windows 11 Media Foundation Virtual Camera COM Server (`integrator_vcam.dll`).
     Vcam,
+    /// CoreAudio Audio Server Plugin HAL Driver (`IntegratorAudioDriver.driver`).
+    AudioDriver,
 }
 
 impl DependencyId {
@@ -274,8 +276,9 @@ impl DependencyId {
             "sunshine" => Ok(Self::Sunshine),
             "moonlight" => Ok(Self::Moonlight),
             "vdd" => Ok(Self::Vdd),
-            "usb_ncm" => Ok(Self::UsbNcm),
+            "usb_ncm" | "usbncm" => Ok(Self::UsbNcm),
             "vcam" => Ok(Self::Vcam),
+            "audio_driver" => Ok(Self::AudioDriver),
             other => Err(format!("Unsupported or unknown dependency ID: '{}'", other)),
         }
     }
@@ -288,6 +291,7 @@ impl DependencyId {
             Self::Vdd => "vdd",
             Self::UsbNcm => "usb_ncm",
             Self::Vcam => "vcam",
+            Self::AudioDriver => "audio_driver",
         }
     }
 
@@ -299,6 +303,7 @@ impl DependencyId {
             Self::Vdd => config::VDD_DOWNLOAD_URL,
             Self::UsbNcm => config::USBNCM_GUIDE_URL,
             Self::Vcam => config::VCAM_DOCS_URL,
+            Self::AudioDriver => "https://github.com/Manveer-Singh-99/Integrator",
         }
     }
 }
@@ -864,6 +869,40 @@ fn find_bundled_script(rel_path: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// Executes a shell script on macOS with native graphical administrator elevation (`osascript`).
+#[cfg(target_os = "macos")]
+fn run_elevated_macos_script(script_path: &Path, prompt: &str) -> Result<String, String> {
+    if !script_path.is_file() {
+        return Err(format!("Installer script not found at '{}'", script_path.display()));
+    }
+    let script_str = script_path.to_string_lossy();
+    let escaped_path = script_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_prompt = prompt.replace('\\', "\\\\").replace('"', "\\\"");
+    let apple_script = format!(
+        "do shell script \"bash \\\"{}\\\"\" with prompt \"{}\" with administrator privileges",
+        escaped_path, escaped_prompt
+    );
+    let out = Command::new(config::MACOS_OSASCRIPT_BIN)
+        .args(["-e", &apple_script])
+        .output()
+        .map_err(|e| format!("Failed to invoke osascript: {}", e))?;
+    if out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if msg.is_empty() {
+            Ok("Installed successfully.".to_string())
+        } else {
+            Ok(msg)
+        }
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.contains("User canceled") {
+            "Installation canceled by user.".to_string()
+        } else {
+            format!("Installation failed: {}", err)
+        })
+    }
+}
+
 // ============================================================================
 // Platform Probes: macOS & Windows Permissions + Dependencies
 // ============================================================================
@@ -1143,16 +1182,19 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
     #[cfg(target_os = "macos")]
     let (sunshine_running, sunshine_method, sunshine_cmd) = {
         let proc_up = sunshine_port_open || is_macos_process_running("sunshine");
-        let method = if find_homebrew_binary().is_some() {
-            "Homebrew"
+        let has_brew = find_homebrew_binary().is_some();
+        let (method, cmd) = if has_brew {
+            (
+                "Homebrew (Recommended)".to_string(),
+                config::BREW_INSTALL_SUNSHINE_CMD.to_string(),
+            )
         } else {
-            "GitHub Release"
+            (
+                "Direct DMG (No Homebrew required)".to_string(),
+                "Download official DMG from GitHub releases and drag to Applications".to_string(),
+            )
         };
-        (
-            proc_up,
-            method.to_string(),
-            config::BREW_INSTALL_SUNSHINE_CMD.to_string(),
-        )
+        (proc_up, method, cmd)
     };
 
     #[cfg(target_os = "windows")]
@@ -1181,10 +1223,10 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
     deps.push(DependencyStatus {
         id: DependencyId::Sunshine.as_str().to_string(),
         name: "Sunshine / Apollo Display Host".to_string(),
-        description: "Hardware-accelerated low-latency video encoder host (VideoToolbox on Mac; NVENC/AMF/QuickSync on Windows) for screen extension.".to_string(),
+        description: "Hardware-accelerated low-latency video encoder (VideoToolbox / NVENC). Optional: only needed if you want to extend or mirror your Mac display to Windows PC.".to_string(),
         installed: sunshine_installed,
         running: Some(sunshine_running),
-        required: true,
+        required: false,
         detected_path: sunshine_bin.map(|p| p.to_string_lossy().into_owned()),
         install_method: sunshine_method,
         install_command: sunshine_cmd,
@@ -1197,16 +1239,19 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
     #[cfg(target_os = "macos")]
     let (moonlight_running, moonlight_method, moonlight_cmd) = {
         let proc_up = is_macos_process_running("Moonlight");
-        let method = if find_homebrew_binary().is_some() {
-            "Homebrew"
+        let has_brew = find_homebrew_binary().is_some();
+        let (method, cmd) = if has_brew {
+            (
+                "Homebrew (Recommended)".to_string(),
+                config::BREW_INSTALL_MOONLIGHT_CMD.to_string(),
+            )
         } else {
-            "GitHub Release"
+            (
+                "Direct DMG (No Homebrew required)".to_string(),
+                "Download official DMG from GitHub releases and drag to Applications".to_string(),
+            )
         };
-        (
-            proc_up,
-            method.to_string(),
-            config::BREW_INSTALL_MOONLIGHT_CMD.to_string(),
-        )
+        (proc_up, method, cmd)
     };
 
     #[cfg(target_os = "windows")]
@@ -1234,10 +1279,10 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
     deps.push(DependencyStatus {
         id: DependencyId::Moonlight.as_str().to_string(),
         name: "Moonlight Streaming Client".to_string(),
-        description: "Hardware-accelerated low-latency stream viewer rendering extended displays at up to 4K 120Hz/240Hz.".to_string(),
+        description: "Hardware-accelerated low-latency stream viewer rendering extended displays at up to 4K 120Hz/240Hz. Optional: only needed if you want to use your Mac as a second display for your Windows PC.".to_string(),
         installed: moonlight_bin.is_some(),
         running: Some(moonlight_running),
-        required: true,
+        required: false,
         detected_path: moonlight_bin.map(|p| p.to_string_lossy().into_owned()),
         install_method: moonlight_method,
         install_command: moonlight_cmd,
@@ -1254,7 +1299,8 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
             .map(|c| parse_macos_usbncm_plist_installed(&c))
             .unwrap_or_else(|_| plist_path.is_file());
         let installed = plist_ok && watchdog_path.is_file();
-        let script_path = find_bundled_script(config::MACOS_INSTALL_SCRIPT_REL_PATH);
+        let script_path = find_bundled_script(config::MACOS_INSTALL_SCRIPT_REL_PATH)
+            .or_else(|| find_bundled_script("install-macos.sh"));
         let cmd_str = script_path
             .as_ref()
             .map(|p| format!("sudo bash \"{}\"", p.display()))
@@ -1262,7 +1308,7 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
         deps.push(DependencyStatus {
             id: DependencyId::UsbNcm.as_str().to_string(),
             name: "Apple USB-C NCM Direct-Link Watchdog".to_string(),
-            description: "Zero-polling event-driven LaunchDaemon that auto-configures 10.99.99.2/24 over any direct Mac-to-PC USB-C cable.".to_string(),
+            description: "Direct Cable Plug-and-Play: Zero-polling background daemon that auto-configures 40Gbps networking (10.99.99.2) the instant you connect a direct USB-C or Thunderbolt cable between Mac and PC. Optional: only needed for direct cable linking without Wi-Fi.".to_string(),
             installed,
             running: Some(installed),
             required: false,
@@ -1271,9 +1317,39 @@ fn probe_dependencies_uncached() -> Vec<DependencyStatus> {
             } else {
                 script_path.map(|p| p.to_string_lossy().into_owned())
             },
-            install_method: "Guided Terminal Script".to_string(),
+            install_method: "1-Click LaunchDaemon Installer".to_string(),
             install_command: cmd_str,
             download_url: DependencyId::UsbNcm.download_url().to_string(),
+            can_auto_install: true,
+        });
+    }
+
+    // 4. macOS CoreAudio HAL Audio Server Plugin (Integrator Audio Driver)
+    #[cfg(target_os = "macos")]
+    {
+        let driver_path = Path::new("/Library/Audio/Plug-Ins/HAL/IntegratorAudioDriver.driver");
+        let installed = driver_path.is_dir() || driver_path.exists();
+        let script_path = find_bundled_script("macos/audio-driver/install-audio-driver.sh")
+            .or_else(|| find_bundled_script("install-audio-driver.sh"));
+        let cmd_str = script_path
+            .as_ref()
+            .map(|p| format!("sudo bash \"{}\"", p.display()))
+            .unwrap_or_else(|| "sudo bash macos/audio-driver/install-audio-driver.sh".to_string());
+        deps.push(DependencyStatus {
+            id: DependencyId::AudioDriver.as_str().to_string(),
+            name: "CoreAudio HAL Sound Sink (Integrator Audio)".to_string(),
+            description: "Native macOS Virtual Sound Device: Creates 'Windows PC (Integrator)' in macOS Control Center and Sound Settings. Routes Mac system audio (YouTube, Spotify, games) directly to Windows PC speakers with sub-5ms latency. Optional: only needed if you want to stream Mac sound to PC.".to_string(),
+            installed,
+            running: Some(installed),
+            required: false,
+            detected_path: if installed {
+                Some(driver_path.to_string_lossy().into_owned())
+            } else {
+                script_path.map(|p| p.to_string_lossy().into_owned())
+            },
+            install_method: "1-Click System HAL Driver Installer".to_string(),
+            install_command: cmd_str,
+            download_url: DependencyId::AudioDriver.download_url().to_string(),
             can_auto_install: true,
         });
     }
@@ -1954,9 +2030,8 @@ fn install_dependency_by_id(dep_id: DependencyId) -> Result<String, String> {
                 }
                 open_allowlisted_uri(config::SUNSHINE_DOWNLOAD_URL)?;
                 Ok(format!(
-                    "Opened Sunshine releases page ({}). You can also install via `{}`.",
-                    config::SUNSHINE_DOWNLOAD_URL,
-                    config::BREW_INSTALL_SUNSHINE_CMD
+                    "No Homebrew detected. Opened official Sunshine GitHub DMG download page in your browser ({}). Download the macOS DMG and drag Sunshine to Applications.",
+                    config::SUNSHINE_DOWNLOAD_URL
                 ))
             }
             #[cfg(target_os = "windows")]
@@ -2004,9 +2079,8 @@ fn install_dependency_by_id(dep_id: DependencyId) -> Result<String, String> {
                 }
                 open_allowlisted_uri(config::MOONLIGHT_DOWNLOAD_URL)?;
                 Ok(format!(
-                    "Opened Moonlight releases page ({}). You can also install via `{}`.",
-                    config::MOONLIGHT_DOWNLOAD_URL,
-                    config::BREW_INSTALL_MOONLIGHT_CMD
+                    "No Homebrew detected. Opened official Moonlight GitHub DMG download page in your browser ({}). Download the macOS DMG and drag Moonlight to Applications.",
+                    config::MOONLIGHT_DOWNLOAD_URL
                 ))
             }
             #[cfg(target_os = "windows")]
@@ -2049,21 +2123,17 @@ fn install_dependency_by_id(dep_id: DependencyId) -> Result<String, String> {
         DependencyId::UsbNcm => {
             #[cfg(target_os = "macos")]
             {
-                if let Some(script_path) = find_bundled_script(config::MACOS_INSTALL_SCRIPT_REL_PATH)
-                {
-                    let mut cmd = Command::new(config::MACOS_OPEN_BIN);
-                    cmd.args(["-R", &script_path.to_string_lossy()]);
-                    let _ = spawn_and_reap_setup(cmd, "reveal-usbncm-mac");
-                    Ok(format!(
-                        "Revealed installer in Finder. Run in Terminal: sudo bash \"{}\"",
-                        script_path.display()
-                    ))
-                } else {
-                    Ok(format!(
-                        "Run in Terminal from the Integrator folder: {}",
-                        MACOS_USBNCM_DEFAULT_INSTALL_CMD
-                    ))
+                let script_path = find_bundled_script(config::MACOS_INSTALL_SCRIPT_REL_PATH)
+                    .or_else(|| find_bundled_script("install-macos.sh"));
+                if let Some(script) = script_path {
+                    let res = run_elevated_macos_script(
+                        &script,
+                        "Integrator requires administrator privileges to configure the USB-C NCM direct-link LaunchDaemon in /Library/LaunchDaemons."
+                    )?;
+                    return Ok(format!("Apple USB-C NCM direct-link configured: {}", res));
                 }
+                open_allowlisted_uri(config::USBNCM_GUIDE_URL)?;
+                Ok(format!("Opened USB-C direct-link guide at {}", config::USBNCM_GUIDE_URL))
             }
             #[cfg(target_os = "windows")]
             {
@@ -2095,6 +2165,26 @@ fn install_dependency_by_id(dep_id: DependencyId) -> Result<String, String> {
             #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             {
                 Ok(MACOS_USBNCM_DEFAULT_INSTALL_CMD.to_string())
+            }
+        }
+        DependencyId::AudioDriver => {
+            #[cfg(target_os = "macos")]
+            {
+                let script_path = find_bundled_script("macos/audio-driver/install-audio-driver.sh")
+                    .or_else(|| find_bundled_script("install-audio-driver.sh"));
+                if let Some(script) = script_path {
+                    let res = run_elevated_macos_script(
+                        &script,
+                        "Integrator requires administrator privileges to install the CoreAudio HAL audio driver to /Library/Audio/Plug-Ins/HAL."
+                    )?;
+                    return Ok(format!("CoreAudio HAL audio driver installed: {}", res));
+                }
+                open_allowlisted_uri("https://github.com/Manveer-Singh-99/Integrator")?;
+                Ok("Opened Integrator documentation to review Audio Driver installation.".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok("Audio driver is only applicable to macOS.".to_string())
             }
         }
         DependencyId::Vcam => {
@@ -2257,6 +2347,7 @@ mod tests {
             ("vdd", DependencyId::Vdd),
             ("usb_ncm", DependencyId::UsbNcm),
             ("vcam", DependencyId::Vcam),
+            ("audio_driver", DependencyId::AudioDriver),
         ];
         for (raw, expected) in valid_ids {
             let parsed = DependencyId::parse(raw).expect("valid DependencyId should parse");

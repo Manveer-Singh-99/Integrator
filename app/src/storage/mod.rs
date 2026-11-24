@@ -333,6 +333,18 @@ impl StorageManager {
             .and_then(|s| validate_smb_share_name(&s).ok())
     }
 
+    /// Checks whether automatic SMB share mounting on peer detection is enabled.
+    pub fn is_auto_mount_on_peer_detect() -> bool {
+        system_info::load_path_preferences().auto_mount_on_peer_detect
+    }
+
+    /// Enables or disables automatic SMB share mounting on peer detection.
+    pub fn set_auto_mount_on_peer_detect(enabled: bool) -> std::io::Result<()> {
+        let mut prefs = system_info::load_path_preferences();
+        prefs.auto_mount_on_peer_detect = enabled;
+        system_info::save_path_preferences(&prefs)
+    }
+
     /// Checks whether an SMB share is currently active and mounted locally.
     #[allow(dead_code)]
     pub fn is_mounted() -> bool {

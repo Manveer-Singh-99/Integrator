@@ -262,6 +262,7 @@ impl WinDisplayManager {
         fps: u32,
         bitrate_kbps: u32,
         audio_on_host: bool,
+        hdr: bool,
     ) -> Result<()> {
         if !system_info::is_valid_ipv4(mac_ip) {
             anyhow::bail!("Invalid host IPv4 address for Moonlight: {}", mac_ip);
@@ -311,6 +312,9 @@ impl WinDisplayManager {
         ]);
         if audio_on_host {
             cmd.arg("--audio-on-host");
+        }
+        if hdr {
+            cmd.arg("--hdr");
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())

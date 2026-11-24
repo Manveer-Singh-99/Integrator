@@ -63,6 +63,20 @@ if [ -f "$APP_DIR/icons/icon.icns" ]; then
     cp "$APP_DIR/icons/icon.icns" "$OUT_BUNDLE/Contents/Resources/icon.icns"
 fi
 
+if [ -d "$REPO_ROOT/macos/audio-driver/build/IntegratorAudioDriver.driver" ]; then
+    cp -R "$REPO_ROOT/macos/audio-driver/build/IntegratorAudioDriver.driver" "$OUT_BUNDLE/Contents/Resources/"
+fi
+
+if [ -f "$REPO_ROOT/macos/audio-driver/install-audio-driver.sh" ]; then
+    cp "$REPO_ROOT/macos/audio-driver/install-audio-driver.sh" "$OUT_BUNDLE/Contents/Resources/"
+    chmod 755 "$OUT_BUNDLE/Contents/Resources/install-audio-driver.sh"
+fi
+
+if [ -f "$REPO_ROOT/macos/install-macos.sh" ]; then
+    cp "$REPO_ROOT/macos/install-macos.sh" "$OUT_BUNDLE/Contents/Resources/"
+    chmod 755 "$OUT_BUNDLE/Contents/Resources/install-macos.sh"
+fi
+
 cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,7 +118,42 @@ cat << EOF > "$OUT_BUNDLE/Contents/Info.plist"
 </plist>
 EOF
 
-codesign --force --deep --sign - "$OUT_BUNDLE"
+# Ensure persistent developer code signing identity exists so TCC permissions (Accessibility, Input Monitoring) NEVER reset across builds
+KEYCHAIN_PATH="$HOME/.integrator_codesign/integrator.keychain-db"
+CERT_PATH="$HOME/.integrator_codesign/cert.pem"
+
+if [ ! -f "$KEYCHAIN_PATH" ] || [ ! -f "$CERT_PATH" ]; then
+    echo "Creating persistent Integrator developer code-signing identity (so Accessibility permissions never reset)..."
+    mkdir -p "$HOME/.integrator_codesign"
+    CNF_PATH="$HOME/.integrator_codesign/cert.cnf"
+    KEY_PATH="$HOME/.integrator_codesign/key.pem"
+    P12_PATH="$HOME/.integrator_codesign/cert.p12"
+    cat << 'CNF_EOF' > "$CNF_PATH"
+[ req ]
+default_bits       = 2048
+distinguished_name = req_dn
+prompt             = no
+[ req_dn ]
+CN = Integrator Development Code Signing
+[ v3_ca ]
+basicConstraints = critical, CA:FALSE
+keyUsage = digitalSignature
+extendedKeyUsage = 1.3.6.1.5.5.7.3.3
+CNF_EOF
+    openssl req -x509 -new -nodes -keyout "$KEY_PATH" -out "$CERT_PATH" -days 3650 -config "$CNF_PATH" -extensions v3_ca
+    openssl pkcs12 -export -out "$P12_PATH" -inkey "$KEY_PATH" -in "$CERT_PATH" -passout pass:integrator -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+    security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+    security create-keychain -p "integrator" "$KEYCHAIN_PATH"
+    security unlock-keychain -p "integrator" "$KEYCHAIN_PATH"
+    security set-keychain-settings "$KEYCHAIN_PATH"
+    security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "integrator" -T /usr/bin/codesign
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "integrator" "$KEYCHAIN_PATH"
+    security add-trusted-cert -d -r trustRoot -p codeSign "$CERT_PATH" 2>/dev/null || true
+fi
+
+security unlock-keychain -p "integrator" "$KEYCHAIN_PATH" 2>/dev/null || true
+echo "Signing bundle with persistent Integrator identity (prevents TCC permission resets)..."
+codesign --force --deep --keychain "$KEYCHAIN_PATH" --sign "Integrator Development Code Signing" "$OUT_BUNDLE"
 echo "Built Universal app bundle: $OUT_BUNDLE"
 file "$OUT_BUNDLE/Contents/MacOS/integrator"
 
@@ -114,7 +163,7 @@ ditto "$OUT_BUNDLE" "$SCRIPT_DIR/build/Integrator.app"
 echo "Mirrored to: $SCRIPT_DIR/build/Integrator.app"
 
 if [ "$INSTALL_TO_APPS" -eq 1 ]; then
-    echo "Installing to ${INSTALL_DIR}/Integrator.app (note: ad-hoc re-sign may require re-enabling Accessibility permission)..."
+    echo "Installing to ${INSTALL_DIR}/Integrator.app (signed with persistent identity: Accessibility permissions will NOT reset)..."
     mkdir -p "$INSTALL_DIR"
     rm -rf "${INSTALL_DIR}/Integrator.app"
     ditto "$OUT_BUNDLE" "${INSTALL_DIR}/Integrator.app"

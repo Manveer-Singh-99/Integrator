@@ -245,6 +245,9 @@ pub struct CameraStatus {
     /// Friendly device name exposed for the shared virtual camera (defaults to [`DEFAULT_CAMERA_FRIENDLY_NAME`]).
     #[serde(default = "default_camera_device_name")]
     pub device_name: String,
+    /// Whether the Hardware Camera Privacy Killswitch shutter is actively muting outgoing frames.
+    #[serde(default)]
+    pub privacy_muted: bool,
 }
 
 /// Parsed, zero-copy camera frame received over the network transport.
@@ -444,11 +447,109 @@ extern "C" {
     fn integrator_mac_camera_start() -> i32;
     fn integrator_mac_camera_stop();
     fn integrator_mac_camera_is_running() -> i32;
+    fn integrator_mac_camera_list_json(out_buf: *mut std::os::raw::c_char, cap: i32) -> i32;
+    fn integrator_mac_camera_select(device_id_utf8: *const std::os::raw::c_char) -> i32;
     #[allow(dead_code)]
     fn integrator_mac_prompt_camera_consent(peer_name: *const std::os::raw::c_char) -> bool;
     fn integrator_mac_prompt_camera_consent_scoped(peer_name: *const std::os::raw::c_char, timeout_sec: i32) -> i32;
     #[allow(dead_code)]
     fn integrator_mac_cancel_camera_consent_prompt();
+}
+
+/// Serializable descriptor for a discovered camera hardware/continuity device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CameraDeviceWire {
+    pub id: String,
+    pub name: String,
+    pub is_active: bool,
+}
+
+/// Enumerates all connected video capture devices on macOS (FaceTime HD, Continuity Camera, external webcams).
+pub fn list_available_cameras() -> Vec<CameraDeviceWire> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 8192];
+        let n = unsafe {
+            integrator_mac_camera_list_json(buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len() as i32)
+        };
+        if n > 0 {
+            if let Ok(s) = std::str::from_utf8(&buf[..n as usize]) {
+                if let Ok(list) = serde_json::from_str::<Vec<CameraDeviceWire>>(s) {
+                    return list;
+                }
+            }
+        }
+        Vec::new()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Selects a specific video capture device by unique device identifier.
+pub fn select_camera_device(device_id: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(c_str) = std::ffi::CString::new(device_id) {
+            let res = unsafe { integrator_mac_camera_select(c_str.as_ptr()) };
+            return res == 1;
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device_id;
+        false
+    }
+}
+
+/// Global atomic gate for the Hardware Camera Privacy Killswitch shutter.
+///
+/// When `true`, `integrator_on_mac_camera_frame` immediately substitutes a precomputed
+/// studio-black privacy-shutter NV12 frame instead of live FaceTime HD pixels, keeping
+/// the Windows virtual webcam stream alive (so Zoom/Teams/OBS never drops) while cutting
+/// the live camera image instantaneously.
+static CAMERA_PRIVACY_MUTED: AtomicBool = AtomicBool::new(false);
+
+/// Precomputed 1280x720 NV12 privacy shutter frame (zero per-frame allocations).
+///
+/// Uses broadcast studio black (`Y = 16`, `UV = 128`) with a subtle centered matte slate
+/// shutter band (`Y = 38`) so remote conferencing apps show a clean closed-shutter state.
+fn privacy_shutter_nv12_frame() -> &'static [u8] {
+    static FRAME: OnceLock<Vec<u8>> = OnceLock::new();
+    FRAME.get_or_init(|| {
+        let y_bytes = (CAMERA_WIDTH * CAMERA_HEIGHT) as usize;
+        let mut buf = vec![16u8; NV12_FRAME_BYTES];
+        // Neutral chroma (UV = 128) across the entire interleaved UV plane
+        buf[y_bytes..].fill(128u8);
+        // Subtle centered matte privacy-shutter bar (16px tall across center third)
+        let w = CAMERA_WIDTH as usize;
+        let y_start = (CAMERA_HEIGHT as usize / 2).saturating_sub(8);
+        let y_end = y_start + 16;
+        let x_start = w / 3;
+        let x_end = (w * 2) / 3;
+        for row in y_start..y_end {
+            let row_off = row * w;
+            buf[row_off + x_start..row_off + x_end].fill(40u8);
+        }
+        buf
+    })
+}
+
+/// Returns whether the hardware camera privacy shutter killswitch is currently engaged.
+pub fn is_camera_privacy_muted() -> bool {
+    CAMERA_PRIVACY_MUTED.load(Ordering::Acquire)
+}
+
+/// Engages or disengages the hardware camera privacy shutter killswitch and notifies Touch Bar HUD.
+pub fn set_camera_privacy_muted(muted: bool) -> bool {
+    CAMERA_PRIVACY_MUTED.store(muted, Ordering::SeqCst);
+    info!(
+        "📹 Hardware Camera Privacy Shutter {}",
+        if muted { "ENGAGED (feeding black NV12 shutter frames)" } else { "RELEASED (live camera active)" }
+    );
+    muted
 }
 
 /// C FFI callback invoked by `camera_macos.swift` upon capturing a new video sample buffer.
@@ -474,8 +575,12 @@ pub extern "C" fn integrator_on_mac_camera_frame(
     if data.is_null() || len as usize != NV12_FRAME_BYTES || width != CAMERA_WIDTH || height != CAMERA_HEIGHT {
         return;
     }
-    // SAFETY: Caller (`camera_macos.swift`) guarantees `data` stays valid for `len` bytes during callback.
-    let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    let slice: &[u8] = if CAMERA_PRIVACY_MUTED.load(Ordering::Acquire) {
+        privacy_shutter_nv12_frame()
+    } else {
+        // SAFETY: Caller (`camera_macos.swift`) guarantees `data` stays valid for `len` bytes during callback.
+        unsafe { std::slice::from_raw_parts(data, len as usize) }
+    };
     if let Ok(encoded) = encode_camera_frame(
         width as u16,
         height as u16,
@@ -3098,6 +3203,7 @@ impl CameraService {
                     #[cfg(target_os = "macos")]
                     {
                         self.set_state("Camera Active", None);
+                        crate::core::notify_touchbar_camera_state(true, is_camera_privacy_muted());
                         info!("📷 Mac camera capture started (720p30 NV12)");
                     }
                 }
@@ -3436,6 +3542,7 @@ impl CameraService {
             prev
         };
         self.active.store(false, Ordering::SeqCst);
+        crate::core::notify_touchbar_camera_state(false, is_camera_privacy_muted());
         if was_running || self.lifecycle.backend.is_capture_running() {
             self.lifecycle.backend.stop_capture();
             self.lifecycle
@@ -3516,7 +3623,22 @@ impl CameraService {
             last_error: self.last_error.lock().ok().and_then(|e| e.clone()),
             port: CAMERA_PORT,
             device_name: DEFAULT_CAMERA_FRIENDLY_NAME.to_string(),
+            privacy_muted: is_camera_privacy_muted(),
         }
+    }
+
+    /// Sets the hardware privacy shutter mute state and updates the macOS Touch Bar pill immediately.
+    pub fn set_privacy_muted(&self, muted: bool) -> bool {
+        let res = set_camera_privacy_muted(muted);
+        let active = self.active.load(Ordering::Relaxed);
+        crate::core::notify_touchbar_camera_state(active, res);
+        res
+    }
+
+    /// Toggles the hardware privacy shutter killswitch and returns the new muted state.
+    pub fn toggle_privacy_muted(&self) -> bool {
+        let next = !is_camera_privacy_muted();
+        self.set_privacy_muted(next)
     }
 }
 
@@ -4970,6 +5092,7 @@ mod tests {
         barrier.wait();
         backend.wait_for_stop_count(1).await;
         wait_for_lingering_count(&svc, 0).await;
+        wait_for_reaped_total(&svc, 1).await;
         assert_eq!(backend.stop_calls(), 1);
         assert_eq!(svc.shutdown_execution_count(), 1);
         assert!(!svc.is_active());
@@ -5291,5 +5414,22 @@ mod tests {
         assert!(!svc.has_peer_consent(peer, 1));
         assert!(*rx.borrow(), "Revocation must signal stream cancellation watch");
         assert_eq!(svc.frame_hub.active_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn test_camera_privacy_shutter_nv12_frame_and_toggle() {
+        let frame = privacy_shutter_nv12_frame();
+        assert_eq!(frame.len(), NV12_FRAME_BYTES);
+        let y_bytes = (CAMERA_WIDTH * CAMERA_HEIGHT) as usize;
+        // Top-left corner luma is studio black (16), entire UV plane is neutral (128)
+        assert_eq!(frame[0], 16);
+        assert!(frame[y_bytes..].iter().all(|&b| b == 128));
+
+        let prev = is_camera_privacy_muted();
+        assert!(set_camera_privacy_muted(true));
+        assert!(is_camera_privacy_muted());
+        assert!(!set_camera_privacy_muted(false));
+        assert!(!is_camera_privacy_muted());
+        let _ = set_camera_privacy_muted(prev);
     }
 }

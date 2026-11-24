@@ -562,6 +562,10 @@ namespace IntegratorUI
         [JsonPropertyName("is_active")] public bool IsActive { get; set; }
         /// <summary>Active UDP transport port bound for spatial audio streaming.</summary>
         [JsonPropertyName("port")] public ushort Port { get; set; } = DefaultAudioPort;
+        /// <summary>Cross-platform audio mixer balance (-1.0 Mac boost to +1.0 Windows boost).</summary>
+        [JsonPropertyName("mixer_balance")] public float MixerBalance { get; set; }
+        /// <summary>True if the remote Windows soundbar sink is muted.</summary>
+        [JsonPropertyName("sink_muted")] public bool SinkMuted { get; set; }
     }
 
     /// <summary>
@@ -606,6 +610,18 @@ namespace IntegratorUI
         [JsonPropertyName("port")] public ushort Port { get; set; } = DefaultCameraPort;
         /// <summary>Friendly display name advertised by the Windows virtual camera.</summary>
         [JsonPropertyName("device_name")] public string DeviceName { get; set; } = DefaultCameraDeviceName;
+        /// <summary>True if the hardware camera privacy shutter killswitch is engaged.</summary>
+        [JsonPropertyName("privacy_muted")] public bool PrivacyMuted { get; set; }
+    }
+
+    /// <summary>
+    /// Discovered camera hardware/continuity device.
+    /// </summary>
+    internal sealed class CameraDeviceModel
+    {
+        [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+        [JsonPropertyName("is_active")] public bool IsActive { get; set; }
     }
 
     /// <summary>
@@ -685,6 +701,8 @@ namespace IntegratorUI
         [JsonPropertyName("peer_height")] public uint PeerHeight { get; set; }
         /// <summary>Filename label of payload currently being dragged across displays.</summary>
         [JsonPropertyName("active_drag_label")] public string? ActiveDragLabel { get; set; }
+        /// <summary>True if KVM Gaming Boundary Lock is freezing cursor edge-hopping.</summary>
+        [JsonPropertyName("boundary_locked")] public bool BoundaryLocked { get; set; }
         /// <summary>Desk monitor arrangement layout settings.</summary>
         [JsonPropertyName("layout")] public KvmLayoutConfigModel Layout { get; set; } = new();
     }
@@ -823,6 +841,8 @@ namespace IntegratorUI
         [JsonPropertyName("memory_total_mb")] public ulong MemoryTotalMb { get; set; }
         /// <summary>GPU core clock frequency in MHz.</summary>
         [JsonPropertyName("core_clock_mhz")] public uint CoreClockMhz { get; set; }
+        /// <summary>All detected physical GPUs installed in the machine.</summary>
+        [JsonPropertyName("all_gpus")] public List<string> AllGpus { get; set; } = new List<string>();
     }
 
     /// <summary>
@@ -922,6 +942,8 @@ namespace IntegratorUI
         [JsonPropertyName("preferred_peer_share")] public string? PreferredPeerShare { get; set; }
         /// <summary>User-configured local shared directory path.</summary>
         [JsonPropertyName("local_shared_folder")] public string? LocalSharedFolder { get; set; }
+        /// <summary>True if SMB share should automatically mount upon peer detection.</summary>
+        [JsonPropertyName("auto_mount_storage")] public bool AutoMountStorage { get; set; }
 
         /// <summary>Spatial audio routing status.</summary>
         [JsonPropertyName("audio_status")] public AudioRoutingStatusModel AudioStatus { get; set; } = new();

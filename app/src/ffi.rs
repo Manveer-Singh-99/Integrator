@@ -278,6 +278,8 @@ pub extern "C" fn integrator_core_shutdown() {
         if let Some(core) = GLOBAL_CORE.get() {
             core.shutdown();
         } else {
+            // Ensure partial-init audio resources are latched shut even before GLOBAL_CORE.set() (AUD-1G7-07)
+            crate::audio::AudioManager::shutdown_sync();
             register_ui_callback(None);
         }
     }));

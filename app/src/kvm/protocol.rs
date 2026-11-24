@@ -382,6 +382,12 @@ pub enum KvmWireMessage {
     /// Emitted on disconnect, network error, or feature deactivation to prevent stuck keys.
     ReleaseAll,
 
+    /// Synchronizes KVM Gaming Boundary Lock state so edge-hopping is frozen during full-screen games.
+    SetBoundaryLock {
+        /// `true` to lock the cursor to its current screen and disable edge-hopping.
+        locked: bool,
+    },
+
     /// Keep-alive ping frame to verify end-to-end transport responsiveness and detect link loss.
     Ping,
 }

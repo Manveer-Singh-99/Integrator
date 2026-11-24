@@ -108,6 +108,9 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
     /// Active AVFoundation capture session managing input device and video data output.
     private var session: AVCaptureSession?
 
+    /// User-selected or explicitly requested camera device ID.
+    private var selectedDeviceId: String?
+
     /// Reusable contiguous heap buffer holding tightly-packed NV12 frame bytes.
     private var packedBuffer = Data()
 
@@ -217,6 +220,80 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
         return AVCaptureDevice.default(for: .video)
     }
 
+    /// Discovers all connected, active video capture devices.
+    private static func allDiscoveredDevices() -> [AVCaptureDevice] {
+        var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+        if #available(macOS 14.0, *) {
+            deviceTypes.append(.external)
+            deviceTypes.append(.continuityCamera)
+        } else {
+            deviceTypes.append(.externalUnknown)
+        }
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .video,
+            position: .unspecified
+        )
+        return session.devices.filter { $0.isConnected && !$0.isSuspended }
+    }
+
+    /// Finds a specific camera device by unique identifier.
+    private static func discoverDeviceWithId(_ id: String) -> AVCaptureDevice? {
+        return allDiscoveredDevices().first { $0.uniqueID == id }
+    }
+
+    /// Enumerates all available camera devices as JSON string.
+    func listCamerasJson() -> String {
+        let devices = Self.allDiscoveredDevices()
+        lock.lock()
+        let activeId = self.selectedDeviceId ?? Self.discoverPreferredCameraDevice()?.uniqueID ?? ""
+        lock.unlock()
+
+        let list: [[String: Any]] = devices.map { dev in
+            [
+                "id": dev.uniqueID,
+                "name": dev.localizedName,
+                "is_active": (dev.uniqueID == activeId)
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: list, options: []),
+              let s = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return s
+    }
+
+    /// Selects a specific camera device by unique ID. If capture is actively running, hot-swaps the device input.
+    func selectCamera(deviceId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let target = Self.discoverDeviceWithId(deviceId) else {
+            return false
+        }
+        self.selectedDeviceId = deviceId
+
+        guard let currentSession = self.session, currentSession.isRunning else {
+            return true
+        }
+
+        do {
+            currentSession.beginConfiguration()
+            for input in currentSession.inputs {
+                currentSession.removeInput(input)
+            }
+            let newInput = try AVCaptureDeviceInput(device: target)
+            if currentSession.canAddInput(newInput) {
+                currentSession.addInput(newInput)
+            }
+            currentSession.commitConfiguration()
+            return true
+        } catch {
+            currentSession.commitConfiguration()
+            return false
+        }
+    }
+
     /// Returns `true` if at least one physical, external USB, or Continuity video capture device is present.
     func hasCameraHardware() -> Bool {
         return Self.discoverPreferredCameraDevice() != nil
@@ -252,10 +329,11 @@ private final class MacCameraCaptureController: NSObject, AVCaptureVideoDataOutp
             lock.unlock()
             return 0
         }
+        let targetDevId = self.selectedDeviceId
         lock.unlock()
 
         // Verify that a built-in, external USB, or Continuity camera exists before prompting or starting
-        guard let device = Self.discoverPreferredCameraDevice() else {
+        guard let device = (targetDevId.flatMap { Self.discoverDeviceWithId($0) }) ?? Self.discoverPreferredCameraDevice() else {
             return -3
         }
 
@@ -492,4 +570,26 @@ public func integrator_mac_camera_stop() {
 @_cdecl("integrator_mac_camera_is_running")
 public func integrator_mac_camera_is_running() -> Int32 {
     return MacCameraCaptureController.shared.isRunning() ? 1 : 0
+}
+
+/// Returns available video capture devices as a JSON string written to `outBuf`.
+/// Returns the byte count written (excluding trailing null), or negative error code.
+@_cdecl("integrator_mac_camera_list_json")
+public func integrator_mac_camera_list_json(outBuf: UnsafeMutablePointer<CChar>, cap: Int32) -> Int32 {
+    let json = MacCameraCaptureController.shared.listCamerasJson()
+    let cStr = json.utf8CString
+    if cStr.count > cap {
+        return -1
+    }
+    _ = cStr.withUnsafeBufferPointer { buf in
+        outBuf.initialize(from: buf.baseAddress!, count: buf.count)
+    }
+    return Int32(cStr.count - 1)
+}
+
+/// Selects the active video capture device on macOS by its unique device ID. Returns 1 on success, 0 on failure.
+@_cdecl("integrator_mac_camera_select")
+public func integrator_mac_camera_select(deviceIdUtf8: UnsafePointer<CChar>) -> Int32 {
+    let id = String(cString: deviceIdUtf8)
+    return MacCameraCaptureController.shared.selectCamera(deviceId: id) ? 1 : 0
 }

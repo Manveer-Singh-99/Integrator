@@ -38,9 +38,13 @@ core-foundation = "0.10"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Devices_Bluetooth_Advertisement",
+    "Media_Control",
     "Storage_Streams",
     "Foundation",
     "Foundation_Collections",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
 ] }
 
 [lib]

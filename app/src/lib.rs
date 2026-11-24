@@ -109,6 +109,9 @@ pub mod ffi;
 /// Seamless cross-machine mouse, keyboard, and gesture routing with coordinate normalization.
 pub(crate) mod kvm;
 
+/// Windows GSMTC media session telemetry and remote playback transport controls.
+pub(crate) mod media;
+
 /// Cryptographic security layer implementing SPAKE2+, X25519, ChaCha20-Poly1305, and replay protection.
 pub(crate) mod security;
 

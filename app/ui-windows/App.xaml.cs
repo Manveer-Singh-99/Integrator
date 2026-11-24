@@ -98,7 +98,7 @@ namespace IntegratorUI
             // 2. Initialize the native Win32 system tray icon with action callbacks
             _tray = new TrayIconManager(
                 onShowWindow: () => dispatcher.TryEnqueue(ShowMainWindow),
-                onQuit: () => dispatcher.TryEnqueue(ExitApplication)
+                onQuit: () => dispatcher.TryEnqueue(RequestQuit)
             );
 
             // 3. Register reverse event handler for asynchronous events pushed from integrator_core.dll
@@ -150,6 +150,90 @@ namespace IntegratorUI
         }
 
         /// <summary>
+        /// Initiates user-requested quit flow (shows quit confirmation unless suppressed,
+        /// then displays live step-by-step process shutdown progress before terminating).
+        /// </summary>
+        public void RequestQuit()
+        {
+            if (_exiting) { return; }
+            if (_window != null)
+            {
+                _ = _window.RequestQuitAsync();
+            }
+            else
+            {
+                ExitApplication(fromCoreQuitEvent: false);
+            }
+        }
+
+        /// <summary>
+        /// Terminates any lingering IntegratorPasskeyHost processes owned by the current Windows session
+        /// so no background Integrator helper processes remain running after full Quit.
+        /// </summary>
+        internal static void TerminateSessionPasskeyHosts()
+        {
+            try
+            {
+                int currentSession = System.Diagnostics.Process.GetCurrentProcess().SessionId;
+                foreach (var proc in System.Diagnostics.Process.GetProcessesByName("IntegratorPasskeyHost"))
+                {
+                    try
+                    {
+                        if (proc.SessionId == currentSession && !proc.HasExited)
+                        {
+                            proc.Kill();
+                            proc.WaitForExit(1500);
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        proc.Dispose();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Disposes the Win32 system tray icon safely during graceful shutdown.
+        /// </summary>
+        internal void DisposeTrayIcon()
+        {
+            try
+            {
+                _tray?.Dispose();
+                _tray = null;
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Completes process exit after <see cref="MainWindow"/> has finished executing and
+        /// displaying all subsystem teardown steps.
+        /// </summary>
+        internal void FinishExitAfterVisualShutdown()
+        {
+            if (_exiting) { return; }
+            _exiting = true;
+
+            if (_uiEventHandler != null)
+            {
+                CoreBridge.UiEventReceived -= _uiEventHandler;
+                _uiEventHandler = null;
+            }
+
+            try
+            {
+                _window?.CleanupForExit();
+            }
+            catch { }
+
+            DisposeTrayIcon();
+            Exit();
+        }
+
+        /// <summary>
         /// Initiates normal user-requested application termination sequence.
         /// </summary>
         public void ExitApplication() => ExitApplication(fromCoreQuitEvent: false);
@@ -178,12 +262,7 @@ namespace IntegratorUI
             catch { }
 
             // Destroy the Win32 notification icon and unregister its window class
-            try
-            {
-                _tray?.Dispose();
-                _tray = null;
-            }
-            catch { }
+            DisposeTrayIcon();
 
             // Notify core backend of user exit if initiated from UI
             if (!fromCoreQuitEvent)
@@ -194,6 +273,14 @@ namespace IntegratorUI
                 }
                 catch { }
             }
+
+            // Stop Windows passkey helper process in this session
+            try
+            {
+                PasskeyAuthenticatorPlugin.Shutdown();
+                TerminateSessionPasskeyHosts();
+            }
+            catch { }
 
             // Perform synchronous shutdown of Rust runtime (Tokio listeners, network sockets)
             CoreBridge.Shutdown();

@@ -214,6 +214,36 @@ fn resolve_vdd_stream_dimensions(
     }
 }
 
+/// User-selected display resolution, refresh rate (Hz), and HDR override applied via Touch Bar or UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayModeOverride {
+    /// Target horizontal resolution in pixels (`0` uses native peer display width).
+    pub width: u32,
+    /// Target vertical resolution in pixels (`0` uses native peer display height).
+    pub height: u32,
+    /// Target refresh rate in Hertz (`60`, `120`, `165`, etc.).
+    pub fps: u32,
+    /// Whether HDR video streaming should be enabled.
+    pub hdr: bool,
+}
+
+/// RAII guard illuminating the animated Touch Bar Touch ID sensor pointer during biometric evaluation
+/// and guaranteeing dismissal on return, error, or panic.
+struct TouchBarTouchIdGuard;
+
+impl TouchBarTouchIdGuard {
+    fn activate(label: &str) -> Self {
+        crate::core::notify_touchbar_touchid_prompt(label, true);
+        Self
+    }
+}
+
+impl Drop for TouchBarTouchIdGuard {
+    fn drop(&mut self) {
+        crate::core::notify_touchbar_touchid_prompt("", false);
+    }
+}
+
 /// Stateful controller managing extended display sessions, bitrate calculations, and RPC routing.
 #[derive(Clone)]
 pub struct DisplayController {
@@ -235,6 +265,8 @@ pub struct DisplayController {
     host_peer_id: Arc<RwLock<Option<String>>>,
     /// Device ID hex of the peer whose screen this machine is viewing via Moonlight client.
     client_peer_id: Arc<RwLock<Option<String>>>,
+    /// Optional user-selected display resolution / refresh rate / HDR override.
+    preferred_mode: Arc<RwLock<Option<DisplayModeOverride>>>,
 }
 
 impl DisplayController {
@@ -254,7 +286,86 @@ impl DisplayController {
             active_peer_ip: Arc::new(RwLock::new(None)),
             host_peer_id: Arc::new(RwLock::new(None)),
             client_peer_id: Arc::new(RwLock::new(None)),
+            preferred_mode: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Returns the currently configured display mode override `(width, height, fps, hdr)` if any.
+    pub async fn get_preferred_mode(&self) -> Option<DisplayModeOverride> {
+        *self.preferred_mode.read().await
+    }
+
+    /// Applies a new display resolution, refresh rate (Hz), and HDR preference, immediately
+    /// reconfiguring any active extended display session without opening system settings.
+    pub async fn set_display_mode(&self, width: u32, height: u32, fps: u32, hdr: bool) -> Result<String> {
+        let clamped_fps = if fps > 0 {
+            fps.clamp(config::MIN_DISPLAY_FPS, config::MAX_DISPLAY_FPS)
+        } else {
+            config::DEFAULT_DISPLAY_FPS
+        };
+        let clamped_w = if width > 0 {
+            width.clamp(config::MIN_DISPLAY_WIDTH, config::MAX_DISPLAY_WIDTH) & !1
+        } else {
+            0
+        };
+        let clamped_h = if height > 0 {
+            height.clamp(config::MIN_DISPLAY_HEIGHT, config::MAX_DISPLAY_HEIGHT) & !1
+        } else {
+            0
+        };
+
+        let next_mode = DisplayModeOverride {
+            width: clamped_w,
+            height: clamped_h,
+            fps: clamped_fps,
+            hdr,
+        };
+        *self.preferred_mode.write().await = Some(next_mode);
+        crate::core::notify_touchbar_display_mode(clamped_w, clamped_h, clamped_fps, hdr);
+
+        let is_host = *self.host_active.read().await;
+        let is_client = *self.client_active.read().await;
+
+        // If we are currently hosting an extended display, hot-reconfigure the active stream
+        if is_host {
+            let _tx = self.transition_lock.lock().await;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = self.stop_mac_to_pc_locked().await;
+                self.start_mac_to_pc_locked().await?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = self.stop_pc_to_mac_locked().await;
+                self.start_pc_to_mac_locked().await?;
+            }
+        } else if is_client {
+            // Forward the mode update to the peer currently hosting our extended display
+            let target_ip = match self.active_peer_ip.read().await.clone() {
+                Some(ip) => Some(ip),
+                None => self.discovery.get_peer_ip().await,
+            };
+            if let Some(peer_ip) = target_ip {
+                let rpc = DisplayRpcRequest::SetDisplayMode {
+                    width: clamped_w,
+                    height: clamped_h,
+                    fps: clamped_fps,
+                    hdr,
+                };
+                let resp = Self::send_remote_rpc(&peer_ip, &rpc).await?;
+                if !resp.success {
+                    anyhow::bail!("{}", resp.message);
+                }
+            }
+        }
+
+        let res_label = if clamped_w > 0 && clamped_h > 0 {
+            format!("{}x{}", clamped_w, clamped_h)
+        } else {
+            "Native".to_string()
+        };
+        let hdr_label = if hdr { " HDR" } else { "" };
+        Ok(format!("Display mode set to {} @ {}Hz{}", res_label, clamped_fps, hdr_label))
     }
 
     /// Constructs a baseline [`DisplayRpcResponse`] populated with current active state.
@@ -598,8 +709,12 @@ impl DisplayController {
             tokio::task::spawn_blocking(|| -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
-                    crate::display::mac_display::MacDisplayManager::stop_virtual_display()?;
-                    crate::display::mac_display::MacDisplayManager::stop_sunshine()?;
+                    if let Err(e) = crate::display::mac_display::MacDisplayManager::stop_virtual_display() {
+                        tracing::warn!("Virtual display teardown notice: {}", e);
+                    }
+                    if let Err(e) = crate::display::mac_display::MacDisplayManager::stop_sunshine() {
+                        tracing::warn!("Sunshine host stop notice: {}", e);
+                    }
                 }
                 #[cfg(target_os = "windows")]
                 {
@@ -650,10 +765,21 @@ impl DisplayController {
             .flatten()
             .with_context(|| format!("Could not determine local route IP to reach peer {}", peer_ip))?;
 
-        let (w, h, fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
+        let (mut w, mut h, mut fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
+        let mut hdr = false;
+        if let Some(ov) = *self.preferred_mode.read().await {
+            if ov.width > 0 && ov.height > 0 {
+                w = ov.width;
+                h = ov.height;
+            }
+            if ov.fps > 0 {
+                fps = ov.fps;
+            }
+            hdr = ov.hdr;
+        }
         info!(
-            "Starting Mac-to-PC extended display (Host: {}, Client: {} [{}], Mode: {}x{} @ {}Hz)",
-            my_ip, peer_hostname, peer_ip, w, h, fps
+            "Starting Mac-to-PC extended display (Host: {}, Client: {} [{}], Mode: {}x{} @ {}Hz{})",
+            my_ip, peer_hostname, peer_ip, w, h, fps, if hdr { " HDR" } else { "" }
         );
 
         // 1. Spawn virtual display matching peer display dimensions and configure Sunshine output ID
@@ -712,6 +838,7 @@ impl DisplayController {
             fps,
             bitrate_kbps,
             audio_on_host: false,
+            hdr,
         };
 
         let resp = match Self::send_remote_rpc(&peer_ip, &rpc).await {
@@ -840,10 +967,21 @@ impl DisplayController {
             .flatten()
             .with_context(|| format!("Could not determine local route IP to reach peer {}", peer_ip))?;
 
-        let (w, h, fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
+        let (mut w, mut h, mut fps, peer_hostname) = self.resolve_peer_display_and_host(&peer).await;
+        let mut hdr = false;
+        if let Some(ov) = *self.preferred_mode.read().await {
+            if ov.width > 0 && ov.height > 0 {
+                w = ov.width;
+                h = ov.height;
+            }
+            if ov.fps > 0 {
+                fps = ov.fps;
+            }
+            hdr = ov.hdr;
+        }
         info!(
-            "Starting PC-to-Mac extended display (Host: {}, Client: {} [{}], Mode: {}x{} @ {}Hz)",
-            my_ip, peer_hostname, peer_ip, w, h, fps
+            "Starting PC-to-Mac extended display (Host: {}, Client: {} [{}], Mode: {}x{} @ {}Hz{})",
+            my_ip, peer_hostname, peer_ip, w, h, fps, if hdr { " HDR" } else { "" }
         );
 
         // 1. Enable Windows virtual display / secondary Sunshine if present
@@ -930,6 +1068,7 @@ impl DisplayController {
             fps,
             bitrate_kbps,
             audio_on_host: false,
+            hdr,
         };
 
         let resp = match Self::send_remote_rpc(&peer_ip, &rpc).await {
@@ -1007,6 +1146,9 @@ impl DisplayController {
                 | DisplayRpcRequest::ShowWindow
                 | DisplayRpcRequest::GetPairingPin
                 | DisplayRpcRequest::PairWithPeer { .. }
+                | DisplayRpcRequest::RouteRemoteAudio { .. }
+                | DisplayRpcRequest::StopAudioRouting
+                | DisplayRpcRequest::GetAudioStatus
         ) && !is_loopback_caller
             && !is_authorized_remote_toggle
         {
@@ -1061,6 +1203,7 @@ impl DisplayController {
                 fps,
                 bitrate_kbps,
                 audio_on_host,
+                hdr,
             } => {
                 let caller_ip_str = peer_ip.map(|ip| ip.to_string()).unwrap_or_default();
                 let is_loopback_caller = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
@@ -1194,6 +1337,7 @@ impl DisplayController {
                             eff_fps,
                             eff_bitrate,
                             audio_on_host,
+                            hdr,
                         )
                     } else {
                         MacDisplayManager::start_moonlight_client(
@@ -1205,6 +1349,7 @@ impl DisplayController {
                             eff_fps,
                             eff_bitrate,
                             audio_on_host,
+                            hdr,
                         )
                     }
                 })
@@ -1216,7 +1361,12 @@ impl DisplayController {
                         *self.client_active.write().await = true;
                         *self.client_peer_id.write().await = peer_device_id.map(|s| s.trim().to_ascii_lowercase());
                         *self.active_peer_ip.write().await = Some(effective_host_ip.clone());
-                        *self.active_mode.write().await = Some("Client".into());
+                        let client_mode_str = if cfg!(target_os = "windows") {
+                            "Mac -> PC (Client)"
+                        } else {
+                            "PC -> Mac (Client)"
+                        };
+                        *self.active_mode.write().await = Some(client_mode_str.into());
                         self.base_response(
                             true,
                             format!(
@@ -1441,11 +1591,22 @@ impl DisplayController {
                         .base_response(false, "Missing peer IP for audio session negotiation")
                         .await;
                 };
-                let auth_id = peer_device_id.map(|s| s.to_string());
+                // Fail-closed: require authenticated, non-revoked peer_device_id (AUD-1G7-15)
+                let Some(auth_id_raw) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) else {
+                    return self
+                        .base_response(false, "Audio session negotiation requires authenticated peer identity")
+                        .await;
+                };
+                if crate::security::transport::is_peer_revoked(auth_id_raw) {
+                    return self
+                        .base_response(false, "Audio session negotiation rejected: requesting peer is revoked")
+                        .await;
+                }
+                let auth_id = auth_id_raw.to_string();
                 let nonce_arg = sender_nonce_hex;
                 let neg_res = tokio::task::spawn_blocking(move || {
                     crate::audio::AudioManager::handle_negotiate_session_for_peer(
-                        auth_id.as_deref(),
+                        Some(auth_id.as_str()),
                         caller_ip,
                         &nonce_arg,
                         sample_rate,
@@ -1475,6 +1636,109 @@ impl DisplayController {
                             .await
                     }
                 }
+            }
+            DisplayRpcRequest::StartAudioCapture {
+                sample_rate,
+                channels,
+                bit_depth,
+            } => {
+                let Some(caller_ip) = peer_ip else {
+                    return self
+                        .base_response(false, "Missing peer IP for audio capture request")
+                        .await;
+                };
+                // Fail-closed: require authenticated, non-revoked peer_device_id (AUD-1G7-15)
+                let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) else {
+                    return self
+                        .base_response(false, "StartAudioCapture requires authenticated peer identity")
+                        .await;
+                };
+                if crate::security::transport::is_peer_revoked(auth_id) {
+                    return self
+                        .base_response(false, "StartAudioCapture rejected: requesting peer is revoked")
+                        .await;
+                }
+                let ip_str = caller_ip.to_string();
+                let Some(peer_creds) = trust::lookup_verified_peer_by_id_at_ip(auth_id, caller_ip) else {
+                    return self
+                        .base_response(
+                            false,
+                            format!("Peer {} ({}) is not cryptographically paired or verified", auth_id, ip_str),
+                        )
+                        .await;
+                };
+                let res = crate::audio::AudioManager::start_capture_and_stream_for_peer(
+                    &ip_str,
+                    peer_creds,
+                    sample_rate,
+                    channels,
+                    bit_depth,
+                )
+                .await;
+                match res {
+                    Ok(msg) => self.base_response(true, msg).await,
+                    Err(e) => {
+                        self.base_response(false, format!("Failed to start audio capture: {}", e))
+                            .await
+                    }
+                }
+            }
+            DisplayRpcRequest::StopAudioCapture => {
+                let Some(caller_ip) = peer_ip else {
+                    return self
+                        .base_response(false, "Missing peer IP for stop audio capture")
+                        .await;
+                };
+                // Fail-closed: require authenticated, non-revoked peer_device_id and enforce session ownership (AUD-1G7-15)
+                let Some(auth_id) = peer_device_id.map(str::trim).filter(|s| !s.is_empty()) else {
+                    return self
+                        .base_response(false, "StopAudioCapture requires authenticated peer identity")
+                        .await;
+                };
+                if crate::security::transport::is_peer_revoked(auth_id) {
+                    return self
+                        .base_response(false, "StopAudioCapture rejected: requesting peer is revoked")
+                        .await;
+                }
+                let ip_str = caller_ip.to_string();
+                let Some(peer_creds) = trust::lookup_verified_peer_by_id_at_ip(auth_id, caller_ip) else {
+                    return self
+                        .base_response(
+                            false,
+                            format!("Peer {} ({}) is not cryptographically paired or verified", auth_id, ip_str),
+                        )
+                        .await;
+                };
+                match crate::audio::AudioManager::stop_capture_for_peer(&peer_creds.device_id).await {
+                    Ok(msg) => self.base_response(true, msg).await,
+                    Err(err) => self.base_response(false, err).await,
+                }
+            }
+            DisplayRpcRequest::RouteRemoteAudio { peer_ip: target_ip } => {
+                let res = crate::audio::AudioManager::start_audio_routing(&target_ip).await;
+                match res {
+                    Ok(msg) => self.base_response(true, msg).await,
+                    Err(e) => {
+                        self.base_response(false, format!("Failed to start audio routing: {}", e))
+                            .await
+                    }
+                }
+            }
+            DisplayRpcRequest::StopAudioRouting => {
+                let res = crate::audio::AudioManager::stop_audio_routing().await;
+                match res {
+                    Ok(msg) => self.base_response(true, msg).await,
+                    Err(e) => {
+                        self.base_response(false, format!("Failed to stop audio routing: {}", e))
+                            .await
+                    }
+                }
+            }
+            DisplayRpcRequest::GetAudioStatus => {
+                let st = crate::audio::AudioManager::status();
+                let mut resp = self.base_response(true, "Audio status retrieved").await;
+                resp.audio_status = Some(st);
+                resp
             }
             DisplayRpcRequest::GetPairingPin => {
                 let (pin, _ttl_secs) = trust::open_or_get_pairing_pin();
@@ -1621,6 +1885,26 @@ impl DisplayController {
                     self.base_response(false, "Core not initialized").await
                 }
             }
+            DisplayRpcRequest::ListCameras => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                let mut resp = self.base_response(true, "Camera list retrieved").await;
+                resp.available_cameras = Some(crate::camera::list_available_cameras());
+                resp
+            }
+            DisplayRpcRequest::SelectCamera { device_id } => {
+                if !self.features.is_enabled("camera") {
+                    return self.base_response(false, "Rejected: feature 'camera' is disabled on this device").await;
+                }
+                let ok = crate::camera::select_camera_device(&device_id);
+                let msg = if ok {
+                    format!("Selected camera '{}'", device_id)
+                } else {
+                    format!("Failed to select camera '{}'", device_id)
+                };
+                self.base_response(ok, msg).await
+            }
             DisplayRpcRequest::VerifyTouchId {
                 challenge_nonce_hex,
                 requester_hostname,
@@ -1638,6 +1922,8 @@ impl DisplayController {
                 };
                 let nonce = challenge_nonce_hex.trim().to_ascii_lowercase();
                 let req_host = requester_hostname.trim().to_string();
+                let host_label = if req_host.is_empty() { "Windows Hello Login" } else { &req_host };
+                let _tb_guard = TouchBarTouchIdGuard::activate(&format!("Approve {}", host_label));
                 crate::core::emit_ui_toast(
                     "info",
                     &format!(
@@ -1685,6 +1971,7 @@ impl DisplayController {
                 }
                 let req_copy = make_req.clone();
                 let rp_id_label = req_copy.rp_id.clone();
+                let _tb_guard = TouchBarTouchIdGuard::activate(&format!("Create Passkey: {}", rp_id_label));
                 crate::core::emit_ui_toast(
                     "info",
                     &format!(
@@ -1729,6 +2016,7 @@ impl DisplayController {
                 }
                 let req_copy = assert_req.clone();
                 let rp_id_label = req_copy.rp_id.clone();
+                let _tb_guard = TouchBarTouchIdGuard::activate(&format!("Sign in to {}", rp_id_label));
                 crate::core::emit_ui_toast(
                     "info",
                     &format!(
@@ -1765,6 +2053,67 @@ impl DisplayController {
                         crate::core::emit_ui_toast("error", &format!("Passkey sign-in failed: {}", err_msg));
                         self.base_response(false, err_msg).await
                     }
+                }
+            }
+            DisplayRpcRequest::NotifyTouchIdPrompt { label, active } => {
+                let clean = crate::media::sanitize_media_text(&label, 64);
+                let effective = if clean.is_empty() {
+                    "Approve Windows Hello Login".to_string()
+                } else {
+                    clean
+                };
+                crate::core::notify_touchbar_touchid_prompt(&effective, active);
+                self.base_response(
+                    true,
+                    if active {
+                        format!("Touch ID Touch Bar prompt illuminated: {}", effective)
+                    } else {
+                        "Touch ID Touch Bar prompt dismissed".to_string()
+                    },
+                )
+                .await
+            }
+            DisplayRpcRequest::SetDisplayMode {
+                width,
+                height,
+                fps,
+                hdr,
+            } => match self.set_display_mode(width, height, fps, hdr).await {
+                Ok(msg) => self.base_response(true, msg).await,
+                Err(e) => self.base_response(false, e.to_string()).await,
+            },
+            DisplayRpcRequest::SetKvmBoundaryLock { locked } => {
+                if let Some(core) = crate::core::GLOBAL_CORE.get() {
+                    core.kvm.set_boundary_locked(locked, false);
+                    self.base_response(
+                        true,
+                        if locked {
+                            "KVM boundary locked".to_string()
+                        } else {
+                            "KVM boundary unlocked".to_string()
+                        },
+                    )
+                    .await
+                } else {
+                    self.base_response(false, "Integrator core not initialized").await
+                }
+            }
+            DisplayRpcRequest::GetMediaState => {
+                let st = tokio::task::spawn_blocking(crate::media::query_media_state)
+                    .await
+                    .unwrap_or_default();
+                let mut resp = self.base_response(true, "Media state queried").await;
+                resp.media_state = Some(st);
+                resp
+            }
+            DisplayRpcRequest::SendMediaCommand { action } => {
+                let act = action.clone();
+                let res = tokio::task::spawn_blocking(move || crate::media::execute_media_command(&act))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Media task panicked: {}", e)));
+                match res {
+                    Ok(msg) => self.base_response(true, msg).await,
+                    Err(err) => self.base_response(false, err).await,
                 }
             }
         }
@@ -2173,5 +2522,130 @@ mod tests {
         let resp_stop_revoked = ctrl.handle_rpc(DisplayRpcRequest::StopCamera, Some(caller_ip), Some(revoked_peer)).await;
         assert!(!resp_stop_revoked.success);
         assert!(resp_stop_revoked.message.contains("requesting peer is revoked"));
+    }
+
+    #[tokio::test]
+    async fn test_audio_routing_rpc_authorization_and_loopback_restriction() {
+        // Use in-memory test feature flags so cargo test NEVER mutates live features.json (AUD-1G7-18).
+        let flags_enabled = crate::features::FeatureFlags {
+            audio: true,
+            ..Default::default()
+        };
+        let features = Arc::new(FeatureManager::from_flags_for_test(flags_enabled));
+        let discovery = DiscoveryManager::new("disp_audio_auth_test");
+        let ctrl = DisplayController::new(discovery, features.clone());
+
+        let remote_ip = "192.168.1.50".parse().unwrap();
+        let loopback_ip = "127.0.0.1".parse().unwrap();
+
+        // 1. Remote caller requesting RouteRemoteAudio must be rejected by loopback restriction
+        let resp = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::RouteRemoteAudio {
+                    peer_ip: "192.168.1.1".to_string(),
+                },
+                Some(remote_ip),
+                None,
+            )
+            .await;
+        assert!(!resp.success);
+        assert!(resp.message.contains("restricted to local loopback CLI"));
+
+        // 2. Remote caller requesting StopAudioRouting must be rejected by loopback restriction
+        let resp = ctrl
+            .handle_rpc(DisplayRpcRequest::StopAudioRouting, Some(remote_ip), None)
+            .await;
+        assert!(!resp.success);
+        assert!(resp.message.contains("restricted to local loopback CLI"));
+
+        // 3. Remote caller requesting GetAudioStatus must be rejected by loopback restriction
+        let resp = ctrl
+            .handle_rpc(DisplayRpcRequest::GetAudioStatus, Some(remote_ip), None)
+            .await;
+        assert!(!resp.success);
+        assert!(resp.message.contains("restricted to local loopback CLI"));
+
+        // 4. StartAudioCapture / StopAudioCapture / NegotiateAudioSession without peer_device_id must fail closed (AUD-1G7-15)
+        let resp_cap_no_auth = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::StartAudioCapture {
+                    sample_rate: 48000,
+                    channels: 2,
+                    bit_depth: 16,
+                },
+                Some(remote_ip),
+                None,
+            )
+            .await;
+        assert!(!resp_cap_no_auth.success);
+        assert!(resp_cap_no_auth.message.contains("requires authenticated peer identity"));
+
+        let resp_stop_no_auth = ctrl
+            .handle_rpc(DisplayRpcRequest::StopAudioCapture, Some(remote_ip), None)
+            .await;
+        assert!(!resp_stop_no_auth.success);
+        assert!(resp_stop_no_auth.message.contains("requires authenticated peer identity"));
+
+        let resp_neg_no_auth = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::NegotiateAudioSession {
+                    sender_nonce_hex: "11".repeat(32),
+                    sample_rate: 48000,
+                    channels: 2,
+                    bit_depth: 16,
+                },
+                Some(remote_ip),
+                None,
+            )
+            .await;
+        assert!(!resp_neg_no_auth.success);
+        assert!(resp_neg_no_auth.message.contains("requires authenticated peer identity"));
+
+        // 5. Revoked peer must fail closed on StartAudioCapture / StopAudioCapture / NegotiateAudioSession
+        let revoked_id = "88888888888888888888888888888888";
+        crate::security::transport::invalidate_peer_trust(revoked_id, 2);
+        let resp_cap_revoked = ctrl
+            .handle_rpc(
+                DisplayRpcRequest::StartAudioCapture {
+                    sample_rate: 48000,
+                    channels: 2,
+                    bit_depth: 16,
+                },
+                Some(remote_ip),
+                Some(revoked_id),
+            )
+            .await;
+        assert!(!resp_cap_revoked.success);
+        assert!(resp_cap_revoked.message.contains("requesting peer is revoked"));
+
+        // 6. Loopback caller with audio feature disabled must be rejected on GetAudioStatus,
+        //    but StopAudioRouting must remain permitted (AUD-1G7-15).
+        let flags_disabled = crate::features::FeatureFlags {
+            audio: false,
+            ..Default::default()
+        };
+        let features_off = Arc::new(FeatureManager::from_flags_for_test(flags_disabled));
+        let ctrl_off = DisplayController::new(DiscoveryManager::new("disp_audio_off_test"), features_off);
+        let resp = ctrl_off
+            .handle_rpc(DisplayRpcRequest::GetAudioStatus, Some(loopback_ip), None)
+            .await;
+        assert!(!resp.success);
+        assert!(resp.message.contains("feature 'audio' is disabled"));
+
+        let resp_stop_off = ctrl_off
+            .handle_rpc(DisplayRpcRequest::StopAudioRouting, Some(loopback_ip), None)
+            .await;
+        assert!(
+            resp_stop_off.success,
+            "StopAudioRouting must remain permitted even when audio feature is disabled (AUD-1G7-15): {}",
+            resp_stop_off.message
+        );
+
+        // 7. Loopback caller with audio feature enabled gets status
+        let resp = ctrl
+            .handle_rpc(DisplayRpcRequest::GetAudioStatus, Some(loopback_ip), None)
+            .await;
+        assert!(resp.success);
+        assert!(resp.audio_status.is_some());
     }
 }

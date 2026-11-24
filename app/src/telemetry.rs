@@ -85,6 +85,9 @@ pub struct GpuTelemetry {
     pub memory_total_mb: u64,
     /// Current graphics core clock frequency in Megahertz (MHz). Range: 0–3500.
     pub core_clock_mhz: u32,
+    /// List of all detected physical graphics adapters installed in the system.
+    #[serde(default)]
+    pub all_gpus: Vec<String>,
 }
 
 /// Parses an unsigned 32-bit integer from a raw string, handling floating-point strings and invalid values.
@@ -155,28 +158,58 @@ fn parse_nvidia_smi_csv_line(line: &str) -> Option<GpuTelemetry> {
         memory_used_mb: parse_optional_u64(rev_parts[2]),
         memory_total_mb: parse_optional_u64(rev_parts[1]),
         core_clock_mhz: parse_optional_u32(rev_parts[0]),
+        all_gpus: Vec::new(),
     })
 }
 
 /// Public cross-platform entry point to query real-time GPU telemetry.
 ///
-/// On Windows, probes `nvidia-smi` first; if unavailable or non-NVIDIA, falls back to DXGI enumeration.
-/// On macOS / Unix, queries IOKit/Metal GPU topology via `system_info::enumerate_gpus`.
+/// Discovers and enumerates all physical GPUs (Intel, AMD, NVIDIA, Apple Silicon)
+/// and pairs them with real-time discrete telemetry metrics when available.
 ///
 /// # Return Value
-/// Returns `Some(GpuTelemetry)` with populated metrics, or `None` if no GPU was found.
+/// Returns `Some(GpuTelemetry)` with populated metrics and `all_gpus` listing, or `None` if no GPU was found.
 pub fn query_gpu_telemetry() -> Option<GpuTelemetry> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(nvidia) = query_nvidia_smi() {
-            return Some(nvidia);
+    let enumerated = system_info::enumerate_gpus();
+    let mut all_gpu_names: Vec<String> = Vec::new();
+    for g in &enumerated {
+        if !g.name.is_empty() && !all_gpu_names.iter().any(|n| n.eq_ignore_ascii_case(&g.name)) {
+            all_gpu_names.push(g.name.clone());
         }
-        query_generic_windows_gpu()
     }
+
+    #[cfg(target_os = "windows")]
+    let mut result = {
+        if let Some(nvidia) = query_nvidia_smi() {
+            Some(nvidia)
+        } else {
+            query_generic_windows_gpu()
+        }
+    };
+
     #[cfg(not(target_os = "windows"))]
-    {
-        query_generic_unix_gpu()
+    let mut result = query_generic_unix_gpu();
+
+    if let Some(ref mut t) = result {
+        if !all_gpu_names.iter().any(|n| n.eq_ignore_ascii_case(&t.gpu_name)) {
+            all_gpu_names.insert(0, t.gpu_name.clone());
+        }
+        t.all_gpus = all_gpu_names;
+    } else if !all_gpu_names.is_empty() {
+        result = Some(GpuTelemetry {
+            gpu_name: all_gpu_names[0].clone(),
+            temperature_c: 0,
+            power_usage_watts: 0.0,
+            gpu_utilization_percent: 0,
+            memory_utilization_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            core_clock_mhz: 0,
+            all_gpus: all_gpu_names,
+        });
     }
+
+    result
 }
 
 /// Locates the `nvidia-smi.exe` binary in trusted system directories.
@@ -356,6 +389,7 @@ fn query_generic_windows_gpu() -> Option<GpuTelemetry> {
         memory_used_mb: 0,
         memory_total_mb: chosen.vram_mb.unwrap_or(0),
         core_clock_mhz: 0,
+        all_gpus: Vec::new(),
     })
 }
 
@@ -375,6 +409,7 @@ fn query_generic_unix_gpu() -> Option<GpuTelemetry> {
         memory_used_mb: 0,
         memory_total_mb: chosen.vram_mb.unwrap_or(0),
         core_clock_mhz: 0,
+        all_gpus: Vec::new(),
     })
 }
 
@@ -400,5 +435,21 @@ mod tests {
         assert_eq!(parsed.memory_used_mb, 1024);
         assert_eq!(parsed.memory_total_mb, 24576);
         assert_eq!(parsed.core_clock_mhz, 2100);
+        assert!(parsed.all_gpus.is_empty());
+
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"all_gpus\":[]"));
+        let de: GpuTelemetry = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.gpu_name, "NVIDIA GeForce RTX, Studio Edition");
+        assert!(de.all_gpus.is_empty());
+    }
+
+    #[test]
+    fn query_gpu_telemetry_enumerates_physical_gpus() {
+        if let Some(t) = query_gpu_telemetry() {
+            assert!(!t.gpu_name.is_empty());
+            assert!(!t.all_gpus.is_empty());
+            assert!(t.all_gpus.iter().any(|g| g.eq_ignore_ascii_case(&t.gpu_name)));
+        }
     }
 }

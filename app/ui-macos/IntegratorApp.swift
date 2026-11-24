@@ -71,6 +71,7 @@
 // ==============================================================================================
 
 import AppKit
+import CoreText
 import Foundation
 import SwiftUI
 
@@ -375,6 +376,10 @@ struct AudioRoutingStatusModel: Codable, Hashable {
     var is_active: Bool
     /// Active UDP transport port bound for spatial audio streaming.
     var port: UInt16?
+    /// Cross-platform audio mixer balance (-1.0 Mac boost to +1.0 Windows boost).
+    var mixer_balance: Float?
+    /// True if the remote Windows soundbar sink is muted.
+    var sink_muted: Bool?
 }
 
 /// Telemetry and state of the Mac -> PC shared virtual camera pipeline.
@@ -405,6 +410,8 @@ struct CameraStatusModel: Codable, Hashable {
     var port: UInt16?
     /// Friendly device name exposed by the Windows virtual camera.
     var device_name: String?
+    /// True if the hardware camera privacy shutter killswitch is currently engaged.
+    var privacy_muted: Bool?
 }
 
 /// Boolean feature flags controlling active subsystem daemons in Rust core.
@@ -467,6 +474,8 @@ struct KvmStatusSnapshotModel: Codable, Hashable {
     var hook_active: Bool?
     /// Current KVM role: "idle", "controlling" (local cursor captured), or "controlled".
     var role: String
+    /// True if KVM Gaming Boundary Lock is freezing edge-hopping.
+    var boundary_locked: Bool?
     /// IP address of peer currently engaged in KVM control.
     var connected_peer_ip: String?
     /// Operating system of the active peer.
@@ -603,6 +612,8 @@ struct GpuTelemetryModel: Codable, Hashable {
     var memory_utilization_percent: UInt32
     /// GPU graphics core load percentage (0-100%).
     var gpu_utilization_percent: UInt32
+    /// All physical GPUs detected on the machine.
+    var all_gpus: [String]?
 }
 
 /// Aggregate system state model returned by `get_bridge_status` RPC.
@@ -699,6 +710,8 @@ struct BridgeStatusModel: Codable {
     var preferred_peer_share: String?
     /// User's configured local shared directory path.
     var local_shared_folder: String?
+    /// True if SMB share is configured to mount automatically on peer detection.
+    var auto_mount_storage: Bool?
 
     /// Spatial audio routing status.
     var audio_status: AudioRoutingStatusModel
@@ -1504,6 +1517,8 @@ struct MainDashboardView: View {
     @ObservedObject var vm: IntegratorViewModel
     /// User-configurable liquid glass shader opacity and refractive intensity setting.
     @AppStorage("liquidGlassIntensity") private var glassIntensity: Double = 0.85
+    /// When true, skips the quit confirmation dialog when quitting Integrator.
+    @AppStorage("com.manveersingh.integrator.skipQuitConfirmation") private var skipQuitConfirmation: Bool = false
 
     /// Convenience accessor for latest bridge status snapshot.
     private var s: BridgeStatusModel? { vm.status }
@@ -1768,6 +1783,14 @@ struct MainDashboardView: View {
             Button { vm.runAction("hide_window", refreshAfter: false) } label: {
                 Label("Hide", systemImage: "minus.rectangle")
             }
+
+            Button {
+                gMacAppDelegate?.requestQuit()
+            } label: {
+                Label("Quit", systemImage: "power")
+                    .foregroundStyle(.red)
+            }
+            .help("Quit Integrator and shut down all background processes (⌘Q)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1828,11 +1851,18 @@ struct MainDashboardView: View {
 
             // Real-time discrete GPU metrics telemetry box
             if let t = vm.gpuTelemetry {
-                HStack(spacing: 12) {
-                    Label("\(t.gpu_name)", systemImage: "cpu")
-                    Label("\(t.temperature_c)°C", systemImage: "thermometer")
-                    Label("\(t.gpu_utilization_percent)%", systemImage: "gauge")
-                    Label("\(t.memory_used_mb)/\(t.memory_total_mb) MB", systemImage: "memorychip")
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 12) {
+                        Label("\(t.gpu_name)", systemImage: "cpu")
+                        Label("\(t.temperature_c)°C", systemImage: "thermometer")
+                        Label("\(t.gpu_utilization_percent)%", systemImage: "gauge")
+                        Label("\(t.memory_used_mb)/\(t.memory_total_mb) MB", systemImage: "memorychip")
+                    }
+                    if let all = t.all_gpus, !all.isEmpty {
+                        Text("Detected GPUs: \(all.joined(separator: " • "))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1846,29 +1876,59 @@ struct MainDashboardView: View {
                     .foregroundStyle(.secondary)
             }
 
+            let mode = s?.active_mode ?? ""
+            let isMacToPcActive = s?.display_active == true && mode.localizedCaseInsensitiveContains("Mac -> PC")
+            let isPcToMacActive = s?.display_active == true && mode.localizedCaseInsensitiveContains("PC -> Mac")
+
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
-                    Button {
-                        vm.isDisplayToggling = true
-                        vm.runAction("toggle_mac_to_pc") { _ in
-                            vm.isDisplayToggling = false
+                    if isMacToPcActive {
+                        Button {
+                            vm.isDisplayToggling = true
+                            vm.runAction("toggle_mac_to_pc") { _ in
+                                vm.isDisplayToggling = false
+                            }
+                        } label: {
+                            Text("Stop Extending").frame(maxWidth: .infinity)
                         }
-                    } label: {
-                        Text("Extend Mac -> PC").frame(maxWidth: .infinity)
+                        .buttonStyle(.bordered)
+                        .disabled(!flags.display || vm.isDisplayToggling)
+                    } else {
+                        Button {
+                            vm.isDisplayToggling = true
+                            vm.runAction("toggle_mac_to_pc") { _ in
+                                vm.isDisplayToggling = false
+                            }
+                        } label: {
+                            Text("Extend Mac -> PC").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!flags.display || vm.isDisplayToggling)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!flags.display || vm.isDisplayToggling)
 
-                    Button {
-                        vm.isDisplayToggling = true
-                        vm.runAction("toggle_pc_to_mac") { _ in
-                            vm.isDisplayToggling = false
+                    if isPcToMacActive {
+                        Button {
+                            vm.isDisplayToggling = true
+                            vm.runAction("toggle_pc_to_mac") { _ in
+                                vm.isDisplayToggling = false
+                            }
+                        } label: {
+                            Text("Stop Extending").frame(maxWidth: .infinity)
                         }
-                    } label: {
-                        Text("Extend PC -> Mac").frame(maxWidth: .infinity)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!flags.display || vm.isDisplayToggling)
+                    } else {
+                        Button {
+                            vm.isDisplayToggling = true
+                            vm.runAction("toggle_pc_to_mac") { _ in
+                                vm.isDisplayToggling = false
+                            }
+                        } label: {
+                            Text("Extend PC -> Mac").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!flags.display || vm.isDisplayToggling)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(!flags.display || vm.isDisplayToggling)
                 }
                 HStack(spacing: 8) {
                     Button("Apply GPU") {
@@ -2494,6 +2554,12 @@ struct MainDashboardView: View {
                 .buttonStyle(.bordered)
             }
 
+            Toggle("Auto-Mount on Peer Detect", isOn: Binding(
+                get: { s?.auto_mount_storage ?? false },
+                set: { vm.runAction("set_auto_mount_storage", params: ["enabled": $0]) }
+            ))
+            .font(.caption)
+
             HStack(spacing: 8) {
                 Button(s?.storage_mounted == true ? "Unmount Storage" : "Mount Shared Storage") {
                     vm.runAction(s?.storage_mounted == true ? "unmount_shared_storage" : "mount_shared_storage")
@@ -2530,7 +2596,7 @@ struct MainDashboardView: View {
                 icon: "sun.max",
                 title: "True Tone & Chromatic Sync",
                 pillText: s?.ambient_supported == true
-                    ? String(format: "%.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct))
+                    ? (flags.truetone ? String(format: "Auto • %.0f lux • %dK", s?.ambient_lux ?? 0, s?.ambient_cct ?? UInt32(UiDefaults.defaultTrueToneCct)) : "Paused")
                     : "Manual",
                 pillColor: flags.truetone ? .yellow : .secondary,
                 toggleBinding: Binding(
@@ -2582,13 +2648,15 @@ struct MainDashboardView: View {
             )
 
             Text(s?.has_touch_bar == true
-                 ? "Liquid Glass Touch Bar GPU telemetry strip & quick controls."
+                 ? "Liquid Glass Touch Bar GPU telemetry & expanded Windows media controls. Tap ∫ in the Control Strip anytime to restore after closing."
                  : "No Apple Touch Bar hardware detected on this workstation.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             HStack {
-                Button("Toggle Touch Bar HUD") { vm.runAction("toggle_touchbar_hud") }
+                Button(s?.touchbar_active == true ? "Hide Touch Bar HUD" : "Show Touch Bar HUD") {
+                    vm.runAction("toggle_touchbar_hud")
+                }
                     .buttonStyle(.borderedProminent)
                     .disabled(!flags.touchbar || s?.has_touch_bar != true)
                 Spacer()
@@ -2707,6 +2775,12 @@ struct MainDashboardView: View {
             Toggle("Launch Integrator Automatically at Login", isOn: Binding(
                 get: { s?.autostart_enabled ?? false },
                 set: { vm.runAction("set_autostart", params: ["enabled": $0]) }
+            ))
+            .toggleStyle(.switch)
+
+            Toggle("Ask for Confirmation Before Quitting", isOn: Binding(
+                get: { !skipQuitConfirmation },
+                set: { skipQuitConfirmation = !$0 }
             ))
             .toggleStyle(.switch)
 
@@ -2845,6 +2919,59 @@ private struct SetupAssistantSheetView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // Friendly Architecture & Explanations Card
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 20))
+                                .foregroundStyle(Color.accentColor)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Core Features Require Zero Additional Downloads")
+                                    .font(.subheadline.weight(.semibold))
+                                Text("KVM mouse & keyboard sharing, clipboard synchronization, folder drag-and-drop, and True Tone sync are 100% self-contained and ready to use immediately once Accessibility permission is granted.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Divider()
+
+                        Text("Optional Feature Companions (Only install if you use these features):")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
+
+                        HStack(alignment: .top, spacing: 14) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label("Virtual Displays", systemImage: "display.2")
+                                    .font(.caption.weight(.semibold))
+                                Text("Sunshine (Host) & Moonlight (Client) enable low-latency 4K 120Hz/240Hz screen extension. Available via Homebrew or direct DMG download.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label("Native Sound Sink", systemImage: "speaker.wave.3")
+                                    .font(.caption.weight(.semibold))
+                                Text("Creates 'Windows PC (Integrator)' in Control Center to stream Mac system audio to PC speakers with sub-5ms latency. 1-click install.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label("Direct Cable Link", systemImage: "cable.connector")
+                                    .font(.caption.weight(.semibold))
+                                Text("Auto-configures 40Gbps networking when connecting Mac and PC with a direct USB-C/Thunderbolt cable without Wi-Fi. 1-click install.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+
                     // Section 1: Operating System Permissions
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -2870,7 +2997,7 @@ private struct SetupAssistantSheetView: View {
 
                     // Section 2: Drivers & Companion Streaming Tools
                     VStack(alignment: .leading, spacing: 10) {
-                        Label("Drivers & Companion Streaming Tools", systemImage: "shippingbox.fill")
+                        Label("Companion Tools & Drivers (Optional)", systemImage: "shippingbox.fill")
                             .font(.headline)
 
                         ForEach(setup?.dependencies ?? []) { dep in
@@ -2914,9 +3041,16 @@ private struct SetupAssistantSheetView: View {
             return "Auditing macOS TCC permissions and companion streaming tools…"
         }
         if !snap.needs_attention {
-            return "All required macOS permissions and streaming tools are configured."
+            return "All required macOS permissions are configured. Core features are 100% ready."
         }
-        return "\(snap.missing_required_permissions) required permission(s) and \(snap.missing_required_dependencies) required tool(s) need attention."
+        var parts: [String] = []
+        if snap.missing_required_permissions > 0 {
+            parts.append("\(snap.missing_required_permissions) required permission(s)")
+        }
+        if snap.missing_required_dependencies > 0 {
+            parts.append("\(snap.missing_required_dependencies) required tool(s)")
+        }
+        return "\(parts.joined(separator: " and ")) need attention."
     }
 
     /// Renders an individual OS permission audit row with status badge, detail text, and 1-click Request / Settings actions.
@@ -2974,7 +3108,15 @@ private struct SetupAssistantSheetView: View {
 
     /// Renders an individual companion tool/driver row with Installed/Missing badge, 1-click Install/Download, and copyable CLI command.
     private func dependencyRow(_ dep: DependencyStatusModel) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let installTitle: String = {
+            if dep.installed { return "Reinstall / Guide" }
+            if dep.install_method.contains("DMG") { return "Download DMG" }
+            if dep.install_method.contains("1-Click") { return "1-Click Install" }
+            if dep.install_method.contains("Homebrew") { return "Install (Brew)" }
+            return "Install / Download"
+        }()
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: dep.installed ? "checkmark.seal.fill" : (dep.required ? "exclamationmark.circle.fill" : "wrench.and.screwdriver.fill"))
                     .font(.system(size: 16))
@@ -2986,7 +3128,7 @@ private struct SetupAssistantSheetView: View {
                         Text(dep.name)
                             .font(.subheadline.weight(.semibold))
                         StatusPill(
-                            text: dep.installed ? "Installed" : (dep.required ? "Required • Missing" : "Optional • Not Installed"),
+                            text: dep.installed ? "Installed" : (dep.required ? "Required • Missing" : "Optional Companion"),
                             color: dep.installed ? .green : (dep.required ? .orange : .secondary)
                         )
                         if let running = dep.running {
@@ -3008,7 +3150,7 @@ private struct SetupAssistantSheetView: View {
 
                 Spacer(minLength: 8)
 
-                Button(dep.installed ? "Reinstall / Guide" : "Install / Download") {
+                Button(installTitle) {
                     vm.runAction("install_dependency", params: ["id": dep.id]) { _ in
                         vm.refreshSetupStatus()
                     }
@@ -3031,13 +3173,23 @@ private struct SetupAssistantSheetView: View {
                         .padding(.vertical, 4)
                         .background(Color(nsColor: .textBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
                     Spacer()
-                    Button("Copy Command") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(dep.install_command, forType: .string)
-                        vm.showToast("success", "Copied install command to clipboard")
+                    if dep.install_method.contains("DMG") {
+                        if let url = URL(string: dep.download_url) {
+                            Link(destination: url) {
+                                Label("Open DMG Page", systemImage: "arrow.up.right.square")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                    } else {
+                        Button("Copy Command") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(dep.install_command, forType: .string)
+                            vm.showToast("success", "Copied install command to clipboard")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
                 }
             }
         }
@@ -3067,18 +3219,309 @@ private struct VisualEffectBackdrop: NSViewRepresentable {
     }
 }
 
+// MARK: - Graceful Shutdown Progress View (macOS)
+
+private enum ShutdownStepState: Equatable {
+    case pending
+    case stopping
+    case stopped
+}
+
+private struct ShutdownStepItem: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    var state: ShutdownStepState = .pending
+}
+
+@MainActor
+private final class ShutdownProgressViewModel: ObservableObject {
+    @Published var headerTitle: String = "Shutting Down Integrator…"
+    @Published var headerSubtitle: String = "Stopping all background processes and services"
+    @Published var allComplete: Bool = false
+    @Published var steps: [ShutdownStepItem] = [
+        ShutdownStepItem(id: "audio", title: "Dynamic Audio Routing", detail: "Stopping CoreAudio & UDP sink"),
+        ShutdownStepItem(id: "camera", title: "Shared Camera", detail: "Stopping AVFoundation capture & streams"),
+        ShutdownStepItem(id: "display", title: "Extended Display & GPU", detail: "Stopping Moonlight, virtual display & gamma"),
+        ShutdownStepItem(id: "storage", title: "Clipboard & Shared Storage", detail: "Clearing cache & unmounting remote shares"),
+        ShutdownStepItem(id: "kvm", title: "KVM Hooks & Core Services", detail: "Releasing input taps & closing network sockets"),
+    ]
+
+    func markStopping(_ id: String) {
+        if let idx = steps.firstIndex(where: { $0.id == id }) {
+            steps[idx].state = .stopping
+        }
+    }
+
+    func markStopped(_ id: String) {
+        if let idx = steps.firstIndex(where: { $0.id == id }) {
+            steps[idx].state = .stopped
+        }
+    }
+
+    func markAllDone() {
+        for idx in steps.indices {
+            steps[idx].state = .stopped
+        }
+        allComplete = true
+        headerTitle = "All Integrator Processes Stopped"
+        headerSubtitle = "Quitting cleanly…"
+    }
+}
+
+private struct ShutdownProgressView: View {
+    @ObservedObject var model: ShutdownProgressViewModel
+
+    var body: some View {
+        ZStack {
+            VisualEffectBackdrop(material: .hudWindow, blendingMode: .behindWindow)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(model.allComplete ? Color.green.opacity(0.18) : Color.red.opacity(0.16))
+                            .frame(width: 38, height: 38)
+                        if model.allComplete {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 19, weight: .semibold))
+                                .foregroundStyle(.green)
+                        } else {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.headerTitle)
+                            .font(.headline)
+                        Text(model.headerSubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 9) {
+                    ForEach(model.steps) { step in
+                        HStack(spacing: 10) {
+                            Group {
+                                switch step.state {
+                                case .pending:
+                                    Image(systemName: "circle")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.tertiary)
+                                case .stopping:
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                        .scaleEffect(0.85)
+                                case .stopped:
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                            .frame(width: 18, height: 18)
+
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(step.title)
+                                    .font(.subheadline.weight(step.state == .stopping ? .semibold : .medium))
+                                    .foregroundStyle(step.state == .pending ? .secondary : .primary)
+                                Text(step.state == .stopped ? "Stopped" : (step.state == .stopping ? step.detail : "Waiting…"))
+                                    .font(.caption2)
+                                    .foregroundStyle(step.state == .stopped ? .green : .secondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 420, height: 310)
+    }
+}
+
 // MARK: - AppKit Shell + Menu Bar Tray + Event Callback
+
+/// Layer-backed rotating icon view for the macOS menu bar status item.
+///
+/// Provides a smooth hardware-accelerated 60/120fps rotation animation pivoting
+/// strictly around the exact optical center of the integral glyph (`∫`) between
+/// vertical (0°) when inactive and horizontal (-90°) when the menu opens.
+private final class RotatingIntegralIconView: NSView {
+    private let imageView: NSImageView
+    private(set) var isHorizontal: Bool = false
+    private var currentAngle: CGFloat = 0.0
+
+    override init(frame frameRect: NSRect) {
+        self.imageView = NSImageView(frame: NSRect(origin: .zero, size: frameRect.size))
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        self.imageView = NSImageView(frame: .zero)
+        super.init(coder: coder)
+        setup()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Transparent to mouse clicks so the parent NSStatusBarButton receives clicks directly
+        return nil
+    }
+
+    private func setup() {
+        wantsLayer = true
+        layer?.masksToBounds = false
+        autoresizingMask = [.width, .height]
+
+        imageView.image = makeIntegralGlyph()
+        imageView.imageAlignment = .alignCenter
+        imageView.imageScaling = .scaleNone
+        imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = false
+        imageView.frame = bounds
+        imageView.autoresizingMask = [.width, .height]
+        addSubview(imageView)
+    }
+
+    override func layout() {
+        super.layout()
+        // Keep imageView aligned to full bounds and re-center the rotation transform
+        // around the live (bounds.midX, bounds.midY) without fighting AppKit's anchorPoint.
+        imageView.frame = bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        imageView.layer?.transform = centeredRotation(currentAngle)
+        CATransaction.commit()
+    }
+
+    /// Computes a pure 2D Z-axis rotation matrix pivoting strictly around `(bounds.midX, bounds.midY)`
+    /// while leaving AppKit's native `(0, 0)` backing-layer anchorPoint untouched.
+    private func centeredRotation(_ angle: CGFloat) -> CATransform3D {
+        let cx = bounds.midX
+        let cy = bounds.midY
+        var t = CATransform3DIdentity
+        t = CATransform3DTranslate(t, cx, cy, 0)
+        t = CATransform3DRotate(t, angle, 0, 0, 1)
+        t = CATransform3DTranslate(t, -cx, -cy, 0)
+        return t
+    }
+
+    private static func easeInOutCubic(_ t: CGFloat) -> CGFloat {
+        return t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
+    }
+
+    func setRotated(_ horizontal: Bool, animated: Bool = true) {
+        guard isHorizontal != horizontal else { return }
+        isHorizontal = horizontal
+
+        guard let layer = imageView.layer else { return }
+        let targetAngle: CGFloat = horizontal ? -CGFloat.pi / 2 : 0.0
+
+        if !animated {
+            currentAngle = targetAngle
+            layer.removeAllAnimations()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = centeredRotation(targetAngle)
+            CATransaction.commit()
+            return
+        }
+
+        // Sample live in-flight rotation angle from the presentation layer so rapid open/close reverses smoothly
+        let startAngle: CGFloat
+        if let pres = layer.presentation() {
+            let m = pres.transform
+            startAngle = atan2(m.m12, m.m11)
+        } else {
+            startAngle = currentAngle
+        }
+        currentAngle = targetAngle
+
+        // Sample 32 ease-in-out keyframes of `T(cx,cy) * R_z(theta) * T(-cx,-cy)` so every GPU frame
+        // keeps the exact geometric center of `∫` pinned with zero translational drift.
+        let steps = 32
+        var values: [NSValue] = []
+        var keyTimes: [NSNumber] = []
+        values.reserveCapacity(steps + 1)
+        keyTimes.reserveCapacity(steps + 1)
+        for i in 0...steps {
+            let frac = CGFloat(i) / CGFloat(steps)
+            let eased = Self.easeInOutCubic(frac)
+            let theta = startAngle + (targetAngle - startAngle) * eased
+            values.append(NSValue(caTransform3D: centeredRotation(theta)))
+            keyTimes.append(NSNumber(value: Double(frac)))
+        }
+
+        let anim = CAKeyframeAnimation(keyPath: "transform")
+        anim.values = values
+        anim.keyTimes = keyTimes
+        anim.calculationMode = .linear
+        anim.duration = 0.22
+        anim.isRemovedOnCompletion = true
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = centeredRotation(targetAngle)
+        CATransaction.commit()
+        layer.add(anim, forKey: "smoothCenterRotation")
+    }
+
+    /// Draws the mathematical integral glyph (`∫`) optically centered inside an 18×18 template image
+    /// using CoreText glyph path bounds so its inked center sits at exactly `(9.0, 9.0)`.
+    private func makeIntegralGlyph() -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.black
+            ]
+            let attrStr = NSAttributedString(string: "∫", attributes: attrs)
+            let line = CTLineCreateWithAttributedString(attrStr)
+            let optical = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
+            let drawX = (size.width - optical.width) / 2.0 - optical.origin.x
+            let drawY = (size.height - optical.height) / 2.0 - optical.origin.y
+            ctx.saveGState()
+            ctx.textMatrix = .identity
+            ctx.textPosition = CGPoint(x: drawX, y: drawY)
+            CTLineDraw(line, ctx)
+            ctx.restoreGState()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+}
 
 /// Native AppKit application and window delegate coordinating menu bar status item,
 /// dashboard window presentation, and graceful lifecycle termination.
 @MainActor
-private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+    private static let skipQuitConfirmationKey = "com.manveersingh.integrator.skipQuitConfirmation"
+
     /// macOS status bar item in the menu bar.
     var statusItem: NSStatusItem?
+    /// Custom rotating integral icon view providing smooth 60fps rotation animation.
+    private var statusIconView: RotatingIntegralIconView?
     /// Main dashboard window instance.
     var mainWindow: NSWindow?
+    /// Floating shutdown progress window displayed during graceful exit.
+    var shutdownWindow: NSWindow?
     /// Flag indicating whether the app was launched in hidden tray-only mode.
     var startHidden: Bool = false
+    /// Reentrancy guard while the quit confirmation alert is presented.
+    private var isQuitPromptOpen: Bool = false
+    /// Reentrancy guard while graceful shutdown is in progress.
+    private var isShuttingDown: Bool = false
+    /// Set to true only after all shutdown steps finish so `applicationShouldTerminate` permits exit.
+    private var isTerminationApproved: Bool = false
 
     /// Invoked when macOS completes initial application launch sequence.
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -3099,12 +3542,32 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
     /// Re-activates dashboard window when user clicks the macOS Dock icon.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showDashboard()
+        if !isShuttingDown {
+            showDashboard()
+        }
         return true
+    }
+
+    /// Intercepts all NSApplication termination attempts (Dock Quit, Cmd+Q, AppleEvent) so the
+    /// confirmation prompt and live process shutdown sequence always run cleanly.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isTerminationApproved {
+            return .terminateNow
+        }
+        if isShuttingDown {
+            return .terminateLater
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.requestQuit()
+        }
+        return .terminateCancel
     }
 
     /// Intercepts window close button to hide dashboard to menu bar tray instead of quitting.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if isShuttingDown {
+            return false
+        }
         sender.orderOut(nil)
         IntegratorViewModel.shared.setPollingPaused(true)
         return false
@@ -3158,14 +3621,20 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     private func setupStatusBar() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let btn = item.button {
-            btn.image = NSImage(systemSymbolName: "link.circle", accessibilityDescription: "Integrator")
-            btn.image?.isTemplate = true
+            let blank = NSImage(size: NSSize(width: 18, height: 18))
+            blank.isTemplate = true
+            btn.image = blank
+            let iconView = RotatingIntegralIconView(frame: btn.bounds)
+            btn.addSubview(iconView)
+            statusIconView = iconView
         }
         let menu = NSMenu()
+        menu.delegate = self
         menu.addItem(withTitle: "Show Dashboard", action: #selector(onShowDashboard), keyEquivalent: "d")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "Paste Remote Item", action: #selector(onPasteRemote), keyEquivalent: "v")
         menu.addItem(withTitle: "Toggle Extended Screen", action: #selector(onToggleDisplay), keyEquivalent: "e")
+        menu.addItem(withTitle: "Toggle Touch Bar HUD", action: #selector(onToggleTouchBar), keyEquivalent: "t")
         menu.addItem(withTitle: "Open Clipboard Cache", action: #selector(onOpenCache), keyEquivalent: "c")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "Quit Integrator", action: #selector(onQuit), keyEquivalent: "q")
@@ -3174,6 +3643,16 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         }
         item.menu = menu
         statusItem = item
+    }
+
+    // MARK: - NSMenuDelegate (Menu Bar Icon Animation)
+
+    func menuWillOpen(_ menu: NSMenu) {
+        statusIconView?.setRotated(true, animated: true)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        statusIconView?.setRotated(false, animated: true)
     }
 
     /// Creates and styles the main dashboard window with full-size content view and transparent titlebar.
@@ -3211,14 +3690,119 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     @objc private func onShowDashboard() { showDashboard() }
     @objc private func onPasteRemote() { "paste_remote".withCString { rustCoreTrayAction($0) } }
     @objc private func onToggleDisplay() { "toggle_display".withCString { rustCoreTrayAction($0) } }
+    @objc private func onToggleTouchBar() { "toggle_touchbar".withCString { rustCoreTrayAction($0) } }
     @objc private func onOpenCache() { "open_cache".withCString { rustCoreTrayAction($0) } }
 
-    /// Graceful application termination sequence.
+    /// Menu bar, App menu, and Cmd+Q entry point.
     @objc private func onQuit() {
+        requestQuit()
+    }
+
+    /// Prompts the user to confirm quitting (unless "Don't ask again" was previously checked),
+    /// warning that all Integrator features and background processes will stop working.
+    func requestQuit() {
+        if isShuttingDown || isQuitPromptOpen { return }
+
+        if UserDefaults.standard.bool(forKey: Self.skipQuitConfirmationKey) {
+            beginGracefulShutdown()
+            return
+        }
+
+        isQuitPromptOpen = true
+        defer { isQuitPromptOpen = false }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Quit Integrator?"
+        alert.informativeText =
+            "Are you sure you want to quit Integrator?\n\n" +
+            "All of Integrator's features and background processes will stop working — including KVM mouse & keyboard sharing, Universal Clipboard & Drag-and-Drop, Extended Screen, Shared Camera, Dynamic Audio Routing, Shared Storage, and Touch ID / Passkey bridging."
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don't ask again"
+
+        let quitBtn = alert.addButton(withTitle: "Quit Integrator")
+        if #available(macOS 11.0, *) {
+            quitBtn.hasDestructiveAction = true
+        }
+        let cancelBtn = alert.addButton(withTitle: "Cancel")
+        cancelBtn.keyEquivalent = "\u{1b}"
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            if alert.suppressionButton?.state == .on {
+                UserDefaults.standard.set(true, forKey: Self.skipQuitConfirmationKey)
+            }
+            beginGracefulShutdown()
+        }
+    }
+
+    /// Displays a live floating shutdown progress window while tearing down every Integrator
+    /// subsystem and process sequentially, then terminates the application cleanly.
+    func beginGracefulShutdown() {
+        if isShuttingDown { return }
+        isShuttingDown = true
+
         IntegratorViewModel.shared.stopPolling()
-        rustCoreSetUiCallback(nil)
-        rustCoreShutdown()
-        NSApp.terminate(nil)
+        mainWindow?.orderOut(nil)
+
+        let model = ShutdownProgressViewModel()
+        let hosting = NSHostingController(rootView: ShutdownProgressView(model: model))
+        let win = NSWindow(contentViewController: hosting)
+        win.title = "Shutting Down Integrator"
+        win.setContentSize(NSSize(width: 420, height: 310))
+        win.styleMask = [.titled, .fullSizeContentView]
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.level = .floating
+        win.isReleasedWhenClosed = false
+        win.center()
+        shutdownWindow = win
+
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+
+        let orderedSteps = ["audio", "camera", "display", "storage", "kvm"]
+        DispatchQueue.global(qos: .userInitiated).async {
+            for step in orderedSteps {
+                DispatchQueue.main.sync {
+                    model.markStopping(step)
+                }
+                let payload = "{\"step\":\"\(step)\"}"
+                "shutdown_subsystem".withCString { mPtr in
+                    payload.withCString { pPtr in
+                        if let raw = rustCoreInvoke(mPtr, pPtr) {
+                            rustCoreFreeString(raw)
+                        }
+                    }
+                }
+                // Brief visual beat so each process teardown transition is legible
+                Thread.sleep(forTimeInterval: 0.14)
+                DispatchQueue.main.sync {
+                    model.markStopped(step)
+                }
+            }
+
+            rustCoreSetUiCallback(nil)
+            rustCoreShutdown()
+
+            DispatchQueue.main.async { [weak self] in
+                if let item = self?.statusItem {
+                    NSStatusBar.system.removeStatusItem(item)
+                    self?.statusItem = nil
+                }
+                model.markAllDone()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                    self?.shutdownWindow?.orderOut(nil)
+                    self?.shutdownWindow = nil
+                    self?.isTerminationApproved = true
+                    NSApp.terminate(nil)
+                }
+            }
+        }
     }
 }
 
@@ -3251,9 +3835,7 @@ private let swiftUiEventTrampoline: RustUiCallback = { evPtr, payloadPtr in
                 IntegratorViewModel.shared.showToast(kind, msg)
             }
         case "quit":
-            IntegratorViewModel.shared.stopPolling()
-            rustCoreSetUiCallback(nil)
-            NSApp.terminate(nil)
+            gMacAppDelegate?.beginGracefulShutdown()
         default:
             break
         }

@@ -167,9 +167,43 @@ fn main() {
         println!("cargo:rerun-if-changed=ui-macos/IntegratorApp.swift");
         println!("cargo:rerun-if-changed=macos_clip_files.swift");
 
+        let audio_obj_path = format!("{}/audio_macos.o", out_dir);
+        let audio_lib_path = format!("{}/libaudiomacos.a", out_dir);
+        let min_ver_flag = format!("-mmacosx-version-min={}", deploy_target);
+
+        let mut audio_clang = Command::new("clang");
+        audio_clang.args([
+            "-std=c11",
+            if is_release { "-O2" } else { "-O1" },
+            "-Wall",
+            "-Wextra",
+            &min_ver_flag,
+            "-c",
+            "src/audio_macos.c",
+            "-o",
+            &audio_obj_path,
+        ]);
+        if !clang_arch.is_empty() {
+            audio_clang.args(["-arch", clang_arch]);
+        }
+        let audio_clang_status = audio_clang
+            .status()
+            .expect("Failed to execute clang to compile audio_macos.c");
+        if !audio_clang_status.success() {
+            panic!("clang failed compiling src/audio_macos.c");
+        }
+        let audio_ar_status = Command::new("ar")
+            .args(["rcs", &audio_lib_path, &audio_obj_path])
+            .status()
+            .expect("Failed to execute ar for libaudiomacos.a");
+        if !audio_ar_status.success() {
+            panic!("ar failed creating libaudiomacos.a");
+        }
+        println!("cargo:rustc-link-lib=static=audiomacos");
+        println!("cargo:rerun-if-changed=src/audio_macos.c");
+
         let obj_path = format!("{}/virtual_display.o", out_dir);
         let vd_lib_path = format!("{}/libvirtualdisplay.a", out_dir);
-        let min_ver_flag = format!("-mmacosx-version-min={}", deploy_target);
 
         let mut clang_cmd = Command::new("clang");
         clang_cmd.args([
@@ -211,6 +245,8 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreMedia");
         println!("cargo:rustc-link-lib=framework=CoreVideo");
         println!("cargo:rustc-link-lib=framework=CoreBluetooth");
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rerun-if-changed=src/virtual_display.m");
     }
 
@@ -218,8 +254,10 @@ fn main() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         cc::Build::new()
             .cpp(true)
+            .flag_if_supported("/EHsc")
             .file("src/kvm_windows.cpp")
             .file("src/camera_windows.cpp")
+            .file("src/win_capture.cpp")
             .compile("kvm_windows");
         println!("cargo:rustc-link-lib=ole32");
         println!("cargo:rustc-link-lib=shell32");
@@ -231,6 +269,7 @@ fn main() {
         println!("cargo:rustc-link-lib=mfuuid");
         println!("cargo:rerun-if-changed=src/kvm_windows.cpp");
         println!("cargo:rerun-if-changed=src/camera_windows.cpp");
+        println!("cargo:rerun-if-changed=src/win_capture.cpp");
         println!("cargo:rerun-if-changed=src/vcam_windows.cpp");
 
         // Compile standalone FrameServer COM DLL (`integrator_vcam.dll`) with zero external runtime deps (/MT).

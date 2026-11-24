@@ -736,6 +736,41 @@ pub fn get_peer_trust_generation(peer_device_id_hex: &str) -> Option<u64> {
     reg.peer_generations.get(&key).copied()
 }
 
+/// Result of fail-closed peer trust and generation verification against `ACTIVE_SESSION_REGISTRY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTrustCheck {
+    Valid,
+    Revoked,
+    StaleOrUnregisteredGeneration,
+}
+
+/// Verifies a peer's revocation status and expected trust generation fail-closed (matching `SEC-1C-05`).
+///
+/// Remote peers with no registered trust generation fail closed (`StaleOrUnregisteredGeneration`).
+/// Only verified local loopback device identities (`local_device_ids`) are permitted to pass with
+/// an unregistered generation `>= 1`.
+pub fn check_peer_trust_generation_fail_closed(
+    peer_device_id_hex: &str,
+    expected_generation: u64,
+) -> PeerTrustCheck {
+    let key = peer_device_id_hex.trim().to_ascii_lowercase();
+    let reg = ACTIVE_SESSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    if reg.revoked_peers.contains(&key) {
+        return PeerTrustCheck::Revoked;
+    }
+    if let Some(&cur_gen) = reg.peer_generations.get(&key) {
+        if cur_gen == expected_generation {
+            PeerTrustCheck::Valid
+        } else {
+            PeerTrustCheck::StaleOrUnregisteredGeneration
+        }
+    } else if reg.local_device_ids.contains(&key) && expected_generation >= 1 {
+        PeerTrustCheck::Valid
+    } else {
+        PeerTrustCheck::StaleOrUnregisteredGeneration
+    }
+}
+
 /// Directional AEAD cipher state for either outbound transmission (`tx`) or inbound reception (`rx`).
 ///
 /// Manages the active 256-bit ChaCha20-Poly1305 key, the 256-bit rekey secret, the 4-byte IV salt prefix,
@@ -1675,9 +1710,14 @@ where
     ) -> Result<Self, TransportError> {
         let (local_dev_id_hex, peer_gen) = {
             let ks = keystore_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            let creds = ks.get_peer(&peer.device_id_hex)
-                .ok_or_else(|| TransportError::UntrustedPeer(peer.device_id_hex.clone()))?;
-            (ks.local_device_id_hex().to_string(), creds.trust_generation)
+            let peer_gen = if let Some(creds) = ks.get_peer(&peer.device_id_hex) {
+                creds.trust_generation
+            } else if constant_time_eq(&peer.device_id, &ks.local_device_id()) {
+                peer.trust_generation
+            } else {
+                return Err(TransportError::UntrustedPeer(peer.device_id_hex.clone()));
+            };
+            (ks.local_device_id_hex().to_string(), peer_gen)
         };
 
         // Coordinate peer revocation with handshake initiation and session registration.

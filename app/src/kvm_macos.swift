@@ -413,6 +413,7 @@ public func integrator_kvm_macos_set_controlled(controlled: Bool, entryX: Double
     }
 
     if controlled && entryX.isFinite && entryY.isFinite {
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         DispatchQueue.main.async {
             gStateLock.lock()
             let needShow = gCursorHidden
@@ -531,6 +532,7 @@ public func integrator_kvm_macos_free_str(ptr: UnsafeMutablePointer<CChar>?) {
 public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHeld: Bool) {
     guard x.isFinite, y.isFinite else { return }
     let pt = CGPoint(x: x, y: y)
+    CGWarpMouseCursorPosition(pt)
     let src = CGEventSource(stateID: .hidSystemState)
     let evType: CGEventType = leftHeld ? .leftMouseDragged : .mouseMoved
     if let ev = CGEvent(mouseEventSource: src, mouseType: evType, mouseCursorPosition: pt, mouseButton: .left) {
@@ -544,6 +546,7 @@ public func integrator_kvm_macos_inject_mouse_move(x: Double, y: Double, leftHel
 public func integrator_kvm_macos_inject_mouse_button(button: Int32, pressed: Bool, x: Double, y: Double) {
     guard x.isFinite, y.isFinite else { return }
     let pt = CGPoint(x: x, y: y)
+    CGWarpMouseCursorPosition(pt)
     let src = CGEventSource(stateID: .hidSystemState)
     let cgBtn: CGMouseButton
     let evType: CGEventType

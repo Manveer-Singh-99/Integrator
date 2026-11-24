@@ -1258,7 +1258,7 @@ async fn ingest_authenticated_hint(
         return;
     }
 
-    let Ok((verified_dev_id, prof_opt, rtt_ms)) = authenticate_hint_via_transport_v2(
+    let Ok((verified_dev_id, prof_opt, _rpc_elapsed_ms)) = authenticate_hint_via_transport_v2(
         peer_ip,
         port,
         expected_device_id,
@@ -1268,6 +1268,10 @@ async fn ingest_authenticated_hint(
     else {
         return;
     };
+
+    // Measure true network TCP 3-way handshake RTT rather than GetHardwareProfile RPC elapsed time
+    // (which includes remote PowerShell / nvidia-smi subprocess execution taking 800-1500ms on cache miss).
+    let tcp_rtt_ms = measure_tcp_connect_rtt(&ip_str, port).await;
 
     if let Some(exp) = expected_device_id {
         if !verified_dev_id.eq_ignore_ascii_case(exp) {
@@ -1374,7 +1378,7 @@ async fn ingest_authenticated_hint(
         link_description: link_desc,
         local_ip_used: local_ip,
         same_subnet,
-        rtt_ms: Some(rtt_ms),
+        rtt_ms: tcp_rtt_ms,
         trusted,
         discovery_source: source.to_string(),
     };
@@ -1392,7 +1396,7 @@ async fn ingest_authenticated_hint(
                 source,
                 b,
                 transport.label(),
-                rtt_ms
+                tcp_rtt_ms.unwrap_or(0.0)
             );
         }
     }
@@ -1589,10 +1593,13 @@ fn upsert_peer_candidate(list: &mut Vec<PeerCandidate>, candidate: PeerCandidate
     }
 
     if let Some(existing) = list.iter_mut().find(|c| c.addr.ip() == candidate.addr.ip()) {
-        // Merge discovery_source tags cleanly (e.g. "udp+bonjour+ble")
+        // Merge discovery_source tags cleanly (e.g. "udp+bonjour+ble") and preserve measured TCP RTT
+        // if the incoming refresh has not yet completed a fresh TCP RTT probe.
         let merged_source = merge_discovery_sources(&existing.discovery_source, &candidate.discovery_source);
+        let merged_rtt = candidate.rtt_ms.or(existing.rtt_ms);
         *existing = candidate;
         existing.discovery_source = merged_source;
+        existing.rtt_ms = merged_rtt;
     } else {
         if list.len() >= MAX_PEER_CANDIDATES {
             if let Some(evict_idx) = list
@@ -1833,8 +1840,23 @@ mod tests {
         let chosen_tb = select_best_peer(&[wifi.clone(), stale_alias.clone(), eth.clone(), tb.clone()]).unwrap();
         assert_eq!(chosen_tb.addr.ip().to_string(), "169.254.10.5");
 
-        let chosen_eth = select_best_peer(&[wifi, stale_alias, eth]).unwrap();
+        let chosen_eth = select_best_peer(&[wifi.clone(), stale_alias, eth]).unwrap();
         assert_eq!(chosen_eth.addr.ip().to_string(), "169.254.20.5");
+
+        // USB-C and Ethernet share top priority (rank 0); tie broken by lower RTT
+        let usbc_fast = make("10.99.99.1", LinkTransport::DirectUsb, true, 0.4);
+        let eth_slower = make("192.168.1.50", LinkTransport::Ethernet, true, 0.8);
+        let chosen_usbc = select_best_peer(&[wifi.clone(), eth_slower.clone(), usbc_fast.clone()]).unwrap();
+        assert_eq!(chosen_usbc.addr.ip().to_string(), "10.99.99.1");
+
+        let eth_faster = make("192.168.1.50", LinkTransport::Ethernet, true, 0.2);
+        let chosen_faster_eth = select_best_peer(&[wifi.clone(), eth_faster.clone(), usbc_fast.clone()]).unwrap();
+        assert_eq!(chosen_faster_eth.addr.ip().to_string(), "192.168.1.50");
+
+        // Wired Ethernet and USB-C strictly beat Wi-Fi even if Wi-Fi has lower measured ping
+        let wifi_low_ping = make("192.168.1.100", LinkTransport::Wifi, true, 0.05);
+        let chosen_over_wifi = select_best_peer(&[wifi_low_ping, eth_slower]).unwrap();
+        assert_eq!(chosen_over_wifi.transport, LinkTransport::Ethernet);
     }
 
     #[test]
@@ -1911,5 +1933,45 @@ mod tests {
         assert_eq!(failed_over.addr.ip().to_string(), "172.20.10.7");
         assert_eq!(failed_over.transport, LinkTransport::Hotspot);
         assert!(!failed_over.transport.is_direct_cable());
+    }
+
+    #[test]
+    fn upsert_preserves_measured_tcp_rtt_when_hint_has_no_rtt() {
+        let now = Instant::now();
+        let initial = PeerCandidate {
+            addr: SocketAddr::new("10.99.99.1".parse().unwrap(), CONTROL_PORT),
+            last_seen: now,
+            os: "windows".into(),
+            device_id: "peer1".into(),
+            device_name: "PC".into(),
+            hardware_model: "Laptop".into(),
+            form_factor: "laptop".into(),
+            display_width: 1920,
+            display_height: 1080,
+            display_fps: 165,
+            share_name: None,
+            sunshine_name: None,
+            sunshine_port: SUNSHINE_DEFAULT_PORT,
+            gpus: vec![],
+            transport: LinkTransport::DirectUsb,
+            link_speed_mbps: None,
+            link_description: "USB-C Direct".into(),
+            local_ip_used: Some("10.99.99.2".into()),
+            same_subnet: true,
+            rtt_ms: Some(0.84),
+            trusted: true,
+            discovery_source: "udp".into(),
+        };
+        let mut table = Vec::new();
+        upsert_peer_candidate(&mut table, initial.clone(), now);
+
+        let mut bonjour_refresh = initial;
+        bonjour_refresh.rtt_ms = None;
+        bonjour_refresh.discovery_source = "bonjour".into();
+        upsert_peer_candidate(&mut table, bonjour_refresh, now);
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].rtt_ms, Some(0.84));
+        assert_eq!(table[0].discovery_source, "udp+bonjour");
     }
 }

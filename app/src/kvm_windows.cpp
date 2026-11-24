@@ -183,6 +183,11 @@ static std::atomic<int32_t> g_park_x{kDefaultParkX};
 static std::atomic<int32_t> g_park_y{kDefaultParkY};
 static std::atomic<bool> g_park_pending{false};
 static std::atomic<int32_t> g_edge_mode{0}; // 0=Left, 1=Right, 2=Top, 3=Bottom
+static std::atomic<int32_t> g_last_mouse_x{0};
+static std::atomic<int32_t> g_last_mouse_y{0};
+static std::atomic<bool> g_has_last_mouse{false};
+static std::atomic<int32_t> g_expected_warp_x{-1};
+static std::atomic<int32_t> g_expected_warp_y{-1};
 
 static std::atomic<int32_t> g_ghost_x{0};
 static std::atomic<int32_t> g_ghost_y{0};
@@ -549,17 +554,59 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
             case WM_MOUSEMOVE: {
                 int32_t px = g_park_x.load();
                 int32_t py = g_park_y.load();
-                if (g_controlling_peer.load() && g_park_pending.load()) {
-                    if (std::abs(ms->pt.x - px) > 120 || std::abs(ms->pt.y - py) > 120) {
-                        SetCursorPos(px, py);
+                int32_t cur_x = ms->pt.x;
+                int32_t cur_y = ms->pt.y;
+
+                if (g_controlling_peer.load()) {
+                    int32_t exp_x = g_expected_warp_x.load();
+                    int32_t exp_y = g_expected_warp_y.load();
+                    if (exp_x != -1 && cur_x == exp_x && cur_y == exp_y) {
+                        g_expected_warp_x.store(-1);
+                        g_expected_warp_y.store(-1);
+                        g_last_mouse_x.store(cur_x);
+                        g_last_mouse_y.store(cur_y);
+                        g_has_last_mouse.store(true);
                         return 1;
                     }
-                    g_park_pending.store(false);
+
+                    if (!g_has_last_mouse.load()) {
+                        g_last_mouse_x.store(cur_x);
+                        g_last_mouse_y.store(cur_y);
+                        g_has_last_mouse.store(true);
+                        if (std::abs(cur_x - px) > 20 || std::abs(cur_y - py) > 20) {
+                            g_expected_warp_x.store(px);
+                            g_expected_warp_y.store(py);
+                            SetCursorPos(px, py);
+                        }
+                        return 1;
+                    }
+
+                    int32_t last_x = g_last_mouse_x.load();
+                    int32_t last_y = g_last_mouse_y.load();
+                    double dx = static_cast<double>(cur_x - last_x);
+                    double dy = static_cast<double>(cur_y - last_y);
+                    g_last_mouse_x.store(cur_x);
+                    g_last_mouse_y.store(cur_y);
+
+                    if (std::abs(cur_x - px) > 20 || std::abs(cur_y - py) > 20) {
+                        g_expected_warp_x.store(px);
+                        g_expected_warp_y.store(py);
+                        SetCursorPos(px, py);
+                    }
+
+                    if (dx == 0.0 && dy == 0.0) {
+                        return 1;
+                    }
+
+                    uint64_t lbtn = g_physical_left_down.load() ? 1ULL : 0ULL;
+                    decision = cb(1, static_cast<double>(cur_x), static_cast<double>(cur_y), dx, dy, lbtn);
+                    break;
                 }
-                double dx = static_cast<double>(ms->pt.x - px);
-                double dy = static_cast<double>(ms->pt.y - py);
+
+                double dx = 0.0;
+                double dy = 0.0;
                 uint64_t lbtn = g_physical_left_down.load() ? 1ULL : 0ULL;
-                decision = cb(1, static_cast<double>(ms->pt.x), static_cast<double>(ms->pt.y), dx, dy, lbtn);
+                decision = cb(1, static_cast<double>(cur_x), static_cast<double>(cur_y), dx, dy, lbtn);
                 break;
             }
             case WM_LBUTTONDOWN:
@@ -597,7 +644,11 @@ static LRESULT CALLBACK low_level_mouse_proc(int nCode, WPARAM wParam, LPARAM lP
             }
 
             if (decision == 2) {
-                SetCursorPos(g_park_x.load(), g_park_y.load());
+                int32_t px = g_park_x.load();
+                int32_t py = g_park_y.load();
+                g_expected_warp_x.store(px);
+                g_expected_warp_y.store(py);
+                SetCursorPos(px, py);
                 return 1;
             } else if (decision == 1) {
                 return 1;
@@ -682,7 +733,11 @@ static LRESULT CALLBACK guard_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             SetWindowPos(hwnd, HWND_TOPMOST, vx, vy, vw, vh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-            SetCursorPos(g_park_x.load(), g_park_y.load());
+            int32_t px = g_park_x.load();
+            int32_t py = g_park_y.load();
+            g_expected_warp_x.store(px);
+            g_expected_warp_y.store(py);
+            SetCursorPos(px, py);
             g_park_pending.store(false);
         } else {
             g_park_pending.store(false);
@@ -887,6 +942,18 @@ static LRESULT CALLBACK ole_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 static DWORD WINAPI hook_thread_main(LPVOID param) {
     StartHandshake* hs = static_cast<StartHandshake*>(param);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    // Enable Per-Monitor DPI awareness V2 so display bounds and mouse coordinates match 1:1
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef BOOL(WINAPI* SetProcessDpiAwarenessContextFn)(HANDLE);
+        SetProcessDpiAwarenessContextFn set_dpi_fn =
+            reinterpret_cast<SetProcessDpiAwarenessContextFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (set_dpi_fn) {
+            set_dpi_fn(reinterpret_cast<HANDLE>(-4)); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        }
+    }
+
     OleInitialize(nullptr);
 
     int cx = std::max(16, std::min(256, GetSystemMetrics(SM_CXCURSOR)));
@@ -1163,6 +1230,9 @@ void integrator_kvm_win_set_controlling(
     g_swallowed_mod_keys.store(0);
     g_park_x.store(park_x);
     g_park_y.store(park_y);
+    g_has_last_mouse.store(false);
+    g_expected_warp_x.store(-1);
+    g_expected_warp_y.store(-1);
     g_park_pending.store(controlling);
     g_controlling_peer.store(controlling);
     HWND edge_hw = g_edge_hwnd.load();

@@ -155,8 +155,308 @@ extern "C" {
     fn dismiss_touchbar_in_app();
     /// Checks whether the macOS Touch Bar HUD is currently visible.
     fn is_touchbar_active_in_app() -> bool;
+    /// Installs or removes the persistent `∫` Control Strip system tray button on Touch Bar Macs.
+    fn set_touchbar_tray_enabled_in_app(enabled: bool);
     /// CLI loop driving the Touch Bar interface standalone.
     fn run_touchbar_cli_loop(peer_ip: *const c_char);
+    /// Illuminates or dismisses the far-right animated Touch ID sensor prompt on the Touch Bar.
+    fn notify_touchbar_touchid_prompt_in_app(label: *const c_char, active: bool);
+    /// Updates the illuminated green/red Camera Privacy Killswitch pill on the Touch Bar.
+    fn notify_touchbar_camera_state_in_app(active: bool, muted: bool);
+    /// Updates the KVM Gaming Boundary Lock toggle pill on the Touch Bar.
+    fn notify_touchbar_kvm_lock_state_in_app(locked: bool);
+    /// Updates the Display Mode Quick-Slider pill state on the Touch Bar.
+    fn notify_touchbar_display_mode_in_app(width: u32, height: u32, fps: u32, hdr: bool);
+}
+
+/// Illuminates or dismisses the visual Touch ID passkey/UAC prompt strip on the macOS Touch Bar.
+pub fn notify_touchbar_touchid_prompt(label: &str, active: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(c_lbl) = CString::new(label) {
+            unsafe { notify_touchbar_touchid_prompt_in_app(c_lbl.as_ptr(), active) };
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (label, active);
+    }
+}
+
+/// Synchronizes the macOS Touch Bar Hardware Camera Privacy Killswitch pill with live camera state.
+pub fn notify_touchbar_camera_state(active: bool, muted: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { notify_touchbar_camera_state_in_app(active, muted) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (active, muted);
+    }
+}
+
+/// Synchronizes the macOS Touch Bar KVM Gaming Boundary Lock toggle with live KVM state.
+pub fn notify_touchbar_kvm_lock_state(locked: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { notify_touchbar_kvm_lock_state_in_app(locked) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = locked;
+    }
+}
+
+/// Synchronizes the macOS Touch Bar Display Mode Quick-Slider state with live display settings.
+pub fn notify_touchbar_display_mode(width: u32, height: u32, fps: u32, hdr: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { notify_touchbar_display_mode_in_app(width, height, fps, hdr) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (width, height, fps, hdr);
+    }
+}
+
+/// C-ABI entry point invoked by `touchbar_hud.swift` when the user scrubs refresh rate or toggles resolution/HDR.
+#[no_mangle]
+pub extern "C" fn set_rust_display_mode(width: u32, height: u32, fps: u32, hdr: bool) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(core) = GLOBAL_CORE.get() else {
+            return false;
+        };
+        let core_ref = Arc::clone(core);
+        core.rt.spawn(async move {
+            match core_ref.display_ctrl.set_display_mode(width, height, fps, hdr).await {
+                Ok(msg) => emit_ui_toast("info", &msg),
+                Err(e) => emit_ui_toast("error", &format!("Display mode error: {}", e)),
+            }
+        });
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// C-ABI entry point invoked by `touchbar_hud.swift` when tapping the Hardware Camera Privacy Killswitch pill.
+#[no_mangle]
+pub extern "C" fn toggle_rust_camera_privacy_mute() -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(core) = GLOBAL_CORE.get() {
+            let muted = core.camera.toggle_privacy_muted();
+            emit_ui_toast(
+                if muted { "warning" } else { "success" },
+                if muted {
+                    "Camera privacy shutter engaged (feeding black NV12 frames to PC)"
+                } else {
+                    "Camera privacy shutter released (live FaceTime HD restored)"
+                },
+            );
+            muted
+        } else {
+            crate::camera::set_camera_privacy_muted(!crate::camera::is_camera_privacy_muted())
+        }
+    }))
+    .unwrap_or(false)
+}
+
+/// C-ABI entry point invoked by `touchbar_hud.swift` when scrubbing the Cross-Platform Audio Mixer slider or tapping mute.
+#[no_mangle]
+pub extern "C" fn set_rust_audio_mixer(balance: f32, muted: bool) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = audio::AudioManager::set_mixer(balance, muted);
+    }));
+}
+
+/// C-ABI entry point invoked by `touchbar_hud.swift` when tapping the KVM Gaming Boundary Lock toggle.
+#[no_mangle]
+pub extern "C" fn toggle_rust_kvm_boundary_lock() -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(core) = GLOBAL_CORE.get() else {
+            return false;
+        };
+        let locked = core.kvm.toggle_boundary_locked();
+        let core_ref = Arc::clone(core);
+        core.rt.spawn(async move {
+            if let Some(peer_ip) = core_ref.discovery.get_peer_ip().await {
+                let _ = DisplayController::send_remote_rpc(
+                    &peer_ip,
+                    &DisplayRpcRequest::SetKvmBoundaryLock { locked },
+                )
+                .await;
+            }
+        });
+        emit_ui_toast(
+            "info",
+            if locked {
+                "KVM Cursor Boundary LOCKED (gaming mode)"
+            } else {
+                "KVM Cursor Boundary UNLOCKED"
+            },
+        );
+        locked
+    }))
+    .unwrap_or(false)
+}
+
+/// C-ABI entry point invoked by `touchbar_hud.swift` to control Windows Spotify/YouTube/VLC media playback.
+///
+/// `cmd_code`: `0 = PlayPause`, `1 = Next`, `2 = Previous`, `3 = Seek(seek_secs)`.
+#[no_mangle]
+pub extern "C" fn send_rust_windows_media_cmd(cmd_code: i32, seek_secs: f64) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(core) = GLOBAL_CORE.get() else {
+            return false;
+        };
+        let action = match cmd_code {
+            0 => crate::media::MediaControlAction::PlayPause,
+            1 => crate::media::MediaControlAction::Next,
+            2 => crate::media::MediaControlAction::Previous,
+            3 => crate::media::MediaControlAction::Seek {
+                position_secs: if seek_secs.is_finite() { seek_secs.max(0.0) } else { 0.0 },
+            },
+            _ => return false,
+        };
+        let core_ref = Arc::clone(core);
+        core.rt.spawn(async move {
+            if let Some(peer_ip) = core_ref.discovery.get_peer_ip().await {
+                let _ = DisplayController::send_remote_rpc(
+                    &peer_ip,
+                    &DisplayRpcRequest::SendMediaCommand { action },
+                )
+                .await;
+            }
+        });
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Aggregated live snapshot polled by `touchbar_hud.swift` over a single C-ABI round-trip.
+#[derive(Serialize)]
+struct TouchBarLiveSnapshot {
+    gpu_telemetry: Option<telemetry::GpuTelemetry>,
+    media_state: Option<crate::media::MediaPlaybackState>,
+    camera_active: bool,
+    camera_muted: bool,
+    kvm_locked: bool,
+    audio_balance: f32,
+    audio_muted: bool,
+    display_active: bool,
+    display_width: u32,
+    display_height: u32,
+    display_fps: u32,
+    display_hdr: bool,
+}
+
+/// C-ABI entry point polled by `touchbar_hud.swift` to fetch synchronized GPU telemetry,
+/// Windows GSMTC media state, camera privacy state, KVM boundary lock, audio mixer, and display mode.
+#[no_mangle]
+pub extern "C" fn fetch_rust_touchbar_snapshot_json(
+    peer_ip_ptr: *const c_char,
+    out_buf: *mut u8,
+    cap: usize,
+) -> usize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_buf.is_null() || cap < 2 {
+            return 0;
+        }
+        let hinted_ip = if !peer_ip_ptr.is_null() {
+            let s = unsafe { CStr::from_ptr(peer_ip_ptr) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            if !s.is_empty() && s.parse::<std::net::IpAddr>().is_ok() {
+                Some(s)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let fetch_future = async move {
+            let core_opt = GLOBAL_CORE.get().cloned();
+            let peer_ip = if let Some(ip) = hinted_ip {
+                Some(ip)
+            } else if let Some(ref c) = core_opt {
+                c.discovery.get_peer_ip().await
+            } else {
+                None
+            };
+
+            let (gpu_telemetry, media_state) = if let Some(ref ip) = peer_ip {
+                let (gpu_res, media_res) = tokio::join!(
+                    DisplayController::send_remote_rpc(ip, &DisplayRpcRequest::GetGpuTelemetry),
+                    DisplayController::send_remote_rpc(ip, &DisplayRpcRequest::GetMediaState),
+                );
+                (
+                    gpu_res.ok().and_then(|r| r.gpu_telemetry),
+                    media_res.ok().and_then(|r| r.media_state),
+                )
+            } else {
+                (None, None)
+            };
+
+            let (camera_active, kvm_locked, display_active, disp_ov) = if let Some(ref c) = core_opt {
+                (
+                    c.camera.status().active,
+                    c.kvm.is_boundary_locked(),
+                    c.display_ctrl.is_active().await,
+                    c.display_ctrl.get_preferred_mode().await,
+                )
+            } else {
+                (false, false, false, None)
+            };
+
+            TouchBarLiveSnapshot {
+                gpu_telemetry,
+                media_state,
+                camera_active,
+                camera_muted: crate::camera::is_camera_privacy_muted(),
+                kvm_locked,
+                audio_balance: audio::AudioManager::mixer_balance(),
+                audio_muted: audio::AudioManager::is_sink_muted(),
+                display_active,
+                display_width: disp_ov.map(|m| m.width).unwrap_or(0),
+                display_height: disp_ov.map(|m| m.height).unwrap_or(0),
+                display_fps: disp_ov.map(|m| m.fps).unwrap_or(120),
+                display_hdr: disp_ov.map(|m| m.hdr).unwrap_or(false),
+            }
+        };
+
+        let snap = if let Some(core) = GLOBAL_CORE.get() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let h = core.rt.handle().clone();
+                let Ok(s) = std::thread::spawn(move || h.block_on(fetch_future)).join() else {
+                    return 0;
+                };
+                s
+            } else {
+                core.rt.block_on(fetch_future)
+            }
+        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(fetch_future)
+        } else {
+            return 0;
+        };
+
+        let Ok(bytes) = serde_json::to_vec(&snap) else {
+            return 0;
+        };
+        if bytes.is_empty() || bytes.len() >= cap {
+            return 0;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+            *out_buf.add(bytes.len()) = 0;
+        }
+        bytes.len()
+    }))
+    .unwrap_or(0)
 }
 
 /// Structured record representing an individual log event stored in the UI ring buffer.
@@ -343,6 +643,9 @@ pub struct BridgeStatus {
     pub preferred_peer_share: Option<String>,
     /// User-configured local folder path being shared to peer.
     pub local_shared_folder: Option<String>,
+    /// `true` if SMB share is configured to mount automatically on peer detection.
+    #[serde(default)]
+    pub auto_mount_storage: bool,
 
     // Audio Routing Status
     /// Active audio sink/source capture and playback routing states.
@@ -1378,6 +1681,121 @@ pub(crate) fn build_windows_firewall_remote_scopes() -> String {
     build_windows_firewall_remote_scopes_from(&interfaces, &prefs.firewall_extra_subnets)
 }
 
+/// Background macOS watcher that monitors paired Windows media playback and auto-presents
+/// the Integrator Touch Bar HUD when Windows begins playing Spotify/YouTube/VLC media.
+#[cfg(target_os = "macos")]
+async fn run_macos_touchbar_media_watcher(
+    discovery: DiscoveryManager,
+    features: Arc<FeatureManager>,
+) {
+    if !system_info::has_touch_bar_hardware() {
+        return;
+    }
+    let mut was_playing = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if !features.is_enabled("touchbar") {
+            was_playing = false;
+            continue;
+        }
+        // If Touch Bar HUD is already active, its own 1s snapshot poller handles media updates directly
+        if unsafe { is_touchbar_active_in_app() } {
+            was_playing = true;
+            continue;
+        }
+        let Some(peer_ip) = discovery.get_peer_ip().await else {
+            was_playing = false;
+            continue;
+        };
+        let playing_now = DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetMediaState)
+            .await
+            .ok()
+            .and_then(|r| r.media_state)
+            .map(|m| m.has_session && m.is_playing)
+            .unwrap_or(false);
+
+        if playing_now && !was_playing {
+            if let Ok(c_ip) = CString::new(peer_ip) {
+                unsafe {
+                    set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                    init_touchbar_in_app(c_ip.as_ptr());
+                }
+            }
+        }
+        was_playing = playing_now;
+    }
+}
+
+/// Continuously watches for active Windows UAC (`consent.exe`) or Windows Hello
+/// (`CredentialUIBroker.exe`) prompts on the Windows workstation and sends
+/// `DisplayRpcRequest::NotifyTouchIdPrompt` to the paired Mac so its Touch Bar illuminates
+/// the animated pointer pointing directly at the physical Touch ID sensor.
+#[cfg(target_os = "windows")]
+async fn run_windows_touchid_prompt_watcher(
+    discovery: DiscoveryManager,
+    features: Arc<FeatureManager>,
+) {
+    let mut last_prompt: Option<&'static str> = None;
+    let mut active_peer_notified: Option<String> = None;
+    loop {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        if !features.is_enabled("touchid") {
+            if last_prompt.is_some() {
+                if let Some(ip) = active_peer_notified.take() {
+                    let _ = DisplayController::send_remote_rpc(
+                        &ip,
+                        &DisplayRpcRequest::NotifyTouchIdPrompt {
+                            label: String::new(),
+                            active: false,
+                        },
+                    )
+                    .await;
+                }
+                last_prompt = None;
+            }
+            continue;
+        }
+
+        let current = tokio::task::spawn_blocking(IntegratorCore::detect_active_windows_security_prompt)
+            .await
+            .ok()
+            .flatten();
+        if current != last_prompt {
+            match current {
+                Some(label) => {
+                    if let Some(peer_ip) = discovery.get_peer_ip().await {
+                        let _ = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::NotifyTouchIdPrompt {
+                                label: label.to_string(),
+                                active: true,
+                            },
+                        )
+                        .await;
+                        active_peer_notified = Some(peer_ip);
+                    }
+                }
+                None => {
+                    let target = active_peer_notified
+                        .take()
+                        .or(discovery.get_peer_ip().await);
+                    if let Some(peer_ip) = target {
+                        let _ = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::NotifyTouchIdPrompt {
+                                label: String::new(),
+                                active: false,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            last_prompt = current;
+        }
+    }
+}
+
 /// Automatically configures Windows Defender Firewall rules for Integrator on Windows hosts.
 ///
 /// Ensures direct Thunderbolt/USB4, USB-C NCM, Ethernet, and Mobile Hotspot interfaces
@@ -1655,12 +2073,45 @@ impl IntegratorCore {
                 tracing::warn!("Failed to start shared camera listener: {}", e);
             }
 
+            // Spawn continuous True Tone ambient sync daemon
+            let disc_tt = discovery.clone();
+            let feat_tt = Arc::clone(&feature_manager);
+            tokio::spawn(async move {
+                truetone::run_continuous_truetone_sync(disc_tt, feat_tt).await;
+            });
+
+            // On macOS with Touch Bar hardware, watch for Windows media playback starting and
+            // auto-present the Touch Bar HUD seamlessly so Spotify/YouTube controls appear immediately.
+            #[cfg(target_os = "macos")]
+            {
+                let disc_tb = discovery.clone();
+                let feat_tb = Arc::clone(&feature_manager);
+                tokio::spawn(async move {
+                    run_macos_touchbar_media_watcher(disc_tb, feat_tb).await;
+                });
+            }
+
+            // On Windows, watch for UAC elevation (`consent.exe`) and Windows Hello (`CredentialUIBroker.exe`)
+            // prompts and illuminate the paired Mac Touch Bar Touch ID sensor pointer in real time.
+            #[cfg(target_os = "windows")]
+            {
+                let disc_tid = discovery.clone();
+                let feat_tid = Arc::clone(&feature_manager);
+                tokio::spawn(async move {
+                    run_windows_touchid_prompt_watcher(disc_tid, feat_tid).await;
+                });
+            }
+
             Ok::<_, anyhow::Error>((discovery, display_ctrl, clipboard, kvm, camera))
         })?;
 
         #[cfg(target_os = "macos")]
         unsafe {
             crate::clipboard::service::init_shortcut_interceptor();
+            if system_info::has_touch_bar_hardware() && feature_manager.is_enabled("touchbar") {
+                set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                set_touchbar_tray_enabled_in_app(true);
+            }
         }
 
         let core = Arc::new(Self {
@@ -1683,6 +2134,71 @@ impl IntegratorCore {
         }
 
         Ok(core)
+    }
+
+    /// Background Windows watcher that detects active UAC (`consent.exe`) or Windows Hello
+    /// (`CredentialUIBroker.exe`) prompts via unprivileged Win32 Toolhelp snapshots and
+    /// illuminates the paired Mac Touch Bar's animated Touch ID pointer in real time.
+    #[cfg(target_os = "windows")]
+    fn detect_active_windows_security_prompt() -> Option<&'static str> {
+        #[repr(C)]
+        struct ProcessEntry32W {
+            dw_size: u32,
+            cnt_usage: u32,
+            th32_process_id: u32,
+            th32_default_heap_id: usize,
+            th32_module_id: u32,
+            cnt_threads: u32,
+            th32_parent_process_id: u32,
+            pc_pri_class_base: i32,
+            dw_flags: u32,
+            sz_exe_file: [u16; 260],
+        }
+        const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+        const INVALID_HANDLE_VALUE: isize = -1;
+        extern "system" {
+            fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+            fn Process32FirstW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+            fn Process32NextW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+            fn CloseHandle(h_object: isize) -> i32;
+        }
+
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == 0 || snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = ProcessEntry32W {
+            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            cnt_usage: 0,
+            th32_process_id: 0,
+            th32_default_heap_id: 0,
+            th32_module_id: 0,
+            cnt_threads: 0,
+            th32_parent_process_id: 0,
+            pc_pri_class_base: 0,
+            dw_flags: 0,
+            sz_exe_file: [0u16; 260],
+        };
+        let mut found: Option<&'static str> = None;
+        if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
+            loop {
+                let nul_pos = entry.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..nul_pos]).to_ascii_lowercase();
+                if name == "consent.exe" {
+                    found = Some("Approve Windows UAC Prompt");
+                    break;
+                } else if name == "credentialuibroker.exe" {
+                    found = Some("Approve Windows Hello Login");
+                }
+                if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe {
+            CloseHandle(snap);
+        }
+        found
     }
 
     /// Assembles a complete, unified `BridgeStatus` diagnostic structure.
@@ -1715,6 +2231,7 @@ impl IntegratorCore {
             storage_status,
             preferred_peer_share,
             local_shared_folder,
+            auto_mount_storage,
             autostart_enabled,
             (enc_gpu, dec_gpu),
             als,
@@ -1723,9 +2240,20 @@ impl IntegratorCore {
         ) = tokio::task::spawn_blocking({
             let bip = best_ip.clone();
             let bsh = best_share.clone();
+            let storage_on = feature_flags.storage;
             move || {
-                let st =
+                let mut st =
                     storage::StorageManager::status_with_share(bip.as_deref(), bsh.as_deref());
+                let auto_mount = storage::StorageManager::is_auto_mount_on_peer_detect();
+                if storage_on && auto_mount && !st.is_mounted {
+                    if let Some(ref peer_ip) = bip {
+                        if let Ok(mounted_st) =
+                            storage::StorageManager::mount_with_share(peer_ip, bsh.as_deref())
+                        {
+                            st = mounted_st;
+                        }
+                    }
+                }
                 let pref = storage::StorageManager::get_preferred_peer_share();
                 let local_folder = storage::StorageManager::get_local_shared_folder();
                 let auto = autostart::AutostartManager::is_enabled();
@@ -1748,11 +2276,12 @@ impl IntegratorCore {
                     camera_enabled,
                     has_peer_discovered,
                 );
-                (st, pref, local_folder, auto, gpus, als, trust_snap, setup_snap)
+                (st, pref, local_folder, auto_mount, auto, gpus, als, trust_snap, setup_snap)
             }
         })
         .await
         .unwrap_or_else(|_| {
+            let auto_mount = storage::StorageManager::is_auto_mount_on_peer_detect();
             (
                 StorageStatus {
                     is_mounted: false,
@@ -1763,6 +2292,7 @@ impl IntegratorCore {
                 },
                 None,
                 None,
+                auto_mount,
                 false,
                 ("auto".to_string(), "auto".to_string()),
                 truetone::AmbientLightData {
@@ -1916,6 +2446,7 @@ impl IntegratorCore {
             storage_status,
             preferred_peer_share,
             local_shared_folder,
+            auto_mount_storage,
 
             audio_status: audio::AudioManager::status(),
             camera_status: self.camera.status(),
@@ -1975,6 +2506,14 @@ impl IntegratorCore {
                     if !self.features.is_enabled("display") {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
                     }
+                    if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
+                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
+                            self.features.set_flag("input_kvm", false);
+                            self.features.set_flag("input", false);
+                            self.kvm.force_release_all(true);
+                            tracing::info!("🖥️ Screen extension starting: automatically disabled KVM to prevent cursor capture conflicts.");
+                        }
+                    }
                     let msg = if cfg!(target_os = "macos") {
                         self.display_ctrl.toggle_mac_to_pc().await
                     } else {
@@ -1987,6 +2526,14 @@ impl IntegratorCore {
                     if !self.features.is_enabled("display") {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
                     }
+                    if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
+                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
+                            self.features.set_flag("input_kvm", false);
+                            self.features.set_flag("input", false);
+                            self.kvm.force_release_all(true);
+                            tracing::info!("🖥️ Screen extension (Mac -> PC) starting: automatically disabled KVM to prevent cursor capture conflicts.");
+                        }
+                    }
                     let msg = self
                         .display_ctrl
                         .toggle_mac_to_pc()
@@ -1997,6 +2544,14 @@ impl IntegratorCore {
                 "toggle_pc_to_mac" => {
                     if !self.features.is_enabled("display") {
                         return Err("Extended Screen & GPU Acceleration is disabled".into());
+                    }
+                    if !self.display_ctrl.is_active().await && self.display_ctrl.get_active_mode().await.is_none() {
+                        if self.features.is_enabled("input_kvm") || self.features.is_enabled("input") {
+                            self.features.set_flag("input_kvm", false);
+                            self.features.set_flag("input", false);
+                            self.kvm.force_release_all(true);
+                            tracing::info!("🖥️ Screen extension (PC -> Mac) starting: automatically disabled KVM to prevent cursor capture conflicts.");
+                        }
                     }
                     let msg = self
                         .display_ctrl
@@ -2095,18 +2650,18 @@ impl IntegratorCore {
                         if active {
                             unsafe { dismiss_touchbar_in_app() };
                             Ok(serde_json::json!(false))
-                        } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
-                            if let Ok(c_ip) = CString::new(peer_ip) {
-                                unsafe {
-                                    set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
-                                    init_touchbar_in_app(c_ip.as_ptr());
-                                }
-                                Ok(serde_json::json!(true))
-                            } else {
-                                Err("Invalid peer IP".into())
-                            }
                         } else {
-                            Err("Connect to a peer first to initialize Touch Bar HUD".into())
+                            let peer_ip = self.discovery.get_peer_ip().await;
+                            unsafe {
+                                set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                                set_touchbar_tray_enabled_in_app(true);
+                                if let Some(ip) = peer_ip.and_then(|s| CString::new(s).ok()) {
+                                    init_touchbar_in_app(ip.as_ptr());
+                                } else {
+                                    init_touchbar_in_app(std::ptr::null());
+                                }
+                            }
+                            Ok(serde_json::json!(true))
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -2307,7 +2862,25 @@ impl IntegratorCore {
                     let flags = self.features.set_flag_checked(feat, args.enabled)?;
                     if feat == "camera" {
                         self.camera.sync_with_feature_flag(args.enabled).await;
-                    } else if !args.enabled {
+                    } else if args.enabled {
+                        if matches!(feat, "input_kvm" | "input") {
+                            if self.display_ctrl.is_active().await
+                                || self.display_ctrl.get_active_mode().await.is_some()
+                            {
+                                let _ = self.display_ctrl.stop_mac_to_pc().await;
+                                let _ = self.display_ctrl.stop_pc_to_mac().await;
+                                tracing::info!("⌨️🖱️ KVM enabled: automatically stopped active screen extension.");
+                            }
+                        } else if feat == "touchbar" {
+                            #[cfg(target_os = "macos")]
+                            if system_info::has_touch_bar_hardware() {
+                                unsafe {
+                                    set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                                    set_touchbar_tray_enabled_in_app(true);
+                                }
+                            }
+                        }
+                    } else {
                         match feat {
                             "display" => {
                                 if self.display_ctrl.is_active().await
@@ -2326,7 +2899,10 @@ impl IntegratorCore {
                             "touchbar" => {
                                 #[cfg(target_os = "macos")]
                                 if system_info::has_touch_bar_hardware() {
-                                    unsafe { dismiss_touchbar_in_app() };
+                                    unsafe {
+                                        dismiss_touchbar_in_app();
+                                        set_touchbar_tray_enabled_in_app(false);
+                                    }
                                 }
                             }
                             "input_kvm" | "input" | "dragdrop" | "clipboard" => {
@@ -2445,6 +3021,20 @@ impl IntegratorCore {
                     self.discovery.remove_manual_peer_ip(&args.ip).await;
                     Ok(serde_json::to_value(self.discovery.get_manual_peer_ips().await)
                         .map_err(|e| e.to_string())?)
+                }
+                "set_auto_mount_storage" => {
+                    #[derive(Deserialize)]
+                    struct AutoMountArgs {
+                        enabled: bool,
+                    }
+                    let args: AutoMountArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let res = tokio::task::spawn_blocking(move || {
+                        storage::StorageManager::set_auto_mount_on_peer_detect(args.enabled)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!(res))
                 }
                 "set_preferred_peer_share" => {
                     #[derive(Deserialize)]
@@ -2812,6 +3402,159 @@ impl IntegratorCore {
                         .ok_or_else(|| "Remote Mac returned success without passkey assertion".to_string())?;
                     Ok(serde_json::to_value(assertion).map_err(|e| e.to_string())?)
                 }
+                "set_display_mode" => {
+                    #[derive(Deserialize)]
+                    struct ModeArgs {
+                        #[serde(default)]
+                        width: u32,
+                        #[serde(default)]
+                        height: u32,
+                        #[serde(default = "default_mode_fps")]
+                        fps: u32,
+                        #[serde(default)]
+                        hdr: bool,
+                    }
+                    fn default_mode_fps() -> u32 { 120 }
+                    let args: ModeArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let msg = self
+                        .display_ctrl
+                        .set_display_mode(args.width, args.height, args.fps, args.hdr)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!(msg))
+                }
+                "toggle_camera_privacy" => {
+                    let muted = self.camera.toggle_privacy_muted();
+                    Ok(serde_json::json!({ "privacy_muted": muted }))
+                }
+                "set_camera_privacy" => {
+                    #[derive(Deserialize)]
+                    struct PrivacyArgs {
+                        muted: bool,
+                    }
+                    let args: PrivacyArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let muted = self.camera.set_privacy_muted(args.muted);
+                    Ok(serde_json::json!({ "privacy_muted": muted }))
+                }
+                "set_audio_mixer" => {
+                    #[derive(Deserialize)]
+                    struct MixerArgs {
+                        #[serde(default)]
+                        balance: f32,
+                        #[serde(default)]
+                        muted: bool,
+                    }
+                    let args: MixerArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let (bal, muted) = audio::AudioManager::set_mixer(args.balance, args.muted);
+                    Ok(serde_json::json!({ "mixer_balance": bal, "sink_muted": muted }))
+                }
+                "toggle_kvm_boundary_lock" => {
+                    let locked = self.kvm.toggle_boundary_locked();
+                    if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        let _ = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::SetKvmBoundaryLock { locked },
+                        )
+                        .await;
+                    }
+                    Ok(serde_json::json!({ "boundary_locked": locked }))
+                }
+                "set_kvm_boundary_lock" => {
+                    #[derive(Deserialize)]
+                    struct LockArgs {
+                        locked: bool,
+                    }
+                    let args: LockArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let locked = self.kvm.set_boundary_locked(args.locked, true);
+                    if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        let _ = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::SetKvmBoundaryLock { locked },
+                        )
+                        .await;
+                    }
+                    Ok(serde_json::json!({ "boundary_locked": locked }))
+                }
+                "get_windows_media_state" => {
+                    let state = if cfg!(target_os = "windows") {
+                        tokio::task::spawn_blocking(crate::media::query_media_state)
+                            .await
+                            .unwrap_or_default()
+                    } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        DisplayController::send_remote_rpc(&peer_ip, &DisplayRpcRequest::GetMediaState)
+                            .await
+                            .ok()
+                            .and_then(|r| r.media_state)
+                            .unwrap_or_default()
+                    } else {
+                        crate::media::MediaPlaybackState::default()
+                    };
+                    Ok(serde_json::to_value(state).map_err(|e| e.to_string())?)
+                }
+                "send_windows_media_cmd" => {
+                    let action: crate::media::MediaControlAction =
+                        serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    if cfg!(target_os = "windows") {
+                        let msg = tokio::task::spawn_blocking(move || {
+                            crate::media::execute_media_command(&action)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())??;
+                        Ok(serde_json::json!(msg))
+                    } else {
+                        let peer_ip = self
+                            .discovery
+                            .get_peer_ip()
+                            .await
+                            .ok_or_else(|| "No connected Windows peer for media control".to_string())?;
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::SendMediaCommand { action },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if resp.success {
+                            Ok(serde_json::json!(resp.message))
+                        } else {
+                            Err(resp.message)
+                        }
+                    }
+                }
+                "notify_touchid_prompt" => {
+                    #[derive(Deserialize)]
+                    struct PromptArgs {
+                        #[serde(default)]
+                        label: String,
+                        active: bool,
+                    }
+                    let args: PromptArgs = serde_json::from_value(params_val).map_err(|e| e.to_string())?;
+                    let lbl = if args.label.trim().is_empty() {
+                        "Approve Windows Hello Login".to_string()
+                    } else {
+                        args.label
+                    };
+                    if cfg!(target_os = "macos") {
+                        notify_touchbar_touchid_prompt(&lbl, args.active);
+                        Ok(serde_json::json!("Updated Touch Bar Touch ID prompt"))
+                    } else if let Some(peer_ip) = self.discovery.get_peer_ip().await {
+                        let resp = DisplayController::send_remote_rpc(
+                            &peer_ip,
+                            &DisplayRpcRequest::NotifyTouchIdPrompt {
+                                label: lbl,
+                                active: args.active,
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        if resp.success {
+                            Ok(serde_json::json!(resp.message))
+                        } else {
+                            Err(resp.message)
+                        }
+                    } else {
+                        Err("No paired Mac discovered for Touch ID Touch Bar prompt".into())
+                    }
+                }
                 _ => Err(format!("Unknown native command: {}", method)),
             }
         });
@@ -2889,6 +3632,13 @@ impl IntegratorCore {
 
     /// Shuts down all active services, releasing system hooks and closing sockets.
     pub fn shutdown(&self) {
+        #[cfg(target_os = "macos")]
+        if system_info::has_touch_bar_hardware() {
+            unsafe {
+                dismiss_touchbar_in_app();
+                set_touchbar_tray_enabled_in_app(false);
+            }
+        }
         self.camera.shutdown_sync();
         self.kvm.shutdown();
         register_ui_callback(None);
@@ -2899,6 +3649,7 @@ impl IntegratorCore {
     /// # Supported Actions:
     /// - `"paste_remote"`: Initiates remote clipboard paste operation.
     /// - `"toggle_display"`: Starts or stops screen extension streaming.
+    /// - `"toggle_touchbar"`: Shows or hides the macOS Touch Bar HUD strip.
     /// - `"open_cache"`: Reveals application data folder in file manager.
     /// - `"quit"`: Releases input locks and emits application exit event.
     pub fn trigger_tray_action(&self, action: &str) {
@@ -2929,6 +3680,37 @@ impl IntegratorCore {
                         Err(e) => emit_ui_toast("error", &e.to_string()),
                     }
                 });
+            }
+            "toggle_touchbar" => {
+                #[cfg(target_os = "macos")]
+                {
+                    if !self.features.is_enabled("touchbar") {
+                        emit_ui_toast("error", "Touch Bar HUD is disabled by master switch");
+                        return;
+                    }
+                    if !system_info::has_touch_bar_hardware() {
+                        emit_ui_toast("info", "No Apple Touch Bar detected on this Mac");
+                        return;
+                    }
+                    let disc = self.discovery.clone();
+                    self.rt.spawn(async move {
+                        let active = unsafe { is_touchbar_active_in_app() };
+                        if active {
+                            unsafe { dismiss_touchbar_in_app() };
+                        } else {
+                            let peer_ip = disc.get_peer_ip().await;
+                            unsafe {
+                                set_touchbar_rpc_port_in_app(config::CONTROL_PORT);
+                                set_touchbar_tray_enabled_in_app(true);
+                                if let Some(ip) = peer_ip.and_then(|s| CString::new(s).ok()) {
+                                    init_touchbar_in_app(ip.as_ptr());
+                                } else {
+                                    init_touchbar_in_app(std::ptr::null());
+                                }
+                            }
+                        }
+                    });
+                }
             }
             "open_cache" => open_app_data_folder(),
             "quit" => {

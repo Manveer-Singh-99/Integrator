@@ -602,6 +602,29 @@ namespace IntegratorUI
         /// <summary>Returns true if the plugin authenticator is initialized and registered.</summary>
         public static bool IsActive => _isRegisteredWithWindows && _classRegistrationCookie != 0;
 
+        /// <summary>
+        /// Queries Windows 11 WebAuthn subsystem to verify if Integrator Passkey Provider is registered.
+        /// </summary>
+        public static bool IsRegistered
+        {
+            get
+            {
+                if (_isRegisteredWithWindows) return true;
+                try
+                {
+                    Guid clsid = CLSID_IntegratorPasskeyAuthenticator;
+                    int hr = WebAuthNPluginGetAuthenticatorState(ref clsid, out int state);
+                    if (hr == S_OK && state == 1)
+                    {
+                        _isRegisteredWithWindows = true;
+                        return true;
+                    }
+                }
+                catch { }
+                return false;
+            }
+        }
+
         // ======================================================================================
         // Initialization & Teardown Lifecycle
         // ======================================================================================
