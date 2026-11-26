@@ -4,13 +4,14 @@
 # ==============================================================================
 #
 # 1. MODULE PURPOSE & ARCHITECTURAL SCOPE
-#    Compiles Universal macOS release binaries (`aarch64-apple-darwin` +
-#    `x86_64-apple-darwin`) for `integrator` and the fallback clipboard helper
-#    `macos_clip_files`, bundles optional native resources (`IntegratorAudioDriver`,
-#    installer scripts, application icon), generates `Info.plist` with all required
-#    macOS TCC usage descriptions (Camera, Microphone, Bluetooth, Local Network),
-#    and code-signs the bundle with Integrator's persistent development signing
-#    identity so Accessibility / Input Monitoring TCC approvals persist across builds.
+#    Compiles Universal (`aarch64-apple-darwin` + `x86_64-apple-darwin`) or
+#    single-architecture (`--native` / `--arm64` / `--x86_64`) macOS release
+#    binaries for `integrator` and the fallback clipboard helper `macos_clip_files`,
+#    bundles optional native resources (`IntegratorAudioDriver`, installer scripts,
+#    application icon), generates `Info.plist` with all required macOS TCC usage
+#    descriptions (Camera, Microphone, Bluetooth, Local Network), and code-signs
+#    the bundle with Integrator's persistent development signing identity so
+#    Accessibility / Input Monitoring TCC approvals persist across builds.
 #
 # 2. ARCHITECTURAL LINKAGES & DEPENDENCIES
 #    - Upstream Callers: Release packaging / developer `--install` workflows.
@@ -47,18 +48,45 @@ APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$APP_DIR/Cargo.toml" | head 
 APP_VERSION="${APP_VERSION:-1.0.0}"
 OUT_BUNDLE="$APP_DIR/target/bundle/Integrator.app"
 INSTALL_TO_APPS=0
+ARCH_MODE="universal"
 
 for arg in "$@"; do
     case "$arg" in
         --install)
             INSTALL_TO_APPS=1
             ;;
+        --universal)
+            ARCH_MODE="universal"
+            ;;
+        --native)
+            HOST_ARCH="$(uname -m)"
+            case "$HOST_ARCH" in
+                arm64)  ARCH_MODE="arm64" ;;
+                x86_64) ARCH_MODE="x86_64" ;;
+                *)
+                    echo "Unsupported host architecture for --native: '$HOST_ARCH'" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        --arm64)
+            ARCH_MODE="arm64"
+            ;;
+        --x86_64)
+            ARCH_MODE="x86_64"
+            ;;
         *)
-            echo "Unknown option: $arg (expected: [--install])" >&2
+            echo "Unknown option: $arg (expected: [--native|--arm64|--x86_64|--universal] [--install])" >&2
             exit 1
             ;;
     esac
 done
+
+case "$ARCH_MODE" in
+    universal) TARGETS=("aarch64-apple-darwin" "x86_64-apple-darwin") ;;
+    arm64)     TARGETS=("aarch64-apple-darwin") ;;
+    x86_64)    TARGETS=("x86_64-apple-darwin") ;;
+esac
 
 # Reject characters that could corrupt XML Info.plist or shell templates.
 for pair in "APP_BUNDLE_ID:$APP_BUNDLE_ID" "DEPLOY_TARGET:$DEPLOY_TARGET" "APP_VERSION:$APP_VERSION"; do
@@ -72,7 +100,7 @@ for pair in "APP_BUNDLE_ID:$APP_BUNDLE_ID" "DEPLOY_TARGET:$DEPLOY_TARGET" "APP_V
     esac
 done
 
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
+for target in "${TARGETS[@]}"; do
     if ! rustup target list --installed | grep -qx "$target"; then
         echo "Installing Rust target $target..."
         rustup target add "$target"
@@ -85,32 +113,42 @@ if [ -x "$REPO_ROOT/macos/audio-driver/build-audio-driver.sh" ]; then
     bash "$REPO_ROOT/macos/audio-driver/build-audio-driver.sh"
 fi
 
-echo "Building arm64 release (MACOSX_DEPLOYMENT_TARGET=$DEPLOY_TARGET)..."
-MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET" cargo build \
-    --manifest-path "$APP_DIR/Cargo.toml" \
-    --release \
-    --target aarch64-apple-darwin
-
-echo "Building x86_64 release (MACOSX_DEPLOYMENT_TARGET=$DEPLOY_TARGET)..."
-MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET" cargo build \
-    --manifest-path "$APP_DIR/Cargo.toml" \
-    --release \
-    --target x86_64-apple-darwin
-
-ARM_BIN="$APP_DIR/target/aarch64-apple-darwin/release/integrator"
-INTEL_BIN="$APP_DIR/target/x86_64-apple-darwin/release/integrator"
-ARM_CLIP="$APP_DIR/target/aarch64-apple-darwin/release/macos_clip_files"
-INTEL_CLIP="$APP_DIR/target/x86_64-apple-darwin/release/macos_clip_files"
+for target in "${TARGETS[@]}"; do
+    echo "Building $target release (MACOSX_DEPLOYMENT_TARGET=$DEPLOY_TARGET)..."
+    MACOSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET" cargo build \
+        --manifest-path "$APP_DIR/Cargo.toml" \
+        --release \
+        --target "$target"
+done
 
 rm -rf "$OUT_BUNDLE"
 mkdir -p "$OUT_BUNDLE/Contents/MacOS" "$OUT_BUNDLE/Contents/Resources"
 
-lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$OUT_BUNDLE/Contents/MacOS/integrator"
-chmod 755 "$OUT_BUNDLE/Contents/MacOS/integrator"
+if [ "$ARCH_MODE" = "universal" ]; then
+    ARM_BIN="$APP_DIR/target/aarch64-apple-darwin/release/integrator"
+    INTEL_BIN="$APP_DIR/target/x86_64-apple-darwin/release/integrator"
+    ARM_CLIP="$APP_DIR/target/aarch64-apple-darwin/release/macos_clip_files"
+    INTEL_CLIP="$APP_DIR/target/x86_64-apple-darwin/release/macos_clip_files"
 
-if [ -f "$ARM_CLIP" ] && [ -f "$INTEL_CLIP" ]; then
-    lipo -create "$ARM_CLIP" "$INTEL_CLIP" -output "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
-    chmod 755 "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
+    lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$OUT_BUNDLE/Contents/MacOS/integrator"
+    chmod 755 "$OUT_BUNDLE/Contents/MacOS/integrator"
+
+    if [ -f "$ARM_CLIP" ] && [ -f "$INTEL_CLIP" ]; then
+        lipo -create "$ARM_CLIP" "$INTEL_CLIP" -output "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
+        chmod 755 "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
+    fi
+else
+    SINGLE_TARGET="${TARGETS[0]}"
+    SINGLE_BIN="$APP_DIR/target/${SINGLE_TARGET}/release/integrator"
+    SINGLE_CLIP="$APP_DIR/target/${SINGLE_TARGET}/release/macos_clip_files"
+
+    cp "$SINGLE_BIN" "$OUT_BUNDLE/Contents/MacOS/integrator"
+    chmod 755 "$OUT_BUNDLE/Contents/MacOS/integrator"
+
+    if [ -f "$SINGLE_CLIP" ]; then
+        cp "$SINGLE_CLIP" "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
+        chmod 755 "$OUT_BUNDLE/Contents/MacOS/macos_clip_files"
+    fi
 fi
 
 if [ -f "$APP_DIR/icons/icon.icns" ]; then
@@ -215,7 +253,7 @@ security unlock-keychain -p "$SIGNING_PASS" "$KEYCHAIN_PATH" 2>/dev/null || true
 echo "Signing bundle with persistent Integrator identity (prevents TCC permission resets)..."
 codesign --force --deep --keychain "$KEYCHAIN_PATH" --sign "Integrator Development Code Signing" "$OUT_BUNDLE"
 codesign --verify --deep --strict "$OUT_BUNDLE"
-echo "Built Universal app bundle: $OUT_BUNDLE"
+echo "Built ${ARCH_MODE} app bundle: $OUT_BUNDLE"
 file "$OUT_BUNDLE/Contents/MacOS/integrator"
 
 mkdir -p "$SCRIPT_DIR/build"
