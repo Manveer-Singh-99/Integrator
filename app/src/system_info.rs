@@ -2222,15 +2222,60 @@ pub fn default_local_shared_folder() -> Option<String> {
     }
 }
 
+/// Parses a single non-header row from Windows `net share` output into `(share_name, resource_path)`.
+///
+/// Handles spaces in both the resource path (e.g. `C:\Users\Manveer Singh\Docs`) and optional remarks
+/// by splitting on multi-space column separators (`"  "`), while filtering out administrative `$` shares.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn parse_windows_net_share_row(line: &str) -> Option<(String, Option<String>)> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with("----") || t.starts_with("The command completed") {
+        return None;
+    }
+    let cols: Vec<&str> = t
+        .split("  ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let share_name = *cols.first()?;
+    if share_name.ends_with('$')
+        || share_name.eq_ignore_ascii_case("IPC$")
+        || share_name.eq_ignore_ascii_case("ADMIN$")
+    {
+        return None;
+    }
+    let resource = cols.get(1).map(|s| (*s).to_string());
+    Some((share_name.to_string(), resource))
+}
+
+/// Promotes `preferred` to index 0 of `published` only if it actually matches a live OS share
+/// (case-insensitively), preventing stale/unshared ghost preferences from shadowing real SMB shares.
+pub(crate) fn prioritize_published_smb_shares(
+    mut published: Vec<String>,
+    preferred: Option<&str>,
+) -> Vec<String> {
+    if let Some(pref) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(pos) = published.iter().position(|s| s.eq_ignore_ascii_case(pref)) {
+            let matched = published.remove(pos);
+            published.insert(0, matched);
+        }
+    }
+    published
+}
+
 /// Discovers published local SMB shares dynamically using native tools (`sharing -l` on macOS, `net share` on Windows).
+///
+/// Always queries real OS-published shares first and only promotes `prefs.smb_share_name` (or the
+/// share mapped to `prefs.local_shared_folder`) when it genuinely exists on the local SMB server.
 pub fn list_local_smb_shares() -> Vec<String> {
     let mut shares = Vec::new();
     let prefs = load_path_preferences();
-    if let Some(custom) = prefs.smb_share_name {
-        if !custom.trim().is_empty() {
-            shares.push(custom);
-        }
-    }
+    let preferred_share = prefs
+        .smb_share_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     #[cfg(target_os = "macos")]
     {
@@ -2240,13 +2285,13 @@ pub fn list_local_smb_shares() -> Vec<String> {
             MACOS_SHARING_FALLBACK_BIN
         };
         let mut got_shares = false;
+        let mut folder_matched_share: Option<String> = None;
         // 1. Structured JSON parsing via /usr/sbin/sharing -l -f json
         if let Ok(out) = Command::new(sharing_bin).args(["-l", "-f", "json"]).output() {
             if out.status.success() {
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if let Some(obj) = val.as_object() {
                         let pref_folder = prefs.local_shared_folder.as_deref();
-                        let mut folder_matched_share = None;
                         for (share_label, item) in obj {
                             let smb_shared = item.get("smb_shared").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
                             if !smb_shared {
@@ -2266,12 +2311,6 @@ pub fn list_local_smb_shares() -> Vec<String> {
                                 shares.push(smb_name.to_string());
                             }
                             got_shares = true;
-                        }
-                        if let Some(matched) = folder_matched_share {
-                            if let Some(pos) = shares.iter().position(|s| s == &matched) {
-                                shares.remove(pos);
-                            }
-                            shares.insert(0, matched);
                         }
                     }
                 }
@@ -2306,26 +2345,26 @@ pub fn list_local_smb_shares() -> Vec<String> {
                 }
             }
         }
+        let target_pref = folder_matched_share.as_deref().or(preferred_share.as_deref());
+        shares = prioritize_published_smb_shares(shares, target_pref);
         if shares.is_empty() {
-            if let Some(ref custom_folder) = prefs.local_shared_folder {
-                if let Some(name) = std::path::Path::new(custom_folder).file_name().and_then(|n| n.to_str()) {
-                    shares.push(name.to_string());
-                }
-            } else {
-                shares.push(DEFAULT_PUBLIC_SHARE_NAME.to_string());
-            }
+            shares.push(DEFAULT_PUBLIC_SHARE_NAME.to_string());
         }
     }
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(ref custom_folder) = prefs.local_shared_folder {
-            if let Some(name) = std::path::Path::new(custom_folder).file_name().and_then(|n| n.to_str()) {
-                if !shares.contains(&name.to_string()) {
-                    shares.insert(0, name.to_string());
-                }
+        let mut folder_matched_share: Option<String> = None;
+        let pref_folder_norm = prefs.local_shared_folder.as_deref().map(|p| {
+            let trimmed = p.trim().strip_prefix(r"\\?\").unwrap_or(p.trim());
+            let stripped = trimmed.trim_end_matches(['\\', '/']);
+            let b = stripped.as_bytes();
+            if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                format!("{}:\\", (b[0] as char).to_ascii_uppercase())
+            } else {
+                stripped.to_string()
             }
-        }
+        });
         if let Ok(out) = win_cmd(&system32_exe("net.exe")).arg("share").output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
@@ -2339,15 +2378,19 @@ pub fn list_local_smb_shares() -> Vec<String> {
                     if !in_rows || t.is_empty() || t.starts_with("The command completed") {
                         continue;
                     }
-                    if let Some(share_name) = t.split_whitespace().next() {
-                        // Skip administrative shares (C$, IPC$, ADMIN$)
-                        if share_name.ends_with('$')
-                            || share_name.eq_ignore_ascii_case("IPC$")
-                            || share_name.eq_ignore_ascii_case("ADMIN$")
-                        {
-                            continue;
+                    if let Some((s, resource_opt)) = parse_windows_net_share_row(t) {
+                        if let (Some(ref pf_norm), Some(res_tok)) = (&pref_folder_norm, resource_opt.as_deref()) {
+                            let res_stripped = res_tok.trim().trim_end_matches(['\\', '/']);
+                            let rb = res_stripped.as_bytes();
+                            let res_norm = if rb.len() == 2 && rb[0].is_ascii_alphabetic() && rb[1] == b':' {
+                                format!("{}:\\", (rb[0] as char).to_ascii_uppercase())
+                            } else {
+                                res_stripped.to_string()
+                            };
+                            if res_norm.eq_ignore_ascii_case(pf_norm) {
+                                folder_matched_share = Some(s.clone());
+                            }
                         }
-                        let s = share_name.to_string();
                         if !shares.contains(&s) {
                             shares.push(s);
                         }
@@ -2355,6 +2398,8 @@ pub fn list_local_smb_shares() -> Vec<String> {
                 }
             }
         }
+        let target_pref = folder_matched_share.as_deref().or(preferred_share.as_deref());
+        shares = prioritize_published_smb_shares(shares, target_pref);
         if shares.is_empty() {
             shares.push(DEFAULT_PUBLIC_SHARE_NAME.to_string());
         }
@@ -4111,6 +4156,33 @@ mod tests {
         assert_eq!(
             infer_vendor("Qualcomm(R) Adreno(TM) X1-85 GPU"),
             "Qualcomm"
+        );
+    }
+
+    #[test]
+    fn prioritize_published_smb_shares_ignores_ghost_prefs_and_promotes_real_shares() {
+        // Ghost preference ("Shared" or "Desktop") must NOT overshadow real OS shares.
+        assert_eq!(
+            super::prioritize_published_smb_shares(vec!["C".into(), "D".into()], Some("Shared")),
+            vec!["C".to_string(), "D".to_string()]
+        );
+        // Matching real OS share is promoted to index 0 case-insensitively.
+        assert_eq!(
+            super::prioritize_published_smb_shares(vec!["C".into(), "D".into()], Some("d")),
+            vec!["D".to_string(), "C".to_string()]
+        );
+        // Windows `net share` row parser handles drive roots, spaced paths, and skips admin shares.
+        assert_eq!(
+            super::parse_windows_net_share_row("D$           D:\\                             Default share"),
+            None
+        );
+        assert_eq!(
+            super::parse_windows_net_share_row("D            D:\\                             Integrator Shared Drive D:"),
+            Some(("D".to_string(), Some("D:\\".to_string())))
+        );
+        assert_eq!(
+            super::parse_windows_net_share_row("Docs         C:\\Users\\Manveer Singh\\Docs    User Docs"),
+            Some(("Docs".to_string(), Some("C:\\Users\\Manveer Singh\\Docs".to_string())))
         );
     }
 }

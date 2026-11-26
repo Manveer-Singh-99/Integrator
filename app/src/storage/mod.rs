@@ -212,6 +212,200 @@ pub fn validate_smb_share_name(raw: &str) -> std::result::Result<String, String>
     Ok(trimmed.to_string())
 }
 
+/// Derives a safe default SMB share name from a local filesystem path.
+///
+/// Handles Windows drive roots (e.g. `D:\`, `D:/`, `D:`) where `Path::file_name()` returns `None`
+/// by returning the uppercase drive letter (`"D"`), rather than falling back to a generic `"Shared"`
+/// name that does not match any OS drive share.
+pub(crate) fn derive_smb_share_name(path_str: &str) -> String {
+    let trimmed = path_str.trim();
+    let stripped = trimmed
+        .strip_prefix(r"\\?\")
+        .unwrap_or(trimmed)
+        .trim_end_matches(['\\', '/']);
+    // Windows drive root such as "D:" (after stripping trailing slashes from "D:\")
+    let bytes = stripped.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return (bytes[0] as char).to_ascii_uppercase().to_string();
+    }
+    if let Some(name) = stripped
+        .rsplit(['\\', '/'])
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    "Shared".to_string()
+}
+
+/// Normalizes a filesystem path string for case-insensitive Windows or exact Unix share-path comparison.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+fn normalize_share_dir_path(path_str: &str) -> String {
+    let trimmed = path_str.trim().strip_prefix(r"\\?\").unwrap_or(path_str.trim());
+    let without_trailing = trimmed.trim_end_matches(['\\', '/']);
+    let bytes = without_trailing.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return format!("{}:\\", (bytes[0] as char).to_ascii_uppercase());
+    }
+    if without_trailing.is_empty() && !trimmed.is_empty() {
+        return "/".to_string();
+    }
+    without_trailing.to_string()
+}
+
+/// Checks Windows SMB shares via PowerShell `Get-SmbShare` and returns the existing non-admin share
+/// name pointing at `folder_path`, if any.
+#[cfg(target_os = "windows")]
+fn find_existing_windows_smb_share_for_path(folder_path: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let target_norm = normalize_share_dir_path(folder_path);
+    let ps = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    let out = Command::new(ps)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-SmbShare | Where-Object { $_.ShareType -eq 'FileSystemDirectory' -and -not $_.Name.EndsWith('$') } | ForEach-Object { \"$($_.Name)`t$($_.Path)\" }",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some((name, path)) = line.split_once('\t') {
+            if normalize_share_dir_path(path).eq_ignore_ascii_case(&target_norm) {
+                if let Ok(valid) = validate_smb_share_name(name) {
+                    return Some(valid);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Encodes raw bytes using standard RFC 4648 Base64 (used for PowerShell `-EncodedCommand`).
+#[cfg(any(target_os = "windows", test))]
+fn encode_base64_std(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Creates a Windows SMB share for `folder_path` named `share_name` (trying direct `New-SmbShare`
+/// first, then triggering a UAC-elevated prompt if running as a standard non-admin user).
+#[cfg(target_os = "windows")]
+fn ensure_windows_smb_share(share_name: &str, folder_path: &str) -> std::io::Result<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    if let Some(existing) = find_existing_windows_smb_share_for_path(folder_path) {
+        return Ok(existing);
+    }
+
+    let clean_path = normalize_share_dir_path(folder_path);
+    let escaped_name = share_name.replace('\'', "''");
+    let escaped_path = clean_path.replace('\'', "''");
+    let create_script = format!(
+        "if (-not (Get-SmbShare -Name '{0}' -ErrorAction SilentlyContinue)) {{ New-SmbShare -Name '{0}' -Path '{1}' -FullAccess 'Authenticated Users' -ErrorAction Stop | Out-Null }}",
+        escaped_name, escaped_path
+    );
+    let ps = system_info::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+
+    // 1. Try direct creation (succeeds immediately when elevated or delegated).
+    let direct = Command::new(&ps)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &create_script])
+        .output();
+    if let Ok(out) = direct {
+        if out.status.success() {
+            return Ok(share_name.to_string());
+        }
+    }
+
+    // 2. If non-elevated, request UAC elevation so Windows can publish the SMB share cleanly.
+    let utf16_bytes: Vec<u8> = create_script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let encoded = encode_base64_std(&utf16_bytes);
+    let elevate_script = format!(
+        "$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{}'); exit $p.ExitCode",
+        encoded
+    );
+    let elevated = Command::new(&ps)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &elevate_script])
+        .output();
+    if let Ok(out) = elevated {
+        if out.status.success() {
+            if let Some(verified) = find_existing_windows_smb_share_for_path(folder_path) {
+                return Ok(verified);
+            }
+            return Ok(share_name.to_string());
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "Failed to publish Windows SMB share '{}' for '{}' (administrator elevation is required to create a new Windows network share)",
+            share_name, clean_path
+        ),
+    ))
+}
+
+/// Checks macOS `sharing -l -f json` and returns the published SMB share name for `folder_path`, if any.
+#[cfg(target_os = "macos")]
+fn find_existing_macos_smb_share_for_path(folder_path: &str) -> Option<String> {
+    let target_norm = normalize_share_dir_path(folder_path);
+    let sharing_bin = if std::path::Path::new(crate::config::MACOS_SHARING_BIN).exists() {
+        crate::config::MACOS_SHARING_BIN
+    } else {
+        "sharing"
+    };
+    let out = Command::new(sharing_bin)
+        .args(["-l", "-f", "json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+    let obj = val.as_object()?;
+    for (share_label, item) in obj {
+        let smb_shared = item.get("smb_shared").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+        if !smb_shared {
+            continue;
+        }
+        let share_path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if normalize_share_dir_path(share_path) == target_norm {
+            let smb_name = item
+                .get("smb_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(share_label.as_str())
+                .trim();
+            if let Ok(valid) = validate_smb_share_name(smb_name) {
+                return Some(valid);
+            }
+        }
+    }
+    None
+}
+
 impl StorageManager {
     /// Returns the currently active local shared folder path (user preference or default Public folder).
     pub fn get_local_shared_folder() -> Option<String> {
@@ -238,52 +432,35 @@ impl StorageManager {
                         format!("Specified shared folder does not exist or is not a directory: {}", path_str),
                     ));
                 }
-                // Derive a valid share name from directory basename
-                let share_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Shared");
-                if let Ok(valid_name) = validate_smb_share_name(share_name) {
-                    #[cfg(target_os = "windows")]
-                    if let Some(old_name) = &prefs.smb_share_name {
-                        if old_name != &valid_name {
-                            use std::os::windows::process::CommandExt;
-                            let net_exe = system_info::system32_exe("net.exe");
-                            let _ = std::process::Command::new(net_exe)
-                                .creation_flags(0x08000000)
-                                .args(["share", old_name, "/delete"])
-                                .status();
-                        }
+                let derived = derive_smb_share_name(path_str);
+                let valid_name = validate_smb_share_name(&derived)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+                #[cfg(target_os = "windows")]
+                {
+                    let published_name = ensure_windows_smb_share(&valid_name, path_str)?;
+                    prefs.smb_share_name = Some(published_name);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    // Only advertise a macOS share name if File Sharing actually publishes this folder;
+                    // otherwise leave `smb_share_name` unset so real published shares remain discoverable.
+                    prefs.smb_share_name = find_existing_macos_smb_share_for_path(path_str);
+                    if prefs.smb_share_name.is_none() {
+                        tracing::info!(
+                            "Selected local folder '{}' is not yet published in macOS File Sharing (System Settings -> General -> Sharing -> File Sharing); keeping live published SMB shares advertised",
+                            path_str
+                        );
                     }
-                    prefs.smb_share_name = Some(valid_name.clone());
-                    #[cfg(target_os = "windows")]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        let net_exe = system_info::system32_exe("net.exe");
-                        let username = std::env::var("USERNAME").unwrap_or_default();
-                        let grant_arg = if !username.is_empty() {
-                            format!("/grant:{},full", username)
-                        } else {
-                            "/grant:everyone,read".to_string()
-                        };
-                        let _ = std::process::Command::new(net_exe)
-                            .creation_flags(0x08000000)
-                            .args(["share", &format!("{}=\"{}\"", valid_name, path_str), &grant_arg])
-                            .status();
-                    }
+                    let _ = valid_name;
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    prefs.smb_share_name = Some(valid_name);
                 }
                 Some(path_str.to_string())
             }
             None => {
-                #[cfg(target_os = "windows")]
-                if let Some(old_name) = &prefs.smb_share_name {
-                    use std::os::windows::process::CommandExt;
-                    let net_exe = system_info::system32_exe("net.exe");
-                    let _ = std::process::Command::new(net_exe)
-                        .creation_flags(0x08000000)
-                        .args(["share", old_name, "/delete"])
-                        .status();
-                }
                 prefs.smb_share_name = None;
                 None
             }
@@ -1153,5 +1330,17 @@ Workspace Drive                                 Disk    Shared SSD
         if StorageManager::get_preferred_peer_share().is_none() {
             assert_eq!(st.remote_share, "Not configured");
         }
+    }
+
+    #[test]
+    fn derive_smb_share_name_handles_windows_drive_roots_and_folders() {
+        assert_eq!(derive_smb_share_name(r"D:\"), "D");
+        assert_eq!(derive_smb_share_name("d:/"), "D");
+        assert_eq!(derive_smb_share_name("C:"), "C");
+        assert_eq!(derive_smb_share_name(r"\\?\D:\"), "D");
+        assert_eq!(derive_smb_share_name(r"C:\Users\Manveer Singh\Projects\"), "Projects");
+        assert_eq!(derive_smb_share_name("/Users/manveersingh/Public"), "Public");
+        assert_eq!(normalize_share_dir_path("d:/"), r"D:\");
+        assert_eq!(encode_base64_std(b"hi"), "aGk=");
     }
 }
