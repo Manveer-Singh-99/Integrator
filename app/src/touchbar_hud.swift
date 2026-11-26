@@ -489,6 +489,56 @@ private func makeTouchBarSymbolImage(
     return img
 }
 
+/// Pre-rasterizes a single-line Touch Bar marquee label into a full-width `@2x` Retina `CGImage`.
+///
+/// Using a `CGImage` on `CALayer` avoids AppKit's clipped `NSView` visible-rect culling, which
+/// otherwise omits rasterizing overflowing `NSTextField` tails and wrap-around clones outside the
+/// pill's `masksToBounds` viewport during CoreAnimation transforms.
+private func renderMarqueeTextImage(
+    text: String,
+    font: NSFont,
+    scale: CGFloat = 2.0
+) -> (cgImage: CGImage, size: CGSize)? {
+    guard !text.isEmpty else { return nil }
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: font,
+        .foregroundColor: NSColor.white
+    ]
+    let attr = NSAttributedString(string: text, attributes: attrs)
+    let measured = attr.size()
+    let ptW = min(max(ceil(measured.width) + 2.0, 1.0), 2048.0)
+    let ptH = max(ceil(measured.height) + 2.0, 1.0)
+    let pxW = max(Int(ceil(ptW * scale)), 1)
+    let pxH = max(Int(ceil(ptH * scale)), 1)
+
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: pxW,
+        pixelsHigh: pxH,
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
+    ) else { return nil }
+    rep.size = NSSize(width: ptW, height: ptH)
+
+    guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = ctx
+    ctx.shouldAntialias = true
+    NSColor.clear.setFill()
+    NSRect(x: 0.0, y: 0.0, width: ptW, height: ptH).fill()
+    attr.draw(at: NSPoint(x: 1.0, y: 1.0))
+    ctx.flushGraphics()
+    NSGraphicsContext.restoreGraphicsState()
+
+    guard let cg = rep.cgImage else { return nil }
+    return (cg, CGSize(width: ptW, height: ptH))
+}
+
 /// Frosted Liquid Glass Touch Bar button view featuring critically-damped tactile spring settle
 /// (`zeta = 1.0`), haptic feedback, SF Symbol icon support, optional seamless looping marquee
 /// scrolling for overflowing labels, and direct NSTouch/mouse hit-slop tracking.
@@ -524,12 +574,12 @@ class GoopyLiquidGlassPillView: NSView {
     private var currentText: String = ""
     /// Masked viewport clipping the horizontally scrolling marquee track to the pill interior.
     private let marqueeClipView = MarqueePassThroughView()
-    /// Animated container sliding two identical copies of overflowing text seamlessly leftwards.
-    private let marqueeTrackView = MarqueePassThroughView()
-    /// Leading marquee text copy.
-    private let marqueePrimaryLabel = NSTextField(labelWithString: "")
-    /// Trailing seamless wrap-around marquee text copy.
-    private let marqueeCloneLabel = NSTextField(labelWithString: "")
+    /// GPU-composited container layer sliding two pre-rasterized text copies seamlessly leftwards.
+    private let marqueeTrackLayer = CALayer()
+    /// Leading pre-rasterized marquee text layer.
+    private let marqueePrimaryLayer = CALayer()
+    /// Trailing seamless wrap-around marquee text layer sharing the same `CGImage` texture.
+    private let marqueeCloneLayer = CALayer()
     /// Soft left/right alpha edge-fade mask applied to `marqueeClipView.layer`.
     private let marqueeMaskLayer = CAGradientLayer()
     /// True while a seamless looping CoreAnimation marquee is actively scrolling.
@@ -662,21 +712,13 @@ class GoopyLiquidGlassPillView: NSView {
             marqueeClipView.isHidden = true
             addSubview(marqueeClipView)
 
-            marqueeTrackView.wantsLayer = true
-            marqueeClipView.addSubview(marqueeTrackView)
-
-            for field in [marqueePrimaryLabel, marqueeCloneLabel] {
-                field.alignment = .left
-                field.font = Self.pillFont
-                field.textColor = .white
-                field.backgroundColor = .clear
-                field.isBezeled = false
-                field.isEditable = false
-                field.isSelectable = false
-                field.maximumNumberOfLines = 1
-                field.lineBreakMode = .byClipping
-                marqueeTrackView.addSubview(field)
+            marqueeTrackLayer.masksToBounds = false
+            for textLayer in [marqueePrimaryLayer, marqueeCloneLayer] {
+                textLayer.contentsScale = 2.0
+                textLayer.contentsGravity = .resize
+                marqueeTrackLayer.addSublayer(textLayer)
             }
+            marqueeClipView.layer?.addSublayer(marqueeTrackLayer)
 
             marqueeMaskLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
             marqueeMaskLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
@@ -713,7 +755,7 @@ class GoopyLiquidGlassPillView: NSView {
     }
 
     private func stopMarqueeAnimation() {
-        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackLayer.removeAnimation(forKey: "marqueeLoop")
         isMarqueeScrolling = false
         activeMarqueeCycle = 0.0
     }
@@ -730,23 +772,28 @@ class GoopyLiquidGlassPillView: NSView {
             attributes: [.font: Self.pillFont]
         ).size()
         let textW = ceil(measured.width)
-        let textH = ceil(measured.height)
 
-        guard textW > clipW + 1.0 else {
+        guard textW > clipW + 1.0,
+              let rendered = renderMarqueeTextImage(text: currentText, font: Self.pillFont) else {
             stopMarqueeAnimation()
             marqueeClipView.isHidden = true
             marqueeClipView.layer?.mask = nil
+            marqueePrimaryLayer.contents = nil
+            marqueeCloneLayer.contents = nil
             label.isHidden = false
             return
         }
 
-        let cycleDistance = textW + marqueeGap
+        let imgSize = rendered.size
+        let cycleDistance = imgSize.width + marqueeGap
         marqueeClipView.frame = CGRect(x: 6.0, y: 0.0, width: clipW, height: totalH)
         marqueeClipView.isHidden = false
         label.isHidden = true
 
         // Update soft edge-fade gradient mask matching the current clip width.
         let fadeFrac = min(max(6.0 / clipW, 0.02), 0.14)
+        let yPos = floor((totalH - imgSize.height) / 2.0)
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         marqueeMaskLayer.frame = marqueeClipView.bounds
@@ -757,27 +804,25 @@ class GoopyLiquidGlassPillView: NSView {
             1.0
         ]
         marqueeClipView.layer?.mask = marqueeMaskLayer
-        CATransaction.commit()
-
-        let yPos = floor((totalH - textH) / 2.0)
 
         // When telemetry updates live values (e.g., GPU temp 54° -> 55°) with nearly identical width,
-        // update both marquee copies in place without resetting the running animation phase.
+        // swap both pre-rasterized textures in place without resetting the running animation phase.
         if !forceRestart && isMarqueeScrolling && abs(cycleDistance - activeMarqueeCycle) <= 8.0 {
-            let slotW = max(textW + 4.0, activeMarqueeCycle - marqueeGap + 4.0)
-            marqueePrimaryLabel.stringValue = currentText
-            marqueeCloneLabel.stringValue = currentText
-            marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: slotW, height: textH)
-            marqueeCloneLabel.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: slotW, height: textH)
+            marqueePrimaryLayer.contents = rendered.cgImage
+            marqueeCloneLayer.contents = rendered.cgImage
+            marqueePrimaryLayer.frame = CGRect(x: 0.0, y: yPos, width: imgSize.width, height: imgSize.height)
+            marqueeCloneLayer.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: imgSize.width, height: imgSize.height)
+            CATransaction.commit()
             return
         }
 
-        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
-        marqueeTrackView.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + textW + 8.0, height: totalH)
-        marqueePrimaryLabel.stringValue = currentText
-        marqueeCloneLabel.stringValue = currentText
-        marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: textW + 4.0, height: textH)
-        marqueeCloneLabel.frame = CGRect(x: cycleDistance, y: yPos, width: textW + 4.0, height: textH)
+        marqueeTrackLayer.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackLayer.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + imgSize.width, height: totalH)
+        marqueePrimaryLayer.contents = rendered.cgImage
+        marqueeCloneLayer.contents = rendered.cgImage
+        marqueePrimaryLayer.frame = CGRect(x: 0.0, y: yPos, width: imgSize.width, height: imgSize.height)
+        marqueeCloneLayer.frame = CGRect(x: cycleDistance, y: yPos, width: imgSize.width, height: imgSize.height)
+        CATransaction.commit()
 
         let anim = CABasicAnimation(keyPath: "transform.translation.x")
         anim.fromValue = 0.0
@@ -786,7 +831,7 @@ class GoopyLiquidGlassPillView: NSView {
         anim.repeatCount = .infinity
         anim.timingFunction = CAMediaTimingFunction(name: .linear)
         anim.isRemovedOnCompletion = false
-        marqueeTrackView.layer?.add(anim, forKey: "marqueeLoop")
+        marqueeTrackLayer.add(anim, forKey: "marqueeLoop")
 
         isMarqueeScrolling = true
         activeMarqueeCycle = cycleDistance
@@ -992,12 +1037,12 @@ final class LiquidGlassMediaMorphPillView: NSView {
     private let staticTitleLabel = NSTextField(labelWithString: "")
     /// Clipped marquee viewport shown when the song title overflows the pill.
     private let marqueeClipView = MarqueePassThroughView()
-    /// Horizontally animated marquee track containing primary and wrap-around copies.
-    private let marqueeTrackView = MarqueePassThroughView()
-    /// Leading marquee label copy.
-    private let marqueePrimaryLabel = NSTextField(labelWithString: "")
-    /// Trailing wrap-around marquee label copy.
-    private let marqueeCloneLabel = NSTextField(labelWithString: "")
+    /// GPU-composited track layer sliding primary and wrap-around pre-rasterized text copies.
+    private let marqueeTrackLayer = CALayer()
+    /// Leading pre-rasterized marquee text layer.
+    private let marqueePrimaryLayer = CALayer()
+    /// Trailing wrap-around marquee text layer sharing the same `CGImage` texture.
+    private let marqueeCloneLayer = CALayer()
     /// Soft left/right alpha fade mask applied to `marqueeClipView.layer`.
     private let marqueeMaskLayer = CAGradientLayer()
 
@@ -1140,21 +1185,13 @@ final class LiquidGlassMediaMorphPillView: NSView {
         marqueeClipView.isHidden = true
         nowPlayingContainer.addSubview(marqueeClipView)
 
-        marqueeTrackView.wantsLayer = true
-        marqueeClipView.addSubview(marqueeTrackView)
-
-        for field in [marqueePrimaryLabel, marqueeCloneLabel] {
-            field.alignment = .left
-            field.font = Self.titleFont
-            field.textColor = .white
-            field.backgroundColor = .clear
-            field.isBezeled = false
-            field.isEditable = false
-            field.isSelectable = false
-            field.maximumNumberOfLines = 1
-            field.lineBreakMode = .byClipping
-            marqueeTrackView.addSubview(field)
+        marqueeTrackLayer.masksToBounds = false
+        for textLayer in [marqueePrimaryLayer, marqueeCloneLayer] {
+            textLayer.contentsScale = 2.0
+            textLayer.contentsGravity = .resize
+            marqueeTrackLayer.addSublayer(textLayer)
         }
+        marqueeClipView.layer?.addSublayer(marqueeTrackLayer)
 
         marqueeMaskLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
         marqueeMaskLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
@@ -1291,7 +1328,7 @@ final class LiquidGlassMediaMorphPillView: NSView {
     }
 
     private func stopMarqueeAnimation() {
-        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackLayer.removeAnimation(forKey: "marqueeLoop")
         isMarqueeScrolling = false
         activeMarqueeCycle = 0.0
     }
@@ -1308,22 +1345,27 @@ final class LiquidGlassMediaMorphPillView: NSView {
             attributes: [.font: Self.titleFont]
         ).size()
         let textW = ceil(measured.width)
-        let textH = ceil(measured.height)
 
-        guard textW > clipW + 1.0 else {
+        guard textW > clipW + 1.0,
+              let rendered = renderMarqueeTextImage(text: currentTitle, font: Self.titleFont) else {
             stopMarqueeAnimation()
             marqueeClipView.isHidden = true
             marqueeClipView.layer?.mask = nil
+            marqueePrimaryLayer.contents = nil
+            marqueeCloneLayer.contents = nil
             staticTitleLabel.isHidden = false
             return
         }
 
-        let cycleDistance = textW + marqueeGap
+        let imgSize = rendered.size
+        let cycleDistance = imgSize.width + marqueeGap
         marqueeClipView.frame = CGRect(x: textX, y: 0.0, width: clipW, height: h)
         marqueeClipView.isHidden = false
         staticTitleLabel.isHidden = true
 
         let fadeFrac = min(max(6.0 / clipW, 0.02), 0.14)
+        let yPos = floor((h - imgSize.height) / 2.0)
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         marqueeMaskLayer.frame = marqueeClipView.bounds
@@ -1334,25 +1376,23 @@ final class LiquidGlassMediaMorphPillView: NSView {
             1.0
         ]
         marqueeClipView.layer?.mask = marqueeMaskLayer
-        CATransaction.commit()
-
-        let yPos = floor((h - textH) / 2.0)
 
         if !forceRestart && isMarqueeScrolling && abs(cycleDistance - activeMarqueeCycle) <= 8.0 {
-            let slotW = max(textW + 4.0, activeMarqueeCycle - marqueeGap + 4.0)
-            marqueePrimaryLabel.stringValue = currentTitle
-            marqueeCloneLabel.stringValue = currentTitle
-            marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: slotW, height: textH)
-            marqueeCloneLabel.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: slotW, height: textH)
+            marqueePrimaryLayer.contents = rendered.cgImage
+            marqueeCloneLayer.contents = rendered.cgImage
+            marqueePrimaryLayer.frame = CGRect(x: 0.0, y: yPos, width: imgSize.width, height: imgSize.height)
+            marqueeCloneLayer.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: imgSize.width, height: imgSize.height)
+            CATransaction.commit()
             return
         }
 
-        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
-        marqueeTrackView.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + textW + 8.0, height: h)
-        marqueePrimaryLabel.stringValue = currentTitle
-        marqueeCloneLabel.stringValue = currentTitle
-        marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: textW + 4.0, height: textH)
-        marqueeCloneLabel.frame = CGRect(x: cycleDistance, y: yPos, width: textW + 4.0, height: textH)
+        marqueeTrackLayer.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackLayer.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + imgSize.width, height: h)
+        marqueePrimaryLayer.contents = rendered.cgImage
+        marqueeCloneLayer.contents = rendered.cgImage
+        marqueePrimaryLayer.frame = CGRect(x: 0.0, y: yPos, width: imgSize.width, height: imgSize.height)
+        marqueeCloneLayer.frame = CGRect(x: cycleDistance, y: yPos, width: imgSize.width, height: imgSize.height)
+        CATransaction.commit()
 
         let anim = CABasicAnimation(keyPath: "transform.translation.x")
         anim.fromValue = 0.0
@@ -1361,7 +1401,7 @@ final class LiquidGlassMediaMorphPillView: NSView {
         anim.repeatCount = .infinity
         anim.timingFunction = CAMediaTimingFunction(name: .linear)
         anim.isRemovedOnCompletion = false
-        marqueeTrackView.layer?.add(anim, forKey: "marqueeLoop")
+        marqueeTrackLayer.add(anim, forKey: "marqueeLoop")
 
         isMarqueeScrolling = true
         activeMarqueeCycle = cycleDistance
