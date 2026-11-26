@@ -1239,10 +1239,16 @@ pub fn evaluate_local_touchid_and_sign(
             .filter(|c| !c.is_control())
             .take(64)
             .collect();
+        // macOS formats LocalAuthentication's Touch Bar & sheet prompt as "Touch ID to <reason>",
+        // so pass concise verb-phrase reasons without duplicating "Touch ID".
         let reason = if clean_host.is_empty() {
-            "authenticate a remote Touch ID request from your paired workstation".to_string()
+            "approve Windows Hello login".to_string()
+        } else if clean_host.starts_with("create a passkey ")
+            || clean_host.starts_with("sign in to ")
+        {
+            clean_host
         } else {
-            format!("authenticate a Touch ID request for '{}'", clean_host)
+            format!("approve {}", clean_host)
         };
         let c_reason = std::ffi::CString::new(reason)
             .map_err(|_| "Invalid Touch ID prompt reason".to_string())?;

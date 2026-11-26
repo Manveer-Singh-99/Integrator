@@ -846,7 +846,8 @@ pub fn evaluate_mac_touchid_and_sign_assertion(
             ));
         }
 
-        let prompt_reason = format!("sign in to {} with Touch ID", req.rp_id.trim());
+        // macOS prefixes "Touch ID to " in its native Touch Bar & sheet UI.
+        let prompt_reason = format!("sign in to {}", req.rp_id.trim());
         let challenge_nonce = crate::security::csprng_array::<32>();
         let challenge_hex = crate::security::hex_encode(&challenge_nonce);
 

@@ -7,20 +7,21 @@
 //  ========================================================================================
 //  This file provides the native macOS TouchBar (`NSTouchBar`) HUD controller for MacBook Pro
 //  models, implementing tactile hardware-level GPU monitoring, expanded Windows media playback
-//  controls with a rounded Liquid Glass scrubber, Visual Touch ID biometric prompts, a Hardware
-//  Camera Privacy Killswitch pill, remote clipboard paste interception, and a persistent `∫`
-//  Control Strip tray button.
+//  controls with a rounded Liquid Glass scrubber, native Touch ID Touch Bar yield/restore
+//  coordination, a Hardware Camera Privacy Killswitch pill, remote clipboard paste interception,
+//  and a persistent `∫` Control Strip tray button.
 //
 //  Key Subsystem Capabilities:
 //  - Viscous Liquid Glass Pill Views (`GoopyLiquidGlassPillView`): Implements critically-damped
 //    tactile spring physics, Frosted HUD blur materials (`NSVisualEffectView` with `.hudWindow`),
-//    and continuous corner curves.
+//    continuous corner curves, and precision Force Touch trackpad waveform haptics on pill touch.
 //  - Rounded Liquid Glass Media Scrubber (`LiquidGlassMediaScrubPillView`): Capsule progress bar
-//    with glowing circular thumb, elapsed/total timestamps (`mm:ss`), and zero-snap-back direct
-//    touch scrubbing for Windows GSMTC / browser / Spotify / VLC sessions.
-//  - Visual Touch ID Passkey & UAC Animated Sensor Pointer (`TouchIdPromptGlowView`): Illuminated
-//    emerald/teal strip pinned to the far-right corner pointing directly toward the physical
-//    MacBook Pro Touch ID sensor (`───────▶ 👆 Touch ID`).
+//    with glowing circular thumb, elapsed/total timestamps (`mm:ss`), continuous tactile detent
+//    feedback during drags via Force Touch actuator waveforms, and zero-snap-back touch scrubbing.
+//  - Native Touch ID Touch Bar Yielding (`showTouchIdPrompt`): Temporarily yields Integrator's
+//    system-modal Touch Bar while macOS `LocalAuthentication` (`LAContext`) is active so Apple's
+//    native `Cancel ... Touch ID to <reason> →` Touch Bar prompt appears unobstructed, then
+//    restores the HUD automatically when evaluation ends.
 //  - Hardware Camera Privacy Killswitch (`camera_privacy`): One-tap hardware privacy shutter
 //    pill (`🟢 FaceTime HD` / `🚫 Cam Muted`) visible whenever the Mac camera is streaming.
 //  - Live GPU Telemetry Streamer (`gpu` pill + `.gpu` detail strip): Displays real-time GPU
@@ -58,6 +59,10 @@
 //  - AppKit TouchBar Framework (`NSTouchBar`, `NSTouchBarItem`, `NSCustomTouchBarItem`) &
 //    private `DFRFoundation.framework` (`DFRSystemModalShowsCloseBoxWhenFrontMost`,
 //    `DFRElementSetControlStripPresenceForIdentifier`, `DFRGetScreenSize`).
+//  - Private `MultitouchSupport.framework` (`MTDeviceCreateList`, `MTDeviceGetDeviceID`,
+//    `MTDeviceIsBuiltIn`, `MTActuatorCreateFromDeviceID`, `MTActuatorOpen`, `MTActuatorClose`,
+//    `MTActuationCreateFromDictionary`, `MTActuationActuate`) for custom Force Touch trackpad
+//    haptic waveform synthesis (using `NSHapticFeedbackManager` as graceful fallback).
 //  - Quartz Core Graphics (`CGEventTapCreate`, `CGEvent.tapEnable`).
 //  - Rust FFI Callbacks: `trigger_rust_remote_paste`, `fetch_rust_touchbar_snapshot_json`,
 //    `fetch_rust_gpu_telemetry_json`, `toggle_rust_camera_privacy_mute`,
@@ -68,6 +73,9 @@
 //  ========================================================================================
 //  - AppKit Main Thread: All TouchBar UI item creation, KVO callbacks, and label updates execute
 //    strictly on `DispatchQueue.main`.
+//  - Haptic Actuator Serial Worker: Custom Force Touch trackpad actuation runs asynchronously
+//    on a dedicated `.userInteractive` serial `DispatchQueue` (`TrackpadHapticEngine`) so
+//    waveform synthesis and `MultitouchSupport` IPC never block `DispatchQueue.main`.
 //  - Telemetry Poll Worker: 1 Hz timer dispatches `fetch_rust_touchbar_snapshot_json` to
 //    `DispatchQueue.global(qos: .userInitiated)` guarded by `_generation` and `isPollingInFlight`
 //    under `stateLock` (`NSLock`) so stale responses from a dismissed session are discarded.
@@ -83,9 +91,12 @@
 //    and `AF_INET6`) before passing host hints across FFI.
 //  - Buffer Capacity Verification: `read_pasteboard_files_in_app` and snapshot FFI buffers strictly
 //    verify non-null pointers and output buffer capacities before copying bytes.
+//  - Bounded Haptic Actuation: Scrub ticks drop stale queued items and clamp `level` (`0.0...1.0`)
+//    with CoreFoundation ownership balanced via `.takeRetainedValue()` / `.release()`.
 //
 
 import AppKit
+import Darwin
 import Foundation
 import IOKit
 
@@ -94,6 +105,274 @@ private let controlStripBundleId = "com.apple.controlstrip"
 
 /// macOS Finder bundle identifier scoped for intercepting remote file Cmd+V shortcuts.
 private let finderBundleId = "com.apple.finder"
+
+// MARK: - Precision Force Touch Trackpad Haptic Engine (MultitouchSupport)
+
+/// Synthesizes custom Force Touch trackpad tactile waveforms using macOS `MultitouchSupport.framework`
+/// (`MTActuationCreateFromDictionary` + `MTActuationActuate`, inspired by `os6/nospeaker`), with
+/// graceful fallback to `NSHapticFeedbackManager` when no Force Touch actuator is attached.
+private final class TrackpadHapticEngine {
+    static let shared = TrackpadHapticEngine()
+
+    private typealias Tone = (hz: Double, amp: Double)
+    private typealias MTDeviceCreateListFn = @convention(c) () -> Unmanaged<CFArray>?
+    private typealias MTDeviceGetDeviceIDFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UInt64>) -> Int32
+    private typealias MTDeviceIsBuiltInFn = @convention(c) (UnsafeMutableRawPointer) -> Bool
+    private typealias MTActuatorCreateFromDeviceIDFn = @convention(c) (UInt64) -> Unmanaged<CFTypeRef>?
+    private typealias MTActuatorOpenFn = @convention(c) (CFTypeRef) -> Int32
+    private typealias MTActuatorCloseFn = @convention(c) (CFTypeRef) -> Int32
+    private typealias MTActuationCreateFromDictionaryFn = @convention(c) (CFDictionary, Int32) -> UnsafeMutableRawPointer?
+    private typealias MTActuationActuateFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutableRawPointer, UInt32, Float, Float) -> Int32
+
+    private struct ApiSymbols {
+        let createList: MTDeviceCreateListFn
+        let getDeviceID: MTDeviceGetDeviceIDFn
+        let isBuiltIn: MTDeviceIsBuiltInFn
+        let actuatorCreate: MTActuatorCreateFromDeviceIDFn
+        let actuatorOpen: MTActuatorOpenFn
+        let actuatorClose: MTActuatorCloseFn
+        let actuationCreate: MTActuationCreateFromDictionaryFn
+        let actuationActuate: MTActuationActuateFn
+    }
+
+    private let queue = DispatchQueue(label: "com.integrator.touchbar.haptics", qos: .userInteractive)
+    private var dlHandle: UnsafeMutableRawPointer? = nil
+    private var symbols: ApiSymbols? = nil
+    private var motorRef: CFTypeRef? = nil
+    private var motorPtr: UnsafeMutableRawPointer? = nil
+    private var lastProbeFailureAt: CFAbsoluteTime = 0
+
+    private init() {}
+
+    deinit {
+        if let ref = motorRef, let sym = symbols {
+            _ = sym.actuatorClose(ref)
+        }
+        motorPtr = nil
+        motorRef = nil
+        if let h = dlHandle {
+            dlclose(h)
+            dlHandle = nil
+        }
+    }
+
+    /// Plays a crisp tactile click when any Touch Bar pill or tray control is touched.
+    func playPillPress() {
+        dispatchWaveform(
+            tones: [(hz: 165.0, amp: 0.72), (hz: 390.0, amp: 0.28)],
+            durationMs: 9.0,
+            level: 0.68,
+            fallback: .generic
+        )
+    }
+
+    /// Plays a lighter confirmation tick on Touch Bar pill tap release.
+    func playPillRelease() {
+        dispatchWaveform(
+            tones: [(hz: 245.0, amp: 0.58), (hz: 620.0, amp: 0.42)],
+            durationMs: 7.0,
+            level: 0.55,
+            fallback: .alignment
+        )
+    }
+
+    /// Plays an engaging latch detent when the user grabs the media scrubber rail.
+    func playScrubBegin() {
+        dispatchWaveform(
+            tones: [(hz: 155.0, amp: 0.75), (hz: 340.0, amp: 0.25)],
+            durationMs: 8.5,
+            level: 0.62,
+            fallback: .generic
+        )
+    }
+
+    /// Plays a velocity- and position-modulated continuous detent while dragging along the scrubber.
+    func playScrubTick(fraction: Double, velocityPtsPerSec: Double, hitEdge: Bool) {
+        let f = min(max(fraction.isFinite ? fraction : 0.0, 0.0), 1.0)
+        if hitEdge {
+            dispatchWaveform(
+                tones: [(hz: 135.0, amp: 0.78), (hz: 290.0, amp: 0.22)],
+                durationMs: 11.0,
+                level: 0.72,
+                fallback: nil,
+                maxStalenessSec: 0.06
+            )
+            return
+        }
+
+        // Sweep fundamental pitch from 195 Hz (start) to 375 Hz (end) so drag position has
+        // an intuitive tactile Pitch gradient, and scale subtlety slightly with drag speed.
+        let baseHz = 195.0 + f * 180.0
+        let harmonicHz = baseHz * 2.15
+        let speedNorm = Float(min(max(velocityPtsPerSec.isFinite ? velocityPtsPerSec / 600.0 : 0.0, 0.0), 1.0))
+        let level: Float = 0.28 + speedNorm * 0.22
+        dispatchWaveform(
+            tones: [(hz: baseHz, amp: 0.72), (hz: harmonicHz, amp: 0.28)],
+            durationMs: 5.0,
+            level: level,
+            fallback: nil,
+            maxStalenessSec: 0.045
+        )
+    }
+
+    /// Plays a decisive lock-in click when committing a media scrub seek.
+    func playScrubCommit() {
+        dispatchWaveform(
+            tones: [(hz: 230.0, amp: 0.62), (hz: 580.0, amp: 0.38)],
+            durationMs: 7.5,
+            level: 0.58,
+            fallback: .alignment
+        )
+    }
+
+    private func dispatchWaveform(
+        tones: [Tone],
+        durationMs: Double,
+        level: Float,
+        fallback: NSHapticFeedbackManager.FeedbackPattern?,
+        maxStalenessSec: CFAbsoluteTime = 0.25
+    ) {
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        queue.async { [weak self] in
+            // Drop stale queued continuous ticks so a fast drag never replays after finger lift.
+            if CFAbsoluteTimeGetCurrent() - enqueuedAt > maxStalenessSec {
+                return
+            }
+            guard let self = self else { return }
+            if self.actuateSync(tones: tones, durationMs: durationMs, level: level) {
+                return
+            }
+            if let pattern = fallback {
+                DispatchQueue.main.async {
+                    NSHapticFeedbackManager.defaultPerformer.perform(pattern, performanceTime: .default)
+                }
+            }
+        }
+    }
+
+    private func resolveSymbolsLocked() -> ApiSymbols? {
+        if let sym = symbols {
+            return sym
+        }
+        let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
+        guard let handle = dlopen(path, RTLD_NOW) else {
+            return nil
+        }
+        guard let pList = dlsym(handle, "MTDeviceCreateList"),
+              let pId = dlsym(handle, "MTDeviceGetDeviceID"),
+              let pBuiltIn = dlsym(handle, "MTDeviceIsBuiltIn"),
+              let pActCreate = dlsym(handle, "MTActuatorCreateFromDeviceID"),
+              let pOpen = dlsym(handle, "MTActuatorOpen"),
+              let pClose = dlsym(handle, "MTActuatorClose"),
+              let pCreate = dlsym(handle, "MTActuationCreateFromDictionary"),
+              let pPlay = dlsym(handle, "MTActuationActuate") else {
+            dlclose(handle)
+            return nil
+        }
+
+        dlHandle = handle
+        let resolved = ApiSymbols(
+            createList: unsafeBitCast(pList, to: MTDeviceCreateListFn.self),
+            getDeviceID: unsafeBitCast(pId, to: MTDeviceGetDeviceIDFn.self),
+            isBuiltIn: unsafeBitCast(pBuiltIn, to: MTDeviceIsBuiltInFn.self),
+            actuatorCreate: unsafeBitCast(pActCreate, to: MTActuatorCreateFromDeviceIDFn.self),
+            actuatorOpen: unsafeBitCast(pOpen, to: MTActuatorOpenFn.self),
+            actuatorClose: unsafeBitCast(pClose, to: MTActuatorCloseFn.self),
+            actuationCreate: unsafeBitCast(pCreate, to: MTActuationCreateFromDictionaryFn.self),
+            actuationActuate: unsafeBitCast(pPlay, to: MTActuationActuateFn.self)
+        )
+        symbols = resolved
+        return resolved
+    }
+
+    private func ensureMotorLocked() -> (UnsafeMutableRawPointer, ApiSymbols)? {
+        guard let sym = resolveSymbolsLocked() else { return nil }
+        if let ptr = motorPtr {
+            return (ptr, sym)
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        // Avoid probing Multitouch devices on every interaction when no Force Touch hardware exists.
+        if now - lastProbeFailureAt < 2.0 {
+            return nil
+        }
+        guard let unmanagedList = sym.createList() else {
+            lastProbeFailureAt = now
+            return nil
+        }
+        let cfList = unmanagedList.takeRetainedValue()
+        let count = CFArrayGetCount(cfList)
+        var candidates: [(id: UInt64, builtIn: Bool)] = []
+        candidates.reserveCapacity(count)
+
+        for idx in 0..<count {
+            guard let devPtr = CFArrayGetValueAtIndex(cfList, idx) else { continue }
+            let mutableDev = UnsafeMutableRawPointer(mutating: devPtr)
+            var devId: UInt64 = 0
+            if sym.getDeviceID(mutableDev, &devId) == 0 {
+                candidates.append((id: devId, builtIn: sym.isBuiltIn(mutableDev)))
+            }
+        }
+        // Prefer internal MacBook Force Touch trackpad before external HID trackpads.
+        candidates.sort { $0.builtIn && !$1.builtIn }
+
+        for candidate in candidates {
+            guard let ref = sym.actuatorCreate(candidate.id)?.takeRetainedValue() else { continue }
+            if sym.actuatorOpen(ref) == 0 {
+                let rawPtr = Unmanaged.passUnretained(ref).toOpaque()
+                motorRef = ref
+                motorPtr = rawPtr
+                return (rawPtr, sym)
+            }
+        }
+
+        lastProbeFailureAt = now
+        return nil
+    }
+
+    private func closeMotorLocked(sym: ApiSymbols) {
+        if let ref = motorRef {
+            _ = sym.actuatorClose(ref)
+        }
+        motorPtr = nil
+        motorRef = nil
+    }
+
+    private func actuateSync(tones: [Tone], durationMs: Double, level: Float) -> Bool {
+        guard !tones.isEmpty, durationMs > 0 else { return false }
+        guard let (motor, sym) = ensureMotorLocked() else { return false }
+
+        let ampSum = max(tones.reduce(0.0) { $0 + $1.amp }, 1e-6)
+        let shape: [String: Any] = [
+            "BaseWaveform": [
+                "Type": "Gaussian",
+                "Amplitude": 0.0,
+                "DurationMS": durationMs
+            ],
+            "Tones": tones.map { tone in
+                [
+                    "Type": "Sine",
+                    "Amplitude": tone.amp / ampSum,
+                    "DurationMS": durationMs,
+                    "DelayMS": 0.0,
+                    "FrequencykHz": tone.hz / 1000.0
+                ]
+            }
+        ]
+        guard let actPtr = sym.actuationCreate(shape as CFDictionary, 0) else {
+            return false
+        }
+        defer { Unmanaged<AnyObject>.fromOpaque(actPtr).release() }
+
+        let clampedLevel = min(max(level, 0.0), 1.0)
+        // MTActuationActuate takes (actuation, actuatorRef, unknown1, level, unknown2).
+        let rc = sym.actuationActuate(actPtr, motor, 0, clampedLevel, 0.0)
+        if rc != 0 {
+            closeMotorLocked(sym: sym)
+            return false
+        }
+        return true
+    }
+}
 
 // MARK: - RPC Data Models
 
@@ -159,137 +438,6 @@ struct TouchBarLiveSnapshotData: Codable {
     let camera_active: Bool
     /// Whether the Hardware Camera Privacy Killswitch shutter is currently engaged (muted).
     let camera_muted: Bool
-}
-
-// MARK: - Feature 1: Visual Touch ID Passkey & UAC Animated Sensor Pointer View
-/// Illuminated animated Touch Bar strip pinned to the far-right corner pointing directly
-/// toward the MacBook Pro physical Touch ID sensor (`[ 🛡️ Approve ... ] ───────> 👆 [Touch ID]`).
-final class TouchIdPromptGlowView: NSView {
-    /// Frosted dark-emerald HUD backdrop container.
-    private let bgEffect = NSVisualEffectView()
-    /// Sweeping horizontal cyan/green light gradient indicating physical Touch ID direction.
-    private let sweepLayer = CAGradientLayer()
-    /// Primary prompt description text shown on the left side of the strip.
-    private let label = NSTextField(labelWithString: "")
-    /// Monospaced directional pointer leading to the physical Touch ID key.
-    private let arrowLabel = NSTextField(labelWithString: "───────▶  👆 Touch ID")
-    /// Pulsing green beacon ring aligned at the far-right edge beside Touch ID.
-    private let pulseRing = CALayer()
-    /// Fixed horizontal layout width in AppKit points (`460 pt`).
-    private let stripWidth: CGFloat = 460
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 460, height: 30))
-        setup()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
-    }
-
-    override var intrinsicContentSize: NSSize {
-        return NSSize(width: stripWidth, height: 30)
-    }
-
-    /// Configures subviews, gradient layers, AutoLayout constraints, and initial sweep animations.
-    private func setup() {
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.masksToBounds = true
-
-        bgEffect.frame = bounds
-        bgEffect.autoresizingMask = [.width, .height]
-        bgEffect.material = .hudWindow
-        bgEffect.blendingMode = .withinWindow
-        bgEffect.state = .active
-        bgEffect.wantsLayer = true
-        bgEffect.layer?.cornerRadius = 9
-        bgEffect.layer?.borderWidth = 1.0
-        bgEffect.layer?.borderColor = NSColor.systemTeal.withAlphaComponent(0.75).cgColor
-        bgEffect.layer?.backgroundColor = NSColor(red: 0.04, green: 0.24, blue: 0.22, alpha: 0.65).cgColor
-        addSubview(bgEffect)
-
-        // Sweeping emerald/cyan light pulse pointing left -> right directly toward the Touch ID sensor
-        sweepLayer.frame = bounds
-        sweepLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
-        sweepLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
-        sweepLayer.colors = [
-            NSColor.clear.cgColor,
-            NSColor.systemTeal.withAlphaComponent(0.45).cgColor,
-            NSColor.systemGreen.withAlphaComponent(0.65).cgColor,
-            NSColor.clear.cgColor
-        ]
-        sweepLayer.locations = [-0.4, -0.2, 0.0, 0.2]
-        bgEffect.layer?.addSublayer(sweepLayer)
-
-        // Glowing circular beacon at the far-right edge beside the physical Touch ID sensor
-        pulseRing.frame = CGRect(x: stripWidth - 26, y: 5, width: 20, height: 20)
-        pulseRing.cornerRadius = 10
-        pulseRing.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.45).cgColor
-        pulseRing.borderWidth = 1.5
-        pulseRing.borderColor = NSColor.systemGreen.cgColor
-        bgEffect.layer?.addSublayer(pulseRing)
-
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        label.textColor = .white
-        label.backgroundColor = .clear
-        label.isBezeled = false
-        label.isEditable = false
-        label.isSelectable = false
-        label.lineBreakMode = .byTruncatingTail
-        label.stringValue = "🛡️ Approve Windows Hello Login"
-        addSubview(label)
-
-        arrowLabel.translatesAutoresizingMaskIntoConstraints = false
-        arrowLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .heavy)
-        arrowLabel.textColor = NSColor(red: 0.45, green: 1.0, blue: 0.72, alpha: 1.0)
-        arrowLabel.backgroundColor = .clear
-        arrowLabel.isBezeled = false
-        arrowLabel.isEditable = false
-        arrowLabel.isSelectable = false
-        addSubview(arrowLabel)
-
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            arrowLabel.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 10),
-            arrowLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -32),
-            arrowLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-
-        startPulseAnimations()
-    }
-
-    /// Updates the displayed authentication prompt string and restarts pulse animations.
-    func updateLabel(_ text: String) {
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        label.stringValue = clean.isEmpty ? "🛡️ Approve Windows Hello Login" : "🛡️ \(clean)"
-        startPulseAnimations()
-    }
-
-    /// Starts continuous left-to-right gradient sweep and beacon scale animations.
-    func startPulseAnimations() {
-        sweepLayer.removeAllAnimations()
-        let sweep = CABasicAnimation(keyPath: "locations")
-        sweep.fromValue = [-0.4, -0.2, 0.0, 0.2]
-        sweep.toValue = [0.8, 1.0, 1.2, 1.4]
-        sweep.duration = 1.15
-        sweep.repeatCount = .infinity
-        sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        sweepLayer.add(sweep, forKey: "touchIdSweep")
-
-        pulseRing.removeAllAnimations()
-        let glow = CABasicAnimation(keyPath: "transform.scale")
-        glow.fromValue = 0.78
-        glow.toValue = 1.22
-        glow.duration = 0.65
-        glow.autoreverses = true
-        glow.repeatCount = .infinity
-        glow.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        pulseRing.add(glow, forKey: "touchIdBeacon")
-    }
 }
 
 // MARK: - Liquid Glass Pill View (Crisp, Critically-Damped Tactile Physics)
@@ -499,7 +647,7 @@ class GoopyLiquidGlassPillView: NSView {
         isTouchInside = true
         initialTouchPoint = point
 
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+        TrackpadHapticEngine.shared.playPillPress()
         layer?.removeAnimation(forKey: "liquidSettle")
 
         let pressed = centeredTransform(sx: 0.96, sy: 0.94)
@@ -571,7 +719,7 @@ class GoopyLiquidGlassPillView: NSView {
         }
 
         if triggerTap {
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            TrackpadHapticEngine.shared.playPillRelease()
             onTap?()
         }
     }
@@ -609,6 +757,12 @@ final class LiquidGlassMediaScrubPillView: NSView {
     private var scrubHoldUntil: Date = .distantPast
     /// Rate-limiter timestamp spacing live preview seeks at `>= 350 ms`.
     private var lastPreviewSentAt: Date = .distantPast
+    /// Horizontal position (pt) where the most recent continuous scrub detent was emitted.
+    private var lastHapticX: CGFloat = 0.0
+    /// Monotonic timestamp (`CACurrentMediaTime`) of the most recent continuous scrub detent.
+    private var lastHapticAt: CFTimeInterval = 0.0
+    /// Endpoint latch state (`-1` start, `0` middle, `1` end) to emit distinct boundary bumps once.
+    private var lastHapticEdge: Int = 0
 
     /// Displayed playback position in seconds (`>= 0`).
     private var positionSecs: Double = 0.0
@@ -807,25 +961,68 @@ final class LiquidGlassMediaScrubPillView: NSView {
         CATransaction.commit()
     }
 
-    private func positionForPoint(_ pt: CGPoint) -> Double {
+    private func scrubGeometry(for pt: CGPoint) -> (clampedX: CGFloat, fraction: Double, positionSecs: Double) {
         let trackMinX = trackContainer.frame.minX
+        let trackMaxX = trackContainer.frame.maxX
         let trackW = max(trackContainer.frame.width, 1.0)
-        let frac = min(max(Double((pt.x - trackMinX) / trackW), 0.0), 1.0)
-        return frac * max(durationSecs, 0.0)
+        let clampedX = min(max(pt.x, trackMinX), trackMaxX)
+        let frac = min(max(Double((clampedX - trackMinX) / trackW), 0.0), 1.0)
+        return (clampedX, frac, frac * max(durationSecs, 0.0))
+    }
+
+    private func positionForPoint(_ pt: CGPoint) -> Double {
+        return scrubGeometry(for: pt).positionSecs
     }
 
     private func beginScrub(at pt: CGPoint) {
         guard hasSession && durationSecs > 0.5 else { return }
+        let geom = scrubGeometry(for: pt)
         isScrubbing = true
-        positionSecs = positionForPoint(pt)
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+        positionSecs = geom.positionSecs
+        lastHapticX = geom.clampedX
+        lastHapticAt = CACurrentMediaTime()
+        lastHapticEdge = geom.fraction <= 0.001 ? -1 : (geom.fraction >= 0.999 ? 1 : 0)
+        TrackpadHapticEngine.shared.playScrubBegin()
         layoutSublayersAndFrames(animated: false)
     }
 
     private func moveScrub(to pt: CGPoint) {
         guard isScrubbing && hasSession && durationSecs > 0.5 else { return }
-        positionSecs = positionForPoint(pt)
+        let geom = scrubGeometry(for: pt)
+        positionSecs = geom.positionSecs
         layoutSublayersAndFrames(animated: false)
+
+        let nowMono = CACurrentMediaTime()
+        let edge = geom.fraction <= 0.001 ? -1 : (geom.fraction >= 0.999 ? 1 : 0)
+        let elapsed = nowMono - lastHapticAt
+        let distance = abs(geom.clampedX - lastHapticX)
+
+        // Hysteresis keeps endpoint detents crisp without edge-chatter while resting near 0% or 100%.
+        if edge == 0 && geom.fraction > 0.025 && geom.fraction < 0.975 {
+            lastHapticEdge = 0
+        }
+
+        if edge != 0 && edge != lastHapticEdge && elapsed >= 0.035 {
+            let velocity = Double(distance) / max(elapsed, 0.001)
+            lastHapticX = geom.clampedX
+            lastHapticAt = nowMono
+            lastHapticEdge = edge
+            TrackpadHapticEngine.shared.playScrubTick(
+                fraction: geom.fraction,
+                velocityPtsPerSec: velocity,
+                hitEdge: true
+            )
+        } else if distance >= 3.2 && elapsed >= 0.018 {
+            let velocity = Double(distance) / max(elapsed, 0.001)
+            lastHapticX = geom.clampedX
+            lastHapticAt = nowMono
+            TrackpadHapticEngine.shared.playScrubTick(
+                fraction: geom.fraction,
+                velocityPtsPerSec: velocity,
+                hitEdge: false
+            )
+        }
+
         let now = Date()
         if now.timeIntervalSince(lastPreviewSentAt) >= 0.35 {
             lastPreviewSentAt = now
@@ -839,9 +1036,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
             positionSecs = positionForPoint(p)
         }
         isScrubbing = false
+        lastHapticEdge = 0
         if commit && hasSession && durationSecs > 0.5 {
             scrubHoldUntil = Date().addingTimeInterval(2.4)
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            TrackpadHapticEngine.shared.playScrubCommit()
             onCommitSeek?(positionSecs)
         }
         layoutSublayersAndFrames(animated: false)
@@ -1020,13 +1218,9 @@ final class LiquidGlassMediaScrubPillView: NSView {
     /// Dynamic Remote Paste announcement & transfer progress pill (`📥 Paste ...`).
     var viewPaste: GoopyLiquidGlassPillView?
 
-    /// Far-right animated Touch ID prompt banner (`touchid_prompt`).
-    var viewTouchIdPrompt: TouchIdPromptGlowView?
-    /// True while the full-width Touch ID prompt takeover banner is displayed.
-    private var touchIdPromptActive: Bool = false
-    /// Display prompt text shown inside `viewTouchIdPrompt`.
-    private var touchIdPromptLabel: String = "Approve Windows Hello Login"
-    /// Remembers whether the standard HUD was active prior to Touch ID takeover so dismissal restores cleanly.
+    /// Active ref-count of concurrent native `LAContext` Touch ID evaluations yielding the modal Touch Bar.
+    private var touchIdYieldCount: Int = 0
+    /// Remembers whether the standard HUD was active prior to yielding so dismissal restores cleanly.
     private var hudWasActiveBeforeTouchId: Bool = false
 
     /// Hardware Camera Privacy Killswitch pill (`🟢 FaceTime HD` / `🚫 Cam Muted`).
@@ -1260,7 +1454,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
     /// Toggles system-modal Touch Bar HUD visibility when the user taps `∫` in Control Strip.
     @objc private func onSystemTrayButtonTapped(_ sender: Any?) {
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+        TrackpadHapticEngine.shared.playPillPress()
         if self.isActive, let tb = self.touchBar, tb.isVisible {
             self.dismiss()
         } else {
@@ -1316,6 +1510,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
     /// Instantiates the modal `NSTouchBar`, bumps session generation, and starts 1 Hz polling.
     private func activateOnMainThread() {
         guard Self.isTouchBarSupported() else { return }
+        if self.touchIdYieldCount > 0 {
+            self.hudWasActiveBeforeTouchId = true
+            return
+        }
         guard !self.isActive else { return }
         guard self.setupTouchBar() else { return }
 
@@ -1365,12 +1563,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
         self.viewVram = nil
         self.viewUtil = nil
         self.viewPaste = nil
-        self.viewTouchIdPrompt = nil
         self.viewCameraPrivacy = nil
         self.viewMediaPlayPause = nil
         self.viewMediaTrackLabel = nil
         self.viewMediaScrub = nil
-        self.touchIdPromptActive = false
 
         // Keep persistent ∫ icon visible in Control Strip so user can reopen anytime with one tap
         if self.systemTrayItem != nil {
@@ -1432,10 +1628,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
-    /// Switches between `.main` and `.gpu` strips on the main thread when not overridden by Touch ID.
+    /// Switches between `.main` and `.gpu` strips on the main thread when not yielded for Touch ID.
     private func switchMode(_ newMode: TouchBarPanelMode) {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.isActive, !self.touchIdPromptActive else { return }
+            guard let self = self, self.isActive, self.touchIdYieldCount == 0 else { return }
             self.activeMode = newMode
             self.refreshTouchBarIdentifiersOnMain()
             switch newMode {
@@ -1460,47 +1656,47 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
-    /// Reapplies `defaultItemIdentifiers` on the active `NSTouchBar` prioritizing Touch ID takeover when active.
+    /// Reapplies `defaultItemIdentifiers` on the active `NSTouchBar`.
     private func refreshTouchBarIdentifiersOnMain() {
         guard let tb = self.touchBar else { return }
-        if touchIdPromptActive {
-            tb.defaultItemIdentifiers = [
-                .flexibleSpace,
-                NSTouchBarItem.Identifier("touchid_prompt")
-            ]
-        } else {
-            tb.defaultItemIdentifiers = buildNormalItemIdentifiers()
-        }
+        tb.defaultItemIdentifiers = buildNormalItemIdentifiers()
     }
 
-    // MARK: - Feature 1: Visual Touch ID Passkey Prompt Control
+    // MARK: - Feature 1: Native macOS Touch ID Touch Bar Yielding
 
-    /// Shows or dismisses the full-width glowing Touch ID directional prompt banner (`touchid_prompt`).
+    /// Temporarily yields Integrator's custom system-modal Touch Bar while macOS `LocalAuthentication`
+    /// (`LAContext`) presents Apple's native Touch ID Touch Bar UI, then restores the HUD afterward.
     public func showTouchIdPrompt(label: String, active: Bool) {
+        _ = label
         guard Self.isTouchBarSupported() else { return }
-        DispatchQueue.main.async { [weak self] in
+        let block: () -> Void = { [weak self] in
             guard let self = self else { return }
             if active {
-                if !self.touchIdPromptActive {
+                if self.touchIdYieldCount == 0 {
                     self.hudWasActiveBeforeTouchId = self.isActive
+                    if self.isActive {
+                        // Dismiss Integrator's modal bar so Apple's native CoreAuthUI Touch Bar prompt
+                        // ("Cancel ... Integrator  Touch ID to <reason> →") shows unobstructed.
+                        self.cleanupAfterDismissalOnMain(clearSystemBar: true)
+                    }
                 }
-                self.touchIdPromptLabel = label
-                self.touchIdPromptActive = true
-                NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
-                if !self.isActive {
-                    self.activateOnMainThread()
-                }
-                self.refreshTouchBarIdentifiersOnMain()
-                self.viewTouchIdPrompt?.updateLabel(label)
+                self.touchIdYieldCount += 1
             } else {
-                guard self.touchIdPromptActive else { return }
-                self.touchIdPromptActive = false
-                if self.hudWasActiveBeforeTouchId {
-                    self.refreshTouchBarIdentifiersOnMain()
-                } else {
-                    self.dismiss()
+                guard self.touchIdYieldCount > 0 else { return }
+                self.touchIdYieldCount -= 1
+                if self.touchIdYieldCount == 0 {
+                    let shouldRestore = self.hudWasActiveBeforeTouchId
+                    self.hudWasActiveBeforeTouchId = false
+                    if shouldRestore && !self.isActive {
+                        self.activateOnMainThread()
+                    }
                 }
             }
+        }
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
         }
     }
 
@@ -1515,7 +1711,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
             self.cameraIsActive = active
             self.cameraIsMuted = muted
             self.applyCameraPillStyle()
-            if activeChanged && self.isActive && !self.touchIdPromptActive {
+            if activeChanged && self.isActive && self.touchIdYieldCount == 0 {
                 self.refreshTouchBarIdentifiersOnMain()
             }
         }
@@ -1581,9 +1777,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
         let tb = NSTouchBar()
         tb.delegate = self
-        tb.defaultItemIdentifiers = touchIdPromptActive
-            ? [.flexibleSpace, NSTouchBarItem.Identifier("touchid_prompt")]
-            : buildNormalItemIdentifiers()
+        tb.defaultItemIdentifiers = buildNormalItemIdentifiers()
 
         let trayIdObj: NSString? = (self.systemTrayItem != nil) ? (self.systemTrayItemId.rawValue as NSString) : nil
 
@@ -1634,7 +1828,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return presented
     }
 
-    /// NSTouchBarDelegate factory constructing each active Liquid Glass pill, media scrubber, or Touch ID view.
+    /// NSTouchBarDelegate factory constructing each active Liquid Glass pill or media scrubber view.
     public func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         switch identifier.rawValue {
         // MARK: Back navigation pill for GPU detail sub-bar
@@ -1642,16 +1836,6 @@ final class LiquidGlassMediaScrubPillView: NSView {
             let item = NSCustomTouchBarItem(identifier: identifier)
             let v = GoopyLiquidGlassPillView(text: "◀", accent: .systemGray, width: 42)
             v.onTap = { [weak self] in self?.switchMode(.main) }
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        // MARK: Visual Touch ID Passkey Prompt (far-right glowing pointer)
-        case "touchid_prompt":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = TouchIdPromptGlowView()
-            v.updateLabel(self.touchIdPromptLabel)
-            self.viewTouchIdPrompt = v
             item.view = v
             item.visibilityPriority = .high
             return item
@@ -1882,7 +2066,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
                     self.cameraIsActive = snap.camera_active
                     self.cameraIsMuted = snap.camera_muted
                     self.applyCameraPillStyle()
-                    if camChanged && !self.touchIdPromptActive {
+                    if camChanged && self.touchIdYieldCount == 0 {
                         self.refreshTouchBarIdentifiersOnMain()
                     }
                 }
@@ -2452,7 +2636,7 @@ public class PasteboardShortcutInterceptor: NSObject {
         lock.unlock()
 
         DispatchQueue.main.async {
-            NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+            TrackpadHapticEngine.shared.playPillPress()
             TouchBarHudController.shared.viewPaste?.setText("⏳ Streaming...")
             TouchBarHudController.shared.viewPaste?.setAccent(NSColor.systemGreen)
         }

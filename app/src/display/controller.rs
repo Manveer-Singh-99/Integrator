@@ -247,13 +247,13 @@ pub struct DisplayModeOverride {
     pub hdr: bool,
 }
 
-/// RAII guard illuminating the animated Touch Bar Touch ID sensor pointer during biometric evaluation
-/// and guaranteeing dismissal on return, error, or panic.
+/// RAII guard that yields Integrator's custom system-modal Touch Bar while macOS `LAContext`
+/// presents Apple's native Touch ID Touch Bar UI, restoring the HUD on return, error, or panic.
 struct TouchBarTouchIdGuard;
 
 impl TouchBarTouchIdGuard {
-    /// Illuminates the Touch Bar Touch ID sensor guidance indicator with `label` and returns an RAII
-    /// guard that dismisses it automatically when dropped.
+    /// Temporarily yields Integrator's modal Touch Bar so Apple's native Touch ID prompt renders
+    /// unobstructed, returning an RAII guard that restores the HUD when dropped.
     fn activate(label: &str) -> Self {
         crate::core::notify_touchbar_touchid_prompt(label, true);
         Self
@@ -2234,20 +2234,13 @@ impl DisplayController {
                 }
             }
             DisplayRpcRequest::NotifyTouchIdPrompt { label, active } => {
-                let clean = crate::media::sanitize_media_text(&label, 64);
-                let effective = if clean.is_empty() {
-                    "Approve Windows Hello Login".to_string()
-                } else {
-                    clean
-                };
-                crate::core::notify_touchbar_touchid_prompt(&effective, active);
+                // Passive Windows watcher notifications no longer present a custom Touch Bar
+                // banner; actual Touch ID / Passkey challenges yield Integrator's HUD so Apple's
+                // native LocalAuthentication Touch Bar prompt renders unobstructed.
+                let _ = (label, active);
                 self.base_response(
                     true,
-                    if active {
-                        format!("Touch ID Touch Bar prompt illuminated: {}", effective)
-                    } else {
-                        "Touch ID Touch Bar prompt dismissed".to_string()
-                    },
+                    "Touch ID uses native macOS LocalAuthentication Touch Bar prompt",
                 )
                 .await
             }

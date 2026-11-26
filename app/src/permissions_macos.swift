@@ -296,7 +296,12 @@ public func integrator_mac_touchid_authenticate(
         return -1
     }
 
-    // Bring Integrator to foreground on main thread so the Touch ID system sheet is immediately visible
+    // Yield Integrator's custom system-modal Touch Bar and bring Integrator to foreground so
+    // macOS LocalAuthentication presents Apple's native Touch ID sheet and Touch Bar prompt cleanly.
+    TouchBarHudController.shared.showTouchIdPrompt(label: reason, active: true)
+    defer {
+        TouchBarHudController.shared.showTouchIdPrompt(label: "", active: false)
+    }
     DispatchQueue.main.async {
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
