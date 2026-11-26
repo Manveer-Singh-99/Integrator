@@ -156,71 +156,76 @@ private final class TrackpadHapticEngine {
         }
     }
 
-    /// Plays a crisp tactile click when any Touch Bar pill or tray control is touched.
+    /// Plays a maximum-intensity physical Force Touch click when any Touch Bar pill or tray control is touched.
     func playPillPress() {
         dispatchWaveform(
-            tones: [(hz: 165.0, amp: 0.72), (hz: 390.0, amp: 0.28)],
-            durationMs: 9.0,
-            level: 0.68,
+            tones: [(hz: 165.0, amp: 0.65), (hz: 950.0, amp: 0.35)],
+            durationMs: 6.5,
+            level: 1.0,
+            baseAmplitude: 1.0,
             fallback: .generic
         )
     }
 
-    /// Plays a lighter confirmation tick on Touch Bar pill tap release.
+    /// Plays a maximum-intensity crisp confirmation snap on Touch Bar pill tap release.
     func playPillRelease() {
         dispatchWaveform(
-            tones: [(hz: 245.0, amp: 0.58), (hz: 620.0, amp: 0.42)],
-            durationMs: 7.0,
-            level: 0.55,
+            tones: [(hz: 260.0, amp: 0.55), (hz: 1200.0, amp: 0.45)],
+            durationMs: 4.5,
+            level: 1.0,
+            baseAmplitude: 1.0,
             fallback: .alignment
         )
     }
 
-    /// Plays an engaging latch detent when the user grabs the media scrubber rail.
+    /// Plays a solid full-intensity latch click when the user grabs the media scrubber rail.
     func playScrubBegin() {
         dispatchWaveform(
-            tones: [(hz: 155.0, amp: 0.75), (hz: 340.0, amp: 0.25)],
-            durationMs: 8.5,
-            level: 0.62,
+            tones: [(hz: 160.0, amp: 0.70), (hz: 880.0, amp: 0.30)],
+            durationMs: 6.0,
+            level: 1.0,
+            baseAmplitude: 1.0,
             fallback: .generic
         )
     }
 
-    /// Plays a velocity- and position-modulated continuous detent while dragging along the scrubber.
+    /// Plays a rapid, maximum-intensity Apple Watch Digital Crown-style `tic` while scrubbing,
+    /// or a deep hard-stop bump when reaching `0%` or `100%`.
     func playScrubTick(fraction: Double, velocityPtsPerSec: Double, hitEdge: Bool) {
+        _ = velocityPtsPerSec
         let f = min(max(fraction.isFinite ? fraction : 0.0, 0.0), 1.0)
         if hitEdge {
             dispatchWaveform(
-                tones: [(hz: 135.0, amp: 0.78), (hz: 290.0, amp: 0.22)],
-                durationMs: 11.0,
-                level: 0.72,
+                tones: [(hz: 125.0, amp: 0.80), (hz: 260.0, amp: 0.20)],
+                durationMs: 10.0,
+                level: 1.0,
+                baseAmplitude: 1.0,
                 fallback: nil,
-                maxStalenessSec: 0.06
+                maxStalenessSec: 0.05
             )
             return
         }
 
-        // Sweep fundamental pitch from 195 Hz (start) to 375 Hz (end) so drag position has
-        // an intuitive tactile Pitch gradient, and scale subtlety slightly with drag speed.
-        let baseHz = 195.0 + f * 180.0
-        let harmonicHz = baseHz * 2.15
-        let speedNorm = Float(min(max(velocityPtsPerSec.isFinite ? velocityPtsPerSec / 600.0 : 0.0, 0.0), 1.0))
-        let level: Float = 0.28 + speedNorm * 0.22
+        // Ultra-short 3.0 ms Gaussian impulse + high-frequency transient at full intensity produces
+        // distinct, rapid Digital Crown "tic-tic-tic" notches without blurring into a buzz.
+        let baseHz = 220.0 + f * 140.0
         dispatchWaveform(
-            tones: [(hz: baseHz, amp: 0.72), (hz: harmonicHz, amp: 0.28)],
-            durationMs: 5.0,
-            level: level,
+            tones: [(hz: baseHz, amp: 0.55), (hz: 1400.0, amp: 0.45)],
+            durationMs: 3.0,
+            level: 1.0,
+            baseAmplitude: 1.0,
             fallback: nil,
-            maxStalenessSec: 0.045
+            maxStalenessSec: 0.03
         )
     }
 
-    /// Plays a decisive lock-in click when committing a media scrub seek.
+    /// Plays a decisive maximum-intensity lock-in click when committing a media scrub seek.
     func playScrubCommit() {
         dispatchWaveform(
-            tones: [(hz: 230.0, amp: 0.62), (hz: 580.0, amp: 0.38)],
-            durationMs: 7.5,
-            level: 0.58,
+            tones: [(hz: 240.0, amp: 0.60), (hz: 1100.0, amp: 0.40)],
+            durationMs: 5.5,
+            level: 1.0,
+            baseAmplitude: 1.0,
             fallback: .alignment
         )
     }
@@ -229,6 +234,7 @@ private final class TrackpadHapticEngine {
         tones: [Tone],
         durationMs: Double,
         level: Float,
+        baseAmplitude: Double = 1.0,
         fallback: NSHapticFeedbackManager.FeedbackPattern?,
         maxStalenessSec: CFAbsoluteTime = 0.25
     ) {
@@ -239,7 +245,7 @@ private final class TrackpadHapticEngine {
                 return
             }
             guard let self = self else { return }
-            if self.actuateSync(tones: tones, durationMs: durationMs, level: level) {
+            if self.actuateSync(tones: tones, durationMs: durationMs, level: level, baseAmplitude: baseAmplitude) {
                 return
             }
             if let pattern = fallback {
@@ -337,15 +343,16 @@ private final class TrackpadHapticEngine {
         motorRef = nil
     }
 
-    private func actuateSync(tones: [Tone], durationMs: Double, level: Float) -> Bool {
+    private func actuateSync(tones: [Tone], durationMs: Double, level: Float, baseAmplitude: Double) -> Bool {
         guard !tones.isEmpty, durationMs > 0 else { return false }
         guard let (motor, sym) = ensureMotorLocked() else { return false }
 
         let ampSum = max(tones.reduce(0.0) { $0 + $1.amp }, 1e-6)
+        let clampedBaseAmp = min(max(baseAmplitude.isFinite ? baseAmplitude : 0.0, 0.0), 1.0)
         let shape: [String: Any] = [
             "BaseWaveform": [
                 "Type": "Gaussian",
-                "Amplitude": 0.0,
+                "Amplitude": clampedBaseAmp,
                 "DurationMS": durationMs
             ],
             "Tones": tones.map { tone in
@@ -442,12 +449,21 @@ struct TouchBarLiveSnapshotData: Codable {
 
 // MARK: - Liquid Glass Pill View (Crisp, Critically-Damped Tactile Physics)
 
+/// Non-interactive container `NSView` that passes all pointer and touch hit-testing directly
+/// through to its parent `GoopyLiquidGlassPillView`.
+private final class MarqueePassThroughView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        return nil
+    }
+}
+
 /// Frosted Liquid Glass Touch Bar button view featuring critically-damped tactile spring settle
-/// (`zeta = 1.0`), haptic feedback, and direct NSTouch/mouse hit-slop tracking.
+/// (`zeta = 1.0`), haptic feedback, optional seamless looping marquee scrolling for overflowing
+/// labels, and direct NSTouch/mouse hit-slop tracking.
 class GoopyLiquidGlassPillView: NSView {
     /// Frosted `.hudWindow` blur layer rendering the tinted glass pill body.
     let visualEffectView = NSVisualEffectView()
-    /// Centered single-line monospaced label rendered atop `visualEffectView`.
+    /// Centered single-line monospaced label rendered atop `visualEffectView` when text fits.
     let label = NSTextField(labelWithString: "")
     /// Semantic tint accent applied to the glass background and active glow border.
     var accentColor: NSColor = .systemGreen {
@@ -466,10 +482,38 @@ class GoopyLiquidGlassPillView: NSView {
     private var isTouchInside: Bool = false
     /// Intrinsic pill width in Touch Bar points (`30 pt` fixed height).
     private let pillWidth: CGFloat
+    /// When true, labels wider than the pill interior scroll seamlessly on a GPU-composited loop.
+    private let marqueeEnabled: Bool
+    /// Most recently assigned label text used to suppress redundant 1 Hz poll resets.
+    private var currentText: String = ""
+    /// Masked viewport clipping the horizontally scrolling marquee track to the pill interior.
+    private let marqueeClipView = MarqueePassThroughView()
+    /// Animated container sliding two identical copies of overflowing text seamlessly leftwards.
+    private let marqueeTrackView = MarqueePassThroughView()
+    /// Leading marquee text copy.
+    private let marqueePrimaryLabel = NSTextField(labelWithString: "")
+    /// Trailing seamless wrap-around marquee text copy.
+    private let marqueeCloneLabel = NSTextField(labelWithString: "")
+    /// Soft left/right alpha edge-fade mask applied to `marqueeClipView.layer`.
+    private let marqueeMaskLayer = CAGradientLayer()
+    /// True while a seamless looping CoreAnimation marquee is actively scrolling.
+    private var isMarqueeScrolling: Bool = false
+    /// Active horizontal cycle distance (pt) of the running marquee loop.
+    private var activeMarqueeCycle: CGFloat = 0.0
+    /// Last measured clip width (pt) to avoid rebuilding marquee layout unnecessarily on `layout()`.
+    private var lastMarqueeClipWidth: CGFloat = 0.0
 
-    /// Creates a new Liquid Glass pill view with the specified initial label, accent color, and width.
-    init(text: String, accent: NSColor, width: CGFloat = 88) {
+    /// Horizontal whitespace separating the end of a scrolling label from its looping wrap copy.
+    private let marqueeGap: CGFloat = 28.0
+    /// Constant horizontal scroll speed in AppKit points per second.
+    private let marqueeSpeedPtsPerSec: CGFloat = 26.0
+    /// Shared pill typography used for both centered and marquee labels.
+    private static let pillFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+
+    /// Creates a new Liquid Glass pill view with the specified initial label, accent color, width, and marquee flag.
+    init(text: String, accent: NSColor, width: CGFloat = 88, marqueeEnabled: Bool = false) {
         self.pillWidth = width
+        self.marqueeEnabled = marqueeEnabled
         self.accentColor = accent
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
         setup(text: text)
@@ -477,6 +521,7 @@ class GoopyLiquidGlassPillView: NSView {
 
     required init?(coder: NSCoder) {
         self.pillWidth = 88
+        self.marqueeEnabled = false
         super.init(coder: coder)
     }
 
@@ -484,20 +529,42 @@ class GoopyLiquidGlassPillView: NSView {
         return NSSize(width: pillWidth, height: 30)
     }
 
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        super.viewWillMove(toWindow: newWindow)
-        if newWindow == nil && isHeld {
-            activeTouchIdentity = nil
-            endInteraction(triggerTap: false)
+    override func layout() {
+        super.layout()
+        guard marqueeEnabled else { return }
+        let clipW = max(bounds.width - 12.0, 1.0)
+        if abs(clipW - lastMarqueeClipWidth) > 0.5 {
+            updateMarquee(forceRestart: false)
         }
     }
 
-    /// Configures frosted glass subviews and AutoLayout label centering.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            if isHeld {
+                activeTouchIdentity = nil
+                endInteraction(triggerTap: false)
+            }
+            if marqueeEnabled {
+                stopMarqueeAnimation()
+            }
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil && marqueeEnabled {
+            updateMarquee(forceRestart: true)
+        }
+    }
+
+    /// Configures frosted glass subviews, AutoLayout label centering, and optional marquee layers.
     func setup(text: String) {
         wantsLayer = true
         layer?.masksToBounds = false
         allowedTouchTypes = [.direct]
         wantsRestingTouches = false
+        currentText = text
 
         // 1. Frosted Glass Blur Backdrop
         visualEffectView.frame = bounds
@@ -513,7 +580,7 @@ class GoopyLiquidGlassPillView: NSView {
         // 2. High-Legibility Monospace Centered Typography via AutoLayout
         label.translatesAutoresizingMaskIntoConstraints = false
         label.alignment = .center
-        label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+        label.font = Self.pillFont
         label.textColor = .white
         label.backgroundColor = .clear
         label.isBezeled = false
@@ -532,14 +599,140 @@ class GoopyLiquidGlassPillView: NSView {
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6)
         ])
 
+        if marqueeEnabled {
+            marqueeClipView.wantsLayer = true
+            marqueeClipView.layer?.masksToBounds = true
+            marqueeClipView.isHidden = true
+            addSubview(marqueeClipView)
+
+            marqueeTrackView.wantsLayer = true
+            marqueeClipView.addSubview(marqueeTrackView)
+
+            for field in [marqueePrimaryLabel, marqueeCloneLabel] {
+                field.alignment = .left
+                field.font = Self.pillFont
+                field.textColor = .white
+                field.backgroundColor = .clear
+                field.isBezeled = false
+                field.isEditable = false
+                field.isSelectable = false
+                field.maximumNumberOfLines = 1
+                field.lineBreakMode = .byClipping
+                marqueeTrackView.addSubview(field)
+            }
+
+            marqueeMaskLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+            marqueeMaskLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+            marqueeMaskLayer.colors = [
+                NSColor.clear.cgColor,
+                NSColor.white.cgColor,
+                NSColor.white.cgColor,
+                NSColor.clear.cgColor
+            ]
+            updateMarquee(forceRestart: true)
+        }
+
         updateRestingStyle()
     }
 
-    /// Updates the pill text safely on the main AppKit thread.
+    /// Updates the pill text safely on the main AppKit thread without stuttering an active marquee loop.
     func setText(_ newText: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.label.stringValue = newText
+        let apply = { [weak self] in
+            guard let self = self else { return }
+            if self.currentText == newText {
+                return
+            }
+            self.currentText = newText
+            self.label.stringValue = newText
+            if self.marqueeEnabled {
+                self.updateMarquee(forceRestart: false)
+            }
         }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    private func stopMarqueeAnimation() {
+        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        isMarqueeScrolling = false
+        activeMarqueeCycle = 0.0
+    }
+
+    /// Measures `currentText` and toggles between static centered typography and a seamless GPU marquee.
+    private func updateMarquee(forceRestart: Bool) {
+        let totalW = bounds.width > 1.0 ? bounds.width : pillWidth
+        let totalH = bounds.height > 1.0 ? bounds.height : 30.0
+        let clipW = max(totalW - 12.0, 1.0)
+        lastMarqueeClipWidth = clipW
+
+        let measured = NSAttributedString(
+            string: currentText,
+            attributes: [.font: Self.pillFont]
+        ).size()
+        let textW = ceil(measured.width)
+        let textH = ceil(measured.height)
+
+        guard textW > clipW + 1.0 else {
+            stopMarqueeAnimation()
+            marqueeClipView.isHidden = true
+            marqueeClipView.layer?.mask = nil
+            label.isHidden = false
+            return
+        }
+
+        let cycleDistance = textW + marqueeGap
+        marqueeClipView.frame = CGRect(x: 6.0, y: 0.0, width: clipW, height: totalH)
+        marqueeClipView.isHidden = false
+        label.isHidden = true
+
+        // Update soft edge-fade gradient mask matching the current clip width.
+        let fadeFrac = min(max(6.0 / clipW, 0.02), 0.14)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        marqueeMaskLayer.frame = marqueeClipView.bounds
+        marqueeMaskLayer.locations = [
+            0.0,
+            NSNumber(value: Double(fadeFrac)),
+            NSNumber(value: Double(1.0 - fadeFrac)),
+            1.0
+        ]
+        marqueeClipView.layer?.mask = marqueeMaskLayer
+        CATransaction.commit()
+
+        let yPos = floor((totalH - textH) / 2.0)
+
+        // When telemetry updates live values (e.g., GPU temp 54° -> 55°) with nearly identical width,
+        // update both marquee copies in place without resetting the running animation phase.
+        if !forceRestart && isMarqueeScrolling && abs(cycleDistance - activeMarqueeCycle) <= 8.0 {
+            let slotW = max(textW + 4.0, activeMarqueeCycle - marqueeGap + 4.0)
+            marqueePrimaryLabel.stringValue = currentText
+            marqueeCloneLabel.stringValue = currentText
+            marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: slotW, height: textH)
+            marqueeCloneLabel.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: slotW, height: textH)
+            return
+        }
+
+        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackView.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + textW + 8.0, height: totalH)
+        marqueePrimaryLabel.stringValue = currentText
+        marqueeCloneLabel.stringValue = currentText
+        marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: textW + 4.0, height: textH)
+        marqueeCloneLabel.frame = CGRect(x: cycleDistance, y: yPos, width: textW + 4.0, height: textH)
+
+        let anim = CABasicAnimation(keyPath: "transform.translation.x")
+        anim.fromValue = 0.0
+        anim.toValue = -Double(cycleDistance)
+        anim.duration = max(Double(cycleDistance / marqueeSpeedPtsPerSec), 1.5)
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .linear)
+        anim.isRemovedOnCompletion = false
+        marqueeTrackView.layer?.add(anim, forKey: "marqueeLoop")
+
+        isMarqueeScrolling = true
+        activeMarqueeCycle = cycleDistance
     }
 
     /// Updates the pill accent tint safely on the main AppKit thread.
@@ -1012,7 +1205,9 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 velocityPtsPerSec: velocity,
                 hitEdge: true
             )
-        } else if distance >= 3.2 && elapsed >= 0.018 {
+        // 1.8 pt notch pitch + 11 ms floor (< 16.6 ms 60 Hz Touch Bar frame) gives rapid Apple Watch
+        // Digital Crown "tic-tic-tic" detents on every drag frame without dropping alternate frames.
+        } else if distance >= 1.8 && elapsed >= 0.011 {
             let velocity = Double(distance) / max(elapsed, 0.001)
             lastHapticX = geom.clampedX
             lastHapticAt = nowMono
@@ -1918,7 +2113,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
         case "media_title":
             let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: "🎵 No Windows Media", accent: .systemGray, width: 168)
+            let v = GoopyLiquidGlassPillView(text: "🎵 No Windows Media", accent: .systemGray, width: 168, marqueeEnabled: true)
             v.onTap = { [weak self] in
                 guard let self = self else { return }
                 if let m = self.currentMediaState {
@@ -1964,7 +2159,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         let item = NSCustomTouchBarItem(identifier: identifier)
         switch identifier.rawValue {
         case "gpu":
-            let v = GoopyLiquidGlassPillView(text: "Peer Offline", accent: .systemGray, width: 102)
+            let v = GoopyLiquidGlassPillView(text: "Peer Offline", accent: .systemGray, width: 102, marqueeEnabled: true)
             v.onTap = { [weak self] in self?.switchMode(.gpu) }
             self.viewGpu = v
             item.view = v
@@ -2150,7 +2345,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
             name = String(name.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
         }
 
-        let maxChars = 14
+        // Preserve full model names so the GPU pill's seamless marquee scrolls instead of chopping with "…".
+        let maxChars = 48
         if name.count > maxChars {
             return String(name.prefix(maxChars - 1)) + "…"
         }
