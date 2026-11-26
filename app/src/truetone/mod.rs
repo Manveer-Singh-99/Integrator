@@ -431,11 +431,52 @@ pub fn read_ambient_light() -> AmbientLightData {
     }
 }
 
+/// Minimum valid CIE 1931 `x` chromaticity coordinate accepted from the hardware ALS sensor.
+#[cfg(any(target_os = "windows", test))]
+const ALS_VALID_CIE_X_MIN: f32 = 0.23;
+
+/// Maximum valid CIE 1931 `x` chromaticity coordinate accepted from the hardware ALS sensor.
+#[cfg(any(target_os = "windows", test))]
+const ALS_VALID_CIE_X_MAX: f32 = 0.55;
+
+/// Minimum valid CIE 1931 `y` chromaticity coordinate accepted from the hardware ALS sensor
+/// (strictly above McCamy's `0.1858` epicenter to reject dark-current noise).
+#[cfg(any(target_os = "windows", test))]
+const ALS_VALID_CIE_Y_MIN: f32 = 0.22;
+
+/// Maximum valid CIE 1931 `y` chromaticity coordinate accepted from the hardware ALS sensor.
+#[cfg(any(target_os = "windows", test))]
+const ALS_VALID_CIE_Y_MAX: f32 = 0.50;
+
+/// Minimum ambient illuminance (lux) below which automatic True Tone adaptation fades to neutral D65
+/// because dark-room ADC counts lack reliable spectral color information.
+#[cfg(any(target_os = "windows", test))]
+const ALS_DARK_ROOM_LUX_FLOOR: f32 = 1.0;
+
+/// Peak Apple-like partial chromatic adaptation strength (`0.48`) reached under bright indoor/daylight
+/// lighting (`>= 300 lux`), matching MacBook Pro True Tone subtlety instead of Night-Shift yellowing.
+#[cfg(any(target_os = "windows", test))]
+const APPLE_MAX_ADAPTATION_DEGREE: f32 = 0.48;
+
+/// Automatic ALS True Tone minimum adapted white-point bound in Kelvin (prevents harsh orange tinting).
+#[cfg(any(target_os = "windows", test))]
+const AUTO_TRUETONE_MIN_CCT: u32 = 4200;
+
+/// Automatic ALS True Tone maximum adapted white-point bound in Kelvin (prevents harsh icy blue tinting).
+#[cfg(any(target_os = "windows", test))]
+const AUTO_TRUETONE_MAX_CCT: u32 = 7500;
+
+/// Standard sRGB display gamma exponent used to encode linear Bradford CAT white-point multipliers
+/// into Win32 `SetDeviceGammaRamp` signal space (`V' = L^(1 / 2.2)`).
+#[cfg(any(target_os = "windows", test))]
+const DISPLAY_SRGB_GAMMA: f32 = 2.2;
+
 /// Estimates raw Correlated Color Temperature in Kelvin on the PC from incoming Mac ALS sensor channels.
 ///
-/// Prefers factory-calibrated CIE XYZ tristimulus coordinates (McCamy 1992 cubic approximation),
-/// falling back to raw red/blue channel ratio (`3000 + (ch2/ch0) * 3500`) or D65 neutral (`6500 K`)
-/// for monochrome hardware.
+/// Prefers factory-calibrated CIE XYZ tristimulus coordinates (McCamy 1992 cubic approximation)
+/// when chromaticity `(x, y)` lies inside the physical daylight/Planckian locus band, falling back
+/// to raw red/blue channel ratio (`3000 + (ch2/ch0) * 3500`) when counts exceed noise floor (`>= 2`),
+/// or D65 neutral (`6500 K`) in pitch-dark / monochrome conditions.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn estimate_cct_from_raw_als(
     als_ch0: Option<f32>,
@@ -447,15 +488,19 @@ pub(crate) fn estimate_cct_from_raw_als(
     if let (Some(cx), Some(cy), Some(cz)) = (cie_x, cie_y, cie_z) {
         if cx.is_finite() && cy.is_finite() && cz.is_finite() && cx > 0.0 && cy > 0.0 && cz >= 0.0 {
             let sum = cx + cy + cz;
-            if sum > 0.001 {
+            if sum > 0.5 {
                 let x = cx / sum;
                 let y = cy / sum;
-                let denom = 0.1858 - y;
-                if denom.abs() > 0.02 {
-                    let n = (x - 0.3320) / denom;
-                    let cct = 449.0 * n.powi(3) + 3525.0 * n.powi(2) + 6823.3 * n + 5520.33;
-                    if cct.is_finite() && cct > 500.0 && cct < 25_000.0 {
-                        return cct.clamp(MIN_CCT_KELVIN as f32, MAX_CCT_KELVIN as f32);
+                if (ALS_VALID_CIE_X_MIN..=ALS_VALID_CIE_X_MAX).contains(&x)
+                    && (ALS_VALID_CIE_Y_MIN..=ALS_VALID_CIE_Y_MAX).contains(&y)
+                {
+                    let denom = 0.1858 - y;
+                    if denom.abs() > 0.02 {
+                        let n = (x - 0.3320) / denom;
+                        let cct = 449.0 * n.powi(3) + 3525.0 * n.powi(2) + 6823.3 * n + 5520.33;
+                        if cct.is_finite() && cct > 1000.0 && cct < 25_000.0 {
+                            return cct.clamp(MIN_CCT_KELVIN as f32, MAX_CCT_KELVIN as f32);
+                        }
                     }
                 }
             }
@@ -463,7 +508,7 @@ pub(crate) fn estimate_cct_from_raw_als(
     }
 
     if let (Some(ch0), Some(ch2)) = (als_ch0, als_ch2) {
-        if ch0.is_finite() && ch2.is_finite() && ch0 > 0.0 && ch2 > 0.0 {
+        if ch0.is_finite() && ch2.is_finite() && ch0 >= 2.0 && ch2 >= 2.0 {
             let ratio = ch2 / ch0;
             if ratio.is_finite() {
                 let cct = 3000.0 + (ratio * 3500.0);
@@ -477,18 +522,18 @@ pub(crate) fn estimate_cct_from_raw_als(
     D65_CCT_KELVIN as f32
 }
 
-/// Computes Apple-style partial chromatic adaptation factor `D` (`0.45..=0.85`) as a smooth
+/// Computes Apple-style partial chromatic adaptation factor `D` (`0.0..=0.48`) as a smooth
 /// logarithmic function of ambient illuminance (lux).
 ///
-/// Prevents dark-room display self-glare from driving full white-point saturation swings while
-/// approaching full visual adaptation under typical indoor/daylight lighting.
+/// Below `1 lux` (pitch dark), returns `0.0` so sensor dark-current noise and monitor self-glare
+/// never tint the display; ramps gently up to `0.48` at `300+ lux`, matching MacBook Pro True Tone.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn apple_adaptation_degree_from_lux(lux: f32) -> f32 {
-    if !lux.is_finite() || lux <= 0.0 {
-        return 0.45;
+    if !lux.is_finite() || lux <= ALS_DARK_ROOM_LUX_FLOOR {
+        return 0.0;
     }
-    let norm = ((1.0 + lux).ln() / (1.0 + 300.0f32).ln()).clamp(0.0, 1.0);
-    0.45 + 0.40 * norm
+    let norm = (lux.ln() / 300.0f32.ln()).clamp(0.0, 1.0);
+    APPLE_MAX_ADAPTATION_DEGREE * norm
 }
 
 /// Persistent PC-side temporal exponential moving average filter state for incoming raw ALS telemetry.
@@ -535,7 +580,7 @@ impl PcAdaptationFilter {
 
         let degree = apple_adaptation_degree_from_lux(ema_lux);
         let blended = (D65_CCT_KELVIN as f32) + degree * (ema_cct - D65_CCT_KELVIN as f32);
-        let adapted_cct = (blended.round() as u32).clamp(MIN_CCT_KELVIN, MAX_CCT_KELVIN);
+        let adapted_cct = (blended.round() as u32).clamp(AUTO_TRUETONE_MIN_CCT, AUTO_TRUETONE_MAX_CCT);
         (ema_lux, adapted_cct)
     }
 
@@ -626,10 +671,17 @@ pub fn calculate_bradford_multipliers(cct_kelvin: u32, gamma_comp: f32) -> (f32,
     let g_lin = -0.9692660 * ax + 1.8760108 * ay + 0.0415560 * az;
     let b_lin = 0.0556434 * ax - 0.2040259 * ay + 1.0572252 * az;
 
+    // Normalize linear light ratios against peak channel to preserve overall luminance, then convert
+    // from linear light space into gamma-2.2 sRGB signal space (`k_lin^(1 / 2.2)`) because Win32
+    // `SetDeviceGammaRamp` scales gamma-encoded RGB values rather than linear photon intensity.
     let max_chan = r_lin.max(g_lin).max(b_lin).max(0.0001);
-    let k_r = ((r_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
-    let k_g = ((g_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
-    let k_b = ((b_lin / max_chan) * safe_gamma).clamp(0.4, 1.5);
+    let inv_gamma = 1.0 / DISPLAY_SRGB_GAMMA;
+    let srgb_r = (r_lin / max_chan).clamp(0.15, 1.0).powf(inv_gamma);
+    let srgb_g = (g_lin / max_chan).clamp(0.15, 1.0).powf(inv_gamma);
+    let srgb_b = (b_lin / max_chan).clamp(0.15, 1.0).powf(inv_gamma);
+    let k_r = (srgb_r * safe_gamma).clamp(0.4, 1.5);
+    let k_g = (srgb_g * safe_gamma).clamp(0.4, 1.5);
+    let k_b = (srgb_b * safe_gamma).clamp(0.4, 1.5);
 
     (
         if k_r.is_finite() { k_r } else { 1.0 },
@@ -1096,18 +1148,29 @@ mod tests {
 
     #[test]
     fn apple_lux_adaptation_and_ema_filter_dampens_glare_spikes() {
-        let low = apple_adaptation_degree_from_lux(2.0);
-        let high = apple_adaptation_degree_from_lux(300.0);
-        assert!(low >= 0.45 && low < 0.55);
-        assert!(high > 0.80 && high <= 0.85);
+        // Pitch dark (< 1 lux) stays neutral D65 so dark-room ADC noise never tints the monitor.
+        assert_eq!(apple_adaptation_degree_from_lux(0.6), 0.0);
+        // Bright indoor lighting reaches subtle Apple-like partial adaptation (~0.48), not Night Shift.
+        let dim = apple_adaptation_degree_from_lux(25.0);
+        let bright = apple_adaptation_degree_from_lux(300.0);
+        assert!(dim > 0.20 && dim < 0.35, "got dim={}", dim);
+        assert!((bright - APPLE_MAX_ADAPTATION_DEGREE).abs() < 0.02, "got bright={}", bright);
+
+        // Dark-room out-of-locus CIE XYZ noise (y=0.09 < 0.22) must safely fall back to D65.
+        let noise_cct = estimate_cct_from_raw_als(Some(1.0), Some(0.0), Some(2.27), Some(0.58), Some(3.55));
+        assert!((noise_cct - 6500.0).abs() < 0.1, "got {}", noise_cct);
+
+        // Verify sRGB gamma encoding prevents double-warming at 5200K (signal scale ~0.85+, not 0.72).
+        let (r52, g52, b52) = calculate_bradford_multipliers(5200, 1.0);
+        assert!((r52 - 1.0).abs() < 0.02 && g52 > 0.93 && b52 > 0.82, "got ({}, {}, {})", r52, g52, b52);
 
         let mut f = PcAdaptationFilter::default();
         let t0 = Instant::now();
         let (_lux0, cct0) = f.ingest(150.0, 6500.0, t0);
         assert_eq!(cct0, 6500);
 
-        // Single-frame 2s spike to 2500K should be damped by EMA rather than snapping to 2500K.
+        // Single-frame 2s spike to 2500K should be damped by EMA + partial adaptation rather than snapping.
         let (_lux1, cct1) = f.ingest(150.0, 2500.0, t0 + Duration::from_secs(2));
-        assert!(cct1 > 5000 && cct1 < 6500, "expected damped transition, got {}", cct1);
+        assert!(cct1 > 5800 && cct1 < 6500, "expected gentle Apple-like transition, got {}", cct1);
     }
 }
