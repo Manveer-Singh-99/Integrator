@@ -161,88 +161,95 @@ private final class TrackpadHapticEngine {
         }
     }
 
-    /// Plays a maximum-intensity physical Force Touch click when any Touch Bar pill or tray control is touched.
+    /// Plays a refined, Apple-tuned Force Touch tap click when a Touch Bar pill or tray button is touched.
     func playPillPress() {
         dispatchWaveform(
-            tones: [(hz: 165.0, amp: 0.65), (hz: 950.0, amp: 0.35)],
-            durationMs: 6.5,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            tones: [(hz: 170.0, amp: 0.65), (hz: 900.0, amp: 0.35)],
+            durationMs: 5.5,
+            level: 0.52,
+            baseAmplitude: 0.40,
+            toneBudget: 0.60,
             fallback: .generic
         )
     }
 
-    /// Plays a maximum-intensity crisp confirmation snap on Touch Bar pill tap release.
+    /// Plays a lighter confirmation click on Touch Bar pill tap release.
     func playPillRelease() {
         dispatchWaveform(
             tones: [(hz: 260.0, amp: 0.55), (hz: 1200.0, amp: 0.45)],
-            durationMs: 4.5,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            durationMs: 4.0,
+            level: 0.36,
+            baseAmplitude: 0.30,
+            toneBudget: 0.60,
             fallback: .alignment
         )
     }
 
-    /// Plays a singular, deep, maximum-intensity Force Touch click for long-press mode toggles
+    /// Plays a singular, deeper Force Touch click for long-press mode toggles
     /// (such as morphing the media pill between Now Playing and SF Symbol Media Controls).
     func playLongPressClick() {
         dispatchWaveform(
-            tones: [(hz: 115.0, amp: 0.72), (hz: 310.0, amp: 0.28)],
-            durationMs: 11.5,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            tones: [(hz: 120.0, amp: 0.72), (hz: 320.0, amp: 0.28)],
+            durationMs: 9.0,
+            level: 0.78,
+            baseAmplitude: 0.55,
+            toneBudget: 0.45,
             fallback: .levelChange
         )
     }
 
-    /// Plays a solid full-intensity latch click when the user grabs the media scrubber rail.
+    /// Plays a clean latch click when the user grabs the media scrubber rail.
     func playScrubBegin() {
         dispatchWaveform(
-            tones: [(hz: 160.0, amp: 0.70), (hz: 880.0, amp: 0.30)],
-            durationMs: 6.0,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            tones: [(hz: 165.0, amp: 0.70), (hz: 880.0, amp: 0.30)],
+            durationMs: 5.0,
+            level: 0.48,
+            baseAmplitude: 0.38,
+            toneBudget: 0.58,
             fallback: .generic
         )
     }
 
-    /// Plays a rapid, maximum-intensity Apple Watch Digital Crown-style `tic` while scrubbing,
-    /// or a deep hard-stop bump when reaching `0%` or `100%`.
+    /// Plays a crisp, delicate Apple Watch Digital Crown-style `tic` while scrubbing,
+    /// or a firmer end-stop bump when reaching `0%` or `100%`.
     func playScrubTick(fraction: Double, velocityPtsPerSec: Double, hitEdge: Bool) {
         _ = velocityPtsPerSec
         let f = min(max(fraction.isFinite ? fraction : 0.0, 0.0), 1.0)
         if hitEdge {
             dispatchWaveform(
-                tones: [(hz: 125.0, amp: 0.80), (hz: 260.0, amp: 0.20)],
-                durationMs: 10.0,
-                level: 1.0,
-                baseAmplitude: 1.0,
+                tones: [(hz: 135.0, amp: 0.78), (hz: 280.0, amp: 0.22)],
+                durationMs: 8.5,
+                level: 0.58,
+                baseAmplitude: 0.48,
+                toneBudget: 0.50,
                 fallback: nil,
                 maxStalenessSec: 0.05
             )
             return
         }
 
-        // Ultra-short 3.0 ms Gaussian impulse + high-frequency transient at full intensity produces
-        // distinct, rapid Digital Crown "tic-tic-tic" notches without blurring into a buzz.
-        let baseHz = 220.0 + f * 140.0
+        // Ultra-short 2.5 ms balanced impulse (base + tones <= 1.0) produces crisp, delicate
+        // Digital Crown ticks without driver stalls or chassis rattle.
+        let baseHz = 230.0 + f * 130.0
         dispatchWaveform(
-            tones: [(hz: baseHz, amp: 0.55), (hz: 1400.0, amp: 0.45)],
-            durationMs: 3.0,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            tones: [(hz: baseHz, amp: 0.50), (hz: 1450.0, amp: 0.50)],
+            durationMs: 2.5,
+            level: 0.30,
+            baseAmplitude: 0.30,
+            toneBudget: 0.55,
             fallback: nil,
             maxStalenessSec: 0.03
         )
     }
 
-    /// Plays a decisive maximum-intensity lock-in click when committing a media scrub seek.
+    /// Plays a clean lock-in click when committing a media scrub seek.
     func playScrubCommit() {
         dispatchWaveform(
-            tones: [(hz: 240.0, amp: 0.60), (hz: 1100.0, amp: 0.40)],
-            durationMs: 5.5,
-            level: 1.0,
-            baseAmplitude: 1.0,
+            tones: [(hz: 250.0, amp: 0.58), (hz: 1150.0, amp: 0.42)],
+            durationMs: 4.5,
+            level: 0.40,
+            baseAmplitude: 0.32,
+            toneBudget: 0.60,
             fallback: .alignment
         )
     }
@@ -251,7 +258,8 @@ private final class TrackpadHapticEngine {
         tones: [Tone],
         durationMs: Double,
         level: Float,
-        baseAmplitude: Double = 1.0,
+        baseAmplitude: Double = 0.40,
+        toneBudget: Double = 0.60,
         fallback: NSHapticFeedbackManager.FeedbackPattern?,
         maxStalenessSec: CFAbsoluteTime = 0.25
     ) {
@@ -262,7 +270,13 @@ private final class TrackpadHapticEngine {
                 return
             }
             guard let self = self else { return }
-            if self.actuateSync(tones: tones, durationMs: durationMs, level: level, baseAmplitude: baseAmplitude) {
+            if self.actuateSync(
+                tones: tones,
+                durationMs: durationMs,
+                level: level,
+                baseAmplitude: baseAmplitude,
+                toneBudget: toneBudget
+            ) {
                 return
             }
             if let pattern = fallback {
@@ -360,12 +374,23 @@ private final class TrackpadHapticEngine {
         motorRef = nil
     }
 
-    private func actuateSync(tones: [Tone], durationMs: Double, level: Float, baseAmplitude: Double) -> Bool {
+    private func actuateSync(
+        tones: [Tone],
+        durationMs: Double,
+        level: Float,
+        baseAmplitude: Double,
+        toneBudget: Double
+    ) -> Bool {
         guard !tones.isEmpty, durationMs > 0 else { return false }
         guard let (motor, sym) = ensureMotorLocked() else { return false }
 
         let ampSum = max(tones.reduce(0.0) { $0 + $1.amp }, 1e-6)
         let clampedBaseAmp = min(max(baseAmplitude.isFinite ? baseAmplitude : 0.0, 0.0), 1.0)
+        // Enforce combined waveform amplitude <= 1.0 so MultitouchSupport never stalls on rapid runs.
+        let clampedToneBudget = min(
+            max(toneBudget.isFinite ? toneBudget : 0.0, 0.0),
+            max(1.0 - clampedBaseAmp, 0.0)
+        )
         let shape: [String: Any] = [
             "BaseWaveform": [
                 "Type": "Gaussian",
@@ -375,7 +400,7 @@ private final class TrackpadHapticEngine {
             "Tones": tones.map { tone in
                 [
                     "Type": "Sine",
-                    "Amplitude": tone.amp / ampSum,
+                    "Amplitude": (tone.amp / ampSum) * clampedToneBudget,
                     "DurationMS": durationMs,
                     "DelayMS": 0.0,
                     "FrequencykHz": tone.hz / 1000.0
