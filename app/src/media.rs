@@ -91,7 +91,7 @@ pub struct MediaPlaybackState {
     pub has_session: bool,
 }
 
-/// Remote media playback command sent from macOS Touch Bar to Windows.
+/// Remote media playback and volume command sent from macOS Touch Bar to Windows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaControlAction {
@@ -106,6 +106,12 @@ pub enum MediaControlAction {
         /// Target playback position in seconds (clamped to `0.0..=MAX_MEDIA_DURATION_SECS`).
         position_secs: f64,
     },
+    /// Toggle Windows master audio mute (`VK_VOLUME_MUTE`).
+    VolumeMute,
+    /// Step Windows master volume down (`VK_VOLUME_DOWN`).
+    VolumeDown,
+    /// Step Windows master volume up (`VK_VOLUME_UP`).
+    VolumeUp,
 }
 
 /// Strips control characters and Unicode bidi overrides and truncates to `max_chars`.
@@ -647,9 +653,28 @@ mod windows_media {
     /// `SendInput` (`VK_MEDIA_*`) for transport keys and UI Automation `LCDScrubber`/`Slider`
     /// scrubbing for timeline seeks, then invalidates [`MEDIA_CACHE`].
     pub fn execute_command(action: &MediaControlAction) -> Result<String, String> {
+        const VK_VOLUME_MUTE: u16 = 0xAD;
+        const VK_VOLUME_DOWN: u16 = 0xAE;
+        const VK_VOLUME_UP: u16 = 0xAF;
         const VK_MEDIA_NEXT_TRACK: u16 = 0xB0;
         const VK_MEDIA_PREV_TRACK: u16 = 0xB1;
         const VK_MEDIA_PLAY_PAUSE: u16 = 0xB3;
+
+        match action {
+            MediaControlAction::VolumeMute => {
+                send_win32_media_vk(VK_VOLUME_MUTE)?;
+                return Ok("Toggled Windows audio mute".to_string());
+            }
+            MediaControlAction::VolumeDown => {
+                send_win32_media_vk(VK_VOLUME_DOWN)?;
+                return Ok("Decreased Windows volume".to_string());
+            }
+            MediaControlAction::VolumeUp => {
+                send_win32_media_vk(VK_VOLUME_UP)?;
+                return Ok("Increased Windows volume".to_string());
+            }
+            _ => {}
+        }
 
         ensure_com_mta();
         let gsmtc_sess = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
@@ -742,6 +767,9 @@ mod windows_media {
                 invalidate_cache();
                 Ok(format!("Seeked Windows media playback to {:.1}s", clamped))
             }
+            MediaControlAction::VolumeMute
+            | MediaControlAction::VolumeDown
+            | MediaControlAction::VolumeUp => unreachable!("volume actions handled above"),
         }
     }
 }
@@ -778,9 +806,19 @@ mod tests {
 
     #[test]
     fn media_control_action_serde_roundtrip() {
-        let seek = MediaControlAction::Seek { position_secs: 42.5 };
-        let json = serde_json::to_string(&seek).unwrap();
-        let back: MediaControlAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, seek);
+        let cases = [
+            MediaControlAction::PlayPause,
+            MediaControlAction::Next,
+            MediaControlAction::Previous,
+            MediaControlAction::Seek { position_secs: 42.5 },
+            MediaControlAction::VolumeMute,
+            MediaControlAction::VolumeDown,
+            MediaControlAction::VolumeUp,
+        ];
+        for action in cases {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: MediaControlAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, action);
+        }
     }
 }

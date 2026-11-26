@@ -302,9 +302,10 @@ pub extern "C" fn toggle_rust_kvm_boundary_lock() -> bool {
     .unwrap_or(false)
 }
 
-/// C-ABI entry point invoked by `touchbar_hud.swift` to control Windows Spotify/YouTube/VLC media playback.
+/// C-ABI entry point invoked by `touchbar_hud.swift` to control Windows media playback and volume.
 ///
-/// `cmd_code`: `0 = PlayPause`, `1 = Next`, `2 = Previous`, `3 = Seek(seek_secs)`.
+/// `cmd_code`: `0 = PlayPause`, `1 = Next`, `2 = Previous`, `3 = Seek(seek_secs)`,
+/// `4 = VolumeMute`, `5 = VolumeDown`, `6 = VolumeUp`.
 #[no_mangle]
 pub extern "C" fn send_rust_windows_media_cmd(cmd_code: i32, seek_secs: f64) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -318,6 +319,9 @@ pub extern "C" fn send_rust_windows_media_cmd(cmd_code: i32, seek_secs: f64) -> 
             3 => crate::media::MediaControlAction::Seek {
                 position_secs: if seek_secs.is_finite() { seek_secs.max(0.0) } else { 0.0 },
             },
+            4 => crate::media::MediaControlAction::VolumeMute,
+            5 => crate::media::MediaControlAction::VolumeDown,
+            6 => crate::media::MediaControlAction::VolumeUp,
             _ => return false,
         };
         let core_ref = Arc::clone(core);

@@ -14,19 +14,24 @@
 //  Key Subsystem Capabilities:
 //  - Viscous Liquid Glass Pill Views (`GoopyLiquidGlassPillView`): Implements critically-damped
 //    tactile spring physics, Frosted HUD blur materials (`NSVisualEffectView` with `.hudWindow`),
-//    continuous corner curves, and precision Force Touch trackpad waveform haptics on pill touch.
+//    continuous corner curves, SF Symbol icon pills (Windows mute / volume down / volume up),
+//    seamless GPU marquee scrolling, and maximum-intensity Force Touch trackpad waveform haptics.
+//  - Morphing Now-Playing / Media Controls Pill (`LiquidGlassMediaMorphPillView`): Displays the
+//    scrolling track title with an SF Symbol status icon, morphing in-place on a `0.35 s` long
+//    press (with a singular strong Force Touch click) into SF Symbol playback controls
+//    (`backward.fill`, `play.fill`/`pause.fill`, `forward.fill`) and back on long press.
 //  - Rounded Liquid Glass Media Scrubber (`LiquidGlassMediaScrubPillView`): Capsule progress bar
-//    with glowing circular thumb, elapsed/total timestamps (`mm:ss`), continuous tactile detent
-//    feedback during drags via Force Touch actuator waveforms, and zero-snap-back touch scrubbing.
+//    with glowing circular thumb, elapsed/total timestamps (`mm:ss`), rapid Digital Crown tactile
+//    detent clicks during drags via Force Touch actuator waveforms, and zero-snap-back scrubbing.
 //  - Native Touch ID Touch Bar Yielding (`showTouchIdPrompt`): Temporarily yields Integrator's
 //    system-modal Touch Bar while macOS `LocalAuthentication` (`LAContext`) is active so Apple's
 //    native `Cancel ... Touch ID to <reason> →` Touch Bar prompt appears unobstructed, then
 //    restores the HUD automatically when evaluation ends.
 //  - Hardware Camera Privacy Killswitch (`camera_privacy`): One-tap hardware privacy shutter
 //    pill (`🟢 FaceTime HD` / `🚫 Cam Muted`) visible whenever the Mac camera is streaming.
-//  - Live GPU Telemetry Streamer (`gpu` pill + `.gpu` detail strip): Displays real-time GPU
-//    metrics from the connected Windows 11 host (GPU name, temperature °C, power draw W, core
-//    clock MHz, VRAM usage GB, and GPU utilization %).
+//  - Live GPU Telemetry Streamer (`gpu` compact / `gpu_expanded` idle + `.gpu` detail strip):
+//    Expands automatically to show full live metrics (GPU model, °C, %, W, MHz, VRAM) when no
+//    media session is playing, collapsing cleanly to a compact scrolling pill during playback.
 //  - Persistent Control Strip System Tray (`∫`): Registers a persistent `NSCustomTouchBarItem`
 //    in the macOS Control Strip and observes `NSTouchBar.isVisible` via KVO so dismissing the
 //    modal bar via the system `X` close button cleans up timers and allows instant 1-tap restore.
@@ -175,6 +180,18 @@ private final class TrackpadHapticEngine {
             level: 1.0,
             baseAmplitude: 1.0,
             fallback: .alignment
+        )
+    }
+
+    /// Plays a singular, deep, maximum-intensity Force Touch click for long-press mode toggles
+    /// (such as morphing the media pill between Now Playing and SF Symbol Media Controls).
+    func playLongPressClick() {
+        dispatchWaveform(
+            tones: [(hz: 115.0, amp: 0.72), (hz: 310.0, amp: 0.28)],
+            durationMs: 11.5,
+            level: 1.0,
+            baseAmplitude: 1.0,
+            fallback: .levelChange
         )
     }
 
@@ -457,14 +474,33 @@ private final class MarqueePassThroughView: NSView {
     }
 }
 
+/// Builds a crisp template SF Symbol `NSImage` sized for `30 pt` Touch Bar Liquid Glass pills.
+private func makeTouchBarSymbolImage(
+    named name: String,
+    pointSize: CGFloat = 13.5,
+    weight: NSFont.Weight = .semibold
+) -> NSImage? {
+    guard let base = NSImage(systemSymbolName: name, accessibilityDescription: name) else {
+        return nil
+    }
+    let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+    let img = base.withSymbolConfiguration(cfg) ?? base
+    img.isTemplate = true
+    return img
+}
+
 /// Frosted Liquid Glass Touch Bar button view featuring critically-damped tactile spring settle
-/// (`zeta = 1.0`), haptic feedback, optional seamless looping marquee scrolling for overflowing
-/// labels, and direct NSTouch/mouse hit-slop tracking.
+/// (`zeta = 1.0`), haptic feedback, SF Symbol icon support, optional seamless looping marquee
+/// scrolling for overflowing labels, and direct NSTouch/mouse hit-slop tracking.
 class GoopyLiquidGlassPillView: NSView {
     /// Frosted `.hudWindow` blur layer rendering the tinted glass pill body.
     let visualEffectView = NSVisualEffectView()
     /// Centered single-line monospaced label rendered atop `visualEffectView` when text fits.
     let label = NSTextField(labelWithString: "")
+    /// Optional centered SF Symbol icon view used for icon-only controls (e.g. volume buttons).
+    private let symbolView = NSImageView()
+    /// Whether this pill renders a centered SF Symbol instead of text.
+    private var isSymbolOnly: Bool = false
     /// Semantic tint accent applied to the glass background and active glow border.
     var accentColor: NSColor = .systemGreen {
         didSet { updateRestingStyle() }
@@ -510,13 +546,20 @@ class GoopyLiquidGlassPillView: NSView {
     /// Shared pill typography used for both centered and marquee labels.
     private static let pillFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
 
-    /// Creates a new Liquid Glass pill view with the specified initial label, accent color, width, and marquee flag.
-    init(text: String, accent: NSColor, width: CGFloat = 88, marqueeEnabled: Bool = false) {
+    /// Creates a new Liquid Glass pill view with text or a centered SF Symbol icon.
+    init(
+        text: String = "",
+        symbolName: String? = nil,
+        accent: NSColor,
+        width: CGFloat = 88,
+        marqueeEnabled: Bool = false
+    ) {
         self.pillWidth = width
-        self.marqueeEnabled = marqueeEnabled
+        self.marqueeEnabled = marqueeEnabled && (symbolName == nil)
+        self.isSymbolOnly = (symbolName != nil)
         self.accentColor = accent
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
-        setup(text: text)
+        setup(text: text, symbolName: symbolName)
     }
 
     required init?(coder: NSCoder) {
@@ -558,8 +601,8 @@ class GoopyLiquidGlassPillView: NSView {
         }
     }
 
-    /// Configures frosted glass subviews, AutoLayout label centering, and optional marquee layers.
-    func setup(text: String) {
+    /// Configures frosted glass subviews, centered text or SF Symbol icon, and optional marquee layers.
+    func setup(text: String, symbolName: String? = nil) {
         wantsLayer = true
         layer?.masksToBounds = false
         allowedTouchTypes = [.direct]
@@ -577,27 +620,41 @@ class GoopyLiquidGlassPillView: NSView {
         visualEffectView.layer?.masksToBounds = true
         addSubview(visualEffectView)
 
-        // 2. High-Legibility Monospace Centered Typography via AutoLayout
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.alignment = .center
-        label.font = Self.pillFont
-        label.textColor = .white
-        label.backgroundColor = .clear
-        label.isBezeled = false
-        label.isEditable = false
-        label.isSelectable = false
-        label.maximumNumberOfLines = 1
-        label.lineBreakMode = .byTruncatingTail
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.stringValue = text
-        addSubview(label)
+        if let sym = symbolName {
+            symbolView.translatesAutoresizingMaskIntoConstraints = false
+            symbolView.imageScaling = .scaleProportionallyDown
+            symbolView.contentTintColor = .white
+            symbolView.image = makeTouchBarSymbolImage(named: sym, pointSize: 13.5, weight: .semibold)
+            addSubview(symbolView)
+            NSLayoutConstraint.activate([
+                symbolView.centerXAnchor.constraint(equalTo: centerXAnchor),
+                symbolView.centerYAnchor.constraint(equalTo: centerYAnchor),
+                symbolView.widthAnchor.constraint(lessThanOrEqualToConstant: 20),
+                symbolView.heightAnchor.constraint(lessThanOrEqualToConstant: 20)
+            ])
+        } else {
+            // 2. High-Legibility Monospace Centered Typography via AutoLayout
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.alignment = .center
+            label.font = Self.pillFont
+            label.textColor = .white
+            label.backgroundColor = .clear
+            label.isBezeled = false
+            label.isEditable = false
+            label.isSelectable = false
+            label.maximumNumberOfLines = 1
+            label.lineBreakMode = .byTruncatingTail
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            label.stringValue = text
+            addSubview(label)
 
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6)
-        ])
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: centerYAnchor),
+                label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
+                label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6)
+            ])
+        }
 
         if marqueeEnabled {
             marqueeClipView.wantsLayer = true
@@ -915,6 +972,677 @@ class GoopyLiquidGlassPillView: NSView {
             TrackpadHapticEngine.shared.playPillRelease()
             onTap?()
         }
+    }
+}
+
+// MARK: - Morphing Liquid Glass Now-Playing <-> SF Symbol Media Controls Pill
+
+/// Frosted Liquid Glass Touch Bar pill that displays the scrolling Now Playing track with an
+/// SF Symbol status badge and morphs in-place (on a `0.35 s` long press with a singular strong
+/// Force Touch haptic click) into SF Symbol playback controls (`backward.fill`, `play.fill` /
+/// `pause.fill`, `forward.fill`), and morphs back on another long press.
+final class LiquidGlassMediaMorphPillView: NSView {
+    /// Frosted `.hudWindow` backdrop container.
+    private let visualEffectView = NSVisualEffectView()
+    /// Container holding the Now Playing icon and scrolling track label.
+    private let nowPlayingContainer = MarqueePassThroughView()
+    /// Leading SF Symbol badge (`music.note` when playing, `pause.fill` when paused).
+    private let statusIconView = NSImageView()
+    /// Static non-scrolling label shown when the song title fits within the pill.
+    private let staticTitleLabel = NSTextField(labelWithString: "")
+    /// Clipped marquee viewport shown when the song title overflows the pill.
+    private let marqueeClipView = MarqueePassThroughView()
+    /// Horizontally animated marquee track containing primary and wrap-around copies.
+    private let marqueeTrackView = MarqueePassThroughView()
+    /// Leading marquee label copy.
+    private let marqueePrimaryLabel = NSTextField(labelWithString: "")
+    /// Trailing wrap-around marquee label copy.
+    private let marqueeCloneLabel = NSTextField(labelWithString: "")
+    /// Soft left/right alpha fade mask applied to `marqueeClipView.layer`.
+    private let marqueeMaskLayer = CAGradientLayer()
+
+    /// Container holding the 3 SF Symbol media control zones (`prev | play/pause | next`).
+    private let controlsContainer = MarqueePassThroughView()
+    /// Frosted capsule highlight sliding behind whichever control zone is pressed.
+    private let zoneHighlightLayer = CALayer()
+    /// Subtle vertical divider between Previous and Play/Pause zones.
+    private let dividerLeft = CALayer()
+    /// Subtle vertical divider between Play/Pause and Next zones.
+    private let dividerRight = CALayer()
+    /// SF Symbol icon for Previous Track (`backward.fill`).
+    private let prevIconView = NSImageView()
+    /// SF Symbol icon for Play/Pause (`play.fill` / `pause.fill`).
+    private let playPauseIconView = NSImageView()
+    /// SF Symbol icon for Next Track (`forward.fill`).
+    private let nextIconView = NSImageView()
+
+    /// Fixed Touch Bar pill width in AppKit points (`30 pt` height).
+    private let pillWidth: CGFloat
+    /// Current semantic glass tint accent.
+    private var accentColor: NSColor = .systemPink
+    /// Current playback state driving Now Playing & Play/Pause SF Symbols.
+    private var isPlaying: Bool = false
+    /// Current formatted track title text (`"Title — Artist"`).
+    private var currentTitle: String = ""
+    /// True while morphed into SF Symbol Media Controls mode; false in Now Playing mode.
+    private(set) var isShowingControls: Bool = false
+    /// True while a seamless looping marquee animation is active.
+    private var isMarqueeScrolling: Bool = false
+    /// Active cycle distance (pt) of the running marquee loop.
+    private var activeMarqueeCycle: CGFloat = 0.0
+    /// Last measured text viewport width (pt).
+    private var lastMarqueeClipWidth: CGFloat = 0.0
+
+    /// Active `NSTouch.identity` tracked during direct Touch Bar gestures.
+    private var activeTouchIdentity: AnyObject? = nil
+    /// True while a touch or mouse press is held on this pill.
+    private var isHeld: Bool = false
+    /// True while the pointer remains within tap/long-press slop bounds.
+    private var isTouchInside: Bool = false
+    /// True once the current press crossed `longPressDuration` and triggered a mode morph.
+    private var longPressFired: Bool = false
+    /// Initial touch location used to cancel long-press if the user slides across zones.
+    private var initialTouchPoint: CGPoint = .zero
+    /// Highlighted control zone index (`0 = prev`, `1 = play/pause`, `2 = next`) in controls mode.
+    private var pressedZone: Int = 1
+    /// Pending main-queue work item firing the long-press mode toggle after `0.35 s`.
+    private var longPressWorkItem: DispatchWorkItem? = nil
+
+    /// Action closures invoked on short taps.
+    var onPrevious: (() -> Void)?
+    var onPlayPause: (() -> Void)?
+    var onNext: (() -> Void)?
+
+    private let longPressDuration: TimeInterval = 0.35
+    private let marqueeGap: CGFloat = 28.0
+    private let marqueeSpeedPtsPerSec: CGFloat = 26.0
+    private static let titleFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+
+    init(width: CGFloat = 174) {
+        self.pillWidth = width
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        self.pillWidth = 174
+        super.init(coder: coder)
+        setup()
+    }
+
+    override var intrinsicContentSize: NSSize {
+        return NSSize(width: pillWidth, height: 30)
+    }
+
+    override func layout() {
+        super.layout()
+        layoutInternalSubviews()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            cancelLongPressTimer()
+            if isHeld {
+                activeTouchIdentity = nil
+                endTouch(triggerTap: false)
+            }
+            stopMarqueeAnimation()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil && !isShowingControls {
+            updateMarquee(forceRestart: true)
+        }
+    }
+
+    private func setup() {
+        wantsLayer = true
+        layer?.masksToBounds = false
+        allowedTouchTypes = [.direct]
+        wantsRestingTouches = false
+
+        visualEffectView.frame = bounds
+        visualEffectView.autoresizingMask = [.width, .height]
+        visualEffectView.material = .hudWindow
+        visualEffectView.blendingMode = .withinWindow
+        visualEffectView.state = .active
+        visualEffectView.wantsLayer = true
+        visualEffectView.layer?.cornerRadius = 9
+        visualEffectView.layer?.masksToBounds = true
+        addSubview(visualEffectView)
+
+        // 1. Now Playing Layer
+        nowPlayingContainer.wantsLayer = true
+        nowPlayingContainer.frame = bounds
+        addSubview(nowPlayingContainer)
+
+        statusIconView.imageScaling = .scaleProportionallyDown
+        statusIconView.contentTintColor = .systemPink
+        statusIconView.image = makeTouchBarSymbolImage(named: "music.note", pointSize: 12.5, weight: .semibold)
+        nowPlayingContainer.addSubview(statusIconView)
+
+        staticTitleLabel.alignment = .left
+        staticTitleLabel.font = Self.titleFont
+        staticTitleLabel.textColor = .white
+        staticTitleLabel.backgroundColor = .clear
+        staticTitleLabel.isBezeled = false
+        staticTitleLabel.isEditable = false
+        staticTitleLabel.isSelectable = false
+        staticTitleLabel.maximumNumberOfLines = 1
+        staticTitleLabel.lineBreakMode = .byTruncatingTail
+        nowPlayingContainer.addSubview(staticTitleLabel)
+
+        marqueeClipView.wantsLayer = true
+        marqueeClipView.layer?.masksToBounds = true
+        marqueeClipView.isHidden = true
+        nowPlayingContainer.addSubview(marqueeClipView)
+
+        marqueeTrackView.wantsLayer = true
+        marqueeClipView.addSubview(marqueeTrackView)
+
+        for field in [marqueePrimaryLabel, marqueeCloneLabel] {
+            field.alignment = .left
+            field.font = Self.titleFont
+            field.textColor = .white
+            field.backgroundColor = .clear
+            field.isBezeled = false
+            field.isEditable = false
+            field.isSelectable = false
+            field.maximumNumberOfLines = 1
+            field.lineBreakMode = .byClipping
+            marqueeTrackView.addSubview(field)
+        }
+
+        marqueeMaskLayer.startPoint = CGPoint(x: 0.0, y: 0.5)
+        marqueeMaskLayer.endPoint = CGPoint(x: 1.0, y: 0.5)
+        marqueeMaskLayer.colors = [
+            NSColor.clear.cgColor,
+            NSColor.white.cgColor,
+            NSColor.white.cgColor,
+            NSColor.clear.cgColor
+        ]
+
+        // 2. SF Symbol Media Controls Layer (hidden until long-press morph)
+        controlsContainer.wantsLayer = true
+        controlsContainer.frame = bounds
+        controlsContainer.alphaValue = 0.0
+        controlsContainer.isHidden = true
+        addSubview(controlsContainer)
+
+        zoneHighlightLayer.cornerRadius = 7
+        zoneHighlightLayer.backgroundColor = NSColor(white: 1.0, alpha: 0.22).cgColor
+        zoneHighlightLayer.opacity = 0.0
+        controlsContainer.layer?.addSublayer(zoneHighlightLayer)
+
+        for div in [dividerLeft, dividerRight] {
+            div.backgroundColor = NSColor(white: 1.0, alpha: 0.14).cgColor
+            controlsContainer.layer?.addSublayer(div)
+        }
+
+        for (iconView, sym) in [
+            (prevIconView, "backward.fill"),
+            (playPauseIconView, "play.fill"),
+            (nextIconView, "forward.fill")
+        ] {
+            iconView.imageScaling = .scaleProportionallyDown
+            iconView.contentTintColor = .white
+            iconView.image = makeTouchBarSymbolImage(named: sym, pointSize: 13.5, weight: .semibold)
+            controlsContainer.addSubview(iconView)
+        }
+
+        layoutInternalSubviews()
+        applyRestingStyle()
+    }
+
+    /// Updates track metadata and play/pause SF Symbols without resetting an active marquee scroll.
+    func update(title: String, isPlaying: Bool) {
+        let apply = { [weak self] in
+            guard let self = self else { return }
+            let playingChanged = (self.isPlaying != isPlaying)
+            let titleChanged = (self.currentTitle != title)
+            self.isPlaying = isPlaying
+            self.currentTitle = title
+
+            if playingChanged || self.statusIconView.image == nil {
+                self.statusIconView.image = makeTouchBarSymbolImage(
+                    named: isPlaying ? "music.note" : "pause.fill",
+                    pointSize: 12.5,
+                    weight: .semibold
+                )
+                self.statusIconView.contentTintColor = isPlaying ? .systemPink : NSColor(white: 0.85, alpha: 1.0)
+                self.playPauseIconView.image = makeTouchBarSymbolImage(
+                    named: isPlaying ? "pause.fill" : "play.fill",
+                    pointSize: 13.5,
+                    weight: .semibold
+                )
+                self.accentColor = isPlaying ? .systemPink : .systemGray
+                if !self.isHeld {
+                    self.applyRestingStyle()
+                }
+            }
+
+            if titleChanged {
+                self.staticTitleLabel.stringValue = title
+                if !self.isShowingControls {
+                    self.updateMarquee(forceRestart: false)
+                }
+            }
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    /// Silently returns the pill to Now Playing mode (e.g., when a media session ends).
+    func resetToNowPlaying() {
+        let apply = { [weak self] in
+            guard let self = self, self.isShowingControls else { return }
+            self.isShowingControls = false
+            self.controlsContainer.isHidden = true
+            self.controlsContainer.alphaValue = 0.0
+            self.nowPlayingContainer.isHidden = false
+            self.nowPlayingContainer.alphaValue = 1.0
+            self.applyRestingStyle()
+            self.updateMarquee(forceRestart: true)
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    private func layoutInternalSubviews() {
+        let w = bounds.width > 1.0 ? bounds.width : pillWidth
+        let h = bounds.height > 1.0 ? bounds.height : 30.0
+
+        nowPlayingContainer.frame = CGRect(x: 0, y: 0, width: w, height: h)
+        controlsContainer.frame = CGRect(x: 0, y: 0, width: w, height: h)
+
+        // Now Playing icon + title viewport
+        statusIconView.frame = CGRect(x: 7.0, y: floor((h - 16.0) / 2.0), width: 15.0, height: 16.0)
+        let textX: CGFloat = 25.0
+        let clipW = max(w - textX - 6.0, 1.0)
+        let lineH: CGFloat = 16.0
+        staticTitleLabel.frame = CGRect(x: textX, y: floor((h - lineH) / 2.0), width: clipW, height: lineH)
+
+        if abs(clipW - lastMarqueeClipWidth) > 0.5 && !isShowingControls {
+            updateMarquee(forceRestart: false)
+        }
+
+        // Media Controls 3-zone layout
+        let zoneW = w / 3.0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dividerLeft.frame = CGRect(x: floor(zoneW), y: 7.0, width: 1.0, height: h - 14.0)
+        dividerRight.frame = CGRect(x: floor(zoneW * 2.0), y: 7.0, width: 1.0, height: h - 14.0)
+        CATransaction.commit()
+
+        let iconSize: CGFloat = 18.0
+        let iconY = floor((h - iconSize) / 2.0)
+        prevIconView.frame = CGRect(x: floor((zoneW - iconSize) / 2.0), y: iconY, width: iconSize, height: iconSize)
+        playPauseIconView.frame = CGRect(x: floor(zoneW + (zoneW - iconSize) / 2.0), y: iconY, width: iconSize, height: iconSize)
+        nextIconView.frame = CGRect(x: floor(zoneW * 2.0 + (zoneW - iconSize) / 2.0), y: iconY, width: iconSize, height: iconSize)
+    }
+
+    private func stopMarqueeAnimation() {
+        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        isMarqueeScrolling = false
+        activeMarqueeCycle = 0.0
+    }
+
+    private func updateMarquee(forceRestart: Bool) {
+        let w = bounds.width > 1.0 ? bounds.width : pillWidth
+        let h = bounds.height > 1.0 ? bounds.height : 30.0
+        let textX: CGFloat = 25.0
+        let clipW = max(w - textX - 6.0, 1.0)
+        lastMarqueeClipWidth = clipW
+
+        let measured = NSAttributedString(
+            string: currentTitle,
+            attributes: [.font: Self.titleFont]
+        ).size()
+        let textW = ceil(measured.width)
+        let textH = ceil(measured.height)
+
+        guard textW > clipW + 1.0 else {
+            stopMarqueeAnimation()
+            marqueeClipView.isHidden = true
+            marqueeClipView.layer?.mask = nil
+            staticTitleLabel.isHidden = false
+            return
+        }
+
+        let cycleDistance = textW + marqueeGap
+        marqueeClipView.frame = CGRect(x: textX, y: 0.0, width: clipW, height: h)
+        marqueeClipView.isHidden = false
+        staticTitleLabel.isHidden = true
+
+        let fadeFrac = min(max(6.0 / clipW, 0.02), 0.14)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        marqueeMaskLayer.frame = marqueeClipView.bounds
+        marqueeMaskLayer.locations = [
+            0.0,
+            NSNumber(value: Double(fadeFrac)),
+            NSNumber(value: Double(1.0 - fadeFrac)),
+            1.0
+        ]
+        marqueeClipView.layer?.mask = marqueeMaskLayer
+        CATransaction.commit()
+
+        let yPos = floor((h - textH) / 2.0)
+
+        if !forceRestart && isMarqueeScrolling && abs(cycleDistance - activeMarqueeCycle) <= 8.0 {
+            let slotW = max(textW + 4.0, activeMarqueeCycle - marqueeGap + 4.0)
+            marqueePrimaryLabel.stringValue = currentTitle
+            marqueeCloneLabel.stringValue = currentTitle
+            marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: slotW, height: textH)
+            marqueeCloneLabel.frame = CGRect(x: activeMarqueeCycle, y: yPos, width: slotW, height: textH)
+            return
+        }
+
+        marqueeTrackView.layer?.removeAnimation(forKey: "marqueeLoop")
+        marqueeTrackView.frame = CGRect(x: 0.0, y: 0.0, width: cycleDistance + textW + 8.0, height: h)
+        marqueePrimaryLabel.stringValue = currentTitle
+        marqueeCloneLabel.stringValue = currentTitle
+        marqueePrimaryLabel.frame = CGRect(x: 0.0, y: yPos, width: textW + 4.0, height: textH)
+        marqueeCloneLabel.frame = CGRect(x: cycleDistance, y: yPos, width: textW + 4.0, height: textH)
+
+        let anim = CABasicAnimation(keyPath: "transform.translation.x")
+        anim.fromValue = 0.0
+        anim.toValue = -Double(cycleDistance)
+        anim.duration = max(Double(cycleDistance / marqueeSpeedPtsPerSec), 1.5)
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .linear)
+        anim.isRemovedOnCompletion = false
+        marqueeTrackView.layer?.add(anim, forKey: "marqueeLoop")
+
+        isMarqueeScrolling = true
+        activeMarqueeCycle = cycleDistance
+    }
+
+    private func activeTint() -> NSColor {
+        return isShowingControls ? .systemCyan : accentColor
+    }
+
+    private func applyRestingStyle() {
+        let tint = activeTint()
+        layer?.shadowColor = tint.cgColor
+        layer?.shadowOffset = .zero
+        layer?.shadowRadius = 4.0
+        layer?.shadowOpacity = 0.0
+        visualEffectView.layer?.backgroundColor = tint.withAlphaComponent(isShowingControls ? 0.20 : 0.14).cgColor
+        visualEffectView.layer?.borderWidth = isShowingControls ? 0.7 : 0.5
+        visualEffectView.layer?.borderColor = isShowingControls
+            ? tint.withAlphaComponent(0.45).cgColor
+            : NSColor(white: 1.0, alpha: 0.20).cgColor
+    }
+
+    private func centeredTransform(sx: CGFloat, sy: CGFloat) -> CATransform3D {
+        let cx = bounds.midX
+        let cy = bounds.midY
+        var t = CATransform3DIdentity
+        t = CATransform3DTranslate(t, cx, cy, 0)
+        t = CATransform3DScale(t, sx, sy, 1.0)
+        t = CATransform3DTranslate(t, -cx, -cy, 0)
+        return t
+    }
+
+    private func zoneIndex(for pt: CGPoint) -> Int {
+        let w = max(bounds.width, 1.0)
+        let third = w / 3.0
+        if pt.x < third { return 0 }
+        if pt.x < third * 2.0 { return 1 }
+        return 2
+    }
+
+    private func setZoneHighlight(zone: Int?, animated: Bool) {
+        let w = bounds.width > 1.0 ? bounds.width : pillWidth
+        let h = bounds.height > 1.0 ? bounds.height : 30.0
+        let zoneW = w / 3.0
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        if let z = zone, isShowingControls {
+            zoneHighlightLayer.frame = CGRect(
+                x: CGFloat(z) * zoneW + 2.0,
+                y: 2.0,
+                width: max(zoneW - 4.0, 1.0),
+                height: h - 4.0
+            )
+            zoneHighlightLayer.opacity = 1.0
+        } else {
+            zoneHighlightLayer.opacity = 0.0
+        }
+        CATransaction.commit()
+    }
+
+    private func cancelLongPressTimer() {
+        longPressWorkItem?.cancel()
+        longPressWorkItem = nil
+    }
+
+    private func triggerLongPressMorph() {
+        guard isHeld && isTouchInside && !longPressFired else { return }
+        longPressFired = true
+        setZoneHighlight(zone: nil, animated: true)
+
+        // Singular strong Force Touch haptic click announcing the pill mode toggle.
+        TrackpadHapticEngine.shared.playLongPressClick()
+
+        isShowingControls.toggle()
+        let showControls = isShowingControls
+        if showControls {
+            stopMarqueeAnimation()
+            controlsContainer.isHidden = false
+            controlsContainer.alphaValue = 0.0
+        } else {
+            nowPlayingContainer.isHidden = false
+            nowPlayingContainer.alphaValue = 0.0
+            updateMarquee(forceRestart: true)
+        }
+
+        // Crisp pop spring to accentuate the in-place morph.
+        layer?.removeAnimation(forKey: "morphPop")
+        let pop = CASpringAnimation(keyPath: "transform")
+        pop.mass = 1.0
+        pop.stiffness = 520.0
+        pop.damping = 34.0
+        pop.fromValue = NSValue(caTransform3D: centeredTransform(sx: 1.04, sy: 1.06))
+        pop.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        pop.duration = pop.settlingDuration
+        layer?.transform = CATransform3DIdentity
+        layer?.add(pop, forKey: "morphPop")
+
+        let tint = activeTint()
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.nowPlayingContainer.animator().alphaValue = showControls ? 0.0 : 1.0
+            self.controlsContainer.animator().alphaValue = showControls ? 1.0 : 0.0
+            self.visualEffectView.layer?.backgroundColor = tint.withAlphaComponent(showControls ? 0.24 : 0.14).cgColor
+            self.visualEffectView.layer?.borderWidth = showControls ? 0.8 : 0.5
+            self.visualEffectView.layer?.borderColor = showControls
+                ? tint.withAlphaComponent(0.55).cgColor
+                : NSColor(white: 1.0, alpha: 0.20).cgColor
+        }, completionHandler: { [weak self] in
+            guard let self = self else { return }
+            if self.isShowingControls {
+                self.nowPlayingContainer.isHidden = true
+            } else {
+                self.controlsContainer.isHidden = true
+            }
+        })
+    }
+
+    private func beginTouch(at pt: CGPoint) {
+        guard !isHeld else { return }
+        isHeld = true
+        isTouchInside = true
+        longPressFired = false
+        initialTouchPoint = pt
+        pressedZone = zoneIndex(for: pt)
+
+        layer?.removeAnimation(forKey: "liquidSettle")
+        let pressed = centeredTransform(sx: 0.965, sy: 0.945)
+        let tint = activeTint()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.08
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.layer?.shadowColor = tint.cgColor
+            self.layer?.shadowRadius = 8.0
+            self.layer?.shadowOpacity = 0.36
+            self.layer?.transform = pressed
+            self.visualEffectView.layer?.backgroundColor = tint.withAlphaComponent(0.30).cgColor
+            self.visualEffectView.layer?.borderWidth = 0.8
+            self.visualEffectView.layer?.borderColor = tint.withAlphaComponent(0.55).cgColor
+        }
+        if isShowingControls {
+            setZoneHighlight(zone: pressedZone, animated: false)
+        }
+
+        cancelLongPressTimer()
+        let work = DispatchWorkItem { [weak self] in
+            self?.triggerLongPressMorph()
+        }
+        longPressWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + longPressDuration, execute: work)
+    }
+
+    private func moveTouch(to pt: CGPoint) {
+        guard isHeld else { return }
+        let inside = bounds.insetBy(dx: -10, dy: -16).contains(pt)
+        isTouchInside = inside
+        if !inside {
+            cancelLongPressTimer()
+            setZoneHighlight(zone: nil, animated: true)
+            if !longPressFired {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.12
+                    self.layer?.transform = CATransform3DIdentity
+                    self.applyRestingStyle()
+                }
+            }
+            return
+        }
+
+        if !longPressFired && abs(pt.x - initialTouchPoint.x) > 16.0 {
+            cancelLongPressTimer()
+        }
+        if isShowingControls && !longPressFired {
+            let z = zoneIndex(for: pt)
+            if z != pressedZone {
+                pressedZone = z
+                setZoneHighlight(zone: z, animated: true)
+            }
+        }
+    }
+
+    private func endTouch(triggerTap: Bool) {
+        cancelLongPressTimer()
+        guard isHeld else { return }
+        let didLongPress = longPressFired
+        let inside = isTouchInside
+        let zone = pressedZone
+        let inControls = isShowingControls
+
+        isHeld = false
+        isTouchInside = false
+        longPressFired = false
+        setZoneHighlight(zone: nil, animated: true)
+
+        if !didLongPress {
+            let currentT = layer?.presentation()?.transform ?? layer?.transform ?? CATransform3DIdentity
+            let settle = CASpringAnimation(keyPath: "transform")
+            settle.mass = 1.0
+            settle.stiffness = 420.0
+            settle.damping = 41.0
+            settle.fromValue = NSValue(caTransform3D: currentT)
+            settle.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            settle.duration = settle.settlingDuration
+            layer?.transform = CATransform3DIdentity
+            layer?.add(settle, forKey: "liquidSettle")
+        }
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.applyRestingStyle()
+        }
+
+        // Long-press already delivered its singular strong click and switched mode; skip tap action.
+        guard triggerTap && inside && !didLongPress else { return }
+
+        TrackpadHapticEngine.shared.playPillPress()
+        if inControls {
+            switch zone {
+            case 0: onPrevious?()
+            case 2: onNext?()
+            default: onPlayPause?()
+            }
+        } else {
+            onPlayPause?()
+        }
+    }
+
+    override func touchesBegan(with event: NSEvent) {
+        guard activeTouchIdentity == nil,
+              let touch = event.touches(matching: .began, in: self).first else { return }
+        activeTouchIdentity = touch.identity as AnyObject
+        beginTouch(at: touch.location(in: self))
+    }
+
+    override func touchesMoved(with event: NSEvent) {
+        guard isHeld, let id = activeTouchIdentity else { return }
+        let moved = event.touches(matching: .moved, in: self)
+        guard let touch = moved.first(where: { ($0.identity as AnyObject).isEqual(id) }) ?? moved.first else { return }
+        moveTouch(to: touch.location(in: self))
+    }
+
+    override func touchesEnded(with event: NSEvent) {
+        guard isHeld else { return }
+        let ended = event.touches(matching: .ended, in: self)
+        let matching: NSTouch?
+        if let id = activeTouchIdentity {
+            matching = ended.first(where: { ($0.identity as AnyObject).isEqual(id) }) ?? ended.first
+        } else {
+            matching = ended.first
+        }
+        if let t = matching {
+            isTouchInside = bounds.insetBy(dx: -10, dy: -16).contains(t.location(in: self))
+            if isShowingControls {
+                pressedZone = zoneIndex(for: t.location(in: self))
+            }
+        }
+        activeTouchIdentity = nil
+        endTouch(triggerTap: true)
+    }
+
+    override func touchesCancelled(with event: NSEvent) {
+        activeTouchIdentity = nil
+        endTouch(triggerTap: false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        beginTouch(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        moveTouch(to: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        isTouchInside = bounds.insetBy(dx: -10, dy: -16).contains(pt)
+        if isShowingControls {
+            pressedZone = zoneIndex(for: pt)
+        }
+        endTouch(triggerTap: true)
     }
 }
 
@@ -1398,8 +2126,10 @@ final class LiquidGlassMediaScrubPillView: NSView {
     /// 1 Hz main-RunLoop timer driving background telemetry and media state polling.
     var pollTimer: Timer?
 
-    /// Compact GPU name + die temperature pill shown in `.main` strip (taps into `.gpu` detail strip).
+    /// Compact GPU name + die temperature pill shown in `.main` strip while media is playing.
     var viewGpu: GoopyLiquidGlassPillView?
+    /// Expanded GPU telemetry pill shown in `.main` strip when no media session is playing.
+    var viewGpuExpanded: GoopyLiquidGlassPillView?
     /// GPU core temperature (`°C`) pill in `.gpu` detail strip.
     var viewTemp: GoopyLiquidGlassPillView?
     /// GPU board power draw (`W`) pill in `.gpu` detail strip.
@@ -1425,14 +2155,14 @@ final class LiquidGlassMediaScrubPillView: NSView {
     /// True while the Hardware Camera Privacy Killswitch shutter is engaged.
     private var cameraIsMuted: Bool = false
 
-    /// Windows media transport Play/Pause pill (`▶️` / `⏸️`).
-    var viewMediaPlayPause: GoopyLiquidGlassPillView?
-    /// Active track title & artist ticker pill in `.main` strip.
-    var viewMediaTrackLabel: GoopyLiquidGlassPillView?
+    /// Morphing Now Playing <-> SF Symbol Media Controls pill (`media_title`) in `.main` strip.
+    var viewMediaMorph: LiquidGlassMediaMorphPillView?
     /// Rounded Liquid Glass media scrub bar (`LiquidGlassMediaScrubPillView`).
     var viewMediaScrub: LiquidGlassMediaScrubPillView?
     /// Most recently polled Windows GSMTC media state cached for optimistic play/pause feedback.
     private var currentMediaState: MediaPlaybackStateData? = nil
+    /// True when Windows reports an active media session with a non-empty track title.
+    private var hasActiveMedia: Bool = false
 
     /// Validates an optional raw IP string as a syntactically valid IPv4 or IPv6 literal via `inet_pton`.
     private static func normalizedIp(_ raw: String?) -> String? {
@@ -1752,6 +2482,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         self.touchBar = nil
         self.activeMode = .main
         self.viewGpu = nil
+        self.viewGpuExpanded = nil
         self.viewTemp = nil
         self.viewPower = nil
         self.viewClock = nil
@@ -1759,8 +2490,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         self.viewUtil = nil
         self.viewPaste = nil
         self.viewCameraPrivacy = nil
-        self.viewMediaPlayPause = nil
-        self.viewMediaTrackLabel = nil
+        self.viewMediaMorph = nil
         self.viewMediaScrub = nil
 
         // Keep persistent ∫ icon visible in Control Strip so user can reopen anytime with one tap
@@ -1800,15 +2530,25 @@ final class LiquidGlassMediaScrubPillView: NSView {
             if cameraIsActive {
                 ids.append(NSTouchBarItem.Identifier("camera_privacy"))
             }
-            // Expanded Windows Media Controls + compact GPU telemetry pill (~558–628pt)
-            ids.append(contentsOf: [
-                NSTouchBarItem.Identifier("gpu"),
-                NSTouchBarItem.Identifier("media_prev"),
-                NSTouchBarItem.Identifier("media_play_pause"),
-                NSTouchBarItem.Identifier("media_next"),
-                NSTouchBarItem.Identifier("media_title"),
-                NSTouchBarItem.Identifier("media_scrub_slider")
-            ])
+            if hasActiveMedia {
+                // Active media layout: compact GPU pill + SF Symbol volume trio + morphing media pill + scrubber
+                ids.append(contentsOf: [
+                    NSTouchBarItem.Identifier("gpu"),
+                    NSTouchBarItem.Identifier("volume_mute"),
+                    NSTouchBarItem.Identifier("volume_down"),
+                    NSTouchBarItem.Identifier("volume_up"),
+                    NSTouchBarItem.Identifier("media_title"),
+                    NSTouchBarItem.Identifier("media_scrub_slider")
+                ])
+            } else {
+                // Idle media layout: expanded GPU telemetry pill + SF Symbol volume trio
+                ids.append(contentsOf: [
+                    NSTouchBarItem.Identifier("gpu_expanded"),
+                    NSTouchBarItem.Identifier("volume_mute"),
+                    NSTouchBarItem.Identifier("volume_down"),
+                    NSTouchBarItem.Identifier("volume_up")
+                ])
+            }
             return ids
 
         case .gpu:
@@ -1926,15 +2666,23 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
     // MARK: - Expanded Windows Media Control Actions
 
-    /// Refreshes Windows GSMTC track title, Play/Pause pill, and Liquid Glass scrub bar on main thread.
+    /// Refreshes Windows GSMTC track title, morphing media pill, scrubber, and dynamic GPU pill expansion.
     private func applyMediaUi(_ st: MediaPlaybackStateData?) {
         currentMediaState = st
-        if let m = st, m.has_session, !m.title.isEmpty {
-            viewMediaPlayPause?.setText(m.is_playing ? "⏸️" : "▶️")
-            viewMediaPlayPause?.setAccent(m.is_playing ? .systemGreen : .systemCyan)
+        let activeMedia: MediaPlaybackStateData?
+        if let m = st, m.has_session, !m.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activeMedia = m
+        } else {
+            activeMedia = nil
+        }
+
+        let nowActive = (activeMedia != nil)
+        let presenceChanged = (nowActive != hasActiveMedia)
+        hasActiveMedia = nowActive
+
+        if let m = activeMedia {
             let subtitle = m.artist.isEmpty ? m.title : "\(m.title) — \(m.artist)"
-            viewMediaTrackLabel?.setText(m.is_playing ? "🎵 \(subtitle)" : "⏸️ \(subtitle)")
-            viewMediaTrackLabel?.setAccent(m.is_playing ? .systemPink : .systemGray)
+            viewMediaMorph?.update(title: subtitle, isPlaying: m.is_playing)
             viewMediaScrub?.update(
                 position: m.position_secs,
                 duration: m.duration_secs,
@@ -1942,11 +2690,19 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 hasSession: true
             )
         } else {
-            viewMediaPlayPause?.setText("▶️")
-            viewMediaPlayPause?.setAccent(.systemGray)
-            viewMediaTrackLabel?.setText("🎵 No Windows Media")
-            viewMediaTrackLabel?.setAccent(.systemGray)
+            viewMediaMorph?.resetToNowPlaying()
+            viewMediaMorph?.update(title: "Not Playing", isPlaying: false)
             viewMediaScrub?.update(position: 0.0, duration: 0.0, isPlaying: false, hasSession: false)
+        }
+
+        if presenceChanged && isActive && activeMode == .main && touchIdYieldCount == 0 {
+            refreshTouchBarIdentifiersOnMain()
+            stateLock.lock()
+            let cached = lastGpuTelemetry
+            stateLock.unlock()
+            if let t = cached {
+                updateUi(with: t)
+            }
         }
     }
 
@@ -2058,27 +2814,58 @@ final class LiquidGlassMediaScrubPillView: NSView {
             item.visibilityPriority = .high
             return item
 
-        // MARK: Expanded Windows Media Controls
-        case "media_prev":
+        // MARK: Windows Master Volume Controls (SF Symbols)
+        case "volume_mute":
             let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: "⏮️", accent: .systemCyan, width: 40)
-            v.onTap = { [weak self] in
+            let v = GoopyLiquidGlassPillView(
+                symbolName: "speaker.slash.fill",
+                accent: .systemOrange,
+                width: 42
+            )
+            v.onTap = {
+                DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(4, 0.0) }
+            }
+            item.view = v
+            item.visibilityPriority = .high
+            return item
+
+        case "volume_down":
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let v = GoopyLiquidGlassPillView(
+                symbolName: "speaker.wave.1.fill",
+                accent: .systemCyan,
+                width: 42
+            )
+            v.onTap = {
+                DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(5, 0.0) }
+            }
+            item.view = v
+            item.visibilityPriority = .high
+            return item
+
+        case "volume_up":
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let v = GoopyLiquidGlassPillView(
+                symbolName: "speaker.wave.3.fill",
+                accent: .systemCyan,
+                width: 42
+            )
+            v.onTap = {
+                DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(6, 0.0) }
+            }
+            item.view = v
+            item.visibilityPriority = .high
+            return item
+
+        // MARK: Morphing Now-Playing <-> SF Symbol Media Controls Pill
+        case "media_title":
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let v = LiquidGlassMediaMorphPillView(width: 174)
+            v.onPrevious = { [weak self] in
                 DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(2, 0.0) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { self?.queryTelemetry() }
             }
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        case "media_play_pause":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let isPlaying = currentMediaState?.is_playing ?? false
-            let v = GoopyLiquidGlassPillView(
-                text: isPlaying ? "⏸️" : "▶️",
-                accent: isPlaying ? .systemGreen : .systemCyan,
-                width: 44
-            )
-            v.onTap = { [weak self] in
+            v.onPlayPause = { [weak self] in
                 guard let self = self else { return }
                 if let m = self.currentMediaState {
                     let toggled = MediaPlaybackStateData(
@@ -2095,43 +2882,11 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(0, 0.0) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { self.queryTelemetry() }
             }
-            self.viewMediaPlayPause = v
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        case "media_next":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: "⏭️", accent: .systemCyan, width: 40)
-            v.onTap = { [weak self] in
+            v.onNext = { [weak self] in
                 DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(1, 0.0) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { self?.queryTelemetry() }
             }
-            item.view = v
-            item.visibilityPriority = .high
-            return item
-
-        case "media_title":
-            let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = GoopyLiquidGlassPillView(text: "🎵 No Windows Media", accent: .systemGray, width: 168, marqueeEnabled: true)
-            v.onTap = { [weak self] in
-                guard let self = self else { return }
-                if let m = self.currentMediaState {
-                    let toggled = MediaPlaybackStateData(
-                        title: m.title,
-                        artist: m.artist,
-                        app_name: m.app_name,
-                        is_playing: !m.is_playing,
-                        position_secs: m.position_secs,
-                        duration_secs: m.duration_secs,
-                        has_session: m.has_session
-                    )
-                    self.applyMediaUi(toggled)
-                }
-                DispatchQueue.global(qos: .userInitiated).async { _ = send_rust_windows_media_cmd(0, 0.0) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { self.queryTelemetry() }
-            }
-            self.viewMediaTrackLabel = v
+            self.viewMediaMorph = v
             item.view = v
             item.visibilityPriority = .high
             applyMediaUi(currentMediaState)
@@ -2139,7 +2894,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
 
         case "media_scrub_slider":
             let item = NSCustomTouchBarItem(identifier: identifier)
-            let v = LiquidGlassMediaScrubPillView(width: 176)
+            let v = LiquidGlassMediaScrubPillView(width: 174)
             v.onPreviewSeek = { [weak self] pos in
                 self?.dispatchWindowsSeek(pos, refreshAfter: false)
             }
@@ -2164,6 +2919,24 @@ final class LiquidGlassMediaScrubPillView: NSView {
             self.viewGpu = v
             item.view = v
             item.visibilityPriority = .high
+            stateLock.lock()
+            let cachedGpu = lastGpuTelemetry
+            stateLock.unlock()
+            if let t = cachedGpu {
+                applyGpuPillsOnMain(t)
+            }
+        case "gpu_expanded":
+            let v = GoopyLiquidGlassPillView(text: "Peer Offline", accent: .systemGray, width: 396, marqueeEnabled: true)
+            v.onTap = { [weak self] in self?.switchMode(.gpu) }
+            self.viewGpuExpanded = v
+            item.view = v
+            item.visibilityPriority = .high
+            stateLock.lock()
+            let cachedGpu = lastGpuTelemetry
+            stateLock.unlock()
+            if let t = cachedGpu {
+                applyGpuPillsOnMain(t)
+            }
         case "temp":
             let v = GoopyLiquidGlassPillView(text: "🌡️ --°C", accent: .systemGray, width: 68)
             self.viewTemp = v
@@ -2353,6 +3126,66 @@ final class LiquidGlassMediaScrubPillView: NSView {
         return name
     }
 
+    /// Formats rich multi-metric GPU telemetry shown inside the expanded GPU pill when no media is playing.
+    private func formatExpandedGpuText(_ t: GpuTelemetryData) -> String {
+        let name = compactGpuName(t.gpu_name)
+        var parts: [String] = [name]
+        let hasLiveCounters =
+            t.temperature_c > 0 ||
+            (t.power_usage_watts.isFinite && t.power_usage_watts > 0.05) ||
+            t.core_clock_mhz > 0 ||
+            t.gpu_utilization_percent > 0
+
+        if t.temperature_c > 0 {
+            parts.append("\(t.temperature_c)°C")
+        }
+        if t.gpu_utilization_percent > 0 || hasLiveCounters {
+            parts.append("\(t.gpu_utilization_percent)%")
+        }
+        if t.power_usage_watts.isFinite && t.power_usage_watts > 0.05 {
+            parts.append(String(format: "%.0fW", t.power_usage_watts))
+        }
+        if t.core_clock_mhz > 0 {
+            parts.append("\(t.core_clock_mhz) MHz")
+        }
+        if t.memory_total_mb > 0 {
+            let totalGb = Double(t.memory_total_mb) / 1024.0
+            if t.memory_used_mb > 0 || hasLiveCounters {
+                let usedGb = Double(t.memory_used_mb) / 1024.0
+                parts.append(String(format: "%.1f/%.0f GB", usedGb, totalGb))
+            } else {
+                parts.append(String(format: "%.0f GB VRAM", totalGb))
+            }
+        }
+        return parts.joined(separator: "  •  ")
+    }
+
+    /// Applies compact and expanded GPU pill text + dynamic thermal accents synchronously on the main thread.
+    private func applyGpuPillsOnMain(_ t: GpuTelemetryData) {
+        let compact = self.compactGpuName(t.gpu_name)
+        let accent: NSColor
+        if t.temperature_c > 0 {
+            if t.temperature_c < 55 {
+                accent = NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0)
+            } else if t.temperature_c < 75 {
+                accent = NSColor(red: 0.95, green: 0.55, blue: 0.1, alpha: 1.0)
+            } else {
+                accent = NSColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1.0)
+            }
+        } else {
+            accent = NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0)
+        }
+
+        if let v = self.viewGpu {
+            v.setText(t.temperature_c > 0 ? "\(compact) \(t.temperature_c)°" : compact)
+            v.setAccent(accent)
+        }
+        if let vExp = self.viewGpuExpanded {
+            vExp.setText(self.formatExpandedGpuText(t))
+            vExp.setAccent(accent)
+        }
+    }
+
     /// Updates all GPU telemetry pills to a neutral offline placeholder state on the main thread.
     func updateOfflineUi(statusText: String = "Peer Offline", expectedGeneration: UInt64? = nil) {
         DispatchQueue.main.async { [weak self] in
@@ -2364,6 +3197,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
             }
             self.viewGpu?.setText(statusText)
             self.viewGpu?.setAccent(.systemGray)
+            self.viewGpuExpanded?.setText("\(statusText)  •  GPU Telemetry Unavailable")
+            self.viewGpuExpanded?.setAccent(.systemGray)
 
             self.viewTemp?.setText("🌡️ --°C")
             self.viewTemp?.setAccent(.systemGray)
@@ -2382,7 +3217,7 @@ final class LiquidGlassMediaScrubPillView: NSView {
         }
     }
 
-    /// Updates the compact GPU pill and `.gpu` detail strip metrics with color-coded thermal states.
+    /// Updates the compact/expanded GPU pills and `.gpu` detail strip metrics with color-coded thermal states.
     func updateUi(with t: GpuTelemetryData, expectedGeneration: UInt64? = nil) {
         self.stateLock.lock()
         self.lastGpuTelemetry = t
@@ -2401,23 +3236,8 @@ final class LiquidGlassMediaScrubPillView: NSView {
                 t.core_clock_mhz > 0 ||
                 t.gpu_utilization_percent > 0
 
-            // 0. Dynamic GPU Name + Live Thermal Temp combined cleanly for compact Touch Bar width
-            if let v = self.viewGpu {
-                let compact = self.compactGpuName(t.gpu_name)
-                if t.temperature_c > 0 {
-                    v.setText("🎮 \(compact) \(t.temperature_c)°")
-                    if t.temperature_c < 55 {
-                        v.setAccent(NSColor(red: 0.1, green: 0.75, blue: 0.35, alpha: 1.0))
-                    } else if t.temperature_c < 75 {
-                        v.setAccent(NSColor(red: 0.95, green: 0.55, blue: 0.1, alpha: 1.0))
-                    } else {
-                        v.setAccent(NSColor(red: 0.95, green: 0.2, blue: 0.2, alpha: 1.0))
-                    }
-                } else {
-                    v.setText("🎮 \(compact)")
-                    v.setAccent(NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0))
-                }
-            }
+            // 0. Dynamic GPU Name + Live Telemetry (compact while media plays, expanded when idle)
+            self.applyGpuPillsOnMain(t)
 
             // 1. Temperature with Dynamic Thermal Color
             if let v = self.viewTemp {
